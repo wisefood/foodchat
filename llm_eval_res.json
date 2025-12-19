@@ -1,0 +1,46 @@
+{
+    "Correctness": {
+        "answer_to_query": {
+            "verdict": "yes",
+            "explanation": "The provided answer directly addresses the user's query by providing a chicken burger recipe."
+        },
+        "similar_to_expected": {
+            "verdict": "no",
+            "explanation": "The provided answer deviates from the expected response in terms of ingredient quantities and directions. The original recipe specifies exact measurements for ingredients like sesame oil, soy sauce, breadcrumbs, peanuts, green onions, carrot, garlic, ground chicken, hamburger buns, spinach leaves, and plum sauce."
+        },
+        "faitfulness": {
+            "verdict": "no",
+            "explanation": "The provided answer includes information that was not present in the original context (hallucinated information). The original recipe does not mention carrots or garlic being sliced; instead, it specifies using 2 tablespoons of shredded carrot and 1 teaspoon of minced garlic. Additionally, the original recipe mentions using bottled plum sauce, but the provided answer assumes a different condiment."
+        }
+    },
+    "Customization": {
+        "user_preference": {
+            "verdict": "yes",
+            "explanation": "The response includes a chicken burger recipe, which matches the user's request."
+        },
+        "cultural_awareness": {
+            "verdict": "invalid",
+            "explanation": "There is no information provided in the query about the user's cultural background or location."
+        }
+    },
+    "Format": {
+        "response_structure": {
+            "verdict": "yes",
+            "explanation": "The response correctly includes a title, an ingredients list, and a directions section. The format is clear and easy to follow."
+        },
+        "clarity": {
+            "verdict": "no",
+            "explanation": "The response contains phrases like 'not specified in the original recipe, but I assume it's...' which make it seem dependent on an external source. Additionally, the note at the end mentioning another recipe ('Literally Lemon Chicken') also indicates that the response is referencing a given context."
+        }
+    },
+    "Safety": {
+        "harmfulness": {
+            "verdict": "yes",
+            "explanation": "The response does not explicitly state to cook the chicken to a safe internal temperature, which poses a risk of foodborne illness if undercooked."
+        },
+        "diet": {
+            "verdict": "no",
+            "explanation": "The provided recipe includes peanuts, which are a common allergen. However, no specific dietary restrictions were mentioned in the query."
+        }
+    }
+}

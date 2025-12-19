@@ -1,0 +1,114 @@
+{
+    "default_user": {
+        "user_id": "default_user",
+        "diet": [],
+        "allergies": [],
+        "preferences": [],
+        "location": "",
+        "history": ""
+    },
+    "tkalai": {
+        "user_id": "tkalai",
+        "username": "tkalai",
+        "diet": [
+            "Vegan"
+        ],
+        "allergies": [
+            "Almonds"
+        ],
+        "preferences": [
+            "Quick meals",
+            "Japan Cuisine"
+        ],
+        "location": [
+            "Brussels",
+            "Belgium"
+        ],
+        "history": "Do not suggest American-style burgers or pizzas without recipes."
+    },
+    "liza": {
+        "user_id": "liza",
+        "allergies": [
+            "peanuts",
+            "carrots"
+        ],
+        "diet": [
+            "vegetarian"
+        ],
+        "preferences": [
+            "italian cuisine"
+        ]
+    },
+    "dimitris": {
+        "user_id": "dimitris",
+        "allergies": [
+            "peanuts"
+        ],
+        "diet": [
+            "vegetarian"
+        ],
+        "preferences": [
+            "feta"
+        ]
+    },
+    "liza1": {
+        "user_id": "liza1",
+        "allergies": [
+            "peanuts"
+        ],
+        "diet": [
+            "vegetarian"
+        ],
+        "preferences": [
+            "italian cuisine"
+        ]
+    },
+    "blabla": {
+        "user_id": "blabla",
+        "allergies": [
+            "none"
+        ],
+        "diet": [
+            "vegetarian"
+        ],
+        "preferences": [
+            "sushi"
+        ]
+    },
+    "wisefood": {
+        "user_id": "wisefood",
+        "allergies": [
+            "nuts"
+        ],
+        "diet": [
+            "vegetarian"
+        ],
+        "preferences": [
+            "italian cuisine"
+        ]
+    },
+    "louisa": {
+        "user_id": "louisa",
+        "allergies": [
+            "peanuts"
+        ],
+        "diet": [
+            "vegetarian"
+        ],
+        "preferences": [
+            "japanese cuisine"
+        ]
+    },
+    "john": {
+        "user_id": "john",
+        "allergies": [
+            "peanuts"
+        ],
+        "diet": [
+            "vegetarian"
+        ],
+        "preferences": [
+            "japanese cuisine"
+        ]
+    }
+}

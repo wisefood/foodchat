@@ -1,0 +1,11 @@
+{
+    "typeCheckingMode": "basic",
+    "reportArgumentType" : false, 
+    "reportGeneralTypeIssues": false,
+    "reportPropertyTypeMismatch": "none",
+    "reportOptionalSubscript": false,
+    "reportOptionalMemberAccess": false,
+    "reportOptionalIterable": false,
+    "reportOptionalCall": false,
+    "reportOptionalOperand": false
+}
