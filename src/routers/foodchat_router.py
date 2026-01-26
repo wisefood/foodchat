@@ -1,10 +1,10 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
-from typing import Optional, List
-from foodchat import *
-from main import main_run
+from typing import Optional
+from foodchat_init import initialize_foodchat
 
-foodchat = main_run()
+# Initialize FoodChat once when the module loads
+foodchat, args = initialize_foodchat()
 
 router = APIRouter(
     prefix="/foodchat",
@@ -12,33 +12,26 @@ router = APIRouter(
     responses={404: {"description": "Not found"}},
 )
 
-# --- Pydantic Models for Input/Output Validation ---
-
 class ChatRequest(BaseModel):
     message: str
-    session_id: Optional[str] = None # conversation history or context
+    session_id: Optional[str] = None
 
 class ChatResponse(BaseModel):
     response: str
 
-
 def get_foodchat_service():
-    return FoodChat() 
-
-# --- Endpoints ---
+    return foodchat
 
 @router.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(
     request: ChatRequest, 
-    service: FoodChat = Depends(get_foodchat_service)
+    service = Depends(get_foodchat_service)
 ):
     """
     Endpoint to interact with the FoodChat bot.
     """
     try:
-        
         answer = service.get_test_response(request.message)
-        
         return ChatResponse(response=answer)
     
     except Exception as e:
