@@ -1,0 +1,81 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info
+.eggs
+*.egg
+.pytest_cache
+.mypy_cache
+.coverage
+htmlcov/
+.tox
+.nox
+.hypothesis
+
+# Virtual environments
+venv/
+env/
+.env
+.venv
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Docker
+Dockerfile*
+docker-compose*
+.docker
+
+# Documentation
+*.md
+docs/
+
+# Test files
+tests/
+test_*.py
+*_test.py
+
+# Build artifacts
+build/
+dist/
+*.so
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Claude
+.claude/
+
+# Local config (keep .env.example)
+.env
+*.local
+
+# Large model files
+*.bin
+*.pt
+*.pth
+*.onnx
+
+# Vector stores (mount as volume instead)
+VECTORSTORE/
+
+# Jupyter
+.ipynb_checkpoints
+*.ipynb

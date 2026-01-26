@@ -4,10 +4,10 @@
 # ==============================================================================
 # Configuration
 # ==============================================================================
-IMAGE_NAME ?= foodchat
-IMAGE_TAG ?= latest
-REGISTRY ?= docker.io
-REGISTRY_USER ?= $(shell whoami)
+IMAGE_NAME = foodchat
+IMAGE_TAG = latest
+REGISTRY = docker.io
+REGISTRY_USER = wisefood
 FULL_IMAGE_NAME = $(REGISTRY)/$(REGISTRY_USER)/$(IMAGE_NAME):$(IMAGE_TAG)
 
 # Container runtime (docker or podman)
