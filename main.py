@@ -6,6 +6,18 @@ from ragas_eval import *
 from user_interface import UI, launch_interface
 from utils import *
 
+from fastapi import FastAPI
+from src.routers import foodchat_router  # Import the new router
+
+app = FastAPI()
+
+# Include the routers
+app.include_router(foodchat_router.router)
+
+@app.get("/")
+def root():
+    return {"message": "Welcome to WiseFood API"}
+
 
 def parse_arguments():
     """Parse command-line arguments."""
@@ -48,16 +60,16 @@ def parse_arguments():
         )
     return args
 
-
-def main() : 
+def main_run() :
     args = parse_arguments()
     embeddings = get_embeddings(args.embedding_model)
-    foodchat= initialize_system(args, embeddings)
+    foodchat = initialize_system(args, embeddings)
     ui = UI(foodchat, args)
     # rag_chain = foodchat.create_chain(args, ask_user_fn = None)
     # run_interactive_chat(foodchat, rag_chain, args)
     launch_interface(ui, args)
+    return foodchat
 
 if __name__ == "__main__":
-    main()
+    main_run()
     

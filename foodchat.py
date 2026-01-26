@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 from colorama import Fore, Style
-from langchain.memory import ConversationBufferMemory
+#from langchain.memory import ConversationBufferMemory
 from langchain.retrievers.multi_query import MultiQueryRetriever
 from langchain_chroma import Chroma
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
@@ -369,6 +369,9 @@ class FoodChat:
         self.vectorstore = vectorstore
         self.ks_weight = ks_weight
         self.vs_weight = vs_weight
+
+    def get_test_response(self, message):
+        return "This was your message: " + message + "\n\n"
 
     def format_docs(self, docs):
         return "\n\n".join(

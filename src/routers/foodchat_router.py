@@ -1,8 +1,10 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from typing import Optional, List
+from foodchat import *
+from main import main_run
 
-from src.backend.foodchat import FoodChat
+foodchat = main_run()
 
 router = APIRouter(
     prefix="/foodchat",
@@ -14,7 +16,7 @@ router = APIRouter(
 
 class ChatRequest(BaseModel):
     message: str
-    session_id: Optional[str] = None 
+    session_id: Optional[str] = None # conversation history or context
 
 class ChatResponse(BaseModel):
     response: str
@@ -35,7 +37,7 @@ async def chat_endpoint(
     """
     try:
         
-        answer = service.chat(request.message) 
+        answer = service.get_test_response(request.message)
         
         return ChatResponse(response=answer)
     
