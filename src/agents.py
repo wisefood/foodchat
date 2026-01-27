@@ -10,7 +10,6 @@ from langchain_ollama import ChatOllama
 
 from prompts import *
 from schemas import *
-from user_profiles import get_user_input
 
 PATH = Path(__file__).parent.resolve()
 RECIPE_SCORING = PATH / 'retrieved_recipe_scoring.json'

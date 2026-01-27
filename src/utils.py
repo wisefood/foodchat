@@ -1,12 +1,13 @@
-import torch
-from transformers import AutoModel, AutoTokenizer
+import json
+import os
+import re
+from pathlib import Path
+
 import numpy as np
+import torch
 from chromadb.utils.embedding_functions import EmbeddingFunction
 from langchain_ollama import OllamaEmbeddings
-from pathlib import Path
-import os
-import json
-
+from transformers import AutoModel, AutoTokenizer
 
 PATH = Path(__file__).parent.resolve()
 
@@ -100,5 +101,75 @@ def write_to_file(data, user_query=False, context=False, response=False, expecte
 
     if entry not in sessions:
         sessions.append(entry)
-    with open(file_path, "w", encoding="utf-8") as trace_file: 
+    with open(file_path, "w", encoding="utf-8") as trace_file:
         json.dump(sessions, trace_file, ensure_ascii=False, indent=4)
+
+
+def pretty_format_recipes(recipe_data: tuple) -> str:
+    """Format a tuple of raw recipe strings into a clean, human-readable format.
+
+    Args:
+        recipe_data: A tuple of strings, where each string contains a recipe
+                     with 'Title:', 'Ingredients:', and 'Directions:' sections.
+
+    Returns:
+        Formatted string with meal plan details.
+    """
+    result = "Here is your meal plan:"
+
+    meal_types = {0: "Breakfast", 1: "Lunch", 2: "Dinner"}
+
+    for i, raw_recipe in enumerate(recipe_data):
+        try:
+            # Clean up known data issues
+            clean_recipe = raw_recipe.strip().replace(",t.',", "").replace("',", "")
+
+            # Use regex to find sections
+            title_match = re.search(
+                r"Title:(.*?)\s*Ingredients:", clean_recipe, re.IGNORECASE | re.DOTALL
+            )
+            ingredients_match = re.search(
+                r"Ingredients:(.*?)\s*Directions:",
+                clean_recipe,
+                re.IGNORECASE | re.DOTALL,
+            )
+            directions_match = re.search(
+                r"Directions:(.*)", clean_recipe, re.IGNORECASE | re.DOTALL
+            )
+
+            if not all([title_match, ingredients_match, directions_match]):
+                result += f"\n\n--- Could not parse Recipe {i + 1} ---"
+                continue
+
+            title = title_match.group(1).strip().title()
+            ingredients_raw = ingredients_match.group(1).strip()
+            directions_raw = directions_match.group(1).strip()
+
+            # Format header
+            meal_name = meal_types.get(i, f"Recipe {i + 1}")
+            result += f"\n\n--- {meal_name}: {title} ---\n\n"
+
+            # Format ingredients
+            result += "Ingredients:"
+            ingredient_list = [
+                ing.strip().capitalize()
+                for ing in ingredients_raw.split(",")
+                if ing.strip()
+            ]
+            for item in ingredient_list:
+                result += f"\n  - {item}"
+
+            # Format directions
+            result += "\n\nDirections:"
+            steps = [
+                step.strip().capitalize()
+                for step in directions_raw.split(".")
+                if step.strip()
+            ]
+            for j, step in enumerate(steps, 1):
+                result += f"\n  {j}. {step}."
+
+        except Exception:
+            result += f"\n\n--- Error parsing Recipe {i + 1} ---"
+
+    return result

@@ -1,6 +1,8 @@
 import argparse
-from foodchat import *
-from utils import *
+import os
+
+from foodchat import initialize_system
+from utils import get_embeddings
 
 def parse_arguments():
     """Parse command-line arguments."""

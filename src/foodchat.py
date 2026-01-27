@@ -4,34 +4,30 @@ import os
 import sys
 from pathlib import Path
 
+import numpy as np
 from colorama import Fore, Style
-#from langchain.memory import ConversationBufferMemory
+from langchain.memory import ConversationBufferMemory
 from langchain.retrievers.multi_query import MultiQueryRetriever
 from langchain_chroma import Chroma
+from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
 from langchain_core.runnables import RunnableLambda, RunnablePassthrough
 from langchain_ollama import OllamaLLM
-# from langchain_milvus import Milvus
 from rank_bm25 import BM25Okapi
 
-from agents import *
-from csv_processor import *
-from pdf_processor import *
-from prompts import *
-from schemas import *
-# from user_interface import *
-from user_profiles import *
-from utils import *
+from agents import DocumentGrader, QueryReconciler
+from csv_processor import CSV_CULINARY_PATH, CSV_HUMMUS_PATH, CSVProcessor
+from pdf_processor import PDFProcessor, SOURCE_NAME
+from prompts import template_foodchat
+from utils import PATH
 
-project_root = Path(__file__).parent.parent  # Goes up to WiseFood/
+project_root = Path(__file__).parent.parent
 sys.path.append(str(project_root))
 
 from KG_neo4j.query_kg import get_filtered_recipe_ids
 
 PDF_PATH = f"./data/{SOURCE_NAME}.pdf"
-
 TEST_TRACE_FILE_PATH = PATH / "test_trace.json"
-
 VECTORSTORE_PATH = PATH / "VECTORSTORE"
 
 QUERY_PROMPT = PromptTemplate(
@@ -42,9 +38,22 @@ QUERY_PROMPT = PromptTemplate(
             Original question: {question}""",
 )
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def format_user_profile(user_profile: dict) -> str:
+    """Format a user profile dict for display/logging."""
+    lines = []
+    if user_profile.get("diet"):
+        lines.append(f"Diet: {', '.join(user_profile['diet'])}")
+    if user_profile.get("allergies"):
+        lines.append(f"Allergies: {', '.join(user_profile['allergies'])}")
+    if user_profile.get("preferences"):
+        lines.append(f"Preferences: {', '.join(user_profile['preferences'])}")
+    if user_profile.get("history"):
+        lines.append(f"History: {user_profile['history']}")
+    return "\n".join(lines) if lines else "No profile information"
 
 
 class Retriever:
@@ -89,9 +98,16 @@ class Retriever:
 
         else:
             selected_cols = (
-                ["title", "ingredients", "directions",
-                'recipe_id', 'allergens', 'meal_course',
-                'diet', 'dish_type']
+                [
+                    "title",
+                    "ingredients",
+                    "directions",
+                    "recipe_id",
+                    "allergens",
+                    "meal_course",
+                    "diet",
+                    "dish_type",
+                ]
                 if dataset_name == "hummus"
                 else ["title", "ingredients"]
             )
@@ -109,12 +125,14 @@ class Retriever:
                     texts=data["combined_text"].to_list(),
                     embedding=processor.embeddings,
                     collection_name="vector-db",
-                    metadatas=data[selected_cols].to_dict("records")
-                    if data_type == "csv"
-                    else data[selected_cols].to_dict("records"),
+                    metadatas=(
+                        data[selected_cols].to_dict("records")
+                        if data_type == "csv"
+                        else data[selected_cols].to_dict("records")
+                    ),
                     persist_directory=persist_dir,
                     collection_metadata={"hnsw:space": "cosine"},
-                )  # Force use of Cosine Distance (score between 0 and 2 with lower better => need to convert)
+                )
 
         return vector_db
 
@@ -166,45 +184,42 @@ class Retriever:
 
         corpus = [text.lower().split(" ") for text in texts]
         bm25_retriever = BM25Okapi(corpus)
-        # bm25_retriever = BM25Retriever.from_texts(
-        #     texts=texts
-        # )
-        # bm25_retriever.k = max_retrieval
 
         return bm25_retriever
 
     def get_vector_search_results(
-        self, query, max_retrieval, retrieval_method, retriever, vectorstore,
-        recipe_ids
+        self, query, max_retrieval, retrieval_method, retriever, vectorstore, recipe_ids
     ):
-        print("FILTERING WITH RECIPE_IDS: ", len(recipe_ids), ' ', type(recipe_ids), ' ', type(recipe_ids[0]))
-        # Loop through the different meal courses
-        # sample = vectorstore._collection.get(limit=10)
+        print(
+            "FILTERING WITH RECIPE_IDS: ",
+            len(recipe_ids),
+            " ",
+            type(recipe_ids),
+            " ",
+            type(recipe_ids[0]),
+        )
         if retrieval_method == "mmr":
-            # MMR doesn't provide scores directly; return as-is
             docs = retriever.invoke(query)
             return docs
         else:
-            # Fetch documents and scores using the original query
             if retrieval_method == "similarity":
                 results = vectorstore.similarity_search_with_score(
-                    query, k=max_retrieval,
-                    filter={"recipe_id" : {"$in" : recipe_ids}}
+                    query, k=max_retrieval, filter={"recipe_id": {"$in": recipe_ids}}
                 )
             elif retrieval_method == "similarity_score_threshold":
                 results = vectorstore.similarity_search_with_score(
-                    query, k=max_retrieval, score_threshold=0.0, 
-                    filter={"recipe_id" : {"$in" : recipe_ids}}
+                    query,
+                    k=max_retrieval,
+                    score_threshold=0.0,
+                    filter={"recipe_id": {"$in": recipe_ids}},
                 )
             else:
                 raise ValueError(f"Unsupported retrieval method: {retrieval_method}")
 
-            # Attach scores to document metadata
             docs = []
             for doc, score in results:
                 doc.metadata["score"] = score
                 docs.append(doc)
-            # Sort documents by score in descending order
             for doc in docs:
                 doc.metadata["score"] = 1 - doc.metadata["score"]
 
@@ -217,7 +232,6 @@ class Retriever:
     def get_keyword_search_results(
         self, query, bm25_retriever, data_type, data, max_retrieval
     ):
-        # bm25_retriever = self.build_bm25_retriever(self.persist_dir, data_type, data, max_retrieval)
         tokenized_query = query.lower().split(" ")
         bm25_results = bm25_retriever.get_scores(tokenized_query)
         top_indices = np.argsort(bm25_results)[::-1][:max_retrieval]
@@ -252,8 +266,7 @@ class Retriever:
         recipe_ids,
     ):
         vector_docs = self.get_vector_search_results(
-            query, max_retrieval, retrieval_method, retriever, vectorstore, 
-            recipe_ids
+            query, max_retrieval, retrieval_method, retriever, vectorstore, recipe_ids
         )
         if isinstance(retriever, BM25Okapi):
             bm25_docs = self.get_keyword_search_results(
@@ -266,11 +279,7 @@ class Retriever:
                 elem.page_content: elem.metadata["score"] for elem in vector_docs
             }
 
-            # print(Fore.GREEN + "Here are the vector search results : " + str(vector_docs) + Style.RESET_ALL)
-            # print(Fore.MAGENTA + "Here are the KEYWORD search results : " + str(bm25_docs) + Style.RESET_ALL)
-            # vector_docs_content = [doc.page_content for doc in vector_docs]
             vector_docs_content = list(vector_docs.keys())
-            # bm25_docs_content = [doc.page_content for doc in bm25_docs]
             bm25_docs_content = list(bm25_docs.keys())
             all_page_contents = set(vector_docs_content).union(bm25_docs_content)
             merged_docs = []
@@ -332,7 +341,6 @@ class Retriever:
                 data=data,
                 max_retrieval=max_retrieval,
             )
-            # hybrid_retriever = EnsembleRetriever(retrievers=[bm25_retriever, vector_retriever], weights = [0.4, 0.6]) #random weights need tests
             return bm25_retriever, vector_db
         return vector_retriever, vector_db
 
@@ -381,7 +389,7 @@ class FoodChat:
     def retrieve_with_score(self, query, recipe_ids):
         daily_plan = {}
         retriever_instance = Retriever(self.persist_dir)
-        for course in recipe_ids.keys() : 
+        for course in recipe_ids.keys():
             docs = retriever_instance.get_relevant_docs_with_scores(
                 data_type=self.data_type,
                 data=self.data,
@@ -392,7 +400,7 @@ class FoodChat:
                 vectorstore=self.vectorstore,
                 ks_weight=self.ks_weight,
                 vs_weight=self.vs_weight,
-                recipe_ids = recipe_ids[course]
+                recipe_ids=recipe_ids[course],
             )
             daily_plan[course] = docs
         return daily_plan
@@ -401,40 +409,40 @@ class FoodChat:
         """Print retrieved context"""
         print("\n=== RETRIEVED CONTEXT ===")
         print(f"NUMBER OF RETRIEVED DOCS: {len(docs)}")
-        # write_to_file(docs, context=True)
-        # write_to_file(docs, context=True, test=True)
         for doc in docs:
-            # score = doc.metadata.get("score", "N/A")
             score = doc[1].get("score", "N/A")
             reason = doc[1].get("reasoning")
-            # print(f"Page {doc.metadata['page']} - Similarity score: {score}") #instead of page put in the recipe id ?
             print(f"Daily Plan Score: {score}")
             print(f"Explanation: {reason}")
             print("Content Preview:")
-            # print(doc.page_content[:1000] + "...")
             print(doc[0])
             print("-----------------------")
         return docs
 
     def create_pre_clarification_chain(self, args):
+        """Create the pre-clarification RAG chain.
+
+        The chain expects input with:
+        - question: The user's query
+        - user_id: The member ID (for reference)
+        - user_profile_data: The user profile dict (passed directly, not fetched)
+        """
         prompt = ChatPromptTemplate.from_template(template_foodchat)
         query_reconciler = QueryReconciler()
 
         if args.data_type == "pdf":
             return (
+                # Profile is passed directly in input, just format it
                 RunnablePassthrough.assign(
-                    user_profile_data=RunnableLambda(
-                        lambda x: get_user_profile(x["user_id"])
-                    )
-                )
-                | RunnablePassthrough.assign(
                     formatted_profile=RunnableLambda(
-                        lambda x: format_user_profile(x["user_profile_data"])
+                        lambda x: format_user_profile(x.get("user_profile_data", {}))
                     )
                 )
                 | RunnablePassthrough.assign(
                     context=lambda x: self.format_docs(
-                        self.log_retrieval(self.retrieve_with_score(x["question"], x['recipe_ids']))
+                        self.log_retrieval(
+                            self.retrieve_with_score(x["question"], x["recipe_ids"])
+                        )
                     )
                 )
                 | RunnablePassthrough.assign(
@@ -450,77 +458,57 @@ class FoodChat:
             )
         elif args.data_type == "csv":
             return (
+                # Profile is passed directly in input
                 RunnablePassthrough.assign(
-                    # We fetch the user profile data
-                    user_profile_data=RunnableLambda(
-                        lambda x: get_user_profile(x["user_id"])
-                    )
-                )
-                | RunnablePassthrough.assign(
-                    # format the fetched user profile to make it easier in next steps.
                     formatted_profile=RunnableLambda(
-                        lambda x: format_user_profile(x["user_profile_data"])
+                        lambda x: format_user_profile(x.get("user_profile_data", {}))
                     )
                 )
                 | RunnablePassthrough.assign(
-                    # TEMPORARILY modify the user data (if there is conflict between user data and user query)
+                    # TEMPORARILY modify the user data if there is conflict
                     modified_user_data=RunnableLambda(
                         lambda x: query_reconciler.reconcile(
-                            x["question"], x["user_profile_data"]
+                            x["question"], x.get("user_profile_data", {})
                         )
                     )
                 )
-                
             )
 
     def create_post_clarification_chain(self):
         doc_grader = DocumentGrader()
-        prompt = ChatPromptTemplate.from_template(template_foodchat) #todo: refine the prompt
+        prompt = ChatPromptTemplate.from_template(template_foodchat)
 
-        return(
-            # RunnablePassthrough.assign(
-            #     check = lambda x: rag_preparator.query_check(x['question'], x['modified_user_data'])
-            # )
-            # |
+        return (
             RunnablePassthrough.assign(
-                    # Based on the diet and allergens list, provide the recipe ids for each course of the day (breakfast,
-                    # lunch, dinner)
-                    recipe_ids = RunnableLambda(
-                        lambda x: get_filtered_recipe_ids(x['modified_user_data']['allergies'], 
-                                                                   x['modified_user_data']['diet']
-                        )
+                recipe_ids=RunnableLambda(
+                    lambda x: get_filtered_recipe_ids(
+                        x["modified_user_data"]["allergies"],
+                        x["modified_user_data"]["diet"],
                     )
-                ) 
-                | RunnablePassthrough.assign(
-                # Retrieval: build the context with a set of graded and retrieved document. 
-                # Make the retriever a "naive" knowledge recommender based on the modified user data
+                )
+            )
+            | RunnablePassthrough.assign(
                 context=lambda x: self.log_retrieval(
                     doc_grader.grading_daily_plans(
                         x["question"],
-                        self.retrieve_with_score(x["question"], x['recipe_ids']),
+                        self.retrieve_with_score(x["question"], x["recipe_ids"]),
                         x["modified_user_data"],
                     )
                 )
             )
             | RunnablePassthrough.assign(
-                # Combine the different parts to ge the final prompt to provide to the LLM
                 final_input=lambda x: {
                     "context": x["context"],
                     "question": x["question"],
-                    "user_profile_context": x[
-                        "modified_user_data"
-                    ],  # OLD: x["formatted_profile"]
+                    "user_profile_context": x["modified_user_data"],
                 }
             )
             | RunnableLambda(lambda x: x["final_input"])
-         #   | (lambda x: x["final_input"])
-         #   | prompt
-         #   | self.llm
         )
 
-def initialize_system(args, embeddings):
-    # Add check to see if vector db exists already then no need to split doc, ect...
 
+def initialize_system(args, embeddings):
+    """Initialize the FoodChat system with retriever and vectorstore."""
     persist_dir = str(
         VECTORSTORE_PATH
         / f"{args.vectorstore}"
@@ -596,66 +584,3 @@ def initialize_system(args, embeddings):
             ks_weight=args.ks_weight,
             vs_weight=args.vs_weight,
         )
-
-
-def run_interactive_chat(foodchat, rag_chain, args):
-
-    current_profile = setup_user_session()
-
-    if current_profile["user_id"] == "default_user":
-        print("Session with default user")
-    else:
-        print(Fore.GREEN + f"Chatting as {current_profile['user_id']}")
-        print(format_user_profile(current_profile) + Style.RESET_ALL)
-
-    chatbot = SimpleChatBot()
-    check_answer = FoodChatResponseEvaluator()
-    query_rewriter = QueryRewriter()
-
-    MAX_RAG_ITERATIONS = 3
-
-    while True:
-        query = input("\nUser: ")
-        write_to_file(query, user_query=True)
-
-        routing = QueryClassifier().router(query)
-
-        if query.lower() == "exit":
-            break
-
-        if routing["source"] == "vectorstore":
-            print("VECTORSTORE")
-            iterations = 0
-
-            while iterations < MAX_RAG_ITERATIONS:
-                response = rag_chain.invoke(
-                    {"question": query, "user_id": current_profile["user_id"]}
-                )
-
-                if args.adaptive_rag == True:
-                    question_list = check_answer.evaluate(query, response)
-
-                    if len(question_list) != 0:
-                        query = query_rewriter.rewrite(query, question_list)
-                        iterations += 1
-                        print(
-                            Fore.GREEN
-                            + "RAG ITERATIONS: "
-                            + str(f"{iterations}/{MAX_RAG_ITERATIONS}")
-                            + Style.RESET_ALL
-                        )
-                    else:
-                        break
-                else:
-                    iterations = MAX_RAG_ITERATIONS
-        else:
-            print("CHATBOT")
-            response = chatbot.chat(query)
-
-        print(f"\nFoodChat: {response}")
-
-        foodchat.memory.save_context({"question": query}, {"answer": response})
-
-        update_user_profile_history(current_profile["user_id"], response)
-
-        write_to_file(response, response=True)
