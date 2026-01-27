@@ -19,9 +19,9 @@ class WiseFoodClientPool:
 
     def _initialize_client(self) -> None:
         """Initialize the WiseFood client from environment variables."""
-        api_url = os.environ.get("WISEFOOD_API_URL")
-        username = os.environ.get("WISEFOOD_USERNAME")
-        password = os.environ.get("WISEFOOD_PASSWORD")
+        api_url = os.getenv("WISEFOOD_API_URL")
+        username = os.getenv("WISEFOOD_USERNAME")
+        password = os.getenv("WISEFOOD_PASSWORD")
 
         if not all([api_url, username, password]):
             raise ValueError(

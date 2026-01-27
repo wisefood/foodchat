@@ -1,6 +1,6 @@
 import pandas as pd
 
-CSV_HUMMUS_PATH = f"./data/data_kg.csv"
+CSV_HUMMUS_PATH = f"../data/data_kg.csv"
 CSV_CULINARY_PATH = f"./data/sample_CulinaryDB.csv"
 
 
