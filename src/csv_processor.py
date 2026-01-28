@@ -1,7 +1,8 @@
+import os
 import pandas as pd
 
-CSV_HUMMUS_PATH = f"../data/data_kg.csv"
-CSV_CULINARY_PATH = f"./data/sample_CulinaryDB.csv"
+CSV_HUMMUS_PATH = os.getenv("CSV_HUMMUS_PATH", "./data/data_kg.csv")
+CSV_CULINARY_PATH = os.getenv("CSV_CULINARY_PATH", "./data/sample_CulinaryDB.csv")
 
 
 
@@ -27,9 +28,9 @@ class CSVProcessor:
                 data[col] = data[col].apply(lambda x : x.lower().strip() if type(x) == str else x)
 
             data['combined_text'] = (
-                "Title: " + data['title'] + 
-                " Ingredients: " + data['ingredients'] + 
-                " Directions: " + data['directions']
+                "Title: " + data['title'].astype(str) + 
+                " Ingredients: " + data['ingredients'].astype(str) + 
+                " Directions: " + data['directions'].astype(str)
             )
         elif source_name == 'culinary' : 
             data = pd.read_csv(CSV_CULINARY_PATH)[['title', 'ingredients']]
@@ -39,8 +40,8 @@ class CSVProcessor:
 
             
             data['combined_text'] = (
-                "Title: " + data['title'] + 
-                " Ingredients: " +data['ingredients']
+                "Title: " + data['title'].astype(str) + 
+                " Ingredients: " + data['ingredients'].astype(str)
             )
         return data
         

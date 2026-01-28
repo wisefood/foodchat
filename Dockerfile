@@ -1,4 +1,15 @@
-FROM python:3.11-slim
+# =============================================================================
+# FoodChat API - Multi-stage Dockerfile
+# =============================================================================
+# Build: docker build -t foodchat .
+# Dev:   docker build --target dev -t foodchat:dev .
+# Prod:  docker build --target prod -t foodchat:prod .
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Base stage - common dependencies
+# -----------------------------------------------------------------------------
+FROM python:3.11-slim AS base
 
 WORKDIR /app
 
@@ -14,10 +25,27 @@ COPY requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
+# -----------------------------------------------------------------------------
+# Development stage - with hot reload and dev tools
+# -----------------------------------------------------------------------------
+FROM base AS dev
+
+# Install dev dependencies
+RUN pip install --no-cache-dir \
+    pytest \
+    pytest-cov \
+    black \
+    isort \
+    ruff \
+    mypy \
+    watchfiles
+
 # Copy application code
 COPY src/ ./src/
 COPY KG_neo4j/ ./KG_neo4j/
-COPY data/ ./data/
+
+# Create data directory (mount volume in dev)
+RUN mkdir -p ./data
 
 # Set working directory to src
 WORKDIR /app/src
@@ -25,20 +53,51 @@ WORKDIR /app/src
 # Expose port
 EXPOSE 8000
 
-# Environment variables (override at runtime)
-ENV WISEFOOD_API_URL=""
-ENV WISEFOOD_USERNAME=""
-ENV WISEFOOD_PASSWORD=""
-ENV DATASET="hummus"
-ENV MODEL="Llama_FoodChat"
-ENV DATA_TYPE="csv"
-ENV EMBEDDINGS="nomic-embed-text:latest"
-ENV VECTORSTORE="chroma"
-ENV MAX_RETRIEVAL="3"
+# Environment defaults for development
+ENV SERVER_HOST=0.0.0.0
+ENV SERVER_PORT=8000
+ENV LOG_LEVEL=DEBUG
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# Run with hot reload for development
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+
+# -----------------------------------------------------------------------------
+# Production stage - optimized for deployment
+# -----------------------------------------------------------------------------
+FROM base AS prod
+
+# Create non-root user for security
+RUN groupadd -r foodchat && useradd -r -g foodchat foodchat
+
+# Copy application code
+COPY src/ ./src/
+COPY KG_neo4j/ ./KG_neo4j/
+COPY data/ ./data/
+
+# Set ownership
+RUN chown -R foodchat:foodchat /app
+
+# Switch to non-root user
+USER foodchat
+
+# Set working directory to src
+WORKDIR /app/src
+
+# Expose port
+EXPOSE 8000
+
+# Environment defaults for production
+ENV SERVER_HOST=0.0.0.0
+ENV SERVER_PORT=8000
+ENV LOG_LEVEL=INFO
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:8000/foodchat/health || exit 1
 
-# Run the application
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Run with multiple workers for production
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]

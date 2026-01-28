@@ -26,7 +26,7 @@ class MealPlan:
         """Create a MealPlan from RAG chain response."""
         return cls(
             id=str(uuid.uuid4()),
-            created_at=datetime.utcnow(),
+            created_at=datetime.now(),
             breakfast=meal_plan_tuple[0] if len(meal_plan_tuple) > 0 else "",
             lunch=meal_plan_tuple[1] if len(meal_plan_tuple) > 1 else "",
             dinner=meal_plan_tuple[2] if len(meal_plan_tuple) > 2 else "",
