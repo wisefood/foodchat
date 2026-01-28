@@ -6,8 +6,7 @@ from pathlib import Path
 
 import numpy as np
 from colorama import Fore, Style
-from langchain.memory import ConversationBufferMemory
-from langchain.retrievers.multi_query import MultiQueryRetriever
+from langchain_classic.retrievers.multi_query import MultiQueryRetriever
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
@@ -367,9 +366,6 @@ class FoodChat:
         self.query_method = query_method
         self.max_retrieval = max_retrieval
         self.retriever = retriever
-        self.memory = ConversationBufferMemory(
-            memory_key="chat_history", return_messages=True
-        )
         self.data = data
         self.dataset = dataset
         self.data_type = data_type

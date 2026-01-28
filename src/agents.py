@@ -5,14 +5,14 @@ from pathlib import Path
 import logging
 
 from colorama import Fore, Style
-from langchain.memory import ConversationBufferMemory
+from langchain_classic.memory import ConversationBufferMemory
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
 from langchain_groq import ChatGroq
 import os
 from backend.groq import GROQ_CHAT
-from src.prompts import *
-from src.schemas import (
+from prompts import *
+from schemas import (
     ScoringSchema,
     QuestionList,
     FoodChatResponseEvaluatorSchema,

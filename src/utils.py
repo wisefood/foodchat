@@ -4,20 +4,37 @@ import re
 from pathlib import Path
 
 import numpy as np
-import torch
-from chromadb.utils.embedding_functions import EmbeddingFunction
 from langchain_ollama import OllamaEmbeddings
-from transformers import AutoModel, AutoTokenizer
 
 PATH = Path(__file__).parent.resolve()
+
+# Lazy imports for HuggingFace embeddings (requires torch + transformers)
+torch = None
+AutoModel = None
+AutoTokenizer = None
+EmbeddingFunction = None
+
+
+def _load_hf_deps():
+    global torch, AutoModel, AutoTokenizer, EmbeddingFunction
+    if torch is None:
+        import torch as _torch
+        from transformers import AutoModel as _AutoModel, AutoTokenizer as _AutoTokenizer
+        from chromadb.utils.embedding_functions import EmbeddingFunction as _EmbeddingFunction
+        torch = _torch
+        AutoModel = _AutoModel
+        AutoTokenizer = _AutoTokenizer
+        EmbeddingFunction = _EmbeddingFunction
 
 EMBEDDING_MODEL = "davanstrien/autotrain-recipes-2451975973"
 TRACE_FILE_PATH = PATH / 'trace.json'
 
 
-class HuggingFaceEmbeddings(EmbeddingFunction):
+class HuggingFaceEmbeddings:
+    """HuggingFace embeddings - requires torch and transformers to be installed."""
 
-    def __init__(self, embedding_model = EMBEDDING_MODEL): 
+    def __init__(self, embedding_model=EMBEDDING_MODEL):
+        _load_hf_deps()
         self.tokenizer = AutoTokenizer.from_pretrained(embedding_model)
         self.model = AutoModel.from_pretrained(embedding_model)
 
