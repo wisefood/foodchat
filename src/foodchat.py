@@ -553,6 +553,9 @@ def initialize_system(args, embeddings):
 
     elif args.data_type == "csv":
         data_path = CSV_HUMMUS_PATH if args.dataset == "hummus" else CSV_CULINARY_PATH
+        if not os.path.exists(data_path):
+            logging.warning(f"CSV file not found at {data_path}, skipping CSV initialization")
+            return None
         processor = CSVProcessor(data_path, embeddings)
         df = processor.load_csv_data(args.dataset)
         retriever, vector_db = retriever_instance.get_retriever(

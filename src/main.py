@@ -2,9 +2,7 @@ from fastapi import FastAPI
 
 from foodchat_init import initialize_foodchat
 from routers import foodchat_router
-from services.chat_service import ChatService
-from services.profile_service import ProfileService
-from services.session_service import SessionService
+from services import init_chat_service
 
 app = FastAPI(
     title="FoodChat API",
@@ -15,12 +13,9 @@ app = FastAPI(
 # Initialize FoodChat system (retriever, vectorstore, etc.)
 foodchat, config = initialize_foodchat()
 
-session_service = SessionService()
-profile_service = ProfileService()
-chat_service = ChatService(foodchat, config, session_service)
+# Initialize chat service (optional - depends on foodchat being loaded)
+init_chat_service(foodchat, config)
 
-# Initialize router with services§
-foodchat_router.init_services(session_service, profile_service, chat_service)
 app.include_router(foodchat_router.router)
 
 

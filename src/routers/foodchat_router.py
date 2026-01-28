@@ -4,10 +4,7 @@ from typing import List, Optional
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
 
-# Services will be injected via init_services()
-_session_service = None
-_profile_service = None
-_chat_service = None
+import services
 
 router = APIRouter(
     prefix="/foodchat",
@@ -56,28 +53,14 @@ class MealPlanResponse(BaseModel):
     reasoning: str
 
 
-# --- Service Initialization ---
-
-
-def init_services(session_service, profile_service, chat_service):
-    """Initialize services for the router.
-
-    This should be called once during application startup.
-    """
-    global _session_service, _profile_service, _chat_service
-    _session_service = session_service
-    _profile_service = profile_service
-    _chat_service = chat_service
-
-
-def _get_services():
-    """Get the initialized services or raise an error."""
-    if not all([_session_service, _profile_service, _chat_service]):
+def _require_chat_service():
+    """Raise 503 if chat service is not available."""
+    if services.chat_service is None:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Services not initialized",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Chat service unavailable (CSV data not loaded)",
         )
-    return _session_service, _profile_service, _chat_service
+    return services.chat_service
 
 
 # --- Endpoints ---
@@ -95,14 +78,12 @@ async def create_session(request: CreateSessionRequest):
     Returns:
         Session details including the session_id for subsequent requests
     """
-    session_service, profile_service, _ = _get_services()
-
     try:
         # Fetch profile from WiseFood
-        user_profile = profile_service.get_member_profile(request.member_id)
+        user_profile = services.profile_service.get_member_profile(request.member_id)
 
         # Create session
-        session = session_service.create_session(request.member_id, user_profile)
+        session = services.session_service.create_session(request.member_id, user_profile)
 
         return SessionResponse(
             session_id=session.session_id,
@@ -120,9 +101,7 @@ async def create_session(request: CreateSessionRequest):
 @router.get("/sessions/{session_id}", response_model=SessionResponse)
 async def get_session(session_id: str):
     """Get session state and metadata."""
-    session_service, _, _ = _get_services()
-
-    session = session_service.get_session(session_id)
+    session = services.session_service.get_session(session_id)
     if not session:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Session not found"
@@ -140,9 +119,7 @@ async def get_session(session_id: str):
 @router.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_session(session_id: str):
     """Delete a session."""
-    session_service, _, _ = _get_services()
-
-    if not session_service.delete_session(session_id):
+    if not services.session_service.delete_session(session_id):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Session not found"
         )
@@ -155,16 +132,16 @@ async def send_message(session_id: str, request: MessageRequest):
     The response includes a `needs_clarification` flag. If True, the assistant
     is asking a clarifying question and expects a follow-up message.
     """
-    session_service, _, chat_service = _get_services()
+    chat_svc = _require_chat_service()
 
-    session = session_service.get_session(session_id)
+    session = services.session_service.get_session(session_id)
     if not session:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Session not found"
         )
 
     try:
-        response_text, needs_clarification = chat_service.process_message(
+        response_text, needs_clarification = chat_svc.process_message(
             session_id, request.content
         )
 
@@ -189,9 +166,7 @@ async def get_messages(session_id: str, limit: Optional[int] = None):
         session_id: The session ID
         limit: Optional limit on number of messages to return (most recent)
     """
-    session_service, _, _ = _get_services()
-
-    session = session_service.get_session(session_id)
+    session = services.session_service.get_session(session_id)
     if not session:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Session not found"
@@ -214,9 +189,7 @@ async def get_messages(session_id: str, limit: Optional[int] = None):
 @router.get("/sessions/{session_id}/meal-plans", response_model=List[MealPlanResponse])
 async def get_meal_plans(session_id: str):
     """Get all meal plans generated in this session."""
-    session_service, _, _ = _get_services()
-
-    session = session_service.get_session(session_id)
+    session = services.session_service.get_session(session_id)
     if not session:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Session not found"
