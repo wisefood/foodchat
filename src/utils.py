@@ -30,6 +30,22 @@ EMBEDDING_MODEL = "davanstrien/autotrain-recipes-2451975973"
 TRACE_FILE_PATH = PATH / 'trace.json'
 
 
+class MiniLMEmbeddings:
+    """MiniLM embeddings using sentence-transformers - lightweight and fast."""
+
+    def __init__(self, model_name="all-MiniLM-L6-v2"):
+        from sentence_transformers import SentenceTransformer
+        self.model = SentenceTransformer(model_name)
+
+    def embed_documents(self, texts):
+        """Embed multiple documents (Required by LangChain)."""
+        return self.model.encode(texts).tolist()
+
+    def embed_query(self, text):
+        """Embed a single query (Required by LangChain)."""
+        return self.model.encode(text).tolist()
+
+
 class HuggingFaceEmbeddings:
     """HuggingFace embeddings - requires torch and transformers to be installed."""
 
@@ -61,10 +77,12 @@ class HuggingFaceEmbeddings:
     
 
 
-def get_embeddings(embedding_model): 
-    if embedding_model == "fine_tuned-recipes": 
+def get_embeddings(embedding_model):
+    if embedding_model == "fine_tuned-recipes":
         embeddings = HuggingFaceEmbeddings()
-    else: 
+    elif embedding_model == "minilm":
+        embeddings = MiniLMEmbeddings()
+    else:
         embeddings = OllamaEmbeddings(model = embedding_model)
     return embeddings
 
