@@ -1,13 +1,20 @@
 from typing import Any
 
-from services.wisefood_client import WiseFoodClientPool
+from backend.platform import WISEFOOD, WiseFoodPool
 
 
 class ProfileService:
     """Service for fetching and mapping WiseFood member profiles."""
 
-    def __init__(self, client_pool: WiseFoodClientPool):
-        self.client_pool = client_pool
+    def __init__(self, client_pool: WiseFoodPool = None):
+        """
+        Initialize ProfileService.
+
+        Args:
+            client_pool: Optional WiseFoodPool instance. If not provided,
+                        uses the global WISEFOOD pool.
+        """
+        self.client_pool = WISEFOOD
 
     def get_member_profile(self, member_id: str) -> dict:
         """Fetch profile from WiseFood and map to FoodChat format.
@@ -22,9 +29,9 @@ class ProfileService:
             - preferences: list of preference strings
             - history: feedback/notes history
         """
-        client = self.client_pool.get_client()
-        member = client.members.get(member_id)
-        return self._map_profile(member.profile)
+        with self.client_pool.client() as client:
+            member = client.members.get(member_id)
+            return self._map_profile(member.profile)
 
     def _map_profile(self, wisefood_profile: Any) -> dict:
         """Map WiseFood profile structure to FoodChat format.
