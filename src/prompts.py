@@ -604,26 +604,28 @@ Your role is to rewrite user queries to improve the completeness and accuracy of
 You do this by analyzing the original query and identifying missing or incorrect elements based on evaluation questions that were not correctly answered.
 You then generate a revised query that emphasizes these missing aspects while maintaining clarity and coherence.
 The refined query should remain natural, unambiguous, well-structured and concise to guide the retrieval of a more complete and correct response.
-Guidelines: 
-1. Maintain Original Intent: Keep the core meaning of the user’s question intact.
+Guidelines:
+1. Maintain Original Intent: Keep the core meaning of the user's question intact.
 2. Emphasize Missing Elements: Adjust the query to explicitly ask for the missing ingredients, steps, or techniques.
 3. Avoid Overcomplication: Keep the query concise and natural while improving its precision.
 4. Ensure Completeness: If multiple evaluation questions were incorrectly answered, adjust the query to cover all missing points.
 5. Use Natural Language: The rewritten query should sound like a real user question, not a robotic or overly structured command.
 6. Try to be as concise as possible because the rewritten query will be used for RAG.
-Example 1: 
+Example 1:
 - Original Query: "How do I make lasagna?"
 - Incorrectly Answered Questions:
   - Is the response about a lasagna recipe? "no"
 - Rewritten Query: I would like a complete recipe to make lasagna
-Example 2: 
+Example 2:
 - Original Query: "Give me a chocolate cake recipe that uses cocoa powder."
 - Incorrectly Answered Questions:
   - Does the response specify whether cocoa powder or melted chocolate is used? "no"
   - Does the response include baking instructions? "no"
 - Rewritten Query: "Can you give me a chocolate cake recipe that specifically uses cocoa powder?"
 
-"Follow these principles when rewriting the query. Your goal is to ensure that the refined query guides the system toward generating a complete and useful recipe."
+Follow these principles when rewriting the query. Your goal is to ensure that the refined query guides the system toward generating a complete and useful recipe.
+
+Return your response as a JSON object with a single key "query" containing the rewritten query string.
 """
 
 QUERY_REWRITER_USER_INSTRUCTIONS = """Here is the original user query: {query}
@@ -801,12 +803,6 @@ Your goal is to produce a *complete*, *specific*, and *search-optimized* query t
 QUERY_CHECKER_SYSTEM_INSTRUCTIONS = """
 You are a strict evaluator that determines whether a user's query is sufficiently specific and self-contained for direct use in a recipe recommendation system using Retrieval-Augmented Generation (RAG).
 
-You must return only one of the following exact strings:
-
-YES
-
-NO
-
 Criteria for returning YES:
 
 The query clearly specifies the user's dietary preferences, goals, or constraints.
@@ -823,28 +819,27 @@ The query lacks sufficient detail and would require external user preferences or
 
 The query assumes personalization based on prior user interaction without stating any relevant criteria.
 
-Only respond with "YES" or "NO" based on these rules.
-
 Examples:
 
 Input: "Can you give me a 2000-calorie vegetarian meal plan for today?"
-Output: YES
+Output: {"response": "YES"}
 
-Input: "What's a good daily meal plan for someone who's gluten-free and low-carb?" Output: YES
+Input: "What's a good daily meal plan for someone who's gluten-free and low-carb?"
+Output: {"response": "YES"}
 
 Input: "Can you make a meal plan for me?"
-Output: NO
+Output: {"response": "NO"}
 
 Input: "Suggest some meals"
-Output: NO
+Output: {"response": "NO"}
 
 Input: "I want a Mediterranean diet meal plan with 3 meals per day"
-Output: YES
+Output: {"response": "YES"}
 
-Input: "Give me meals I’d like"
-Output: NO
+Input: "Give me meals I'd like"
+Output: {"response": "NO"}
 
-Do not include any explanation or reasoning. Only output the exact word YES or NO.
+Return your response as a JSON object with a single key "response" containing either "YES" or "NO".
 """
 
 QUERY_CHECKER_USER_INSTRUCTIONS = """
@@ -991,7 +986,7 @@ Missing information topic:
 Ask the user follow-up questions about the missing topic above, based on the current query.
 """
 
-QUERY_REFORMULATOR_SYSTEM_INSTRUCTIONS = """ 
+QUERY_REFORMULATOR_SYSTEM_INSTRUCTIONS = """
 
 You are an expert assistant in a personalized recipe recommendation system.
 
@@ -1004,13 +999,13 @@ You will receive:
 - Optionally, a feedback history showing what kinds of meals the user liked or disliked in the past
 
 Your task is to:
-1. Reformulate the user’s query as a complete, natural-language request.
+1. Reformulate the user's query as a complete, natural-language request.
 2. Incorporate both long-term preferences and temporary information where appropriate.
 3. Ensure the reformulated query includes enough detail for recipe-level retrieval (e.g., calorie targets, ingredients to include/avoid, cuisine types, etc.).
 4. Do **not** include allergens or dietary restrictions already handled by the system in backend filtering (e.g., vegan, gluten-free).
-5. Focus only on what is helpful for selecting recipes — no need to include goals like “healthy” unless it translates into something concrete like “low calorie” or “low fat”.
+5. Focus only on what is helpful for selecting recipes — no need to include goals like "healthy" unless it translates into something concrete like "low calorie" or "low fat".
 
-Return only the reformulated query in natural language. Do not include any explanation or formatting.
+Return your response as a JSON object with a single key "reformulated_query" containing the reformulated query string.
 """
 
 QUERY_REFORMULATOR_USER_INSTRUCTIONS = """ 
