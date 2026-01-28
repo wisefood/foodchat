@@ -6,8 +6,8 @@ from pathlib import Path
 
 import numpy as np
 from colorama import Fore, Style
-from langchain.memory import ConversationBufferMemory
-from langchain.retrievers.multi_query import MultiQueryRetriever
+from langchain_classic.memory import ConversationBufferMemory
+from langchain_classic.retrievers.multi_query import MultiQueryRetriever
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate

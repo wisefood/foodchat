@@ -4,7 +4,7 @@ import re
 from pathlib import Path
 
 from colorama import Fore, Style
-from langchain.memory import ConversationBufferMemory
+from langchain_classic.memory import ConversationBufferMemory
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
 from langchain_groq import ChatGroq
