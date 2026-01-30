@@ -950,7 +950,7 @@ preferences: {preferences}
 feedback history: {feedback_history}
 """
 
-USER_INFO_COLLECTOR_SYSTEM_ISNTRUCTIONS = """
+USER_INFO_COLLECTOR_SYSTEM_INSTRUCTIONS = """
 You are a helpful assistant tasked with collecting missing information from a user to personalize a meal plan request.
 
 You are provided with:
@@ -975,7 +975,7 @@ USER_INFO_COLLECTOR_USER_INSTRUCTIONS = """
 User query: {user_query}
 
 Known user preferences:
-{prefrences}
+{preferences}
 
 User feedback history:
 {feedback_history}

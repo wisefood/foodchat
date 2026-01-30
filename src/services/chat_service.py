@@ -2,6 +2,7 @@ from typing import Tuple
 
 from src.agents import QueryClassifier, RAGReadyPreparator, SimpleChatBot
 from services.session_service import SessionService
+from services import profile_service
 from utils import pretty_format_recipes
 
 

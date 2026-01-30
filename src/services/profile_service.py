@@ -33,6 +33,34 @@ class ProfileService:
             member = client.members.get(member_id)
             return self._map_profile(member.profile)
 
+    def update_member_history(self, member_id: str, history_update: str) -> dict:
+        """
+        Update the history/notes within a member's nutritional preferences.
+
+        Args:
+            member_id: The WiseFood member ID
+            history_update: The new history string to save
+
+        Returns:
+            The updated, mapped profile dict.
+        """
+        with self.client_pool.client() as client:
+            member = client.members.get(member_id)
+            profile = member.profile
+
+            # 1. Get existing prefs (default to dict if None)
+            # We use .copy() to ensure we have a mutable dict we can work with
+            current_prefs = (profile.nutritional_preferences or {}).copy()
+
+            # 2. Update the history key
+            current_prefs["history"] = history_update
+
+            # 3. Re-assign to trigger the API update (Auto-syncs per SDK example)
+            profile.nutritional_preferences = current_prefs
+
+            # 4. Return the updated mapped profile
+            return self._map_profile(profile)
+
     def _map_profile(self, wisefood_profile: Any) -> dict:
         """Map WiseFood profile structure to FoodChat format.
 
@@ -63,7 +91,7 @@ class ProfileService:
             "diet": list(dietary_groups),
             "allergies": self._extract_allergies(properties),
             "preferences": self._build_preferences(nutritional_preferences, properties),
-            "history": properties.get("notes", "") or "",
+            "history": nutritional_preferences.get("history", "") or "",
         }
 
     def _extract_allergies(self, properties: dict) -> list[str]:

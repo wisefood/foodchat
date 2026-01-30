@@ -1,4 +1,4 @@
-import itertools
+import itertools, random
 import json
 import re
 from pathlib import Path
@@ -32,7 +32,7 @@ DEFAULT_MODEL = os.getenv("FOODCHAT_LLM_MODEL", "llama-3.3-70b-versatile")
 DEFAULT_TEMPERATURE = float(os.getenv("FOODCHAT_LLM_TEMPERATURE", "0.0"))
 CHATBOT_TEMPERATURE = float(os.getenv("FOODCHAT_CHATBOT_TEMPERATURE", "0.7"))
 MAX_RETRIES = int(os.getenv("FOODCHAT_MAX_RETRIES", "3"))
-MAX_PLANS_TO_SCORE = int(os.getenv("FOODCHAT_MAX_PLANS_TO_SCORE", "5"))
+MAX_PLANS_TO_SCORE = int(os.getenv("FOODCHAT_MAX_PLANS_TO_SCORE", "10"))
 
 class QueryClassifier:
 
@@ -103,11 +103,13 @@ class DocumentGrader:
         daily_plans = list(
             itertools.product(breakfasts_options, lunch_options, dinner_options)
         )
+
         logger.info(f"Number of possible daily plans: {len(daily_plans)}")
         #logger.info(f"Daily plans: {daily_plans[0]}")
 
+        random_daily_plans = random.sample(daily_plans, self.max_plans_to_score)
         scored_daily_plans = []
-        for daily_plan in daily_plans[: self.max_plans_to_score]:
+        for daily_plan in random_daily_plans:
             meal_plan = ""
             courses = ["breakfast", "lunch", "dinner"]
             for course in range(len(daily_plan)):
@@ -137,7 +139,7 @@ class DocumentGrader:
         )[:3]
         logger.info(f"Top scored daily plans: {scored_daily_plans}")
 
-        return scored_daily_plans[:1]  # return top 3 daily plans
+        return scored_daily_plans[:1]  # return the best daily plan
 
     # def grading_docs(self, query, documents, user_profile) :
     #     filtered_docs = []
@@ -411,14 +413,14 @@ class RAGReadyPreparator:
                 HumanMessage(
                     content=USER_INFO_COLLECTOR_USER_INSTRUCTIONS.format(
                         user_query=query,
-                        prefrences=user_info["preferences"],
+                        preferences=user_info["preferences"],
                         feedback_history=[],
                         suggestions=suggestion,
                     )
                 )
             ]
             response = self.user_info_collector.invoke(
-                [SystemMessage(content=USER_INFO_COLLECTOR_SYSTEM_ISNTRUCTIONS)]
+                [SystemMessage(content=USER_INFO_COLLECTOR_SYSTEM_INSTRUCTIONS)]
                 + question
                 + conversation_history
             )

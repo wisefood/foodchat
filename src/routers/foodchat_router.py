@@ -47,8 +47,11 @@ class MessageHistoryItem(BaseModel):
 class MealPlanResponse(BaseModel):
     id: str
     created_at: datetime
-    meal_plan: List[tuple]
+    breakfast: str
+    lunch: str
+    dinner: str
     reasoning: str
+    raw_data: tuple
 
 
 def _require_chat_service():
