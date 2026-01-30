@@ -48,11 +48,11 @@ def filter_allergens_diet(driver, allergens, diet, meal_course, exclude_ids):
             OR size($exclude_ids) = 0
             OR NOT r.Id IN $exclude_ids
         )
-        RETURN r.Id as recipe_id
+        RETURN r.Id as recipe_id, r.title as recipe_title, r.Ingredients as recipe_ingredients, 
+               r.Directions as recipe_directions
         """
         params = {"allergens": allergens, "diet" : diet, "meal_course" : meal_course, "exclude_ids" : exclude_ids}
         results = run_cypher_query(driver, query, params)
-        # print("RESULTS: ", results)
         return results
 
 
@@ -69,6 +69,7 @@ def get_filtered_recipe_ids(allergens : list, diet : str):
             print("PARAMETERS TYPE: ", allergens, diet)
             results = filter_allergens_diet(driver, allergens, diet, course, exclude_ids)
             exclude_ids.extend(pd.DataFrame(results)['recipe_id'].values.tolist())
-            res_per_courses[course] = pd.DataFrame(results)['recipe_id'].values.tolist()
+            res_per_courses[course] = pd.DataFrame(results).values.tolist()[:4] # TODO FILTERING WITH A MAX_RETRIEVAL NUM
+            #print('Extracted recipes: ', len(res_per_courses[course]), res_per_courses[course][0])
     # print("List of filtered recipes: ", res_per_courses)
     return res_per_courses

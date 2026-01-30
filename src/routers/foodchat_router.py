@@ -47,9 +47,7 @@ class MessageHistoryItem(BaseModel):
 class MealPlanResponse(BaseModel):
     id: str
     created_at: datetime
-    breakfast: str
-    lunch: str
-    dinner: str
+    meal_plan: List[tuple]
     reasoning: str
 
 

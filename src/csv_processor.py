@@ -1,7 +1,7 @@
 import os
 import pandas as pd
 
-CSV_HUMMUS_PATH = os.getenv("CSV_HUMMUS_PATH", "./data/data_kg.csv")
+CSV_HUMMUS_PATH = os.getenv("CSV_HUMMUS_PATH", "../data/data_kg.csv")
 CSV_CULINARY_PATH = os.getenv("CSV_CULINARY_PATH", "./data/sample_CulinaryDB.csv")
 
 

@@ -92,23 +92,34 @@ class DocumentGrader:
         
     def grading_daily_plans(self, query, documents, user_profile):
         logger.info("Grading daily plans")
+        logger.info(f"Len of documents: {len(documents)}")
+        logger.info(f"User profile: {user_profile}")
 
-        breakfasts_options = [doc.page_content for doc in documents["breakfast"]]
-        lunch_options = [doc.page_content for doc in documents["lunch"]]
-        dinner_options = [doc.page_content for doc in documents["dinner"]]
+
+        breakfasts_options = documents["breakfast"]
+        lunch_options = documents["lunch"]
+        dinner_options = documents["dinner"]
 
         daily_plans = list(
             itertools.product(breakfasts_options, lunch_options, dinner_options)
         )
-        logger.debug(f"Number of possible daily plans: {len(daily_plans)}")
+        logger.info(f"Number of possible daily plans: {len(daily_plans)}")
+        #logger.info(f"Daily plans: {daily_plans[0]}")
 
         scored_daily_plans = []
         for daily_plan in daily_plans[: self.max_plans_to_score]:
+            meal_plan = ""
+            courses = ["breakfast", "lunch", "dinner"]
+            for course in range(len(daily_plan)):
+                i, title, ingredients, directions = daily_plan[course]
+                c = courses[course]
+                meal_plan += f"{c}: {title}\nIngredients: {ingredients}\nDirections: {directions}\n\n"
+            #print('Constructed meal plan: ', meal_plan)
             question = [
                 HumanMessage(
                     content=GRADER_USER_INSTRUCTIONS.format(
                         query=query,
-                        daily_plan=daily_plan,
+                        daily_plan=meal_plan,
                         preferences=",".join(user_profile["preferences"]),
                         feedback_history="",
                     )

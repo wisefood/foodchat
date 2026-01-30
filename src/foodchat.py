@@ -194,9 +194,9 @@ class Retriever:
             "FILTERING WITH RECIPE_IDS: ",
             len(recipe_ids),
             " ",
-            type(recipe_ids),
+            retrieval_method,
             " ",
-            type(recipe_ids[0]),
+            query,
         )
         if retrieval_method == "mmr":
             docs = retriever.invoke(query)
@@ -206,6 +206,7 @@ class Retriever:
                 results = vectorstore.similarity_search_with_score(
                     query, k=max_retrieval, filter={"recipe_id": {"$in": recipe_ids}}
                 )
+                print("RESULTS: ", results)
             elif retrieval_method == "similarity_score_threshold":
                 results = vectorstore.similarity_search_with_score(
                     query,
@@ -480,7 +481,7 @@ class FoodChat:
 
         return (
             RunnablePassthrough.assign(
-                recipe_ids=RunnableLambda(
+                recipe_list=RunnableLambda(
                     lambda x: get_filtered_recipe_ids(
                         x["modified_user_data"]["allergies"],
                         x["modified_user_data"]["diet"],
@@ -491,14 +492,14 @@ class FoodChat:
                 context=lambda x: self.log_retrieval(
                     doc_grader.grading_daily_plans(
                         x["question"],
-                        self.retrieve_with_score(x["question"], x["recipe_ids"]),
+                        x["recipe_list"],
                         x["modified_user_data"],
                     )
                 )
             )
             | RunnablePassthrough.assign(
                 final_input=lambda x: {
-                    "context": x["context"],
+                    "docs": x["context"],
                     "question": x["question"],
                     "user_profile_context": x["modified_user_data"],
                 }

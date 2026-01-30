@@ -116,14 +116,21 @@ class ChatService:
         response = self.rag_chain_part2.invoke(chain_input)
 
         # Extract meal plan and reasoning from response
-        meal_plan = response["context"][0][0]
-        reasoning = response["context"][0][1]["reasoning"]
+        meal_plan = response["docs"][0][0]
+        reasoning = response["docs"][0][1]["reasoning"]
 
         # Store meal plan in session
         self.session_service.add_meal_plan(session_id, meal_plan, reasoning)
 
         # Format response
-        formatted = pretty_format_recipes(meal_plan) + "\n\n" + reasoning
+        formatted = ""
+        courses = ["breakfast", "lunch", "dinner"]
+        for course in range(len(meal_plan)):
+            i, title, ingredients, directions = meal_plan[course]
+            c = courses[course]
+            formatted += f"{c}: {title}\nIngredients: {ingredients}\nDirections: {directions}\n\n"
+        formatted += "\n\n" + reasoning
+        #formatted = pretty_format_recipes(meal_plan) + "\n\n" + reasoning
         self.session_service.add_message(session_id, "assistant", formatted)
 
         return formatted, False
