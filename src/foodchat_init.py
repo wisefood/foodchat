@@ -44,6 +44,11 @@ class Config:
     max_retrieval: int = _get_int("MAX_RETRIEVAL", 3)
     query_method: str = os.getenv("QUERY_METHOD", "standard")
 
+    # ChromaDB settings (local or remote)
+    chroma_mode: str = os.getenv("CHROMA_MODE", "local")  # "local" or "remote"
+    chroma_host: str = os.getenv("CHROMA_HOST", "localhost")
+    chroma_port: int = _get_int("CHROMA_PORT", 8000)
+
     # Hybrid search settings
     hybrid_search: bool = _get_bool("HYBRID_SEARCH", False)
     ks_weight: float = _get_float("KS_WEIGHT", 0.5)

@@ -8,6 +8,7 @@ import numpy as np
 from colorama import Fore, Style
 from langchain_classic.memory import ConversationBufferMemory
 from langchain_classic.retrievers.multi_query import MultiQueryRetriever
+import chromadb
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
@@ -57,8 +58,18 @@ def format_user_profile(user_profile: dict) -> str:
 
 
 class Retriever:
-    def __init__(self, persist_dir):
+    def __init__(self, persist_dir, chroma_mode="local", chroma_host="localhost", chroma_port=8000):
         self.persist_dir = persist_dir
+        self.chroma_mode = chroma_mode
+        self.chroma_host = chroma_host
+        self.chroma_port = chroma_port
+
+    def _get_chroma_client(self):
+        """Get ChromaDB client based on mode (local or remote)."""
+        if self.chroma_mode == "remote":
+            print(f"Connecting to remote ChromaDB at {self.chroma_host}:{self.chroma_port}")
+            return chromadb.HttpClient(host=self.chroma_host, port=self.chroma_port)
+        return None  # Local mode uses persist_directory directly
 
     def get_vector_db(
         self,
@@ -77,9 +88,22 @@ class Retriever:
             / f"{dataset_name.upper()}_SOURCE"
         )
 
+        # Remote ChromaDB mode
+        if self.chroma_mode == "remote":
+            print(f"Using remote ChromaDB at {self.chroma_host}:{self.chroma_port}")
+            client = self._get_chroma_client()
+            vector_db = Chroma(
+                client=client,
+                collection_name="vector-db",
+                embedding_function=processor.embeddings,
+                collection_metadata={"hnsw:space": "cosine"},
+            )
+            return vector_db
+
+        # Local ChromaDB mode (default)
         if data_type == "pdf":
             if os.path.exists(persist_dir):
-                print("Loading Vector Database")
+                print("Loading Vector Database (local)")
                 vector_db = Chroma(
                     collection_name="vector-db",
                     persist_directory=persist_dir,
@@ -87,7 +111,7 @@ class Retriever:
                     collection_metadata={"hnsw:space": "cosine"},
                 )
             else:
-                print("Generating Vector Database")
+                print("Generating Vector Database (local)")
                 vector_db = Chroma.from_documents(
                     data,
                     embedding=processor.embeddings,
@@ -112,7 +136,7 @@ class Retriever:
                 else ["title", "ingredients"]
             )
             if os.path.exists(persist_dir):
-                print("Loading Vector Database")
+                print("Loading Vector Database (local)")
                 vector_db = Chroma(
                     collection_name="vector-db",
                     persist_directory=persist_dir,
@@ -120,7 +144,7 @@ class Retriever:
                     collection_metadata={"hnsw:space": "cosine"},
                 )
             else:
-                print("Generating Vector Database")
+                print("Generating Vector Database (local)")
                 vector_db = Chroma.from_texts(
                     texts=data["combined_text"].to_list(),
                     embedding=processor.embeddings,
@@ -517,7 +541,18 @@ def initialize_system(args, embeddings):
         / f"{args.data_type.upper()}"
         / f"{args.dataset.upper()}_SOURCE"
     )
-    retriever_instance = Retriever(persist_dir)
+
+    # Get chroma settings with defaults for backward compatibility
+    chroma_mode = getattr(args, "chroma_mode", "local")
+    chroma_host = getattr(args, "chroma_host", "chromadb")
+    chroma_port = getattr(args, "chroma_port", 8000)
+
+    retriever_instance = Retriever(
+        persist_dir,
+        chroma_mode=chroma_mode,
+        chroma_host=chroma_host,
+        chroma_port=chroma_port
+    )
 
     if args.data_type == "pdf":
         processor = PDFProcessor(PDF_PATH, args.split, embeddings)
