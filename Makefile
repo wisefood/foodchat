@@ -1,5 +1,5 @@
 .PHONY: all install install-dev run dev test lint format clean help
-.PHONY: docker-build docker-build-dev docker-build-prod
+.PHONY: docker-build docker-build-dev docker-build-prod push
 .PHONY: docker-run docker-dev docker-prod docker-stop docker-logs docker-shell
 .PHONY: docker-up docker-up-dev docker-up-prod docker-down
 
@@ -85,6 +85,11 @@ docker-build-dev:
 ## Build Docker production image
 docker-build-prod:
 	docker build --target prod -t $(DOCKER_IMAGE):prod .
+
+## Push Docker image to wisefood/foodchat:latest
+push: docker-build-prod
+	docker tag $(DOCKER_IMAGE):prod wisefood/foodchat:latest
+	docker push wisefood/foodchat:latest
 
 # =============================================================================
 # Docker Run Commands
@@ -183,6 +188,7 @@ help:
 	@echo "  make docker-build       Build production image (default)"
 	@echo "  make docker-build-dev   Build development image"
 	@echo "  make docker-build-prod  Build production image"
+	@echo "  make push               Build and push to wisefood/foodchat:latest"
 	@echo ""
 	@echo "Docker Run:"
 	@echo "  make docker-dev     Run dev container (hot reload, volume mounts)"

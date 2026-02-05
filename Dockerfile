@@ -74,7 +74,9 @@ RUN groupadd -r foodchat && useradd -r -g foodchat foodchat
 # Copy application code
 COPY src/ ./src/
 COPY KG_neo4j/ ./KG_neo4j/
-COPY data/ ./data/
+
+# Create data directory (mount volume in prod)
+RUN mkdir -p ./data
 
 # Set ownership
 RUN chown -R foodchat:foodchat /app
