@@ -44,9 +44,6 @@ RUN pip install --no-cache-dir \
 COPY src/ ./src/
 COPY KG_neo4j/ ./KG_neo4j/
 
-# Create data directory (mount volume in dev)
-RUN mkdir -p ./data
-
 # Set working directory to src
 WORKDIR /app/src
 
