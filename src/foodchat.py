@@ -509,6 +509,11 @@ class FoodChat:
                     lambda x: get_filtered_recipe_ids(
                         x["modified_user_data"]["allergies"],
                         x["modified_user_data"]["diet"],
+                        list(set(
+                            x["modified_user_data"].get("food_likes", [])
+                            + x["modified_user_data"].get("include_ingredients", [])
+                        )),
+                        x["modified_user_data"].get("food_dislikes"),
                     )
                 )
             )

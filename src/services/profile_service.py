@@ -66,22 +66,28 @@ class ProfileService:
 
         WiseFood structure:
         - dietary_groups: list (vegetarian, gluten_free, etc.)
-        - nutritional_preferences: dict (calories, protein, fiber)
-        - properties: dict (allergies, notes)
+        - allergies: list (shellfish, sesame, etc.)
+        - nutritional_preferences: dict (calories, protein, fat, carbs,
+          food_likes, food_dislikes)
+        - properties: dict (age_group, feedback_history, liked_recipes)
 
         FoodChat structure:
         - diet: list[str]
         - allergies: list[str]
         - preferences: list[str]
         - history: str
+        - food_likes: list[str]
+        - food_dislikes: list[str]
         """
         # Handle both object attributes and dict-like access
         if hasattr(wisefood_profile, "dietary_groups"):
             dietary_groups = wisefood_profile.dietary_groups or []
+            allergies = wisefood_profile.allergies or []
             nutritional_preferences = wisefood_profile.nutritional_preferences or {}
             properties = wisefood_profile.properties or {}
         else:
             dietary_groups = wisefood_profile.get("dietary_groups", []) or []
+            allergies = wisefood_profile.get("allergies", []) or []
             nutritional_preferences = (
                 wisefood_profile.get("nutritional_preferences", {}) or {}
             )
@@ -89,17 +95,12 @@ class ProfileService:
 
         return {
             "diet": list(dietary_groups),
-            "allergies": self._extract_allergies(properties),
+            "allergies": list(allergies),
             "preferences": self._build_preferences(nutritional_preferences, properties),
-            "history": nutritional_preferences.get("history", "") or "",
+            "history": properties.get("feedback_history", "") or "",
+            "food_likes": list(nutritional_preferences.get("food_likes", []) or []),
+            "food_dislikes": list(nutritional_preferences.get("food_dislikes", []) or []),
         }
-
-    def _extract_allergies(self, properties: dict) -> list[str]:
-        """Extract allergies from properties."""
-        allergies = properties.get("allergies", [])
-        if isinstance(allergies, str):
-            return [a.strip() for a in allergies.split(",") if a.strip()]
-        return list(allergies) if allergies else []
 
     def _build_preferences(
         self, nutritional_prefs: dict, properties: dict

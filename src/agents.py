@@ -362,6 +362,7 @@ class QueryReconciler:
                 elem for elem in user_profile["allergies"] if elem != conflicting_elem
             ]
             logger.debug(f"Updated user profile: {user_profile}")
+        user_profile["include_ingredients"] = extracted_items.get("item", [])
         return user_profile
 
 
