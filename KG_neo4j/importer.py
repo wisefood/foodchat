@@ -7,12 +7,26 @@ load_dotenv()
 
 from neo4j import GraphDatabase
 
-URI = os.getenv('URI')
-#AUTH = os.getenv('AUTH')
-AUTH = (os.getenv("NEO4J_USERNAME"),os.getenv("NEO4J_PASSWORD"))
-# Create the driver instance
-print('AUTH: ', AUTH)
-driver = GraphDatabase.driver(URI, auth=AUTH)
+# Set up the connection
+URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+
+# Support NEO4J_AUTH="username/password", NEO4J_AUTH="password" (defaults user to neo4j),
+# or separate NEO4J_USERNAME + NEO4J_PASSWORD.
+neo4j_auth = os.getenv("NEO4J_AUTH")
+if neo4j_auth:
+    if "/" in neo4j_auth:
+        username, password = neo4j_auth.split("/", 1)
+    else:
+        username, password = "neo4j", neo4j_auth
+else:
+    username = os.getenv("NEO4J_USERNAME") or os.getenv("NEO4J_USER")
+    password = os.getenv("NEO4J_PASSWORD")
+    if not username or not password:
+        raise ValueError(
+            "Set NEO4J_AUTH (username/password) or NEO4J_USERNAME + NEO4J_PASSWORD."
+        )
+
+AUTH = (username, password)
 
 
 
