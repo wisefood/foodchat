@@ -1,9 +1,9 @@
-from typing import Tuple
+from typing import Optional, Tuple
 
 from src.agents import QueryClassifier, RAGReadyPreparator, SimpleChatBot
 from services.session_service import SessionService
 from services import profile_service
-from utils import pretty_format_recipes
+from models.session import MealPlan
 
 
 class ChatService:
@@ -19,15 +19,17 @@ class ChatService:
         self.chatbot = SimpleChatBot()
         self.classifier = QueryClassifier()
 
-    def process_message(self, session_id: str, message: str) -> Tuple[str, bool]:
-        """Process a message and return (response, needs_clarification).
+    def process_message(
+        self, session_id: str, message: str
+    ) -> Tuple[str, bool, Optional[MealPlan]]:
+        """Process a message and return (response, needs_clarification, meal_plan).
 
         Args:
             session_id: The session ID
             message: The user's message
 
         Returns:
-            Tuple of (response_text, needs_clarification_flag)
+            Tuple of (response_text, needs_clarification_flag, optional_meal_plan)
         """
         session = self.session_service.get_session(session_id)
         if not session:
@@ -48,9 +50,11 @@ class ChatService:
         else:
             response = self.chatbot.chat(message)
             self.session_service.add_message(session_id, "assistant", response)
-            return response, False
+            return response, False, None
 
-    def _handle_rag_query(self, session_id: str, message: str) -> Tuple[str, bool]:
+    def _handle_rag_query(
+        self, session_id: str, message: str
+    ) -> Tuple[str, bool, Optional[MealPlan]]:
         """Handle RAG-based query with potential clarification."""
         session = self.session_service.get_session(session_id)
 
@@ -75,7 +79,7 @@ class ChatService:
                 session_id, generator, pending_rag_data
             )
             self.session_service.add_message(session_id, "assistant", first_question)
-            return first_question, True
+            return first_question, True, None
 
         except StopIteration as e:
             # No clarification needed, run post-clarification directly
@@ -84,7 +88,9 @@ class ChatService:
                 session_id, final_query, pending_rag_data
             )
 
-    def _handle_clarification(self, session_id: str, message: str) -> Tuple[str, bool]:
+    def _handle_clarification(
+        self, session_id: str, message: str
+    ) -> Tuple[str, bool, Optional[MealPlan]]:
         """Handle user response during clarification flow."""
         session = self.session_service.get_session(session_id)
         generator = session.clarification_generator
@@ -98,7 +104,7 @@ class ChatService:
             # Send user response to generator
             next_question = generator.send(message)
             self.session_service.add_message(session_id, "assistant", next_question)
-            return next_question, True
+            return next_question, True, None
 
         except StopIteration as e:
             # Clarification complete
@@ -109,7 +115,7 @@ class ChatService:
 
     def _run_post_clarification(
         self, session_id: str, final_query: str, pending_data: dict
-    ) -> Tuple[str, bool]:
+    ) -> Tuple[str, bool, Optional[MealPlan]]:
         """Execute post-clarification chain and format response."""
         self.session_service.clear_clarification_state(session_id)
 
@@ -117,21 +123,36 @@ class ChatService:
         response = self.rag_chain_part2.invoke(chain_input)
 
         # Extract meal plan and reasoning from response
-        meal_plan = response["docs"][0][0]
-        reasoning = response["docs"][0][1]["reasoning"]
+        docs = response.get("docs") or []
+        if not docs:
+            msg = ("I'm sorry, I couldn't find enough recipes to build a "
+                   "complete meal plan matching your preferences. "
+                   "Could you try adjusting your requirements?")
+            self.session_service.add_message(session_id, "assistant", msg)
+            return msg, False, None
+
+        raw_plan = docs[0][0]
+        reasoning = docs[0][1]["reasoning"]
 
         # Store meal plan in session
-        self.session_service.add_meal_plan(session_id, meal_plan, reasoning)
+        meal_plan = self.session_service.add_meal_plan(
+            session_id, raw_plan, reasoning
+        )
 
-        # Format response
-        formatted = ""
-        courses = ["breakfast", "lunch", "dinner"]
-        for course in range(len(meal_plan)):
-            i, title, ingredients, directions = meal_plan[course]
-            c = courses[course]
-            formatted += f"{c}: {title}\nIngredients: {ingredients}\nDirections: {directions}\n\n"
-        formatted += "\n\n" + reasoning
-        #formatted = pretty_format_recipes(meal_plan) + "\n\n" + reasoning
+        # Format a human-readable text response
+        course_names = ["Breakfast", "Lunch", "Dinner"]
+        courses = [meal_plan.breakfast, meal_plan.lunch, meal_plan.dinner]
+        parts = ["Here is your meal plan for today:\n"]
+        for name, course in zip(course_names, courses):
+            if course.recipe_id:
+                parts.append(
+                    f"**{name}: {course.title}**\n"
+                    f"Ingredients: {course.ingredients}\n"
+                    f"Directions: {course.directions}\n"
+                )
+        parts.append(f"\n{reasoning}")
+        formatted = "\n".join(parts)
+
         self.session_service.add_message(session_id, "assistant", formatted)
 
-        return formatted, False
+        return formatted, False, meal_plan

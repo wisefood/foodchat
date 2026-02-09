@@ -105,9 +105,12 @@ class DocumentGrader:
         )
 
         logger.info(f"Number of possible daily plans: {len(daily_plans)}")
-        #logger.info(f"Daily plans: {daily_plans[0]}")
 
-        random_daily_plans = random.sample(daily_plans, self.max_plans_to_score)
+        if not daily_plans:
+            logger.warning("No possible daily plans — at least one course has no recipes")
+            return []
+
+        random_daily_plans = random.sample(daily_plans, min(len(daily_plans), self.max_plans_to_score))
         scored_daily_plans = []
         for daily_plan in random_daily_plans:
             meal_plan = ""

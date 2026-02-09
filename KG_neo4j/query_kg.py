@@ -151,34 +151,59 @@ def get_filtered_recipe_ids_api(allergens: list, diet: str):
             response = client.post(
                 f"{base}/api/v1/recipes/search",
                 json=payload,
-                timeout=30.0,
+                timeout=60.0,
             )
             response.raise_for_status()
             data = response.json()
+            logger.debug("RecipeWrangler search response: %s", str(data)[:500])
 
-            # The search endpoint wraps results under "result.results"
+            # The search endpoint may wrap results under "result.results",
+            # "results", or "recipes".  The "result" value may itself be a
+            # dict (with a nested "results" key) or a plain list.
+            results_list = []
             if isinstance(data, dict):
-                results_list = (
-                    data.get("result", {}).get("results")
-                    or data.get("results")
-                    or data.get("recipes")
-                    or []
-                )
-            else:
+                result_field = data.get("result")
+                if isinstance(result_field, dict):
+                    results_list = result_field.get("results") or []
+                elif isinstance(result_field, list):
+                    results_list = result_field
+                if not results_list:
+                    for key in ("results", "recipes"):
+                        val = data.get(key)
+                        if isinstance(val, list):
+                            results_list = val
+                            break
+            elif isinstance(data, list):
                 results_list = data
+
+            # Guard: if results_list is still not a list, skip this course
+            if not isinstance(results_list, list):
+                logger.warning(
+                    "Unexpected results_list type for %s: %s — skipping",
+                    course, type(results_list).__name__,
+                )
+                continue
 
             course_recipes = []
             for r in results_list:
-                recipe_id = r.get("recipe_id") or r.get("id")
+                # Items may be dicts or plain recipe-ID strings/ints
+                if isinstance(r, dict):
+                    recipe_id = r.get("recipe_id") or r.get("id")
+                else:
+                    recipe_id = r
                 if recipe_id in exclude_ids:
                     continue
 
                 # Fetch full recipe details
                 details = _fetch_recipe_details(client, recipe_id)
-                title = details.get("title", r.get("title", ""))
-                ingredients = _format_ingredients(details.get("ingredients", ""))
+                r_title = r.get("title", "") if isinstance(r, dict) else ""
+                title = details.get("title", r_title) if isinstance(details, dict) else r_title
+                ingredients = _format_ingredients(
+                    details.get("ingredients", "") if isinstance(details, dict) else ""
+                )
                 directions = _format_instructions(
-                    details.get("instructions") or details.get("directions", "")
+                    (details.get("instructions") or details.get("directions", ""))
+                    if isinstance(details, dict) else ""
                 )
 
                 course_recipes.append([recipe_id, title, ingredients, directions])

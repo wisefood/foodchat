@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
 
 import services
+from models.session import MealCourse
 
 router = APIRouter(
     prefix="/foodchat",
@@ -32,26 +33,53 @@ class MessageRequest(BaseModel):
     content: str
 
 
+class MealCourseResponse(BaseModel):
+    recipe_id: str
+    title: str
+    ingredients: str
+    directions: str
+
+    @classmethod
+    def from_meal_course(cls, course: MealCourse) -> "MealCourseResponse":
+        return cls(
+            recipe_id=course.recipe_id,
+            title=course.title,
+            ingredients=course.ingredients,
+            directions=course.directions,
+        )
+
+
+class MealPlanResponse(BaseModel):
+    id: str
+    created_at: datetime
+    breakfast: MealCourseResponse
+    lunch: MealCourseResponse
+    dinner: MealCourseResponse
+    reasoning: str
+
+    @classmethod
+    def from_meal_plan(cls, mp) -> "MealPlanResponse":
+        return cls(
+            id=mp.id,
+            created_at=mp.created_at,
+            breakfast=MealCourseResponse.from_meal_course(mp.breakfast),
+            lunch=MealCourseResponse.from_meal_course(mp.lunch),
+            dinner=MealCourseResponse.from_meal_course(mp.dinner),
+            reasoning=mp.reasoning,
+        )
+
+
 class MessageResponse(BaseModel):
     role: str
     content: str
     needs_clarification: bool = False
+    meal_plan: Optional[MealPlanResponse] = None
 
 
 class MessageHistoryItem(BaseModel):
     role: str
     content: str
     timestamp: datetime
-
-
-class MealPlanResponse(BaseModel):
-    id: str
-    created_at: datetime
-    breakfast: str
-    lunch: str
-    dinner: str
-    reasoning: str
-    raw_data: tuple
 
 
 def _require_chat_service():
@@ -142,14 +170,19 @@ async def send_message(session_id: str, request: MessageRequest):
         )
 
     try:
-        response_text, needs_clarification = chat_svc.process_message(
+        response_text, needs_clarification, meal_plan = chat_svc.process_message(
             session_id, request.content
         )
+
+        meal_plan_resp = None
+        if meal_plan is not None:
+            meal_plan_resp = MealPlanResponse.from_meal_plan(meal_plan)
 
         return MessageResponse(
             role="assistant",
             content=response_text,
             needs_clarification=needs_clarification,
+            meal_plan=meal_plan_resp,
         )
     except Exception as e:
         raise HTTPException(
@@ -196,17 +229,7 @@ async def get_meal_plans(session_id: str):
             status_code=status.HTTP_404_NOT_FOUND, detail="Session not found"
         )
 
-    return [
-        MealPlanResponse(
-            id=mp.id,
-            created_at=mp.created_at,
-            breakfast=mp.breakfast,
-            lunch=mp.lunch,
-            dinner=mp.dinner,
-            reasoning=mp.reasoning,
-        )
-        for mp in session.meal_plans
-    ]
+    return [MealPlanResponse.from_meal_plan(mp) for mp in session.meal_plans]
 
 
 @router.get("/health")

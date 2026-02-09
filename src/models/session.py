@@ -12,26 +12,47 @@ class Message:
 
 
 @dataclass
+class MealCourse:
+    recipe_id: str
+    title: str
+    ingredients: str
+    directions: str
+
+    @classmethod
+    def from_list(cls, data) -> "MealCourse":
+        """Create a MealCourse from a [recipe_id, title, ingredients, directions] list."""
+        if isinstance(data, (list, tuple)) and len(data) >= 4:
+            return cls(
+                recipe_id=str(data[0]),
+                title=str(data[1]),
+                ingredients=str(data[2]),
+                directions=str(data[3]),
+            )
+        return cls(recipe_id="", title="", ingredients="", directions="")
+
+
+@dataclass
 class MealPlan:
     id: str
     created_at: datetime
-    breakfast: str
-    lunch: str
-    dinner: str
+    breakfast: MealCourse
+    lunch: MealCourse
+    dinner: MealCourse
     reasoning: str
-    raw_data: tuple
 
     @classmethod
     def from_response(cls, meal_plan_tuple: tuple, reasoning: str) -> "MealPlan":
-        """Create a MealPlan from RAG chain response."""
+        """Create a MealPlan from RAG chain response.
+
+        Each element of meal_plan_tuple is [recipe_id, title, ingredients, directions].
+        """
         return cls(
             id=str(uuid.uuid4()),
             created_at=datetime.now(),
-            breakfast=meal_plan_tuple[0] if len(meal_plan_tuple) > 0 else "",
-            lunch=meal_plan_tuple[1] if len(meal_plan_tuple) > 1 else "",
-            dinner=meal_plan_tuple[2] if len(meal_plan_tuple) > 2 else "",
+            breakfast=MealCourse.from_list(meal_plan_tuple[0] if len(meal_plan_tuple) > 0 else []),
+            lunch=MealCourse.from_list(meal_plan_tuple[1] if len(meal_plan_tuple) > 1 else []),
+            dinner=MealCourse.from_list(meal_plan_tuple[2] if len(meal_plan_tuple) > 2 else []),
             reasoning=reasoning,
-            raw_data=meal_plan_tuple,
         )
 
 
