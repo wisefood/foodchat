@@ -232,6 +232,22 @@ async def get_meal_plans(session_id: str):
     return [MealPlanResponse.from_meal_plan(mp) for mp in session.meal_plans]
 
 
+@router.get("/members/{member_id}/sessions", response_model=List[SessionResponse])
+async def get_member_sessions(member_id: str):
+    """Get all sessions for a specific member."""
+    sessions = services.session_service.get_member_sessions(member_id)
+    return [
+        SessionResponse(
+            session_id=s.session_id,
+            member_id=s.member_id,
+            state=s.state,
+            message_count=len(s.messages),
+            created_at=s.created_at,
+        )
+        for s in sessions
+    ]
+
+
 @router.get("/health")
 async def health_check():
     """Health check endpoint."""

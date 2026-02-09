@@ -65,6 +65,10 @@ class SessionService:
             return True
         return False
 
+    def get_member_sessions(self, member_id: str) -> list[Session]:
+        """Get all sessions for a specific member."""
+        return [s for s in self._sessions.values() if s.member_id == member_id]
+
     def list_sessions(self) -> list[Session]:
         """List all active sessions."""
         return list(self._sessions.values())
