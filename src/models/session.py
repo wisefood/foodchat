@@ -39,13 +39,23 @@ class MealPlan:
     lunch: MealCourse
     dinner: MealCourse
     reasoning: str
+    # Additional evaluation metrics
+    llm_score: int = 0
+    llm_reasoning: str = ""
+    fvs_count: int = 0
+    fvs_reasoning: str = ""
+    diversity_llm_score: int = 0
+    diversity_llm_reasoning: str = ""
+    guideline_adherence_score: int = 0
+    guideline_adherence_reasoning: str = ""
 
     @classmethod
-    def from_response(cls, meal_plan_tuple: tuple, reasoning: str) -> "MealPlan":
+    def from_response(cls, meal_plan_tuple: tuple, reasoning: str, metrics: Optional[dict] = None) -> "MealPlan":
         """Create a MealPlan from RAG chain response.
 
         Each element of meal_plan_tuple is [recipe_id, title, ingredients, directions].
         """
+        metrics = metrics or {}
         return cls(
             id=str(uuid.uuid4()),
             created_at=datetime.now(),
@@ -53,6 +63,14 @@ class MealPlan:
             lunch=MealCourse.from_list(meal_plan_tuple[1] if len(meal_plan_tuple) > 1 else []),
             dinner=MealCourse.from_list(meal_plan_tuple[2] if len(meal_plan_tuple) > 2 else []),
             reasoning=reasoning,
+            llm_score=int(metrics.get("llm_score", 0)),
+            llm_reasoning=str(metrics.get("llm_reasoning", "")),
+            fvs_count=int(metrics.get("fvs_count", 0)),
+            fvs_reasoning=str(metrics.get("fvs_reasoning", "")),
+            diversity_llm_score=int(metrics.get("diversity_llm_score", 0)),
+            diversity_llm_reasoning=str(metrics.get("diversity_llm_reasoning", "")),
+            guideline_adherence_score=int(metrics.get("guideline_adherence_score", 0)),
+            guideline_adherence_reasoning=str(metrics.get("guideline_adherence_reasoning", "")),
         )
 
 

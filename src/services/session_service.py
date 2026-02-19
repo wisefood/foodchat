@@ -28,13 +28,13 @@ class SessionService:
         return message
 
     def add_meal_plan(
-        self, session_id: str, meal_plan_tuple: tuple, reasoning: str
+        self, session_id: str, meal_plan_tuple: tuple, reasoning: str, metrics: dict | None = None
     ) -> MealPlan:
         """Add a meal plan to a session."""
         session = self._sessions.get(session_id)
         if not session:
             raise ValueError(f"Session {session_id} not found")
-        meal_plan = MealPlan.from_response(meal_plan_tuple, reasoning)
+        meal_plan = MealPlan.from_response(meal_plan_tuple, reasoning, metrics)
         session.meal_plans.append(meal_plan)
         return meal_plan
 

@@ -144,6 +144,39 @@ class DocumentGrader:
 
         return scored_daily_plans[:1]  # return the best daily plan
 
+class MealDiversityGrader:
+    def __init__(self, model: str = None, temperature: float = None):
+        self.client = GROQ_CHAT.get_client(
+            model=model or DEFAULT_MODEL,
+            temperature=temperature if temperature is not None else DEFAULT_TEMPERATURE,
+            format=ScoringSchema.model_json_schema(),
+        )
+
+    def score(self, plan_text: str) -> dict:
+        messages = [HumanMessage(content=plan_text)]
+        result = self.client.invoke([SystemMessage(content=MEAL_DIVERSITY_SYSTEM_INSTRUCTIONS)] + messages)
+        try:
+            return json.loads(result.content)
+        except Exception:
+            return {"reasoning": "Could not parse diversity score", "score": 0}
+
+class GuidelineAdherenceGrader:
+    def __init__(self, model: str = None, temperature: float = None):
+        self.client = GROQ_CHAT.get_client(
+            model=model or DEFAULT_MODEL,
+            temperature=temperature if temperature is not None else DEFAULT_TEMPERATURE,
+            format=ScoringSchema.model_json_schema(),
+        )
+
+    def score(self, plan_text: str, guidelines_text: str) -> dict:
+        content = f"GUIDELINES:\n{guidelines_text}\n\nMEAL PLAN:\n{plan_text}"
+        messages = [HumanMessage(content=content)]
+        result = self.client.invoke([SystemMessage(content=GUIDELINE_ADHERENCE_SYSTEM_INSTRUCTIONS)] + messages)
+        try:
+            return json.loads(result.content)
+        except Exception:
+            return {"reasoning": "Could not parse guideline adherence score", "score": 0}
+
     # def grading_docs(self, query, documents, user_profile) :
     #     filtered_docs = []
     #     for doc  in documents :

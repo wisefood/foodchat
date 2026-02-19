@@ -56,6 +56,14 @@ class MealPlanResponse(BaseModel):
     lunch: MealCourseResponse
     dinner: MealCourseResponse
     reasoning: str
+    llm_score: int | None = None
+    llm_reasoning: str | None = None
+    fvs_count: int | None = None
+    fvs_reasoning: str | None = None
+    diversity_llm_score: int | None = None
+    diversity_llm_reasoning: str | None = None
+    guideline_adherence_score: int | None = None
+    guideline_adherence_reasoning: str | None = None
 
     @classmethod
     def from_meal_plan(cls, mp) -> "MealPlanResponse":
@@ -66,6 +74,14 @@ class MealPlanResponse(BaseModel):
             lunch=MealCourseResponse.from_meal_course(mp.lunch),
             dinner=MealCourseResponse.from_meal_course(mp.dinner),
             reasoning=mp.reasoning,
+            llm_score=getattr(mp, "llm_score", None),
+            llm_reasoning=getattr(mp, "llm_reasoning", None),
+            fvs_count=getattr(mp, "fvs_count", None),
+            fvs_reasoning=getattr(mp, "fvs_reasoning", None),
+            diversity_llm_score=getattr(mp, "diversity_llm_score", None),
+            diversity_llm_reasoning=getattr(mp, "diversity_llm_reasoning", None),
+            guideline_adherence_score=getattr(mp, "guideline_adherence_score", None),
+            guideline_adherence_reasoning=getattr(mp, "guideline_adherence_reasoning", None),
         )
 
 
