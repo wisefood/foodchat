@@ -692,66 +692,27 @@ User Query: {query}
 
 
 QUERY_RECONCILER_SYSTEM_INSTRUCTIONS = """
-You are a dietary conflict checker.
-
-Your task is to determine whether a food item conflicts with a user’s dietary restrictions or allergies. You will be given:
-- A food item (e.g., "bacon", "shrimp", "cheese", "burger")
-- A list of dietary tags (e.g., ["vegetarian", "halal"])
-- A list of allergies (e.g., ["peanuts", "shellfish"])
+You are a query reconciler for a meal planning system.
+Your task is to analyze the user's query and their dietary profile to identify:
+1. Missing information: Specifically check if "cooking time", "difficulty level", or "meal goal" (e.g., weight loss, muscle gain) are missing from the query.
+2. Dietary or allergy conflicts: Check if any items or cuisines mentioned in the query conflict with the user's diet (e.g., "vegetarian", "keto") or allergies (e.g., "peanuts", "shellfish").
 
 Instructions:
-1. Check whether the item directly violates any listed diet or allergy.
-2. If a conflict exists, set `conflict` to `true`, explain why, and specify which profile entry caused the conflict using the `trigger` field.
-3. If there is no conflict, set `conflict` to `false` and provide a short explanation why not. The `trigger` should be an empty string in this case.
+- If "cooking time", "difficulty level", or "goal" are not explicitly or implicitly mentioned in the query, add them to `missing_info`.
+- If an item in the query violates the user's diet or allergies, set `has_dietary_conflict` to true and provide a `conflict_explanation` that warns the user and asks if they want to proceed.
+- Set `needs_clarification` to true if `missing_info` is not empty OR `has_dietary_conflict` is true.
 
 Return a JSON object with:
-- "conflict" (true or false)
-- "trigger" (element that causes the conflict)
-- "explanation" (short explanation of why or why not)
+- "missing_info" (list of strings: "cooking time", "difficulty level", "goal")
+- "has_dietary_conflict" (boolean)
+- "conflict_explanation" (string or null)
+- "needs_clarification" (boolean)
 
-Examples:
-
-Input:
-- Item: "bacon"
-- Diet: ["vegetarian"]
-- Allergies: []
-
-Output:
-{{
-  "conflict": true,
-  "trigger" : "vegetarian",
-  "explanation": "Bacon is not allowed in a vegetarian diet"
-}}
-
-Input:
-- Item: "peanut"
-- Diet: []
-- Allergies: ["peanuts"]
-
-Output:
-{{
-  "conflict": true,
-  "trigger": "peanuts",
-  "explanation": "Peanut is listed as an allergen"
-}}
-
-Input:
-- Item: "lentils"
-- Diet: ["vegetarian"]
-- Allergies: []
-
-Output:
-{{
-  "conflict": false,
-  "trigger": "",
-  "explanation": "Lentils are compatible with a vegetarian diet and not an allergen"
-  "trigger": 
-}}
-
-Only return the JSON object. Do not add commentary."""
+Only return the JSON object. Do not add commentary.
+"""
 
 QUERY_RECONCILER_USER_INSTRUCTIONS = """
-Item: {item}
+Query: {query}
 Diet: {diet}
 Allergies: {allergies}
 """
@@ -843,9 +804,9 @@ Return your response as a JSON object with a single key "response" containing ei
 """
 
 QUERY_CHECKER_USER_INSTRUCTIONS = """
-Is this query sufficiently specific and self-contained to be used directly for recipe retrieval?
+Is the user's query sufficiently specific and self-contained for direct use in recipe recommendation?
 User query: {user_query}
-Respond with only one word: "YES" or "NO".
+Respond only with a JSON object: {"response": "YES"} or {"response": "NO"}.
 """
 
 

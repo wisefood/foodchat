@@ -492,9 +492,9 @@ class FoodChat:
                 | RunnablePassthrough.assign(
                     # TEMPORARILY modify the user data if there is conflict
                     modified_user_data=RunnableLambda(
-                        lambda x: query_reconciler.reconcile(
+                        lambda x: {**x.get("user_profile_data", {}), **query_reconciler.reconcile(
                             x["question"], x.get("user_profile_data", {})
-                        )
+                        )}
                     )
                 )
             )

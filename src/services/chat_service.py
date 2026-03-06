@@ -68,12 +68,15 @@ class ChatService:
         )
 
         # Start clarification generator
+        # Note: query_check is now a proper generator function
         generator = self.rag_preparator.query_check(
-            pending_rag_data["question"], pending_rag_data["modified_user_data"]
+            pending_rag_data.get("question", message), 
+            pending_rag_data.get("modified_user_data", session.user_profile)
         )
 
         try:
             # Try to get first clarification question
+            # If query_check returns immediately (no clarification), this will raise StopIteration
             first_question = next(generator)
             self.session_service.set_clarification_state(
                 session_id, generator, pending_rag_data
@@ -82,10 +85,18 @@ class ChatService:
             return first_question, True, None
 
         except StopIteration as e:
-            # No clarification needed, run post-clarification directly
-            final_query = e.value or message
+            # No clarification needed (or it completed immediately), run post-clarification directly
+            # e.value contains the final query returned by the generator
+            final_query = e.value or pending_rag_data.get("question", message)
             return self._run_post_clarification(
                 session_id, final_query, pending_rag_data
+            )
+        except Exception as ex:
+            # Fallback for any other errors in the generator setup
+            import logging
+            logging.getLogger(__name__).error(f"Error in clarification generator: {ex}")
+            return self._run_post_clarification(
+                session_id, message, pending_rag_data
             )
 
     def _handle_clarification(

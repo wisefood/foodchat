@@ -1,5 +1,5 @@
 from pydantic import BaseModel, conint
-from typing import Literal
+from typing import Literal, Optional
 
 
 class QueryRewriterSchema(BaseModel): 
@@ -35,9 +35,10 @@ class DocumentGraderSchema(BaseModel):
     user_feedback : ScoringSchema
 
 class QueryReconcilerSchema(BaseModel): 
-    conflict: bool
-    trigger: str
-    explanation: str
+    missing_info: list[str] # cooking time, difficulty, goal
+    has_dietary_conflict: bool
+    conflict_explanation: Optional[str] = None
+    needs_clarification: bool
 
 class QueryItemExtractorSchema(BaseModel): 
     item: list[str]

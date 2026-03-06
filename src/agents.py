@@ -125,7 +125,7 @@ class DocumentGrader:
                     content=GRADER_USER_INSTRUCTIONS.format(
                         query=query,
                         daily_plan=meal_plan,
-                        preferences=",".join(user_profile["preferences"]),
+                        preferences=",".join(user_profile.get("preferences", [])),
                         feedback_history="",
                     )
                 )
@@ -347,56 +347,26 @@ class QueryReconciler:
     def __init__(self, model: str = None, temperature: float = None):
         model = model or DEFAULT_MODEL
         temperature = temperature if temperature is not None else DEFAULT_TEMPERATURE
-        self.query_item_extractor = GROQ_CHAT.get_client(
-            model=model,
-            temperature=temperature,
-            format=QueryItemExtractorSchema.model_json_schema(),
-        )
         self.query_reconciler = GROQ_CHAT.get_client(
             model=model,
             temperature=temperature,
             format=QueryReconcilerSchema.model_json_schema(),
         )
 
-    def extract_items(self, user_query):
+    def reconcile(self, query, user_profile):
         question = [
             HumanMessage(
-                content=QUERY_ITEM_EXTRACTOR_USER_INSTRUCTIONS.format(query=user_query)
+                content=QUERY_RECONCILER_USER_INSTRUCTIONS.format(
+                    query=query,
+                    diet=user_profile.get("diet", []),
+                    allergies=user_profile.get("allergies", []),
+                )
             )
         ]
-        extracted_items = self.query_item_extractor.invoke(
-            [SystemMessage(content=QUERY_ITEM_EXTRACTOR_SYSTEM_INSTRUCTIONS)] + question
+        reconciliation_details = self.query_reconciler.invoke(
+            [SystemMessage(content=QUERY_RECONCILER_SYSTEM_INSTRUCTIONS)] + question
         )
-        extracted_items = json.loads(extracted_items.content)
-        logger.debug(f"Extracted items: {extracted_items}")
-        return extracted_items
-
-    def reconcile(self, query, user_profile):
-        extracted_items = self.extract_items(query)
-        for item in extracted_items.values():
-            question = [
-                HumanMessage(
-                    content=QUERY_RECONCILER_USER_INSTRUCTIONS.format(
-                        item=item,
-                        diet=user_profile["diet"],
-                        allergies=user_profile["allergies"],
-                    )
-                )
-            ]
-            conflict_details = self.query_reconciler.invoke(
-                [SystemMessage(content=QUERY_RECONCILER_SYSTEM_INSTRUCTIONS)] + question
-            )
-            conflict_details = json.loads(conflict_details.content)
-            conflicting_elem = conflict_details.get("trigger")
-            user_profile["diet"] = [
-                elem for elem in user_profile["diet"] if elem != conflicting_elem
-            ]
-            user_profile["allergies"] = [
-                elem for elem in user_profile["allergies"] if elem != conflicting_elem
-            ]
-            logger.debug(f"Updated user profile: {user_profile}")
-        user_profile["include_ingredients"] = extracted_items.get("item", [])
-        return user_profile
+        return json.loads(reconciliation_details.content)
 
 
 class RAGReadyPreparator:
@@ -422,9 +392,10 @@ class RAGReadyPreparator:
             temperature=temperature,
             format=QueryReformulatorSchema.model_json_schema(),
         )
+        self.query_reconciler = QueryReconciler(model=model, temperature=temperature)
 
     def user_profile_check(self, user_profile):
-        preferences = user_profile["preferences"]
+        preferences = user_profile.get("preferences", [])
         if len(preferences) == 0:
             return {"response": "NO", "suggestions": []}
 
@@ -450,7 +421,7 @@ class RAGReadyPreparator:
                 HumanMessage(
                     content=USER_INFO_COLLECTOR_USER_INSTRUCTIONS.format(
                         user_query=query,
-                        preferences=user_info["preferences"],
+                        preferences=user_info.get("preferences", []),
                         feedback_history=[],
                         suggestions=suggestion,
                     )
@@ -470,7 +441,7 @@ class RAGReadyPreparator:
             if user_reply is None:
                 break
 
-            conversation_history.append(HumanMessage(content=user_reply).content[0])
+            conversation_history.append(user_reply)
 
         logger.debug(f"Conversation history: {conversation_history}")
         return conversation_history
@@ -480,7 +451,7 @@ class RAGReadyPreparator:
             HumanMessage(
                 content=QUERY_REFORMULATOR_USER_INSTRUCTIONS.format(
                     original_query=query,
-                    preferences=user_profile["preferences"],
+                    preferences=user_profile.get("preferences", []),
                     feedback_history=[],
                     collected_info=collected_info,
                 )
@@ -494,6 +465,35 @@ class RAGReadyPreparator:
         return reformulated_query
 
     def query_check(self, query, user_profile):
+        """Checks if the query is specific enough and reconciles with user profile.
+        
+        This is a generator function. It yields clarification questions or warnings if needed.
+        Returns the final (reformulated) query upon completion.
+        """
+        # Step 1: Reconciliation check (missing info and dietary conflicts)
+        reconciliation = self.query_reconciler.reconcile(query, user_profile)
+        logger.info(f"Reconciliation result: {reconciliation}")
+
+        collected_responses = []
+        if reconciliation.get("needs_clarification"):
+            # Handle dietary conflict first
+            if reconciliation.get("has_dietary_conflict"):
+                warning = reconciliation.get("conflict_explanation")
+                user_reply = yield warning
+                collected_responses.append(f"User response to dietary conflict warning: {user_reply}")
+            
+            # Handle missing info
+            missing = reconciliation.get("missing_info", [])
+            if missing:
+                info_responses = yield from self.collect_user_info(
+                    query, missing, user_profile
+                )
+                collected_responses.extend(info_responses)
+            
+            if collected_responses:
+                return self.reformulate_query(collected_responses, user_profile, query)
+
+        # Step 2: Basic specificity check (fallback)
         question = [
             HumanMessage(
                 content=QUERY_CHECKER_USER_INSTRUCTIONS.format(user_query=query)
@@ -502,23 +502,25 @@ class RAGReadyPreparator:
         response = self.query_checker.invoke(
             [SystemMessage(content=QUERY_CHECKER_SYSTEM_INSTRUCTIONS)] + question
         )
-        response = json.loads(response.content)["response"]
+        response_json = json.loads(response.content)
+        check_result = response_json.get("response", "YES")
 
-        if response == "NO":
-            logger.info("Query is too general for RAG, collecting more info")
+        if check_result == "NO":
+            logger.info("Query is too general for RAG, checking profile and collecting more info")
             user_profile_check = self.user_profile_check(user_profile)
 
             if user_profile_check.get("response") == "NO":
-                logger.info(
-                    f"Need to collect info on: {user_profile_check.get('suggestions', [])}"
-                )
+                suggestions = user_profile_check.get("suggestions", [])
+                logger.info(f"Need to collect info on: {suggestions}")
                 collected_info = yield from self.collect_user_info(
-                    query, user_profile_check.get("suggestions", []), user_profile
+                    query, suggestions, user_profile
                 )
                 return self.reformulate_query(collected_info, user_profile, query)
             else:
                 return self.reformulate_query(None, user_profile, query)
         else:
+            # Mark as generator even if no yield occurred
+            if False: yield
             return query
         
         # return response
