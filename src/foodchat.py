@@ -514,6 +514,7 @@ class FoodChat:
                             + x["modified_user_data"].get("include_ingredients", [])
                         )),
                         x["modified_user_data"].get("food_dislikes"),
+                        limit=5,
                     )
                 )
             )

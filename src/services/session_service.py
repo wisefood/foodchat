@@ -1,5 +1,7 @@
-from typing import Dict, Optional
-from models.session import Session, Message, MealPlan
+from typing import Dict, Optional, List, Any
+from models.session import Session, Message, MealPlan, WeeklyMealPlan
+import uuid
+from datetime import datetime
 
 
 class SessionService:
@@ -27,6 +29,15 @@ class SessionService:
         session.messages.append(message)
         return message
 
+    def add_weekly_message(self, session_id: str, role: str, content: str) -> Message:
+        """Add a message to a session's weekly history."""
+        session = self._sessions.get(session_id)
+        if not session:
+            raise ValueError(f"Session {session_id} not found")
+        message = Message(role=role, content=content)
+        session.weekly_messages.append(message)
+        return message
+
     def add_meal_plan(
         self, session_id: str, meal_plan_tuple: tuple, reasoning: str, metrics: dict | None = None
     ) -> MealPlan:
@@ -37,6 +48,21 @@ class SessionService:
         meal_plan = MealPlan.from_response(meal_plan_tuple, reasoning, metrics)
         session.meal_plans.append(meal_plan)
         return meal_plan
+
+    def add_weekly_meal_plan(
+        self, session_id: str, plan_entries: List[Dict[str, Any]]
+    ) -> WeeklyMealPlan:
+        """Add a weekly meal plan to a session."""
+        session = self._sessions.get(session_id)
+        if not session:
+            raise ValueError(f"Session {session_id} not found")
+        weekly_plan = WeeklyMealPlan(
+            id=str(uuid.uuid4()),
+            created_at=datetime.now(),
+            entries=plan_entries
+        )
+        session.weekly_meal_plans.append(weekly_plan)
+        return weekly_plan
 
     def set_clarification_state(
         self, session_id: str, generator, pending_data: dict

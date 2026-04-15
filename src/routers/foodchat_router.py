@@ -92,6 +92,36 @@ class MessageResponse(BaseModel):
     meal_plan: Optional[MealPlanResponse] = None
 
 
+class WeeklyMealPlanEntryResponse(BaseModel):
+    day: int
+    meal_idx: int
+    meal_type: str
+    recipe: dict
+    reward: float
+
+
+class WeeklyMealPlanResponse(BaseModel):
+    id: str
+    created_at: datetime
+    entries: List[WeeklyMealPlanEntryResponse]
+
+    @classmethod
+    def from_weekly_meal_plan(cls, wmp) -> "WeeklyMealPlanResponse":
+        return cls(
+            id=wmp.id,
+            created_at=wmp.created_at,
+            entries=[
+                WeeklyMealPlanEntryResponse(**entry) for entry in wmp.entries
+            ],
+        )
+
+
+class WeeklyMessageResponse(BaseModel):
+    role: str
+    content: str
+    weekly_meal_plan: Optional[WeeklyMealPlanResponse] = None
+
+
 class MessageHistoryItem(BaseModel):
     role: str
     content: str
@@ -106,6 +136,16 @@ def _require_chat_service():
             detail="Chat service unavailable (CSV data not loaded)",
         )
     return services.chat_service
+
+
+def _require_weekly_plan_service():
+    """Raise 503 if weekly plan service is not available."""
+    if services.weekly_plan_service is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Weekly plan service unavailable",
+        )
+    return services.weekly_plan_service
 
 
 # --- Endpoints ---
@@ -246,6 +286,70 @@ async def get_meal_plans(session_id: str):
         )
 
     return [MealPlanResponse.from_meal_plan(mp) for mp in session.meal_plans]
+
+
+@router.post("/sessions/{session_id}/weekly", response_model=WeeklyMessageResponse)
+async def send_weekly_message(session_id: str, request: MessageRequest):
+    """Send a message to generate a 7-day weekly meal plan."""
+    weekly_svc = _require_weekly_plan_service()
+
+    session = services.session_service.get_session(session_id)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Session not found"
+        )
+
+    try:
+        response_text, weekly_plan = weekly_svc.process_message(
+            session_id, request.content
+        )
+
+        return WeeklyMessageResponse(
+            role="assistant",
+            content=response_text,
+            weekly_meal_plan=WeeklyMealPlanResponse.from_weekly_meal_plan(weekly_plan),
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
+        )
+
+
+@router.get(
+    "/sessions/{session_id}/weekly", response_model=List[MessageHistoryItem]
+)
+async def get_weekly_messages(session_id: str, limit: Optional[int] = None):
+    """Get weekly message history for a session."""
+    session = services.session_service.get_session(session_id)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Session not found"
+        )
+
+    messages = session.weekly_messages
+    if limit:
+        messages = messages[-limit:]
+
+    return [
+        MessageHistoryItem(
+            role=msg.role,
+            content=msg.content,
+            timestamp=msg.timestamp,
+        )
+        for msg in messages
+    ]
+
+
+@router.get("/sessions/{session_id}/weekly-meal-plans", response_model=List[WeeklyMealPlanResponse])
+async def get_weekly_meal_plans(session_id: str):
+    """Get all weekly meal plans generated in this session."""
+    session = services.session_service.get_session(session_id)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Session not found"
+        )
+
+    return [WeeklyMealPlanResponse.from_weekly_meal_plan(wmp) for wmp in session.weekly_meal_plans]
 
 
 @router.get("/members/{member_id}/sessions", response_model=List[SessionResponse])

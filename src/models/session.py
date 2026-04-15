@@ -75,12 +75,21 @@ class MealPlan:
 
 
 @dataclass
+class WeeklyMealPlan:
+    id: str
+    created_at: datetime
+    entries: list[dict]
+
+
+@dataclass
 class Session:
     session_id: str
     member_id: str
     user_profile: dict
     messages: list[Message] = field(default_factory=list)
     meal_plans: list[MealPlan] = field(default_factory=list)
+    weekly_messages: list[Message] = field(default_factory=list)
+    weekly_meal_plans: list[WeeklyMealPlan] = field(default_factory=list)
     state: Literal["ready", "clarifying"] = "ready"
     clarification_generator: Optional[Any] = field(default=None, repr=False)
     pending_rag_data: Optional[dict] = field(default=None, repr=False)

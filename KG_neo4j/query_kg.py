@@ -81,7 +81,7 @@ def filter_allergens_diet(driver, allergens, diet, meal_course, exclude_ids):
         return results
 
 
-def get_filtered_recipe_ids_neo4j(allergens: list, diet: str):
+def get_filtered_recipe_ids_neo4j(allergens: list, diet: str, limit: int = 5):
     res_per_courses = {'breakfast' : [], 'lunch' : [], 'dinner' : []}
     exclude_ids  = []
     print("URI: ", URI, "AUTH: ", AUTH)
@@ -92,8 +92,10 @@ def get_filtered_recipe_ids_neo4j(allergens: list, diet: str):
             print("Successfully connected to Neo4j.\n")
             print("PARAMETERS TYPE: ", allergens, diet)
             results = filter_allergens_diet(driver, allergens, diet, course, exclude_ids)
-            exclude_ids.extend(pd.DataFrame(results)['recipe_id'].values.tolist())
-            res_per_courses[course] = pd.DataFrame(results).values.tolist()[:5]
+            if results:
+                df = pd.DataFrame(results)
+                exclude_ids.extend(df['recipe_id'].values.tolist())
+                res_per_courses[course] = df.values.tolist()[:limit]
     return res_per_courses
 
 
@@ -237,13 +239,14 @@ def _classify_course(title, ingredients):
 def get_filtered_recipe_ids_api(
     allergens: list, diet: str,
     include_ingredients: list = None, exclude_ingredients: list = None,
+    limit: int = 5
 ):
     """Fetch candidate recipes from the RecipeWrangler param_search API.
 
     Recipes are classified into breakfast/lunch/dinner using keyword heuristics
     since the API does not support filtering by meal course.
     """
-    recipes_per_course = 5
+    recipes_per_course = limit
     res_per_courses = {'breakfast': [], 'lunch': [], 'dinner': []}
     base = RECIPEWRANGLER_API_URL.rstrip("/")
 
@@ -252,7 +255,7 @@ def get_filtered_recipe_ids_api(
         "diet_tags": diet if isinstance(diet, list) else ([diet] if diet else []),
         "include_ingredients": include_ingredients or [],
         "exclude_ingredients": exclude_ingredients or [],
-        "limit": 50,
+        "limit": max(50, limit * 4),
     }
 
     with httpx.Client() as client:
@@ -309,10 +312,11 @@ def get_filtered_recipe_ids_api(
 def get_filtered_recipe_ids(
     allergens: list, diet: str,
     include_ingredients: list = None, exclude_ingredients: list = None,
+    limit: int = 5
 ):
     """Dispatcher: use RecipeWrangler API or Neo4j based on RECIPE_SOURCE env var."""
     if RECIPE_SOURCE == "api":
         return get_filtered_recipe_ids_api(
-            allergens, diet, include_ingredients, exclude_ingredients
+            allergens, diet, include_ingredients, exclude_ingredients, limit
         )
-    return get_filtered_recipe_ids_neo4j(allergens, diet)
+    return get_filtered_recipe_ids_neo4j(allergens, diet, limit)
