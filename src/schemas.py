@@ -1,5 +1,5 @@
 from pydantic import BaseModel, conint
-from typing import Literal, Optional
+from typing import Literal, Optional, Any
 
 
 class QueryRewriterSchema(BaseModel): 
@@ -50,8 +50,13 @@ class UserProfileCheckerSchema(BaseModel):
     response: Literal['YES', 'NO']
     suggestions: list[str]
 
-class QueryReformulatorSchema(BaseModel): 
+class QueryReformulatorSchema(BaseModel):
     reformulated_query: str
+
+
+class OrchestratorSchema(BaseModel):
+    intent: Literal["daily_plan", "weekly_plan", "refine_plan", "chat"]
+    reasoning: str
 
 # class UserInfoCollectorSchema(BaseModel) : 
 #     response : 

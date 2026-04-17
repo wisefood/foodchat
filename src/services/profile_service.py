@@ -1,65 +1,51 @@
+import logging
 from typing import Any
 
 from backend.platform import WISEFOOD, WiseFoodPool
+
+logger = logging.getLogger(__name__)
 
 
 class ProfileService:
     """Service for fetching and mapping WiseFood member profiles."""
 
     def __init__(self, client_pool: WiseFoodPool = None):
-        """
-        Initialize ProfileService.
-
-        Args:
-            client_pool: Optional WiseFoodPool instance. If not provided,
-                        uses the global WISEFOOD pool.
-        """
         self.client_pool = WISEFOOD
 
     def get_member_profile(self, member_id: str) -> dict:
-        """Fetch profile from WiseFood and map to FoodChat format.
-
-        Args:
-            member_id: The WiseFood member ID
-
-        Returns:
-            FoodChat-formatted profile dict with keys:
-            - diet: list of dietary restrictions
-            - allergies: list of allergies
-            - preferences: list of preference strings
-            - history: feedback/notes history
-        """
-        with self.client_pool.client() as client:
-            member = client.members.get(member_id)
-            return self._map_profile(member.profile)
+        logger.info("Fetching profile for member %s from WiseFood.", member_id)
+        try:
+            with self.client_pool.client() as client:
+                member = client.members.get(member_id)
+                profile = self._map_profile(member.profile)
+            logger.info(
+                "Profile fetched for member %s — diet=%s allergies=%s food_likes=%d food_dislikes=%d.",
+                member_id,
+                profile.get("diet"),
+                profile.get("allergies"),
+                len(profile.get("food_likes", [])),
+                len(profile.get("food_dislikes", [])),
+            )
+            return profile
+        except Exception as e:
+            logger.error("Failed to fetch profile for member %s: %s", member_id, e, exc_info=True)
+            raise
 
     def update_member_history(self, member_id: str, history_update: str) -> dict:
-        """
-        Update the history/notes within a member's nutritional preferences.
-
-        Args:
-            member_id: The WiseFood member ID
-            history_update: The new history string to save
-
-        Returns:
-            The updated, mapped profile dict.
-        """
-        with self.client_pool.client() as client:
-            member = client.members.get(member_id)
-            profile = member.profile
-
-            # 1. Get existing prefs (default to dict if None)
-            # We use .copy() to ensure we have a mutable dict we can work with
-            current_prefs = (profile.nutritional_preferences or {}).copy()
-
-            # 2. Update the history key
-            current_prefs["history"] = history_update
-
-            # 3. Re-assign to trigger the API update (Auto-syncs per SDK example)
-            profile.nutritional_preferences = current_prefs
-
-            # 4. Return the updated mapped profile
-            return self._map_profile(profile)
+        logger.info("Updating history for member %s.", member_id)
+        try:
+            with self.client_pool.client() as client:
+                member = client.members.get(member_id)
+                profile = member.profile
+                current_prefs = (profile.nutritional_preferences or {}).copy()
+                current_prefs["history"] = history_update
+                profile.nutritional_preferences = current_prefs
+                result = self._map_profile(profile)
+            logger.info("History updated for member %s.", member_id)
+            return result
+        except Exception as e:
+            logger.error("Failed to update history for member %s: %s", member_id, e, exc_info=True)
+            raise
 
     def _map_profile(self, wisefood_profile: Any) -> dict:
         """Map WiseFood profile structure to FoodChat format.

@@ -11,7 +11,33 @@ from langchain_ollama import ChatOllama
 from langchain_groq import ChatGroq
 import os
 from backend.groq import GROQ_CHAT
-from prompts import *
+from prompts import (
+    ROUTER_SYSTEM_INSTRUCTIONS,
+    GRADER_SYSTEM_INSTRUCTIONS,
+    GRADER_USER_INSTRUCTIONS,
+    MEAL_DIVERSITY_SYSTEM_INSTRUCTIONS,
+    GUIDELINE_ADHERENCE_SYSTEM_INSTRUCTIONS,
+    SIMPLE_QUESTIONS_GENERATOR_SYSTEM_INSTRUCTIONS,
+    SIMPLE_QUESTIONS_GENERATOR_USER_INSTRUCTIONS,
+    SIMPLE_QUESTIONS_RESPONDER_SYSTEM_INSTRUCTIONS,
+    SIMPLE_QUESTIONS_RESPONDER_USER_INSTRUCTIONS,
+    QUERY_REWRITER_SYSTEM_INSTRUCTIONS,
+    QUERY_REWRITER_USER_INSTRUCTIONS,
+    FEEDBACK_REWRITER_SYSTEM_INSTRUCTIONS,
+    FEEDBACK_REWRITER_USER_INSTRUCTIONS,
+    QUERY_RECONCILER_SYSTEM_INSTRUCTIONS,
+    QUERY_RECONCILER_USER_INSTRUCTIONS,
+    QUERY_CHECKER_SYSTEM_INSTRUCTIONS,
+    QUERY_CHECKER_USER_INSTRUCTIONS,
+    USER_PROFILE_CHECKER_SYSTEM_INSTRUCTIONS,
+    USER_PROFILE_CHECKER_USER_INSTRUCTIONS,
+    USER_INFO_COLLECTOR_SYSTEM_INSTRUCTIONS,
+    USER_INFO_COLLECTOR_USER_INSTRUCTIONS,
+    QUERY_REFORMULATOR_SYSTEM_INSTRUCTIONS,
+    QUERY_REFORMULATOR_USER_INSTRUCTIONS,
+    ORCHESTRATOR_SYSTEM_INSTRUCTIONS,
+    ORCHESTRATOR_USER_INSTRUCTIONS,
+)
 from schemas import (
     ScoringSchema,
     QuestionList,
@@ -22,6 +48,7 @@ from schemas import (
     QueryCheckerSchema,
     UserProfileCheckerSchema,
     QueryReformulatorSchema,
+    OrchestratorSchema,
 )
 
 logger = logging.getLogger(__name__)
@@ -233,7 +260,14 @@ class SimpleChatBot:
 
     def chat(self, query):
         chat_history = self.memory.load_memory_variables({})["chat_history"]
-        messages = chat_history + [HumanMessage(content=query)]
+        system = SystemMessage(content=(
+            "You are FoodChat, a friendly and knowledgeable meal-planning assistant. "
+            "You help users plan their meals, discover recipes, understand nutrition, "
+            "and make healthy food choices. Keep your answers focused on food, cooking, "
+            "nutrition, and meal planning. If asked something completely unrelated to food, "
+            "politely steer the conversation back to your area of expertise."
+        ))
+        messages = [system] + chat_history + [HumanMessage(content=query)]
         chatbot_message = self.chatbot.invoke(messages)
         response = chatbot_message.content
         self.memory.save_context({"input": query}, {"output": response})
@@ -522,8 +556,55 @@ class RAGReadyPreparator:
             # Mark as generator even if no yield occurred
             if False: yield
             return query
-        
+
         # return response
+
+
+class OrchestratorAgent:
+    """Routes a user message to the correct sub-service based on conversational intent."""
+
+    def __init__(self, model: str = None, temperature: float = None):
+        self.llm = GROQ_CHAT.get_client(
+            model=model or DEFAULT_MODEL,
+            temperature=temperature if temperature is not None else DEFAULT_TEMPERATURE,
+            format=OrchestratorSchema.model_json_schema(),
+        )
+
+    def classify(self, message: str, history: list[dict]) -> str:
+        """Return one of: 'daily_plan', 'weekly_plan', 'refine_plan', 'chat'.
+
+        history: list of {"role": "user"|"assistant", "content": str} dicts,
+                 most recent last, max last 6 turns passed in.
+        """
+        history_text = "\n".join(
+            f"{turn['role'].upper()}: {turn['content'][:300]}"
+            for turn in history[-6:]
+        ) or "(no prior conversation)"
+
+        messages = [
+            SystemMessage(content=ORCHESTRATOR_SYSTEM_INSTRUCTIONS),
+            HumanMessage(
+                content=ORCHESTRATOR_USER_INSTRUCTIONS.format(
+                    history=history_text,
+                    message=message,
+                )
+            ),
+        ]
+
+        for attempt in range(MAX_RETRIES):
+            try:
+                result = self.llm.invoke(messages)
+                parsed = json.loads(result.content)
+                intent = parsed.get("intent", "chat")
+                if intent in ("daily_plan", "weekly_plan", "refine_plan", "chat"):
+                    logger.info(f"Orchestrator intent: {intent} — {parsed.get('reasoning', '')}")
+                    return intent
+            except Exception as e:
+                logger.warning(f"Orchestrator attempt {attempt + 1} failed: {e}")
+
+        logger.error("Orchestrator failed after retries, defaulting to chat")
+        return "chat"
+
 
 # class QueryEnhancer:
 #     def __init__(self):

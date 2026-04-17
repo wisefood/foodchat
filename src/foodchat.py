@@ -596,7 +596,12 @@ def initialize_system(args, embeddings):
     elif args.data_type == "csv":
         data_path = CSV_HUMMUS_PATH if args.dataset == "hummus" else CSV_CULINARY_PATH
         if not os.path.exists(data_path):
-            logging.warning(f"CSV file not found at {data_path}, skipping CSV initialization")
+            env_var = "CSV_HUMMUS_PATH" if args.dataset == "hummus" else "CSV_CULINARY_PATH"
+            logging.error(
+                f"CSV file not found at '{data_path}' (env: {env_var}={os.getenv(env_var, 'not set')}). "
+                "FoodChat cannot initialize without recipe data. "
+                "Mount the data volume or set the correct path in your environment."
+            )
             return None
         processor = CSVProcessor(data_path, embeddings)
         df = processor.load_csv_data(args.dataset)

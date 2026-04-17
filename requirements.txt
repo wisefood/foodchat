@@ -30,6 +30,7 @@ unstructured>=0.15.0
 
 # Database
 neo4j>=5.20.0
+sqlalchemy>=2.0.0
 
 # WiseFood client
 wisefood

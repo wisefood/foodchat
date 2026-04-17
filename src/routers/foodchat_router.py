@@ -1,10 +1,14 @@
+import logging
 from datetime import datetime
 from typing import List, Optional
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel
 
 import services
+
+logger = logging.getLogger(__name__)
+from db import SessionLocal, db_upsert_feedback, db_get_message_by_id
 from models.session import MealCourse
 
 router = APIRouter(
@@ -128,22 +132,75 @@ class MessageHistoryItem(BaseModel):
     timestamp: datetime
 
 
-def _require_chat_service():
-    """Raise 503 if chat service is not available."""
-    if services.chat_service is None:
+# --- Unified chat models ---
+
+
+class ChatRequest(BaseModel):
+    content: str
+    member_id: str  # caller must identify themselves — enforces session ownership
+
+
+class ChatTurnResponse(BaseModel):
+    role: str
+    content: str
+    intent: str
+    needs_clarification: bool = False
+    meal_plan: Optional[MealPlanResponse] = None
+    weekly_meal_plan: Optional[WeeklyMealPlanResponse] = None
+    at_message_limit: bool = False
+
+
+class ConversationPage(BaseModel):
+    messages: List[dict]
+    has_more: bool
+    next_before_id: Optional[int] = None
+
+
+class FeedbackRequest(BaseModel):
+    member_id: str
+    rating: str          # "up" | "down"
+    comment: Optional[str] = None
+
+
+class FeedbackResponse(BaseModel):
+    message_id: int
+    rating: str
+    comment: Optional[str] = None
+
+
+def _require_orchestrator_service():
+    if services.orchestrator_service is None:
+        logger.error(
+            "Request reached /chat but orchestrator_service is None. "
+            "Root cause: FoodChat failed to initialize at startup (missing CSV data or embeddings). "
+            "Check startup logs for 'CSV file not found' or embedding errors."
+        )
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Chat service unavailable (CSV data not loaded)",
+            detail="Orchestrator service unavailable — recipe data not loaded at startup. Check server logs.",
+        )
+    return services.orchestrator_service
+
+
+def _require_chat_service():
+    if services.chat_service is None:
+        logger.error(
+            "Request reached a chat endpoint but chat_service is None. "
+            "FoodChat system was not initialized — CSV data missing or embeddings failed."
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Chat service unavailable — CSV data not loaded. Check server logs.",
         )
     return services.chat_service
 
 
 def _require_weekly_plan_service():
-    """Raise 503 if weekly plan service is not available."""
     if services.weekly_plan_service is None:
+        logger.error("weekly_plan_service is None — this should not happen after startup.")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Weekly plan service unavailable",
+            detail="Weekly plan service unavailable. Check server logs.",
         )
     return services.weekly_plan_service
 
@@ -164,12 +221,9 @@ async def create_session(request: CreateSessionRequest):
         Session details including the session_id for subsequent requests
     """
     try:
-        # Fetch profile from WiseFood
         user_profile = services.profile_service.get_member_profile(request.member_id)
-
-        # Create session
         session = services.session_service.create_session(request.member_id, user_profile)
-
+        logger.info("Session %s created for member %s.", session.session_id, request.member_id)
         return SessionResponse(
             session_id=session.session_id,
             member_id=session.member_id,
@@ -178,35 +232,42 @@ async def create_session(request: CreateSessionRequest):
             created_at=session.created_at,
         )
     except Exception as e:
+        logger.error("Failed to create session for member %s: %s", request.member_id, e, exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
         )
 
 
 @router.get("/sessions/{session_id}", response_model=SessionResponse)
-async def get_session(session_id: str):
-    """Get session state and metadata."""
-    session = services.session_service.get_session(session_id)
+async def get_session(
+    session_id: str,
+    member_id: str = Query(..., description="Must match session owner"),
+):
+    """Get session state and metadata. Only the owning member may read it."""
+    session = services.session_service.get_session(session_id, member_id=member_id)
     if not session:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Session not found"
+            status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or access denied"
         )
 
     return SessionResponse(
         session_id=session.session_id,
         member_id=session.member_id,
         state=session.state,
-        message_count=len(session.messages),
+        message_count=len(session.conversation),
         created_at=session.created_at,
     )
 
 
 @router.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_session(session_id: str):
-    """Delete a session."""
-    if not services.session_service.delete_session(session_id):
+async def delete_session(
+    session_id: str,
+    member_id: str = Query(..., description="Must match session owner"),
+):
+    """Delete a session. Only the owning member may delete it."""
+    if not services.session_service.delete_session(session_id, member_id):
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Session not found"
+            status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or access denied"
         )
 
 
@@ -366,6 +427,144 @@ async def get_member_sessions(member_id: str):
         )
         for s in sessions
     ]
+
+
+@router.post("/sessions/{session_id}/chat", response_model=ChatTurnResponse)
+async def unified_chat(session_id: str, request: ChatRequest):
+    """
+    Unified conversational endpoint.
+
+    Accepts any message and routes to the correct sub-service based on intent:
+      - daily meal plan request
+      - weekly meal plan request
+      - refinement of the last plan shown
+      - general chat / nutrition questions
+
+    The caller must supply member_id to prove session ownership.
+    """
+    orch_svc = _require_orchestrator_service()
+
+    logger.info("[%s] /chat from member %s: %.120s", session_id, request.member_id, request.content)
+    try:
+        turn = orch_svc.process(session_id, request.member_id, request.content)
+        logger.info("[%s] /chat response — intent=%s needs_clarification=%s at_limit=%s",
+                    session_id, turn.intent, turn.needs_clarification, turn.at_message_limit)
+    except ValueError as e:
+        logger.warning("[%s] /chat 404: %s", session_id, e)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except RuntimeError as e:
+        logger.warning("[%s] /chat 429 (message limit): %s", session_id, e)
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
+    except Exception as e:
+        logger.error("[%s] /chat 500: %s", session_id, e, exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+    meal_plan_resp = None
+    if turn.meal_plan is not None:
+        meal_plan_resp = MealPlanResponse.from_meal_plan(turn.meal_plan)
+
+    weekly_resp = None
+    if turn.weekly_meal_plan is not None:
+        weekly_resp = WeeklyMealPlanResponse.from_weekly_meal_plan(turn.weekly_meal_plan)
+
+    return ChatTurnResponse(
+        role=turn.role,
+        content=turn.content,
+        intent=turn.intent,
+        needs_clarification=turn.needs_clarification,
+        meal_plan=meal_plan_resp,
+        weekly_meal_plan=weekly_resp,
+        at_message_limit=turn.at_message_limit,
+    )
+
+
+@router.get("/sessions/{session_id}/conversation", response_model=ConversationPage)
+async def get_conversation(
+    session_id: str,
+    member_id: str = Query(..., description="WiseFood member ID — must match session owner"),
+    before_id: Optional[int] = Query(None, description="Cursor: return messages with DB id < this value"),
+    limit: int = Query(20, ge=1, le=100, description="Number of messages to return"),
+):
+    """
+    Cursor-based paginated conversation history for infinite scroll.
+
+    First call: omit before_id → returns the most recent `limit` messages.
+    Next page:  pass next_before_id from the previous response.
+    Scroll is exhausted when has_more=False.
+
+    Returns messages oldest-first so the UI can prepend to the top of the chat.
+    """
+    session = services.session_service.get_session(session_id, member_id=member_id)
+    if not session:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or access denied")
+
+    page = services.session_service.get_messages_page(session_id, before_id=before_id, limit=limit)
+
+    has_more = len(page) == limit
+    next_cursor = page[0]["id"] if has_more else None
+
+    return ConversationPage(
+        messages=[
+            {
+                "id": m["id"],
+                "role": m["role"],
+                "content": m["content"],
+                "intent": m["intent"],
+                "plan_id": m["plan_id"],
+                "timestamp": m["timestamp"].isoformat(),
+            }
+            for m in page
+        ],
+        has_more=has_more,
+        next_before_id=next_cursor,
+    )
+
+
+@router.post(
+    "/sessions/{session_id}/messages/{message_id}/feedback",
+    response_model=FeedbackResponse,
+)
+async def submit_feedback(session_id: str, message_id: int, request: FeedbackRequest):
+    """
+    Submit thumbs up/down feedback on an assistant message.
+
+    Calling again with the same member_id updates the existing feedback (upsert).
+    If rating is "down", an optional comment can be included.
+    """
+    if request.rating not in ("up", "down"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="rating must be 'up' or 'down'",
+        )
+
+    # Verify session ownership
+    session = services.session_service.get_session(session_id, member_id=request.member_id)
+    if not session:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or access denied")
+
+    db = SessionLocal()
+    try:
+        # Verify message belongs to this session
+        msg_row = db_get_message_by_id(db, message_id)
+        if not msg_row or msg_row.session_id != session_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found")
+        if msg_row.role != "assistant":
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Feedback can only be submitted on assistant messages",
+            )
+
+        fb = db_upsert_feedback(
+            db,
+            message_id=message_id,
+            session_id=session_id,
+            member_id=request.member_id,
+            rating=request.rating,
+            comment=request.comment,
+        )
+        return FeedbackResponse(message_id=fb.message_id, rating=fb.rating, comment=fb.comment)
+    finally:
+        db.close()
 
 
 @router.get("/health")
