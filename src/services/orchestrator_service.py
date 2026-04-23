@@ -6,7 +6,6 @@ then routes to the appropriate sub-service:
 
   daily_plan       → ChatService (fresh plan, new canvas)
   weekly_plan      → WeeklyPlanService (fresh plan, new canvas)
-  refine_plan      → ChatService or WeeklyPlanService depending on active canvas
   switch_plan_type → abandons current canvas type, starts fresh canvas of target type
   chat             → ChatService (chatbot path)
 
@@ -96,15 +95,6 @@ class OrchestratorService:
 
         if intent == "daily_plan":
             return self._handle_chat(session_id, message, intent, is_refinement=False)
-
-        if intent == "refine_plan":
-            canvas = session.active_canvas
-            if canvas is None:
-                # No plan exists yet — treat as a fresh daily plan request
-                return self._handle_chat(session_id, message, "daily_plan", is_refinement=False)
-            if canvas.plan_type == "weekly":
-                return self._handle_weekly(session_id, message, intent, is_refinement=True)
-            return self._handle_chat(session_id, message, intent, is_refinement=True)
 
         # "chat" and any unexpected values
         return self._handle_chat(session_id, message, intent, is_refinement=False)

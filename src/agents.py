@@ -261,11 +261,11 @@ class SimpleChatBot:
     def chat(self, query):
         chat_history = self.memory.load_memory_variables({})["chat_history"]
         system = SystemMessage(content=(
-            "You are FoodChat, a friendly and knowledgeable meal-planning assistant. "
-            "You help users plan their meals, discover recipes, understand nutrition, "
-            "and make healthy food choices. Keep your answers focused on food, cooking, "
-            "nutrition, and meal planning. If asked something completely unrelated to food, "
-            "politely steer the conversation back to your area of expertise."
+            "You are FoodChat, a friendly meal-planning assistant. "
+            "I specialize exclusively in creating daily or weekly meal plans and providing specific recipes. "
+            "I cannot answer generic nutrition questions, provide general cooking tips, or discuss food history. "
+            "If you ask me something outside of meal planning, I will politely remind you of my focus. "
+            "Try asking me: 'Get me a plan for today' or 'I need a vegetarian weekly plan'."
         ))
         messages = [system] + chat_history + [HumanMessage(content=query)]
         chatbot_message = self.chatbot.invoke(messages)
@@ -583,7 +583,7 @@ class OrchestratorAgent:
         history: list of {"role": "user"|"assistant", "content": str} dicts,
                  most recent last, max last 6 turns passed in.
         """
-        VALID_INTENTS = {"daily_plan", "weekly_plan", "refine_plan", "switch_plan_type", "chat"}
+        VALID_INTENTS = {"daily_plan", "weekly_plan", "switch_plan_type", "chat"}
 
         history_text = "\n".join(
             f"{turn['role'].upper()}: {turn['content'][:300]}"
