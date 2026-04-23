@@ -18,7 +18,9 @@ router = APIRouter(
 )
 
 
-# --- Request/Response Models ---
+# ---------------------------------------------------------------------------
+# Request / Response models
+# ---------------------------------------------------------------------------
 
 
 class CreateSessionRequest(BaseModel):
@@ -56,6 +58,8 @@ class MealCourseResponse(BaseModel):
 class MealPlanResponse(BaseModel):
     id: str
     created_at: datetime
+    version: int
+    parent_id: Optional[str] = None
     breakfast: MealCourseResponse
     lunch: MealCourseResponse
     dinner: MealCourseResponse
@@ -74,6 +78,8 @@ class MealPlanResponse(BaseModel):
         return cls(
             id=mp.id,
             created_at=mp.created_at,
+            version=getattr(mp, "version", 1),
+            parent_id=getattr(mp, "parent_id", None),
             breakfast=MealCourseResponse.from_meal_course(mp.breakfast),
             lunch=MealCourseResponse.from_meal_course(mp.lunch),
             dinner=MealCourseResponse.from_meal_course(mp.dinner),
@@ -107,6 +113,8 @@ class WeeklyMealPlanEntryResponse(BaseModel):
 class WeeklyMealPlanResponse(BaseModel):
     id: str
     created_at: datetime
+    version: int
+    parent_id: Optional[str] = None
     entries: List[WeeklyMealPlanEntryResponse]
 
     @classmethod
@@ -114,9 +122,9 @@ class WeeklyMealPlanResponse(BaseModel):
         return cls(
             id=wmp.id,
             created_at=wmp.created_at,
-            entries=[
-                WeeklyMealPlanEntryResponse(**entry) for entry in wmp.entries
-            ],
+            version=getattr(wmp, "version", 1),
+            parent_id=getattr(wmp, "parent_id", None),
+            entries=[WeeklyMealPlanEntryResponse(**entry) for entry in wmp.entries],
         )
 
 
@@ -137,7 +145,7 @@ class MessageHistoryItem(BaseModel):
 
 class ChatRequest(BaseModel):
     content: str
-    member_id: str  # caller must identify themselves — enforces session ownership
+    member_id: str
 
 
 class ChatTurnResponse(BaseModel):
@@ -148,6 +156,9 @@ class ChatTurnResponse(BaseModel):
     meal_plan: Optional[MealPlanResponse] = None
     weekly_meal_plan: Optional[WeeklyMealPlanResponse] = None
     at_message_limit: bool = False
+    # Version metadata so the UI knows which canvas version was just produced
+    plan_version: Optional[int] = None
+    plan_parent_id: Optional[str] = None
 
 
 class ConversationPage(BaseModel):
@@ -166,6 +177,11 @@ class FeedbackResponse(BaseModel):
     message_id: int
     rating: str
     comment: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Service guards
+# ---------------------------------------------------------------------------
 
 
 def _require_orchestrator_service():
@@ -205,21 +221,16 @@ def _require_weekly_plan_service():
     return services.weekly_plan_service
 
 
-# --- Endpoints ---
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
 
 
 @router.post(
     "/sessions", response_model=SessionResponse, status_code=status.HTTP_201_CREATED
 )
 async def create_session(request: CreateSessionRequest):
-    """Create a new chat session for a household member.
-
-    Args:
-        request: Contains member_id from WiseFood
-
-    Returns:
-        Session details including the session_id for subsequent requests
-    """
+    """Create a new chat session for a household member."""
     try:
         user_profile = services.profile_service.get_member_profile(request.member_id)
         session = services.session_service.create_session(request.member_id, user_profile)
@@ -249,7 +260,6 @@ async def get_session(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or access denied"
         )
-
     return SessionResponse(
         session_id=session.session_id,
         member_id=session.member_id,
@@ -273,28 +283,18 @@ async def delete_session(
 
 @router.post("/sessions/{session_id}/messages", response_model=MessageResponse)
 async def send_message(session_id: str, request: MessageRequest):
-    """Send a message and get a response.
-
-    The response includes a `needs_clarification` flag. If True, the assistant
-    is asking a clarifying question and expects a follow-up message.
-    """
+    """Send a message and get a response (legacy daily-plan endpoint)."""
     chat_svc = _require_chat_service()
 
     session = services.session_service.get_session(session_id)
     if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Session not found"
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
 
     try:
         response_text, needs_clarification, meal_plan = chat_svc.process_message(
             session_id, request.content
         )
-
-        meal_plan_resp = None
-        if meal_plan is not None:
-            meal_plan_resp = MealPlanResponse.from_meal_plan(meal_plan)
-
+        meal_plan_resp = MealPlanResponse.from_meal_plan(meal_plan) if meal_plan else None
         return MessageResponse(
             role="assistant",
             content=response_text,
@@ -302,115 +302,144 @@ async def send_message(session_id: str, request: MessageRequest):
             meal_plan=meal_plan_resp,
         )
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
-        )
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
-@router.get(
-    "/sessions/{session_id}/messages", response_model=List[MessageHistoryItem]
-)
+@router.get("/sessions/{session_id}/messages", response_model=List[MessageHistoryItem])
 async def get_messages(session_id: str, limit: Optional[int] = None):
-    """Get message history for a session.
-
-    Args:
-        session_id: The session ID
-        limit: Optional limit on number of messages to return (most recent)
-    """
+    """Get message history for a session."""
     session = services.session_service.get_session(session_id)
     if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Session not found"
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
 
     messages = session.messages
     if limit:
         messages = messages[-limit:]
 
     return [
-        MessageHistoryItem(
-            role=msg.role,
-            content=msg.content,
-            timestamp=msg.timestamp,
-        )
+        MessageHistoryItem(role=msg.role, content=msg.content, timestamp=msg.timestamp)
         for msg in messages
     ]
 
 
 @router.get("/sessions/{session_id}/meal-plans", response_model=List[MealPlanResponse])
 async def get_meal_plans(session_id: str):
-    """Get all meal plans generated in this session."""
+    """Get all daily meal plan versions in this session (canvas history)."""
     session = services.session_service.get_session(session_id)
     if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Session not found"
-        )
-
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
     return [MealPlanResponse.from_meal_plan(mp) for mp in session.meal_plans]
+
+
+@router.get("/sessions/{session_id}/meal-plans/current", response_model=Optional[MealPlanResponse])
+async def get_current_meal_plan(
+    session_id: str,
+    member_id: str = Query(..., description="Must match session owner"),
+):
+    """Get the current (latest) daily meal plan on the canvas."""
+    session = services.session_service.get_session(session_id, member_id=member_id)
+    if not session:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or access denied")
+    plan = session.get_current_daily_plan()
+    if plan is None:
+        return None
+    return MealPlanResponse.from_meal_plan(plan)
+
+
+@router.get("/sessions/{session_id}/meal-plans/history", response_model=List[MealPlanResponse])
+async def get_daily_plan_history(
+    session_id: str,
+    member_id: str = Query(..., description="Must match session owner"),
+):
+    """
+    Get the full version history of daily meal plans for this session,
+    ordered oldest to newest. Each entry has version and parent_id set,
+    so the caller can reconstruct the refinement chain.
+    """
+    session = services.session_service.get_session(session_id, member_id=member_id)
+    if not session:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or access denied")
+    plans = services.session_service.get_daily_plan_history(session_id)
+    return [MealPlanResponse.from_meal_plan(mp) for mp in plans]
 
 
 @router.post("/sessions/{session_id}/weekly", response_model=WeeklyMessageResponse)
 async def send_weekly_message(session_id: str, request: MessageRequest):
-    """Send a message to generate a 7-day weekly meal plan."""
+    """Send a message to generate a 7-day weekly meal plan (legacy endpoint)."""
     weekly_svc = _require_weekly_plan_service()
 
     session = services.session_service.get_session(session_id)
     if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Session not found"
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
 
     try:
         response_text, weekly_plan = weekly_svc.process_message(
             session_id, request.content
         )
-
         return WeeklyMessageResponse(
             role="assistant",
             content=response_text,
             weekly_meal_plan=WeeklyMealPlanResponse.from_weekly_meal_plan(weekly_plan),
         )
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
-        )
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
-@router.get(
-    "/sessions/{session_id}/weekly", response_model=List[MessageHistoryItem]
-)
+@router.get("/sessions/{session_id}/weekly", response_model=List[MessageHistoryItem])
 async def get_weekly_messages(session_id: str, limit: Optional[int] = None):
     """Get weekly message history for a session."""
     session = services.session_service.get_session(session_id)
     if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Session not found"
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
 
     messages = session.weekly_messages
     if limit:
         messages = messages[-limit:]
 
     return [
-        MessageHistoryItem(
-            role=msg.role,
-            content=msg.content,
-            timestamp=msg.timestamp,
-        )
+        MessageHistoryItem(role=msg.role, content=msg.content, timestamp=msg.timestamp)
         for msg in messages
     ]
 
 
 @router.get("/sessions/{session_id}/weekly-meal-plans", response_model=List[WeeklyMealPlanResponse])
 async def get_weekly_meal_plans(session_id: str):
-    """Get all weekly meal plans generated in this session."""
+    """Get all weekly meal plan versions in this session (canvas history)."""
     session = services.session_service.get_session(session_id)
     if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Session not found"
-        )
-
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
     return [WeeklyMealPlanResponse.from_weekly_meal_plan(wmp) for wmp in session.weekly_meal_plans]
+
+
+@router.get("/sessions/{session_id}/weekly-meal-plans/current", response_model=Optional[WeeklyMealPlanResponse])
+async def get_current_weekly_meal_plan(
+    session_id: str,
+    member_id: str = Query(..., description="Must match session owner"),
+):
+    """Get the current (latest) weekly meal plan on the canvas."""
+    session = services.session_service.get_session(session_id, member_id=member_id)
+    if not session:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or access denied")
+    plan = session.get_current_weekly_plan()
+    if plan is None:
+        return None
+    return WeeklyMealPlanResponse.from_weekly_meal_plan(plan)
+
+
+@router.get("/sessions/{session_id}/weekly-meal-plans/history", response_model=List[WeeklyMealPlanResponse])
+async def get_weekly_plan_history(
+    session_id: str,
+    member_id: str = Query(..., description="Must match session owner"),
+):
+    """
+    Get the full version history of weekly meal plans for this session,
+    ordered oldest to newest. Each entry has version and parent_id set.
+    """
+    session = services.session_service.get_session(session_id, member_id=member_id)
+    if not session:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or access denied")
+    plans = services.session_service.get_weekly_plan_history(session_id)
+    return [WeeklyMealPlanResponse.from_weekly_meal_plan(wmp) for wmp in plans]
 
 
 @router.get("/members/{member_id}/sessions", response_model=List[SessionResponse])
@@ -435,20 +464,26 @@ async def unified_chat(session_id: str, request: ChatRequest):
     Unified conversational endpoint.
 
     Accepts any message and routes to the correct sub-service based on intent:
-      - daily meal plan request
-      - weekly meal plan request
-      - refinement of the last plan shown
-      - general chat / nutrition questions
+      - daily_plan       → new daily meal plan (fresh canvas)
+      - weekly_plan      → new weekly meal plan (fresh canvas)
+      - refine_plan      → update the active canvas plan in-place (version++)
+      - switch_plan_type → freeze current canvas type, start fresh canvas of the other type
+      - chat             → general nutrition / cooking conversation
 
     The caller must supply member_id to prove session ownership.
+
+    Response includes plan_version and plan_parent_id so the UI can track
+    which canvas version was just produced.
     """
     orch_svc = _require_orchestrator_service()
 
     logger.info("[%s] /chat from member %s: %.120s", session_id, request.member_id, request.content)
     try:
         turn = orch_svc.process(session_id, request.member_id, request.content)
-        logger.info("[%s] /chat response — intent=%s needs_clarification=%s at_limit=%s",
-                    session_id, turn.intent, turn.needs_clarification, turn.at_message_limit)
+        logger.info(
+            "[%s] /chat response — intent=%s v=%s needs_clarification=%s at_limit=%s",
+            session_id, turn.intent, turn.plan_version, turn.needs_clarification, turn.at_message_limit,
+        )
     except ValueError as e:
         logger.warning("[%s] /chat 404: %s", session_id, e)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -475,6 +510,8 @@ async def unified_chat(session_id: str, request: ChatRequest):
         meal_plan=meal_plan_resp,
         weekly_meal_plan=weekly_resp,
         at_message_limit=turn.at_message_limit,
+        plan_version=turn.plan_version,
+        plan_parent_id=turn.plan_parent_id,
     )
 
 
@@ -529,7 +566,6 @@ async def submit_feedback(session_id: str, message_id: int, request: FeedbackReq
     Submit thumbs up/down feedback on an assistant message.
 
     Calling again with the same member_id updates the existing feedback (upsert).
-    If rating is "down", an optional comment can be included.
     """
     if request.rating not in ("up", "down"):
         raise HTTPException(
@@ -537,14 +573,12 @@ async def submit_feedback(session_id: str, message_id: int, request: FeedbackReq
             detail="rating must be 'up' or 'down'",
         )
 
-    # Verify session ownership
     session = services.session_service.get_session(session_id, member_id=request.member_id)
     if not session:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or access denied")
 
     db = SessionLocal()
     try:
-        # Verify message belongs to this session
         msg_row = db_get_message_by_id(db, message_id)
         if not msg_row or msg_row.session_id != session_id:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found")
@@ -553,7 +587,6 @@ async def submit_feedback(session_id: str, message_id: int, request: FeedbackReq
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="Feedback can only be submitted on assistant messages",
             )
-
         fb = db_upsert_feedback(
             db,
             message_id=message_id,

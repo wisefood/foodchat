@@ -9,6 +9,20 @@ from models.session import MealPlan
 logger = logging.getLogger(__name__)
 
 
+def _format_plan_as_context(plan: MealPlan) -> str:
+    """Serialise the current canvas plan into a text block for the LLM."""
+    lines = [f"[Current daily meal plan — version {plan.version}]"]
+    for name, course in [("Breakfast", plan.breakfast), ("Lunch", plan.lunch), ("Dinner", plan.dinner)]:
+        if course.recipe_id:
+            lines.append(
+                f"{name}: {course.title}\n"
+                f"  Ingredients: {course.ingredients}\n"
+                f"  Directions: {course.directions}"
+            )
+    lines.append(f"Reasoning: {plan.reasoning}")
+    return "\n".join(lines)
+
+
 class ChatService:
     """Orchestrates chat interactions and RAG chain flow."""
 
@@ -24,24 +38,45 @@ class ChatService:
         logger.info("ChatService initialized.")
 
     def process_message(
-        self, session_id: str, message: str
+        self,
+        session_id: str,
+        message: str,
+        is_refinement: bool = False,
     ) -> Tuple[str, bool, Optional[MealPlan]]:
         session = self.session_service.get_session(session_id)
         if not session:
             raise ValueError(f"Session {session_id} not found")
 
-        logger.info("[%s] Incoming message (state=%s): %.120s", session_id, session.state, message)
+        logger.info(
+            "[%s] Incoming message (state=%s, refinement=%s): %.120s",
+            session_id, session.state, is_refinement, message,
+        )
         self.session_service.add_message(session_id, "user", message)
 
         if session.state == "clarifying":
             logger.info("[%s] Resuming clarification flow.", session_id)
             return self._handle_clarification(session_id, message)
 
-        routing = self.classifier.router(message)
+        # For refinements, prepend the current plan so the RAG chain has context
+        effective_message = message
+        if is_refinement and session.daily_canvas:
+            current_plan = session.get_current_daily_plan()
+            if current_plan:
+                plan_context = _format_plan_as_context(current_plan)
+                effective_message = (
+                    f"{plan_context}\n\n"
+                    f"User refinement request: {message}"
+                )
+                logger.info(
+                    "[%s] Refinement: injecting canvas plan v%d as context.",
+                    session_id, current_plan.version,
+                )
+
+        routing = self.classifier.router(effective_message)
         logger.info("[%s] Query classified → source=%s", session_id, routing.get("source"))
 
         if routing["source"] == "vectorstore":
-            return self._handle_rag_query(session_id, message)
+            return self._handle_rag_query(session_id, effective_message, is_refinement=is_refinement)
         else:
             logger.info("[%s] Routing to chatbot (non-RAG).", session_id)
             response = self.chatbot.chat(message)
@@ -49,7 +84,10 @@ class ChatService:
             return response, False, None
 
     def _handle_rag_query(
-        self, session_id: str, message: str
+        self,
+        session_id: str,
+        message: str,
+        is_refinement: bool = False,
     ) -> Tuple[str, bool, Optional[MealPlan]]:
         session = self.session_service.get_session(session_id)
         logger.info("[%s] Running pre-clarification RAG chain.", session_id)
@@ -78,11 +116,11 @@ class ChatService:
         except StopIteration as e:
             final_query = e.value or pending_rag_data.get("question", message)
             logger.info("[%s] No clarification needed — proceeding to post-clarification chain.", session_id)
-            return self._run_post_clarification(session_id, final_query, pending_rag_data)
+            return self._run_post_clarification(session_id, final_query, pending_rag_data, is_refinement=is_refinement)
 
         except Exception as ex:
             logger.error("[%s] Error in clarification generator: %s", session_id, ex, exc_info=True)
-            return self._run_post_clarification(session_id, message, pending_rag_data)
+            return self._run_post_clarification(session_id, message, pending_rag_data, is_refinement=is_refinement)
 
     def _handle_clarification(
         self, session_id: str, message: str
@@ -107,7 +145,11 @@ class ChatService:
             return self._run_post_clarification(session_id, final_query, session.pending_rag_data)
 
     def _run_post_clarification(
-        self, session_id: str, final_query: str, pending_data: dict
+        self,
+        session_id: str,
+        final_query: str,
+        pending_data: dict,
+        is_refinement: bool = False,
     ) -> Tuple[str, bool, Optional[MealPlan]]:
         logger.info("[%s] Running post-clarification chain (final_query=%.120s).", session_id, final_query)
         self.session_service.clear_clarification_state(session_id)
@@ -115,14 +157,15 @@ class ChatService:
         chain_input = {**pending_data, "reformulated_query": final_query}
         response = self.rag_chain_part2.invoke(chain_input)
 
-        # Extract meal plan and reasoning from response
         docs = response.get("docs") or []
         logger.info("[%s] Post-clarification chain returned %d candidate plan(s).", session_id, len(docs))
         if not docs:
             logger.warning("[%s] No candidate recipes found — returning empty plan response.", session_id)
-            msg = ("I'm sorry, I couldn't find enough recipes to build a "
-                   "complete meal plan matching your preferences. "
-                   "Could you try adjusting your requirements?")
+            msg = (
+                "I'm sorry, I couldn't find enough recipes to build a "
+                "complete meal plan matching your preferences. "
+                "Could you try adjusting your requirements?"
+            )
             self.session_service.add_message(session_id, "assistant", msg)
             return msg, False, None
 
@@ -131,31 +174,17 @@ class ChatService:
         llm_score = int(docs[0][1].get("score", 0))
         logger.info("[%s] Top plan selected (llm_score=%d).", session_id, llm_score)
 
-        # Build a simple plan text for LLM scoring and FVS
-        def _course_to_text(name: str, data) -> str:
-            try:
-                rid, title, ingredients, directions = data
-            except Exception:
-                title = ingredients = directions = ""
-            return f"{name}: {title}\nIngredients: {ingredients}\nDirections: {directions}\n"
-
-        plan_text = "\n".join([
-            _course_to_text("Breakfast", raw_plan[0] if len(raw_plan) > 0 else []),
-            _course_to_text("Lunch", raw_plan[1] if len(raw_plan) > 1 else []),
-            _course_to_text("Dinner", raw_plan[2] if len(raw_plan) > 2 else []),
-        ])
-
-        # Compute Food Variety Score (unique ingredients across meals)
+        # Food Variety Score
         import re
+
         def _extract_ingredients(ing_str: str) -> list[str]:
             if not isinstance(ing_str, str):
                 return []
-            # Split by comma/semicolon/newlines and dashes
             parts = re.split(r"[\n,;•\-]+", ing_str)
             cleaned = []
             for p in parts:
                 t = p.strip().lower()
-                t = re.sub(r"\([^\)]*\)", "", t)  # remove parentheses
+                t = re.sub(r"\([^\)]*\)", "", t)
                 t = re.sub(r"[^a-zA-Z\s]", " ", t)
                 t = re.sub(r"\s+", " ", t).strip()
                 if t:
@@ -171,8 +200,24 @@ class ChatService:
                 except Exception:
                     pass
             unique_items = sorted(set(items))
-            reasoning = f"Unique food items across meals: {len(unique_items)} (e.g., {', '.join(unique_items[:8])}{'...' if len(unique_items)>8 else ''})"
+            reasoning = (
+                f"Unique food items across meals: {len(unique_items)} "
+                f"(e.g., {', '.join(unique_items[:8])}{'...' if len(unique_items) > 8 else ''})"
+            )
             return len(unique_items), reasoning
+
+        def _course_to_text(name: str, data) -> str:
+            try:
+                rid, title, ingredients, directions = data
+            except Exception:
+                title = ingredients = directions = ""
+            return f"{name}: {title}\nIngredients: {ingredients}\nDirections: {directions}\n"
+
+        plan_text = "\n".join([
+            _course_to_text("Breakfast", raw_plan[0] if len(raw_plan) > 0 else []),
+            _course_to_text("Lunch", raw_plan[1] if len(raw_plan) > 1 else []),
+            _course_to_text("Dinner", raw_plan[2] if len(raw_plan) > 2 else []),
+        ])
 
         fvs_count, fvs_reasoning = _unique_variety_count(raw_plan)
         logger.info("[%s] FVS score: %d unique ingredients.", session_id, fvs_count)
@@ -210,16 +255,29 @@ class ChatService:
             "guideline_adherence_reasoning": guideline_reason,
         }
 
-        meal_plan = self.session_service.add_meal_plan(
-            session_id, raw_plan, llm_reasoning, metrics
-        )
-        logger.info("[%s] Meal plan %s stored (scores: llm=%d, fvs=%d, diversity=%d, guidelines=%d).",
-                    session_id, meal_plan.id, llm_score, fvs_count, diversity_score, guideline_score)
+        # Use refine vs. add depending on whether we're updating the canvas
+        if is_refinement:
+            meal_plan = self.session_service.refine_meal_plan(
+                session_id, raw_plan, llm_reasoning, metrics
+            )
+            logger.info(
+                "[%s] Refined daily plan → %s (v%d, parent=%s).",
+                session_id, meal_plan.id, meal_plan.version, meal_plan.parent_id,
+            )
+        else:
+            meal_plan = self.session_service.add_meal_plan(
+                session_id, raw_plan, llm_reasoning, metrics
+            )
+            logger.info(
+                "[%s] New daily plan %s stored (scores: llm=%d, fvs=%d, diversity=%d, guidelines=%d).",
+                session_id, meal_plan.id, llm_score, fvs_count, diversity_score, guideline_score,
+            )
 
-        # Format a human-readable text response
+        # Format human-readable response
         course_names = ["Breakfast", "Lunch", "Dinner"]
         courses = [meal_plan.breakfast, meal_plan.lunch, meal_plan.dinner]
-        parts = ["Here is your meal plan for today:\n"]
+        version_label = f" (version {meal_plan.version})" if meal_plan.version > 1 else ""
+        parts = [f"Here is your meal plan for today{version_label}:\n"]
         for name, course in zip(course_names, courses):
             if course.recipe_id:
                 parts.append(

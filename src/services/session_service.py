@@ -2,16 +2,20 @@
 SessionService — persists sessions and messages to SQLite via db.py.
 
 Conversation messages are written to the DB immediately on creation.
-MealPlan / WeeklyMealPlan objects are kept in-memory (they are large
-structured blobs; add a plans table later if persistence is needed).
+MealPlan / WeeklyMealPlan objects are kept in-memory and also persisted
+as JSON blobs in the meal_plans table.
 
-All session lookups that take a session_id also require the member_id
-of the requesting user so access is always scoped to the owner.
+Each plan type maintains an independent "canvas": a versioned lineage of
+plans generated and refined within a session.  When the user asks to
+switch plan types (e.g. "forget daily, let's do weekly"), the old canvas
+is frozen and a fresh canvas for the new type is started.
 """
 
 import json
 import logging
-from typing import Dict, Optional, List, Any
+from datetime import datetime as dt
+from typing import Dict, Optional, List
+import uuid
 
 from db import (
     SessionLocal,
@@ -22,16 +26,18 @@ from db import (
     db_get_member_sessions,
     db_add_message,
     db_get_messages,
-    db_update_active_context,
+    db_update_canvases,
     db_update_state,
     db_save_meal_plan,
     db_get_session_meal_plans,
     db_get_meal_plan,
+    db_get_plan_lineage,
 )
 from models.session import (
-    ActiveContext,
     Message,
     MealPlan,
+    MealCourse,
+    PlanCanvas,
     Session,
     WeeklyMealPlan,
     MAX_MESSAGES_PER_SESSION,
@@ -41,10 +47,9 @@ logger = logging.getLogger(__name__)
 
 
 class SessionService:
-    """Hybrid session store: metadata + messages → SQLite; plan objects → in-memory."""
+    """Hybrid session store: metadata + messages → SQLite; plan objects → in-memory + SQLite."""
 
     def __init__(self):
-        # In-memory index of live Session objects (rebuilt from DB on get_session)
         self._sessions: Dict[str, Session] = {}
 
     # ------------------------------------------------------------------ #
@@ -64,28 +69,24 @@ class SessionService:
         return session
 
     def get_session(self, session_id: str, member_id: Optional[str] = None) -> Optional[Session]:
-        """Return session if it exists and belongs to member_id (when provided)."""
         session = self._sessions.get(session_id)
 
         if session is None:
-            # Try to rebuild from DB (e.g. after restart)
             session = self._load_from_db(session_id)
 
         if session is None:
             return None
 
-        # Enforce user scoping when caller provides member_id
         if member_id and session.member_id != member_id:
             logger.warning(
-                f"Session {session_id} belongs to {session.member_id}, "
-                f"not {member_id} — access denied"
+                "Session %s belongs to %s, not %s — access denied",
+                session_id, session.member_id, member_id,
             )
             return None
 
         return session
 
     def _load_from_db(self, session_id: str) -> Optional[Session]:
-        """Reconstruct a Session object from DB rows (messages loaded lazily)."""
         db = SessionLocal()
         try:
             row = db_get_session(db, session_id)
@@ -93,7 +94,6 @@ class SessionService:
                 return None
 
             user_profile = json.loads(row.user_profile)
-            active_context_data = json.loads(row.active_context) if row.active_context else None
 
             session = Session(
                 session_id=row.session_id,
@@ -104,13 +104,32 @@ class SessionService:
                 created_at=row.created_at,
             )
 
-            if active_context_data:
-                session.active_context = ActiveContext(
-                    plan_type=active_context_data["plan_type"],
-                    plan_id=active_context_data["plan_id"],
+            # Restore canvases
+            if getattr(row, "daily_canvas", None):
+                d = json.loads(row.daily_canvas)
+                session.daily_canvas = PlanCanvas(
+                    plan_type="daily",
+                    current_id=d["current_id"],
+                    root_id=d["root_id"],
+                )
+            if getattr(row, "weekly_canvas", None):
+                w = json.loads(row.weekly_canvas)
+                session.weekly_canvas = PlanCanvas(
+                    plan_type="weekly",
+                    current_id=w["current_id"],
+                    root_id=w["root_id"],
                 )
 
-            # Load recent messages into the in-memory conversation
+            # Reload persisted plans
+            plan_rows = db_get_session_meal_plans(db, session_id)
+            for pr in plan_rows:
+                payload = json.loads(pr.payload)
+                if pr.plan_type == "daily":
+                    session.meal_plans.append(_deserialize_meal_plan(pr.id, payload))
+                else:
+                    session.weekly_meal_plans.append(_deserialize_weekly_plan(pr.id, payload))
+
+            # Load recent messages
             msg_rows = db_get_messages(db, session_id, before_id=None, limit=MAX_MESSAGES_PER_SESSION)
             for m in msg_rows:
                 session.conversation.append(
@@ -129,7 +148,6 @@ class SessionService:
             db.close()
 
     def delete_session(self, session_id: str, member_id: str) -> bool:
-        """Delete session only if it belongs to member_id."""
         db = SessionLocal()
         try:
             deleted = db_delete_session(db, session_id, member_id)
@@ -175,8 +193,7 @@ class SessionService:
 
         if session.is_at_message_limit:
             raise RuntimeError(
-                f"Session {session_id} has reached the {session.max_messages}-message limit. "
-                "Please start a new session to continue."
+                f"Session {session_id} has reached the {session.max_messages}-message limit."
             )
 
         message = Message(role=role, content=content, intent=intent, plan_id=plan_id)
@@ -190,7 +207,6 @@ class SessionService:
 
         return message
 
-    # Backward-compat aliases used by ChatService / WeeklyPlanService
     def add_weekly_message(self, session_id: str, role: str, content: str) -> Message:
         return self.add_message(session_id, role, content)
 
@@ -200,15 +216,6 @@ class SessionService:
         before_id: Optional[int] = None,
         limit: int = 20,
     ) -> list[dict]:
-        """
-        Cursor-based pagination for the conversation thread.
-
-        Returns up to `limit` messages before `before_id` (the DB row id),
-        oldest-first, so the UI can prepend them to the top of the scroll view.
-
-        Each item: {"id": int, "role": str, "content": str, "intent": str|None,
-                    "plan_id": str|None, "timestamp": datetime}
-        """
         db = SessionLocal()
         try:
             rows = db_get_messages(db, session_id, before_id=before_id, limit=limit)
@@ -228,60 +235,214 @@ class SessionService:
         ]
 
     # ------------------------------------------------------------------ #
-    # Plan management (in-memory)                                          #
+    # Plan management                                                      #
     # ------------------------------------------------------------------ #
 
     def add_meal_plan(
-        self, session_id: str, meal_plan_tuple: tuple, reasoning: str, metrics: dict | None = None
+        self,
+        session_id: str,
+        meal_plan_tuple: tuple,
+        reasoning: str,
+        metrics: dict | None = None,
     ) -> MealPlan:
+        """Create a brand-new daily plan (version 1, no parent)."""
         session = self._sessions.get(session_id)
         if not session:
             raise ValueError(f"Session {session_id} not found")
-        meal_plan = MealPlan.from_response(meal_plan_tuple, reasoning, metrics)
+
+        meal_plan = MealPlan.from_response(meal_plan_tuple, reasoning, metrics, version=1, parent_id=None)
         session.meal_plans.append(meal_plan)
 
         db = SessionLocal()
         try:
-            db_save_meal_plan(db, meal_plan.id, session_id, "daily", _serialize_meal_plan(meal_plan))
+            db_save_meal_plan(
+                db, meal_plan.id, session_id, "daily",
+                _serialize_meal_plan(meal_plan),
+                version=1, parent_id=None,
+            )
         finally:
             db.close()
 
-        session.active_context = ActiveContext(plan_type="daily", plan_id=meal_plan.id)
-        self._persist_active_context(session_id, session.active_context)
+        # Start a fresh canvas for this plan
+        session.daily_canvas = PlanCanvas(
+            plan_type="daily",
+            current_id=meal_plan.id,
+            root_id=meal_plan.id,
+        )
+        self._persist_canvases(session_id, session)
 
         return meal_plan
 
-    def add_weekly_meal_plan(
-        self, session_id: str, plan_entries: List[dict]
-    ) -> WeeklyMealPlan:
-        import uuid
-        from datetime import datetime as dt
+    def refine_meal_plan(
+        self,
+        session_id: str,
+        meal_plan_tuple: tuple,
+        reasoning: str,
+        metrics: dict | None = None,
+    ) -> MealPlan:
+        """Create a refined version of the current daily canvas plan."""
         session = self._sessions.get(session_id)
         if not session:
             raise ValueError(f"Session {session_id} not found")
+
+        if session.daily_canvas is None:
+            # No existing canvas — treat as a fresh plan
+            return self.add_meal_plan(session_id, meal_plan_tuple, reasoning, metrics)
+
+        parent = session.get_current_daily_plan()
+        parent_id = parent.id if parent else None
+        next_version = (parent.version + 1) if parent else 1
+
+        meal_plan = MealPlan.from_response(
+            meal_plan_tuple, reasoning, metrics,
+            version=next_version, parent_id=parent_id,
+        )
+        session.meal_plans.append(meal_plan)
+
+        db = SessionLocal()
+        try:
+            db_save_meal_plan(
+                db, meal_plan.id, session_id, "daily",
+                _serialize_meal_plan(meal_plan),
+                version=next_version, parent_id=parent_id,
+            )
+        finally:
+            db.close()
+
+        # Advance canvas current pointer; root stays the same
+        session.daily_canvas = PlanCanvas(
+            plan_type="daily",
+            current_id=meal_plan.id,
+            root_id=session.daily_canvas.root_id,
+        )
+        self._persist_canvases(session_id, session)
+
+        return meal_plan
+
+    def add_weekly_meal_plan(self, session_id: str, plan_entries: List[dict]) -> WeeklyMealPlan:
+        """Create a brand-new weekly plan (version 1, no parent)."""
+        session = self._sessions.get(session_id)
+        if not session:
+            raise ValueError(f"Session {session_id} not found")
+
         weekly_plan = WeeklyMealPlan(
             id=str(uuid.uuid4()),
             created_at=dt.now(),
             entries=plan_entries,
+            version=1,
+            parent_id=None,
         )
         session.weekly_meal_plans.append(weekly_plan)
 
         db = SessionLocal()
         try:
-            db_save_meal_plan(db, weekly_plan.id, session_id, "weekly", _serialize_weekly_plan(weekly_plan))
+            db_save_meal_plan(
+                db, weekly_plan.id, session_id, "weekly",
+                _serialize_weekly_plan(weekly_plan),
+                version=1, parent_id=None,
+            )
         finally:
             db.close()
 
-        session.active_context = ActiveContext(plan_type="weekly", plan_id=weekly_plan.id)
-        self._persist_active_context(session_id, session.active_context)
+        session.weekly_canvas = PlanCanvas(
+            plan_type="weekly",
+            current_id=weekly_plan.id,
+            root_id=weekly_plan.id,
+        )
+        self._persist_canvases(session_id, session)
 
         return weekly_plan
 
-    def _persist_active_context(self, session_id: str, ctx: Optional[ActiveContext]) -> None:
+    def refine_weekly_meal_plan(self, session_id: str, plan_entries: List[dict]) -> WeeklyMealPlan:
+        """Create a refined version of the current weekly canvas plan."""
+        session = self._sessions.get(session_id)
+        if not session:
+            raise ValueError(f"Session {session_id} not found")
+
+        if session.weekly_canvas is None:
+            return self.add_weekly_meal_plan(session_id, plan_entries)
+
+        parent = session.get_current_weekly_plan()
+        parent_id = parent.id if parent else None
+        next_version = (parent.version + 1) if parent else 1
+
+        weekly_plan = WeeklyMealPlan(
+            id=str(uuid.uuid4()),
+            created_at=dt.now(),
+            entries=plan_entries,
+            version=next_version,
+            parent_id=parent_id,
+        )
+        session.weekly_meal_plans.append(weekly_plan)
+
         db = SessionLocal()
         try:
-            data = {"plan_type": ctx.plan_type, "plan_id": ctx.plan_id} if ctx else None
-            db_update_active_context(db, session_id, data)
+            db_save_meal_plan(
+                db, weekly_plan.id, session_id, "weekly",
+                _serialize_weekly_plan(weekly_plan),
+                version=next_version, parent_id=parent_id,
+            )
+        finally:
+            db.close()
+
+        session.weekly_canvas = PlanCanvas(
+            plan_type="weekly",
+            current_id=weekly_plan.id,
+            root_id=session.weekly_canvas.root_id,
+        )
+        self._persist_canvases(session_id, session)
+
+        return weekly_plan
+
+    # ------------------------------------------------------------------ #
+    # Plan history                                                         #
+    # ------------------------------------------------------------------ #
+
+    def get_daily_plan_history(self, session_id: str) -> list[MealPlan]:
+        """All daily plan versions for this session, oldest first."""
+        session = self._sessions.get(session_id) or self._load_from_db(session_id)
+        if not session:
+            return []
+        return sorted(session.meal_plans, key=lambda p: p.created_at)
+
+    def get_weekly_plan_history(self, session_id: str) -> list[WeeklyMealPlan]:
+        """All weekly plan versions for this session, oldest first."""
+        session = self._sessions.get(session_id) or self._load_from_db(session_id)
+        if not session:
+            return []
+        return sorted(session.weekly_meal_plans, key=lambda p: p.created_at)
+
+    def get_meal_plan_payload(self, plan_id: str) -> Optional[dict]:
+        db = SessionLocal()
+        try:
+            row = db_get_meal_plan(db, plan_id)
+            if not row:
+                return None
+            return {"plan_type": row.plan_type, "payload": json.loads(row.payload)}
+        finally:
+            db.close()
+
+    # ------------------------------------------------------------------ #
+    # Canvas persistence                                                   #
+    # ------------------------------------------------------------------ #
+
+    def _persist_canvases(self, session_id: str, session: Session) -> None:
+        daily_data = None
+        if session.daily_canvas:
+            daily_data = {
+                "current_id": session.daily_canvas.current_id,
+                "root_id": session.daily_canvas.root_id,
+            }
+        weekly_data = None
+        if session.weekly_canvas:
+            weekly_data = {
+                "current_id": session.weekly_canvas.current_id,
+                "root_id": session.weekly_canvas.root_id,
+            }
+
+        db = SessionLocal()
+        try:
+            db_update_canvases(db, session_id, daily_data, weekly_data)
         finally:
             db.close()
 
@@ -317,18 +478,6 @@ class SessionService:
         finally:
             db.close()
 
-    def get_meal_plan_payload(self, plan_id: str) -> Optional[dict]:
-        """Return the raw JSON payload for a plan by ID, or None if not found."""
-        db = SessionLocal()
-        try:
-            row = db_get_meal_plan(db, plan_id)
-            if not row:
-                return None
-            import json
-            return {"plan_type": row.plan_type, "payload": json.loads(row.payload)}
-        finally:
-            db.close()
-
 
 # ------------------------------------------------------------------ #
 # Serialization helpers                                                #
@@ -338,6 +487,8 @@ def _serialize_meal_plan(mp: MealPlan) -> dict:
     return {
         "id": mp.id,
         "created_at": mp.created_at.isoformat(),
+        "version": mp.version,
+        "parent_id": mp.parent_id,
         "reasoning": mp.reasoning,
         "llm_score": mp.llm_score,
         "llm_reasoning": mp.llm_reasoning,
@@ -372,5 +523,46 @@ def _serialize_weekly_plan(wp: WeeklyMealPlan) -> dict:
     return {
         "id": wp.id,
         "created_at": wp.created_at.isoformat(),
+        "version": wp.version,
+        "parent_id": wp.parent_id,
         "entries": wp.entries,
     }
+
+
+def _deserialize_meal_plan(plan_id: str, payload: dict) -> MealPlan:
+    def _course(d: dict) -> MealCourse:
+        return MealCourse(
+            recipe_id=d.get("recipe_id", ""),
+            title=d.get("title", ""),
+            ingredients=d.get("ingredients", ""),
+            directions=d.get("directions", ""),
+        )
+
+    return MealPlan(
+        id=plan_id,
+        created_at=dt.fromisoformat(payload["created_at"]),
+        version=payload.get("version", 1),
+        parent_id=payload.get("parent_id"),
+        breakfast=_course(payload.get("breakfast", {})),
+        lunch=_course(payload.get("lunch", {})),
+        dinner=_course(payload.get("dinner", {})),
+        reasoning=payload.get("reasoning", ""),
+        llm_score=payload.get("llm_score", 0),
+        llm_reasoning=payload.get("llm_reasoning", ""),
+        fvs_count=payload.get("fvs_count", 0),
+        fvs_reasoning=payload.get("fvs_reasoning", ""),
+        diversity_llm_score=payload.get("diversity_llm_score", 0),
+        diversity_llm_reasoning=payload.get("diversity_llm_reasoning", ""),
+        guideline_adherence_score=payload.get("guideline_adherence_score", 0),
+        guideline_adherence_reasoning=payload.get("guideline_adherence_reasoning", ""),
+    )
+
+
+def _deserialize_weekly_plan(plan_id: str, payload: dict) -> WeeklyMealPlan:
+    return WeeklyMealPlan(
+        id=plan_id,
+        created_at=dt.fromisoformat(payload["created_at"]),
+        version=payload.get("version", 1),
+        parent_id=payload.get("parent_id"),
+        entries=payload.get("entries", []),
+    )

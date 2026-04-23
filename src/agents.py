@@ -570,12 +570,21 @@ class OrchestratorAgent:
             format=OrchestratorSchema.model_json_schema(),
         )
 
-    def classify(self, message: str, history: list[dict]) -> str:
-        """Return one of: 'daily_plan', 'weekly_plan', 'refine_plan', 'chat'.
+    def classify(self, message: str, history: list[dict]) -> dict:
+        """
+        Classify user intent.
+
+        Returns a dict:
+          {
+            "intent": "daily_plan" | "weekly_plan" | "refine_plan" | "switch_plan_type" | "chat",
+            "target_plan_type": "daily" | "weekly" | None   # only set for switch_plan_type
+          }
 
         history: list of {"role": "user"|"assistant", "content": str} dicts,
                  most recent last, max last 6 turns passed in.
         """
+        VALID_INTENTS = {"daily_plan", "weekly_plan", "refine_plan", "switch_plan_type", "chat"}
+
         history_text = "\n".join(
             f"{turn['role'].upper()}: {turn['content'][:300]}"
             for turn in history[-6:]
@@ -596,14 +605,18 @@ class OrchestratorAgent:
                 result = self.llm.invoke(messages)
                 parsed = json.loads(result.content)
                 intent = parsed.get("intent", "chat")
-                if intent in ("daily_plan", "weekly_plan", "refine_plan", "chat"):
-                    logger.info(f"Orchestrator intent: {intent} — {parsed.get('reasoning', '')}")
-                    return intent
+                if intent in VALID_INTENTS:
+                    target = parsed.get("target_plan_type") if intent == "switch_plan_type" else None
+                    logger.info(
+                        "Orchestrator intent: %s target=%s — %s",
+                        intent, target, parsed.get("reasoning", ""),
+                    )
+                    return {"intent": intent, "target_plan_type": target}
             except Exception as e:
                 logger.warning(f"Orchestrator attempt {attempt + 1} failed: {e}")
 
         logger.error("Orchestrator failed after retries, defaulting to chat")
-        return "chat"
+        return {"intent": "chat", "target_plan_type": None}
 
 
 # class QueryEnhancer:

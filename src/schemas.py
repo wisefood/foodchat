@@ -55,8 +55,10 @@ class QueryReformulatorSchema(BaseModel):
 
 
 class OrchestratorSchema(BaseModel):
-    intent: Literal["daily_plan", "weekly_plan", "refine_plan", "chat"]
+    intent: Literal["daily_plan", "weekly_plan", "refine_plan", "switch_plan_type", "chat"]
     reasoning: str
+    # Populated only when intent == "switch_plan_type"
+    target_plan_type: Optional[Literal["daily", "weekly"]] = None
 
 # class UserInfoCollectorSchema(BaseModel) : 
 #     response : 

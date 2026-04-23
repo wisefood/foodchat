@@ -133,6 +133,60 @@ def _format_instructions(instructions):
     return str(instructions)
 
 
+# Valid dietary tags as stored on RecipeWrangler recipe nodes (confirmed against API)
+VALID_RW_DIET_TAGS = {
+    "gluten_free", "high-protein", "low-carb", "low-fat",
+    "pescatarian", "pescatarian_safe", "vegan", "dairy_free", "nut_free", "vegetarian",
+}
+
+# Map common user profile diet values → RecipeWrangler tag string
+DIET_TAG_MAP = {
+    "gluten_free": "gluten_free",
+    "gluten-free": "gluten_free",
+    "high_protein": "high-protein",
+    "high-protein": "high-protein",
+    "low_carb": "low-carb",
+    "low-carb": "low-carb",
+    "low_fat": "low-fat",
+    "low-fat": "low-fat",
+    "pescatarian": "pescatarian",
+    "pescatarian_safe": "pescatarian_safe",
+    "vegan": "vegan",
+    "dairy_free": "dairy_free",
+    "dairy-free": "dairy_free",
+    "nut_free": "nut_free",
+    "nut-free": "nut_free",
+    "vegetarian": "vegetarian",
+    # Non-restrictive / cuisine labels that have no RW tag — silently dropped
+    "omnivore": None,
+    "mediterranean": None,
+    "balanced": None,
+    "healthy": None,
+}
+
+
+def _normalize_diet_tags(diet) -> list:
+    """Convert user profile diet values to valid RecipeWrangler diet tags.
+
+    Unknown or non-restrictive values (e.g. 'omnivore', 'mediterranean') are
+    dropped so they don't accidentally produce empty result sets.
+    """
+    raw = diet if isinstance(diet, list) else ([diet] if diet else [])
+    tags = []
+    for d in raw:
+        normalized = DIET_TAG_MAP.get(d.lower().strip())
+        if normalized is None and d.lower().strip() not in DIET_TAG_MAP:
+            # Unknown tag — keep only if it's already a valid RW tag
+            if d.lower().strip() in VALID_RW_DIET_TAGS:
+                tags.append(d.lower().strip())
+            else:
+                logger.warning("Dropping unrecognized diet tag %r — not in RecipeWrangler schema", d)
+        elif normalized is not None:
+            tags.append(normalized)
+        # else: mapped to None → intentionally dropped (non-restrictive label)
+    return tags
+
+
 BREAKFAST_KEYWORDS = {
     # direct meal references
     "breakfast", "brunch", "morning",
@@ -250,9 +304,10 @@ def get_filtered_recipe_ids_api(
     res_per_courses = {'breakfast': [], 'lunch': [], 'dinner': []}
     base = RECIPEWRANGLER_API_URL.rstrip("/")
 
+    valid_diet_tags = _normalize_diet_tags(diet)
     payload = {
         "exclude_allergens": allergens or [],
-        "diet_tags": diet if isinstance(diet, list) else ([diet] if diet else []),
+        "diet_tags": valid_diet_tags,
         "include_ingredients": include_ingredients or [],
         "exclude_ingredients": exclude_ingredients or [],
         "limit": max(50, limit * 4),
