@@ -514,7 +514,8 @@ class FoodChat:
                             + x["modified_user_data"].get("include_ingredients", [])
                         )),
                         exclude_ingredients=x["modified_user_data"].get("food_dislikes"),
-                        limit=15,
+                        limit=8,
+                        nutrition_profile=x["modified_user_data"].get("nutrition_profile") or None,
                         randomize=False,
                     )
                 )
