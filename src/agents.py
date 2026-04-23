@@ -37,6 +37,8 @@ from prompts import (
     QUERY_REFORMULATOR_USER_INSTRUCTIONS,
     ORCHESTRATOR_SYSTEM_INSTRUCTIONS,
     ORCHESTRATOR_USER_INSTRUCTIONS,
+    DIETARY_INTENT_EXTRACTOR_SYSTEM_INSTRUCTIONS,
+    DIETARY_INTENT_EXTRACTOR_USER_INSTRUCTIONS,
 )
 from schemas import (
     ScoringSchema,
@@ -49,6 +51,7 @@ from schemas import (
     UserProfileCheckerSchema,
     QueryReformulatorSchema,
     OrchestratorSchema,
+    DietaryTagsSchema,
 )
 
 logger = logging.getLogger(__name__)
@@ -560,6 +563,30 @@ class RAGReadyPreparator:
         # return response
 
 
+class DietaryIntentExtractor:
+    """Extracts dietary requirements from a user query."""
+
+    def __init__(self, model: str = None, temperature: float = 0.0):
+        self.llm = GROQ_CHAT.get_client(
+            model=model or DEFAULT_MODEL,
+            temperature=temperature,
+            format=DietaryTagsSchema.model_json_schema(),
+        )
+
+    def extract(self, query: str) -> list[str]:
+        messages = [
+            SystemMessage(content=DIETARY_INTENT_EXTRACTOR_SYSTEM_INSTRUCTIONS),
+            HumanMessage(content=DIETARY_INTENT_EXTRACTOR_USER_INSTRUCTIONS.format(query=query)),
+        ]
+        try:
+            result = self.llm.invoke(messages)
+            parsed = json.loads(result.content)
+            return parsed.get("dietary_tags", [])
+        except Exception as e:
+            logger.warning(f"DietaryIntentExtractor failed: {e}")
+            return []
+
+
 class OrchestratorAgent:
     """Routes a user message to the correct sub-service based on conversational intent."""
 
@@ -583,7 +610,7 @@ class OrchestratorAgent:
         history: list of {"role": "user"|"assistant", "content": str} dicts,
                  most recent last, max last 6 turns passed in.
         """
-        VALID_INTENTS = {"daily_plan", "weekly_plan", "switch_plan_type", "chat"}
+        VALID_INTENTS = {"daily_plan", "weekly_plan", "refine_plan", "switch_plan_type", "chat"}
 
         history_text = "\n".join(
             f"{turn['role'].upper()}: {turn['content'][:300]}"

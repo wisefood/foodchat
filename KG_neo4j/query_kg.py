@@ -99,40 +99,6 @@ def get_filtered_recipe_ids_neo4j(allergens: list, diet: str, limit: int = 5):
     return res_per_courses
 
 
-def _fetch_recipe_details(client, recipe_id):
-    """Fetch full recipe details (ingredients, instructions) by ID."""
-    base = RECIPEWRANGLER_API_URL.rstrip("/")
-    resp = client.get(f"{base}/api/v1/recipes/{recipe_id}", timeout=15.0)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def _format_ingredients(ingredients):
-    """Convert ingredients list-of-dicts to a readable string."""
-    if isinstance(ingredients, str):
-        return ingredients
-    if isinstance(ingredients, list):
-        parts = []
-        for ing in ingredients:
-            if isinstance(ing, dict):
-                name = ing.get("name", "")
-                measurement = ing.get("measurement", "")
-                parts.append(f"{measurement} {name}".strip() if measurement else name)
-            else:
-                parts.append(str(ing))
-        return ", ".join(parts)
-    return str(ingredients)
-
-
-def _format_instructions(instructions):
-    """Convert instructions list to a readable string."""
-    if isinstance(instructions, str):
-        return instructions
-    if isinstance(instructions, list):
-        return " ".join(str(step) for step in instructions)
-    return str(instructions)
-
-
 # Valid dietary tags as stored on RecipeWrangler recipe nodes (confirmed against API)
 VALID_RW_DIET_TAGS = {
     "gluten_free", "high-protein", "low-carb", "low-fat",
@@ -187,191 +153,89 @@ def _normalize_diet_tags(diet) -> list:
     return tags
 
 
-BREAKFAST_KEYWORDS = {
-    # direct meal references
-    "breakfast", "brunch", "morning",
-    # pancakes / waffles / crepes
-    "pancake", "pancakes", "waffle", "waffles", "crepe", "crepes",
-    # eggs
-    "scramble", "scrambled", "omelet", "omelette", "frittata",
-    "eggs benedict", "poached egg", "sunny side", "over easy",
-    "hard boiled egg", "soft boiled egg", "egg muffin",
-    # toast / bread
-    "french toast", "toast", "bagel", "english muffin", "crumpet",
-    # cereal / oats / grains
-    "oatmeal", "porridge", "cereal", "granola", "muesli", "overnight oats",
-    # baked breakfast
-    "muffin", "muffins", "scone", "scones", "croissant", "danish", "cinnamon roll",
-    "coffee cake", "banana bread",
-    # potatoes
-    "hash brown", "hash browns", "home fries", "breakfast potato",
-    # bowls / smoothies
-    "smoothie bowl", "acai bowl", "smoothie", "parfait", "yogurt bowl",
-    # other breakfast items
-    "bacon and eggs", "sausage and eggs", "breakfast burrito", "breakfast sandwich",
-    "breakfast wrap", "breakfast casserole", "shakshuka", "chilaquiles",
-    "huevos rancheros", "quiche",
-}
-
-LUNCH_KEYWORDS = {
-    # direct meal references
-    "lunch", "midday",
-    # sandwiches
-    "sandwich", "sandwiches", "sub", "hoagie", "club sandwich", "grilled cheese",
-    "panini", "blt", "po boy", "monte cristo", "open face",
-    # wraps / flatbreads
-    "wrap", "wraps", "pita", "flatbread", "gyro", "falafel wrap",
-    # salads
-    "salad", "slaw", "coleslaw", "caesar salad", "cobb salad",
-    "greek salad", "nicoise", "grain salad", "chopped salad",
-    # soups
-    "soup", "bisque", "chowder", "gazpacho", "minestrone", "broth",
-    # bowls
-    "bowl", "grain bowl", "poke", "buddha bowl", "noodle bowl", "rice bowl",
-    # tacos / mexican light
-    "taco", "tacos", "quesadilla", "burrito", "tostada", "nachos", "enchilada",
-    # burgers
-    "burger", "burgers", "slider", "sliders",
-    # other lunch items
-    "crostini", "bruschetta", "hummus plate", "mezze",
-    "spring roll", "spring rolls", "summer roll", "summer rolls",
-    "empanada", "empanadas", "samosa", "samosas",
-    "quiche lorraine", "croque monsieur", "croque madame",
-}
-
-DINNER_KEYWORDS = {
-    # direct meal references
-    "dinner", "supper", "entree",
-    # roasts / grilled
-    "roast", "roasted", "grilled", "broiled", "seared",
-    "prime rib", "rack of lamb", "pot roast", "rotisserie",
-    # steak / chops
-    "steak", "fillet", "filet mignon", "ribeye", "sirloin", "t-bone",
-    "pork chop", "pork chops", "lamb chop", "lamb chops", "veal chop",
-    # stews / braised
-    "stew", "braised", "slow cooker", "slow-cooker", "pot pie",
-    "beef bourguignon", "coq au vin", "goulash", "tagine",
-    # casseroles / bakes
-    "casserole", "lasagna", "lasagne", "baked ziti", "moussaka",
-    "shepherd's pie", "shepherds pie", "gratin", "au gratin",
-    # pasta / noodles
-    "pasta", "spaghetti", "fettuccine", "penne", "linguine",
-    "carbonara", "bolognese", "alfredo", "puttanesca", "primavera",
-    "mac and cheese", "macaroni", "ramen", "lo mein", "pad thai", "chow mein",
-    # rice dishes
-    "risotto", "paella", "biryani", "jambalaya", "pilaf", "fried rice",
-    # curries / asian
-    "curry", "tikka masala", "korma", "vindaloo", "rendang",
-    "teriyaki", "katsu", "tempura", "kung pao", "general tso",
-    "sweet and sour", "orange chicken", "szechuan",
-    # stir fry
-    "stir fry", "stir-fry",
-    # other dinner items
-    "meatloaf", "meatball", "meatballs", "stroganoff", "chili", "con carne",
-    "stuffed pepper", "stuffed peppers", "stuffed chicken",
-    "wellington", "piccata", "marsala", "parmesan crusted",
-    "fish and chips", "salmon fillet", "shrimp scampi", "crab cake",
-    "lobster", "cioppino", "gumbo", "etouffee",
-}
-
-
-def _classify_course(title, ingredients):
-    """Classify a recipe into breakfast, lunch, or dinner using keyword matching."""
-    text = f"{title} {ingredients}".lower()
-    for keyword in BREAKFAST_KEYWORDS:
-        if keyword in text:
-            return "breakfast"
-    for keyword in LUNCH_KEYWORDS:
-        if keyword in text:
-            return "lunch"
-    for keyword in DINNER_KEYWORDS:
-        if keyword in text:
-            return "dinner"
-    return None
-
-
 def get_filtered_recipe_ids_api(
-    allergens: list, diet: str,
-    include_ingredients: list = None, exclude_ingredients: list = None,
-    limit: int = 5
+    allergens: list,
+    diet,
+    include_ingredients: list = None,
+    exclude_ingredients: list = None,
+    limit: int = 5,
+    exclude_ids: list = None,
+    nutrition_profile: dict = None,
+    randomize: bool = True,
 ):
-    """Fetch candidate recipes from the RecipeWrangler param_search API.
+    """Fetch candidate recipes from the RecipeWrangler foodchat_candidates endpoint.
 
-    Recipes are classified into breakfast/lunch/dinner using keyword heuristics
-    since the API does not support filtering by meal course.
+    Returns recipes already grouped by meal slot (breakfast/lunch/dinner) with
+    server-side dish-type tagging — no client-side keyword classification needed.
     """
-    recipes_per_course = limit
-    res_per_courses = {'breakfast': [], 'lunch': [], 'dinner': []}
     base = RECIPEWRANGLER_API_URL.rstrip("/")
-
     valid_diet_tags = _normalize_diet_tags(diet)
+
     payload = {
-        "exclude_allergens": allergens or [],
-        "diet_tags": valid_diet_tags,
-        "include_ingredients": include_ingredients or [],
-        "exclude_ingredients": exclude_ingredients or [],
-        "limit": max(50, limit * 4),
+        "user_profile": {
+            "allergies": allergens or [],
+            "diet": valid_diet_tags,
+        },
+        "constraints": {
+            "include_ingredients": include_ingredients or [],
+            "exclude_ingredients": exclude_ingredients or [],
+            "exclude_recipe_ids": exclude_ids or [],
+            "nutrition_profile": nutrition_profile,
+        },
+        "quotas": {
+            "breakfast": limit,
+            "lunch": limit,
+            "dinner": limit,
+        },
+        "randomize": randomize,
     }
 
     with httpx.Client() as client:
-        logger.info("Querying RecipeWrangler param_search")
+        logger.info("Querying RecipeWrangler foodchat_candidates (limit=%d per slot)", limit)
         response = client.post(
-            f"{base}/api/v1/recipes/param_search",
+            f"{base}/api/v1/recipes/foodchat_candidates",
             json=payload,
             timeout=60.0,
         )
         response.raise_for_status()
         data = response.json()
-        logger.debug("RecipeWrangler param_search response: %s", str(data)[:500])
 
-        results_list = data.get("results", []) if isinstance(data, dict) else []
+    slot_results = data.get("results", {}) if isinstance(data, dict) else {}
 
-        unclassified = []
-        for r in results_list:
-            recipe_id = r.get("recipe_id") or r.get("id")
-
-            details = _fetch_recipe_details(client, recipe_id)
-            r_title = r.get("title", "")
-            title = details.get("title", r_title) if isinstance(details, dict) else r_title
-            ingredients = _format_ingredients(
-                details.get("ingredients", "") if isinstance(details, dict) else ""
-            )
-            directions = _format_instructions(
-                (details.get("instructions") or details.get("directions", ""))
-                if isinstance(details, dict) else ""
-            )
-
-            recipe_entry = [recipe_id, title, ingredients, directions]
-            course = _classify_course(title, ingredients)
-
-            if course and len(res_per_courses[course]) < recipes_per_course:
-                res_per_courses[course].append(recipe_entry)
-            else:
-                unclassified.append(recipe_entry)
-
-            # Stop early if all courses are full
-            if all(len(v) >= recipes_per_course for v in res_per_courses.values()):
-                break
-
-        # Fill any courses that are still short with unclassified recipes
-        for course in res_per_courses:
-            while len(res_per_courses[course]) < recipes_per_course and unclassified:
-                res_per_courses[course].append(unclassified.pop(0))
-
-    for course, recipes in res_per_courses.items():
-        logger.info("Got %d recipes for %s", len(recipes), course)
+    res_per_courses = {"breakfast": [], "lunch": [], "dinner": []}
+    for slot in res_per_courses:
+        for r in slot_results.get(slot, []):
+            recipe_entry = [
+                r.get("recipe_id", ""),
+                r.get("title", ""),
+                r.get("ingredients", ""),
+                r.get("directions", ""),
+            ]
+            res_per_courses[slot].append(recipe_entry)
+        logger.info("Got %d recipes for %s", len(res_per_courses[slot]), slot)
 
     return res_per_courses
 
 
 def get_filtered_recipe_ids(
-    allergens: list, diet: str,
-    include_ingredients: list = None, exclude_ingredients: list = None,
-    limit: int = 5
+    allergens: list,
+    diet,
+    include_ingredients: list = None,
+    exclude_ingredients: list = None,
+    limit: int = 5,
+    exclude_ids: list = None,
+    nutrition_profile: dict = None,
+    randomize: bool = True,
 ):
     """Dispatcher: use RecipeWrangler API or Neo4j based on RECIPE_SOURCE env var."""
     if RECIPE_SOURCE == "api":
         return get_filtered_recipe_ids_api(
-            allergens, diet, include_ingredients, exclude_ingredients, limit
+            allergens, diet,
+            include_ingredients=include_ingredients,
+            exclude_ingredients=exclude_ingredients,
+            limit=limit,
+            exclude_ids=exclude_ids,
+            nutrition_profile=nutrition_profile,
+            randomize=randomize,
         )
     return get_filtered_recipe_ids_neo4j(allergens, diet, limit)

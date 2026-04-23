@@ -131,6 +131,8 @@ class Session:
     state: Literal["ready", "clarifying"] = "ready"
     clarification_generator: Optional[Any] = field(default=None, repr=False)
     pending_rag_data: Optional[dict] = field(default=None, repr=False)
+    # Intent that triggered clarification — restored after clarification completes
+    pending_intent: Optional[Literal["daily_plan", "weekly_plan", "refine_plan"]] = None
 
     created_at: datetime = field(default_factory=datetime.utcnow)
 

@@ -74,9 +74,10 @@ class OrchestratorService:
             for m in session.conversation[-12:]
         ]
 
-        # Skip orchestrator if already mid-clarification
+        # Skip orchestrator if already mid-clarification — restore the original intent
         if session.state == "clarifying":
-            classification = {"intent": "daily_plan", "target_plan_type": None}
+            pending = session.pending_intent or "daily_plan"
+            classification = {"intent": pending, "target_plan_type": None}
         else:
             classification = self.orchestrator.classify(message, history)
 
@@ -95,6 +96,16 @@ class OrchestratorService:
 
         if intent == "daily_plan":
             return self._handle_chat(session_id, message, intent, is_refinement=False)
+
+        if intent == "refine_plan":
+            canvas = session.active_canvas
+            if canvas is None:
+                # No plan to refine yet — generate a fresh daily plan
+                logger.info("[%s] refine_plan but no active canvas — generating fresh daily plan", session_id)
+                return self._handle_chat(session_id, message, "daily_plan", is_refinement=False)
+            if canvas.plan_type == "weekly":
+                return self._handle_weekly(session_id, message, intent, is_refinement=True)
+            return self._handle_chat(session_id, message, intent, is_refinement=True)
 
         # "chat" and any unexpected values
         return self._handle_chat(session_id, message, intent, is_refinement=False)

@@ -106,6 +106,9 @@ class WeeklyMealPlanEnv:
             user_query=self.user_query
         )
         
+        # Register selected recipe so future fetches exclude it
+        self.action_space.mark_selected(str(chosen_recipe.get("recipe_id", "")))
+
         # Store step in the plan list
         self.plan.append({
             "day": self.current_day,

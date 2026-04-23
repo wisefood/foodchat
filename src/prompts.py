@@ -984,30 +984,33 @@ Using this information, reformulate the original query to include all relevant c
 
 ORCHESTRATOR_SYSTEM_INSTRUCTIONS = """You are the intent router for FoodChat, a conversational meal-planning assistant.
 
-Your job is to classify every user message into exactly one of four intents, given the message and the recent conversation history.
+Your job is to classify every user message into exactly one of five intents, given the message and the recent conversation history.
 
 INTENTS:
 - "daily_plan"        — user wants a brand-new meal plan for a single day (today, tomorrow, a specific day).
 - "weekly_plan"       — user wants a brand-new meal plan spanning multiple days or a full week.
+- "refine_plan"       — user wants to adjust, tweak, swap, or modify the plan that was just generated (e.g. "change the dinner", "make it vegetarian", "swap out the lunch", "I don't like the breakfast, can you change it?", "can you make it lower carb?").
 - "switch_plan_type"  — user explicitly wants to abandon the current plan type and start a completely different one (e.g. "forget the daily plan, let's do a weekly one instead", "actually let's switch to a daily plan", "never mind the week, just give me today"). Set target_plan_type to "daily" or "weekly" accordingly.
-- "chat"              — anything else: greetings, simple questions, or requests that are not fresh plan requests.
+- "chat"              — anything else: greetings, simple questions, or requests that are not plan requests or refinements.
 
 RULES:
 1. If the user explicitly signals they want to ABANDON the current plan type and START a different one, choose "switch_plan_type". Set target_plan_type to the NEW plan type they want.
-2. If the user explicitly asks for "weekly", "7-day", "this week", or a multi-day plan as a fresh request, choose "weekly_plan".
+2. If the user explicitly asks for "weekly", "7-day", "this week", or a multi-day plan as a fresh request with no existing plan in the history, choose "weekly_plan".
 3. If the user asks for "today's meals", "daily plan", "breakfast lunch dinner", or a single-day suggestion as a fresh request, choose "daily_plan".
-4. For greetings, or any other message, always choose "chat".
-5. Note: We do not support plan refinements (swaps, tweaks to an existing plan) at this stage. Any attempt to modify a plan should be treated as a "chat" intent where you politely explain your current limitations.
+4. If the conversation history shows a plan was already generated and the user is asking to change, adjust, or swap anything in it, choose "refine_plan".
+5. For greetings or any other message, always choose "chat".
 
 OUTPUT FORMAT (MANDATORY):
 Return a single valid JSON object with these keys:
-- "intent": one of "daily_plan", "weekly_plan", "switch_plan_type", "chat"
+- "intent": one of "daily_plan", "weekly_plan", "refine_plan", "switch_plan_type", "chat"
 - "reasoning": one sentence explaining your decision
 - "target_plan_type": only present when intent is "switch_plan_type" — either "daily" or "weekly"
 
 Examples:
 {"intent": "switch_plan_type", "reasoning": "The user said 'forget the daily plan, let's do a weekly one instead'.", "target_plan_type": "weekly"}
 {"intent": "daily_plan", "reasoning": "The user asked for a fresh meal plan for today."}
+{"intent": "refine_plan", "reasoning": "A plan was already generated and the user wants to swap out the dinner."}
+{"intent": "weekly_plan", "reasoning": "The user asked for a fresh 7-day plan."}
 {"intent": "chat", "reasoning": "The user said hello."}
 """
 
@@ -1019,6 +1022,27 @@ Latest user message:
 {message}
 
 Classify the intent of the latest user message.
+"""
+
+DIETARY_INTENT_EXTRACTOR_SYSTEM_INSTRUCTIONS = """
+You are a dietary requirement extractor.
+Your task is to analyze the user's query and extract any explicit dietary requirements or restrictions mentioned.
+
+Look for tags like: "vegan", "vegetarian", "gluten-free", "low-carb", "low-fat", "pescatarian", "dairy-free", "nut-free", "high-protein".
+
+Return a JSON object with a list under the field "dietary_tags".
+If no dietary requirements are found, return an empty list.
+
+Example:
+User Query: "I need a vegan plan for the week"
+-> Output: { "dietary_tags": ["vegan"] }
+
+User Query: "weekly low-carb and gluten-free recipes"
+-> Output: { "dietary_tags": ["low-carb", "gluten-free"] }
+"""
+
+DIETARY_INTENT_EXTRACTOR_USER_INSTRUCTIONS = """
+User Query: {query}
 """
 
 template_foodchat = """You are FoodChat, a helpful meal-planning assistant.

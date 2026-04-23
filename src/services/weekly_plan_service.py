@@ -6,6 +6,7 @@ from .weekly_planner.action_adapter import RecipeActionSpace
 from .weekly_planner.reward_logic import RewardCalculator
 from .weekly_planner.environment import WeeklyMealPlanEnv
 from .weekly_planner.planner import WeeklyPlanner
+from agents import DietaryIntentExtractor
 from models.session import WeeklyMealPlan, Message
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,7 @@ class WeeklyPlanService:
     def __init__(self, session_service: SessionService):
         self.session_service = session_service
         self.reward_calculator = RewardCalculator()
+        self.diet_extractor = DietaryIntentExtractor()
         logger.info("WeeklyPlanService initialized.")
 
     def process_message(
@@ -68,8 +70,13 @@ class WeeklyPlanService:
                     session_id, current_plan.version,
                 )
 
+        # Extract dietary requirements from the user query to filter recipes correctly
+        query_diet_tags = self.diet_extractor.extract(content)
+        if query_diet_tags:
+            logger.info("[%s] Extracted diet tags from query: %s", session_id, query_diet_tags)
+
         logger.info("[%s] Initializing action space and environment.", session_id)
-        action_space = RecipeActionSpace(session.user_profile)
+        action_space = RecipeActionSpace(session.user_profile, additional_diet=query_diet_tags)
         env = WeeklyMealPlanEnv(
             user_profile=session.user_profile,
             action_space=action_space,
@@ -89,16 +96,16 @@ class WeeklyPlanService:
                 session_id, weekly_plan.id, weekly_plan.version, weekly_plan.parent_id,
             )
             response_text = (
-                f"I've refined your weekly meal plan (version {weekly_plan.version}) "
-                f"based on your request: '{content}'. "
-                "The updated plan includes 21 meals tailored to your preferences."
+                f"Here's your updated weekly meal plan! "
+                f"I've adjusted it based on what you asked for — take a look and let me know if you'd like any other tweaks."
             )
         else:
             weekly_plan = self.session_service.add_weekly_meal_plan(session_id, plan_entries)
             logger.info("[%s] Weekly meal plan %s stored.", session_id, weekly_plan.id)
             response_text = (
-                f"I've generated a personalized 7-day meal plan for you based on your request: '{content}'. "
-                "The plan includes 21 meals tailored to your preferences and nutritional goals."
+                "Here's your 7-day meal plan! "
+                "I've picked out breakfast, lunch, and dinner for each day based on your profile. "
+                "Let me know if you'd like to swap anything out or adjust it."
             )
 
         self.session_service.add_weekly_message(session_id, "assistant", response_text)

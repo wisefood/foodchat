@@ -450,13 +450,14 @@ class SessionService:
     # Clarification state (in-memory only — generator not serialisable)   #
     # ------------------------------------------------------------------ #
 
-    def set_clarification_state(self, session_id: str, generator, pending_data: dict) -> None:
+    def set_clarification_state(self, session_id: str, generator, pending_data: dict, pending_intent: str = "daily_plan") -> None:
         session = self._sessions.get(session_id)
         if not session:
             raise ValueError(f"Session {session_id} not found")
         session.state = "clarifying"
         session.clarification_generator = generator
         session.pending_rag_data = pending_data
+        session.pending_intent = pending_intent
 
         db = SessionLocal()
         try:
@@ -471,6 +472,7 @@ class SessionService:
         session.state = "ready"
         session.clarification_generator = None
         session.pending_rag_data = None
+        session.pending_intent = None
 
         db = SessionLocal()
         try:

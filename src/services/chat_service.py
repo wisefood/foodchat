@@ -109,7 +109,8 @@ class ChatService:
         try:
             first_question = next(generator)
             logger.info("[%s] Clarification needed — entering clarification state.", session_id)
-            self.session_service.set_clarification_state(session_id, generator, pending_rag_data)
+            pending_intent = "refine_plan" if is_refinement else "daily_plan"
+            self.session_service.set_clarification_state(session_id, generator, pending_rag_data, pending_intent=pending_intent)
             self.session_service.add_message(session_id, "assistant", first_question)
             return first_question, True, None
 
@@ -273,20 +274,17 @@ class ChatService:
                 session_id, meal_plan.id, llm_score, fvs_count, diversity_score, guideline_score,
             )
 
-        # Format human-readable response
-        course_names = ["Breakfast", "Lunch", "Dinner"]
-        courses = [meal_plan.breakfast, meal_plan.lunch, meal_plan.dinner]
-        version_label = f" (version {meal_plan.version})" if meal_plan.version > 1 else ""
-        parts = [f"Here is your meal plan for today{version_label}:\n"]
-        for name, course in zip(course_names, courses):
-            if course.recipe_id:
-                parts.append(
-                    f"**{name}: {course.title}**\n"
-                    f"Ingredients: {course.ingredients}\n"
-                    f"Directions: {course.directions}\n"
-                )
-        parts.append(f"\n{llm_reasoning}")
-        formatted = "\n".join(parts)
+        if is_refinement:
+            formatted = (
+                "Here's your updated meal plan! I've made the adjustments you asked for. "
+                "Let me know if you'd like anything else changed."
+            )
+        else:
+            formatted = (
+                "Here's your meal plan for today! "
+                "I've picked out breakfast, lunch, and dinner based on your preferences. "
+                "Let me know if you'd like to swap something out."
+            )
 
         self.session_service.add_message(session_id, "assistant", formatted)
 

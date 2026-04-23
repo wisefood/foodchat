@@ -60,5 +60,8 @@ class OrchestratorSchema(BaseModel):
     # Populated only when intent == "switch_plan_type"
     target_plan_type: Optional[Literal["daily", "weekly"]] = None
 
+class DietaryTagsSchema(BaseModel):
+    dietary_tags: list[str]
+
 # class UserInfoCollectorSchema(BaseModel) : 
 #     response : 
