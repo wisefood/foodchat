@@ -1,11 +1,11 @@
 import logging
 from typing import List, Tuple, Optional
 
-from services.session_service import SessionService
-from services.weekly_planner.action_adapter import RecipeActionSpace
-from services.weekly_planner.reward_logic import RewardCalculator
-from services.weekly_planner.environment import WeeklyMealPlanEnv
-from services.weekly_planner.planner import WeeklyPlanner
+from .session_service import SessionService
+from .weekly_planner.action_adapter import RecipeActionSpace
+from .weekly_planner.reward_logic import RewardCalculator
+from .weekly_planner.environment import WeeklyMealPlanEnv
+from .weekly_planner.planner import WeeklyPlanner
 from models.session import WeeklyMealPlan, Message
 
 logger = logging.getLogger(__name__)

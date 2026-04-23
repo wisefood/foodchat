@@ -1,9 +1,9 @@
 import logging
 from typing import Dict, Any, List, Tuple, Optional
 from src.models.session import MealCourse
-from src.services.weekly_planner.state_tracking import WeeklyNutritionalTracker
-from src.services.weekly_planner.action_adapter import RecipeActionSpace
-from src.services.weekly_planner.reward_logic import RewardCalculator
+from .state_tracking import WeeklyNutritionalTracker
+from .action_adapter import RecipeActionSpace
+from .reward_logic import RewardCalculator
 
 logger = logging.getLogger(__name__)
 

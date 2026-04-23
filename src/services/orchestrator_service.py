@@ -21,7 +21,7 @@ from typing import Optional, Any
 
 from agents import OrchestratorAgent
 from models.session import MealPlan, WeeklyMealPlan
-from services.session_service import SessionService
+from .session_service import SessionService
 
 logger = logging.getLogger(__name__)
 

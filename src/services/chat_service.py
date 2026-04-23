@@ -2,8 +2,8 @@ import logging
 from typing import Optional, Tuple
 
 from src.agents import QueryClassifier, RAGReadyPreparator, SimpleChatBot, MealDiversityGrader, GuidelineAdherenceGrader
-from services.session_service import SessionService
-from services import profile_service
+from .session_service import SessionService
+from . import profile_service
 from models.session import MealPlan
 
 logger = logging.getLogger(__name__)

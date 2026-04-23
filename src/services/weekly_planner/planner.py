@@ -1,6 +1,6 @@
 import random
 from typing import List, Dict, Any
-from src.services.weekly_planner.environment import WeeklyMealPlanEnv
+from .environment import WeeklyMealPlanEnv
 
 class WeeklyPlanner:
     """
