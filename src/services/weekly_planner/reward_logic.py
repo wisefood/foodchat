@@ -1,11 +1,14 @@
 import json
 import logging
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, TYPE_CHECKING
+
 from langchain_core.messages import HumanMessage, SystemMessage
 from src.backend.groq import GROQ_CHAT
 from src.prompts import GRADER_SYSTEM_INSTRUCTIONS, GRADER_USER_INSTRUCTIONS
 from src.schemas import ScoringSchema
-from src.services.weekly_planner.state_tracking import WeeklyNutritionalTracker
+
+if TYPE_CHECKING:
+    from .state_tracking import WeeklyNutritionalTracker
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +76,7 @@ class RewardCalculator:
                 "score": 3  # Neutral score on failure
             }
 
-    def calculate_constraint_penalty(self, tracker: WeeklyNutritionalTracker, preferences: List[str]) -> float:
+    def calculate_constraint_penalty(self, tracker: "WeeklyNutritionalTracker", preferences: List[str]) -> float:
         """
         Calculate penalties for violating nutritional or dietary constraints.
         
@@ -101,7 +104,7 @@ class RewardCalculator:
             
         return penalty
 
-    def calculate_step_reward(self, action: Dict[str, Any], tracker: WeeklyNutritionalTracker, preferences: List[str], user_query: Optional[str] = None) -> float:
+    def calculate_step_reward(self, action: Dict[str, Any], tracker: "WeeklyNutritionalTracker", preferences: List[str], user_query: Optional[str] = None) -> float:
         """
         Combine LLM feedback and constraint penalties into a single scalar reward.
         
