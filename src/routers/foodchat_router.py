@@ -282,13 +282,19 @@ async def delete_session(
 
 
 @router.post("/sessions/{session_id}/messages", response_model=MessageResponse)
-async def send_message(session_id: str, request: MessageRequest):
+async def send_message(
+    session_id: str,
+    request: MessageRequest,
+    member_id: str = Query(..., description="Must match session owner"),
+):
     """Send a message and get a response (legacy daily-plan endpoint)."""
     chat_svc = _require_chat_service()
 
-    session = services.session_service.get_session(session_id)
+    session = services.session_service.get_session(session_id, member_id=member_id)
     if not session:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or access denied"
+        )
 
     try:
         response_text, needs_clarification, meal_plan = chat_svc.process_message(
@@ -306,11 +312,17 @@ async def send_message(session_id: str, request: MessageRequest):
 
 
 @router.get("/sessions/{session_id}/messages", response_model=List[MessageHistoryItem])
-async def get_messages(session_id: str, limit: Optional[int] = None):
-    """Get message history for a session."""
-    session = services.session_service.get_session(session_id)
+async def get_messages(
+    session_id: str,
+    limit: Optional[int] = None,
+    member_id: str = Query(..., description="Must match session owner"),
+):
+    """Get message history for a session. Only the owning member may read it."""
+    session = services.session_service.get_session(session_id, member_id=member_id)
     if not session:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or access denied"
+        )
 
     messages = session.messages
     if limit:
@@ -323,11 +335,16 @@ async def get_messages(session_id: str, limit: Optional[int] = None):
 
 
 @router.get("/sessions/{session_id}/meal-plans", response_model=List[MealPlanResponse])
-async def get_meal_plans(session_id: str):
+async def get_meal_plans(
+    session_id: str,
+    member_id: str = Query(..., description="Must match session owner"),
+):
     """Get all daily meal plan versions in this session (canvas history)."""
-    session = services.session_service.get_session(session_id)
+    session = services.session_service.get_session(session_id, member_id=member_id)
     if not session:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or access denied"
+        )
     return [MealPlanResponse.from_meal_plan(mp) for mp in session.meal_plans]
 
 
@@ -364,13 +381,19 @@ async def get_daily_plan_history(
 
 
 @router.post("/sessions/{session_id}/weekly", response_model=WeeklyMessageResponse)
-async def send_weekly_message(session_id: str, request: MessageRequest):
+async def send_weekly_message(
+    session_id: str,
+    request: MessageRequest,
+    member_id: str = Query(..., description="Must match session owner"),
+):
     """Send a message to generate a 7-day weekly meal plan (legacy endpoint)."""
     weekly_svc = _require_weekly_plan_service()
 
-    session = services.session_service.get_session(session_id)
+    session = services.session_service.get_session(session_id, member_id=member_id)
     if not session:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or access denied"
+        )
 
     try:
         response_text, weekly_plan = weekly_svc.process_message(
@@ -386,11 +409,17 @@ async def send_weekly_message(session_id: str, request: MessageRequest):
 
 
 @router.get("/sessions/{session_id}/weekly", response_model=List[MessageHistoryItem])
-async def get_weekly_messages(session_id: str, limit: Optional[int] = None):
-    """Get weekly message history for a session."""
-    session = services.session_service.get_session(session_id)
+async def get_weekly_messages(
+    session_id: str,
+    limit: Optional[int] = None,
+    member_id: str = Query(..., description="Must match session owner"),
+):
+    """Get weekly message history for a session. Only the owning member may read it."""
+    session = services.session_service.get_session(session_id, member_id=member_id)
     if not session:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or access denied"
+        )
 
     messages = session.weekly_messages
     if limit:
@@ -403,11 +432,16 @@ async def get_weekly_messages(session_id: str, limit: Optional[int] = None):
 
 
 @router.get("/sessions/{session_id}/weekly-meal-plans", response_model=List[WeeklyMealPlanResponse])
-async def get_weekly_meal_plans(session_id: str):
+async def get_weekly_meal_plans(
+    session_id: str,
+    member_id: str = Query(..., description="Must match session owner"),
+):
     """Get all weekly meal plan versions in this session (canvas history)."""
-    session = services.session_service.get_session(session_id)
+    session = services.session_service.get_session(session_id, member_id=member_id)
     if not session:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or access denied"
+        )
     return [WeeklyMealPlanResponse.from_weekly_meal_plan(wmp) for wmp in session.weekly_meal_plans]
 
 
