@@ -29,6 +29,7 @@ from typing import Any, Optional
 from agents import OrchestratorAgent
 from models.attribution import Attribution
 from models.session import MealPlan, WeeklyMealPlan
+from .edit_service import EditService
 from .foodscholar_service import FoodScholarService
 from .seed_service import SeedService
 from .session_service import SessionService
@@ -62,6 +63,8 @@ class ChatTurn:
     attribution: Optional[Attribution] = None
     # Consent nudges ("remember this?") detected in the user's turn (M3)
     memory_suggestions: Optional[list] = None
+    # Slot-edit proof (M4b): [{meal_type, day, old{title,kcal}, new{...}, directive, verified}]
+    changed_slots: Optional[list] = None
 
 
 class OrchestratorService:
@@ -79,6 +82,7 @@ class OrchestratorService:
         self.weekly_plan_service = weekly_plan_service
         self.foodscholar_service = foodscholar_service or FoodScholarService(session_service)
         self.seed_service = SeedService()
+        self.edit_service = EditService(session_service)
         self.memory_service = memory_service
         self.orchestrator = OrchestratorAgent()
 
@@ -156,6 +160,9 @@ class OrchestratorService:
             if canvas.plan_type == "weekly":
                 return self._handle_weekly(session_id, message, intent, is_refinement=True)
             return self._handle_plan(session_id, message, intent, is_refinement=True)
+
+        if intent == "edit_plan_slot":
+            return self._handle_edit(session_id, message)
 
         if intent == "nutrition_question":
             return self._handle_nutrition_question(session_id, message)
@@ -249,6 +256,11 @@ class OrchestratorService:
             self.session_service.add_message(session_id, "user", message)
             return self._handle_favorites_offer_reply(session_id, message)
 
+        if pending.get("kind") == "edit_slot":
+            # The user is telling us WHICH meal to swap (M4b).
+            outcome = self.edit_service.continue_clarification(session_id, message)
+            return self._turn_from_edit(session_id, outcome)
+
         # FoodScholar clarifications are tagged with kind="foodscholar";
         # plan-flow states (ClarificationState.to_dict) have no "kind" key.
         if pending.get("kind") == FoodScholarService.CLARIFICATION_KIND:
@@ -274,6 +286,26 @@ class OrchestratorService:
             meal_plan=meal_plan,
             plan_version=meal_plan.version if meal_plan else None,
             plan_parent_id=meal_plan.parent_id if meal_plan else None,
+        )
+
+    def _handle_edit(self, session_id: str, message: str) -> ChatTurn:
+        """Targeted single-slot edit with verified directive (M4b)."""
+        outcome = self.edit_service.process(session_id, message)
+        return self._turn_from_edit(session_id, outcome)
+
+    def _turn_from_edit(self, session_id: str, outcome) -> ChatTurn:
+        plan = outcome.meal_plan or outcome.weekly_meal_plan
+        self._tag_last_message(session_id, "edit_plan_slot", plan.id if plan else None)
+        return ChatTurn(
+            role="assistant",
+            content=outcome.text,
+            intent="edit_plan_slot",
+            needs_clarification=outcome.needs_clarification,
+            meal_plan=outcome.meal_plan,
+            weekly_meal_plan=outcome.weekly_meal_plan,
+            changed_slots=outcome.changed_slots or None,
+            plan_version=plan.version if plan else None,
+            plan_parent_id=plan.parent_id if plan else None,
         )
 
     def _handle_nutrition_question(self, session_id: str, message: str) -> ChatTurn:

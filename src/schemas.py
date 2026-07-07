@@ -47,7 +47,7 @@ class QueryReformulatorSchema(BaseModel):
 class OrchestratorSchema(BaseModel):
     """Per-turn intent classification (the single router of the pipeline)."""
     intent: Literal[
-        "daily_plan", "weekly_plan", "refine_plan",
+        "daily_plan", "weekly_plan", "refine_plan", "edit_plan_slot",
         "switch_plan_type", "nutrition_question", "chat",
     ]
     reasoning: str
@@ -75,6 +75,15 @@ class CandidateMemorySchema(BaseModel):
 
 class PreferenceExtractionSchema(BaseModel):
     memories: list[CandidateMemorySchema]
+
+
+class EditCommandSchema(BaseModel):
+    """A targeted single-slot plan edit parsed from the user message (M4b)."""
+    meal_type: Optional[Literal["breakfast", "lunch", "dinner"]] = None
+    day: Optional[conint(ge=1, le=7)] = None
+    directive: str
+    needs_slot_clarification: bool = False
+    question: Optional[str] = None
 
 
 class SeedDishSchema(BaseModel):

@@ -7,8 +7,9 @@ from .session_service import SessionService
 from .weekly_planner.action_adapter import RecipeActionSpace
 from .weekly_planner.reward_logic import RewardCalculator
 from .weekly_planner.environment import WeeklyMealPlanEnv
-from .weekly_planner.planner import WeeklyPlanner
-from agents import DietaryIntentExtractor
+from .weekly_planner.planner import WeeklyPlanner, build_preference_scorer
+from .candidates_client import CANDIDATES
+from agents import DietaryIntentExtractor, ResponseWriter
 from models.session import WeeklyMealPlan
 
 logger = logging.getLogger(__name__)
@@ -41,6 +42,7 @@ class WeeklyPlanService:
         self.diet_extractor = DietaryIntentExtractor()
         self.seed_service = SeedService()
         self.feedback_service = FeedbackService()
+        self.response_writer = ResponseWriter()
         logger.info("WeeklyPlanService initialized.")
 
     def process_message(
@@ -122,8 +124,21 @@ class WeeklyPlanService:
         logger.info(
             "[%s] Generating 7-day plan (21 meals, %d pinned).", session_id, len(pinned)
         )
-        plan_entries = planner.generate_full_plan(user_query=effective_query, pinned=pinned)
+        plan_entries = planner.generate_full_plan(
+            user_query=effective_query, pinned=pinned,
+            scorer=build_preference_scorer(session.user_profile),
+        )
         logger.info("[%s] Plan generation complete — %d entries.", session_id, len(plan_entries))
+
+        # M4 enrichment: one batch details call covers all 21 recipes —
+        # nutrition chips and images for the weekly canvas.
+        entry_ids = [str(e.get("recipe", {}).get("recipe_id", "")) for e in plan_entries]
+        enrichment = CANDIDATES.fetch_details(entry_ids)
+        for entry in plan_entries:
+            rich = enrichment.get(str(entry.get("recipe", {}).get("recipe_id", "")))
+            if rich:
+                entry["recipe"]["nutrition"] = rich.nutrition_dict()
+                entry["recipe"]["image_url"] = rich.image_url
 
         if is_refinement:
             weekly_plan = self.session_service.refine_weekly_meal_plan(session_id, plan_entries)
@@ -131,21 +146,31 @@ class WeeklyPlanService:
                 "[%s] Refined weekly plan → %s (v%d, parent=%s).",
                 session_id, weekly_plan.id, weekly_plan.version, weekly_plan.parent_id,
             )
-            response_text = (
-                f"Here's your updated weekly meal plan! "
-                f"I've adjusted it based on what you asked for — take a look and let me know if you'd like any other tweaks."
+            fallback = (
+                "Here's your updated weekly meal plan! "
+                "I've adjusted it based on what you asked for — take a look and let me know if you'd like any other tweaks."
             )
         else:
             weekly_plan = self.session_service.add_weekly_meal_plan(session_id, plan_entries)
             logger.info("[%s] Weekly meal plan %s stored.", session_id, weekly_plan.id)
-            response_text = (
+            fallback = (
                 "Here's your 7-day meal plan! "
                 "I've picked out breakfast, lunch, and dinner for each day based on your profile. "
                 "Let me know if you'd like to swap anything out or adjust it."
             )
 
-        if seed_note:
-            response_text = f"{response_text} {seed_note}"
+        pinned_titles = [p.get("recipe_title", "") for p in pinned.values()]
+        facts = {
+            "action": "refined_weekly_plan" if is_refinement else "new_weekly_plan",
+            "days": 7, "meals": 21,
+            "anchored_dishes": pinned_titles,
+            "seed_note": seed_note,
+            "cooking_for": session.user_profile.get("cooking_for_names") or [],
+        }
+        response_text = self.response_writer.write(
+            facts, content,
+            fallback=f"{fallback} {seed_note}".strip() if seed_note else fallback,
+        )
 
         self.session_service.add_message(session_id, "assistant", response_text)
 

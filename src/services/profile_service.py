@@ -225,6 +225,7 @@ class ProfileService:
             # M3 memory fields (written only through the consent flow)
             "standing_seeds": list(properties.get("standing_seeds", []) or []),
             "memory_optouts": list(properties.get("memory_optouts", []) or []),
+            "memory_log": list(properties.get("memory_log", []) or []),
         }
 
     def _build_preferences(

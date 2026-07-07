@@ -33,6 +33,7 @@ from db import (
     db_save_meal_plan,
     db_get_session_meal_plans,
     db_get_meal_plan,
+    db_update_meal_plan_payload,
 )
 from models.recipe import CandidateRecipe
 from models.session import (
@@ -431,6 +432,14 @@ class SessionService:
             return []
         return sorted(session.weekly_meal_plans, key=lambda p: p.created_at)
 
+    def resave_meal_plan(self, meal_plan: MealPlan) -> None:
+        """Re-persist a daily plan after in-place enrichment/transparency."""
+        db = SessionLocal()
+        try:
+            db_update_meal_plan_payload(db, meal_plan.id, _serialize_meal_plan(meal_plan))
+        finally:
+            db.close()
+
     def get_meal_plan_payload(self, plan_id: str) -> Optional[dict]:
         db = SessionLocal()
         try:
@@ -501,6 +510,18 @@ class SessionService:
 # Serialization helpers                                                #
 # ------------------------------------------------------------------ #
 
+def _serialize_course(course: MealCourse) -> dict:
+    return {
+        "recipe_id": course.recipe_id,
+        "title": course.title,
+        "ingredients": course.ingredients,
+        "directions": course.directions,
+        "nutrition": course.nutrition,
+        "image_url": course.image_url,
+        "match_reasons": course.match_reasons,
+    }
+
+
 def _serialize_meal_plan(mp: MealPlan) -> dict:
     return {
         "id": mp.id,
@@ -516,24 +537,11 @@ def _serialize_meal_plan(mp: MealPlan) -> dict:
         "diversity_llm_reasoning": mp.diversity_llm_reasoning,
         "guideline_adherence_score": mp.guideline_adherence_score,
         "guideline_adherence_reasoning": mp.guideline_adherence_reasoning,
-        "breakfast": {
-            "recipe_id": mp.breakfast.recipe_id,
-            "title": mp.breakfast.title,
-            "ingredients": mp.breakfast.ingredients,
-            "directions": mp.breakfast.directions,
-        },
-        "lunch": {
-            "recipe_id": mp.lunch.recipe_id,
-            "title": mp.lunch.title,
-            "ingredients": mp.lunch.ingredients,
-            "directions": mp.lunch.directions,
-        },
-        "dinner": {
-            "recipe_id": mp.dinner.recipe_id,
-            "title": mp.dinner.title,
-            "ingredients": mp.dinner.ingredients,
-            "directions": mp.dinner.directions,
-        },
+        "constraints_applied": mp.constraints_applied,
+        "personalization_summary": mp.personalization_summary,
+        "breakfast": _serialize_course(mp.breakfast),
+        "lunch": _serialize_course(mp.lunch),
+        "dinner": _serialize_course(mp.dinner),
     }
 
 
@@ -554,6 +562,9 @@ def _deserialize_meal_plan(plan_id: str, payload: dict) -> MealPlan:
             title=d.get("title", ""),
             ingredients=d.get("ingredients", ""),
             directions=d.get("directions", ""),
+            nutrition=d.get("nutrition"),
+            image_url=d.get("image_url"),
+            match_reasons=d.get("match_reasons", []) or [],
         )
 
     return MealPlan(
@@ -561,6 +572,8 @@ def _deserialize_meal_plan(plan_id: str, payload: dict) -> MealPlan:
         created_at=dt.fromisoformat(payload["created_at"]),
         version=payload.get("version", 1),
         parent_id=payload.get("parent_id"),
+        constraints_applied=payload.get("constraints_applied", []) or [],
+        personalization_summary=payload.get("personalization_summary"),
         breakfast=_course(payload.get("breakfast", {})),
         lunch=_course(payload.get("lunch", {})),
         dinner=_course(payload.get("dinner", {})),

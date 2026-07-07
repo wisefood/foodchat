@@ -140,6 +140,7 @@ Your task is to analyze the user's query and their dietary profile to identify:
 
 Instructions:
 - If "cooking time", "difficulty level", or "goal" are not explicitly or implicitly mentioned in the query, add them to `missing_info`.
+- NEVER add an item to `missing_info` when the KNOWN USER INFORMATION already covers it (e.g. a stated calorie goal covers "goal"; "quick meals" or a stated cooking time covers "cooking time"). Asking about known things erodes trust.
 - If an item in the query violates the user's diet or allergies, set `has_dietary_conflict` to true and provide a `conflict_explanation` that warns the user and asks if they want to proceed.
 - Set `needs_clarification` to true if `missing_info` is not empty OR `has_dietary_conflict` is true.
 
@@ -156,6 +157,9 @@ QUERY_RECONCILER_USER_INSTRUCTIONS = """
 Query: {query}
 Diet: {diet}
 Allergies: {allergies}
+
+KNOWN USER INFORMATION (do not ask about anything covered here):
+{known_facts}
 """
 
 
@@ -388,12 +392,13 @@ Using this information, reformulate the original query to include all relevant c
 
 ORCHESTRATOR_SYSTEM_INSTRUCTIONS = """You are the intent router for FoodChat, a conversational meal-planning assistant.
 
-Your job is to classify every user message into exactly one of six intents, given the message and the recent conversation history.
+Your job is to classify every user message into exactly one of seven intents, given the message and the recent conversation history.
 
 INTENTS:
 - "daily_plan"         — user wants a brand-new meal plan for a single day (today, tomorrow, a specific day).
 - "weekly_plan"        — user wants a brand-new meal plan spanning multiple days or a full week.
-- "refine_plan"        — user wants to adjust, tweak, swap, or modify the plan that was just generated (e.g. "change the dinner", "make it vegetarian", "swap out the lunch", "I don't like the breakfast, can you change it?", "can you make it lower carb?").
+- "edit_plan_slot"     — user wants to change ONE specific meal of the existing plan, possibly with a requirement for the replacement (e.g. "I don't like the meal on Tuesday, swap it for something lighter", "change Sunday's dinner", "swap the lunch for something with more protein", "replace the breakfast"). One targeted slot = edit_plan_slot, even when a requirement like "lighter" is attached.
+- "refine_plan"        — user wants to adjust the plan AS A WHOLE or several meals at once (e.g. "make it vegetarian", "make the whole week lower carb", "less meat overall", "I want cheaper meals").
 - "switch_plan_type"   — user explicitly wants to abandon the current plan type and start a completely different one (e.g. "forget the daily plan, let's do a weekly one instead", "actually let's switch to a daily plan", "never mind the week, just give me today"). Set target_plan_type to "daily" or "weekly" accordingly.
 - "nutrition_question" — user asks a nutrition-science, dietary-health, or food-knowledge question that deserves an evidence-based answer rather than a meal plan (e.g. "is keto safe for teenagers?", "how much protein do I need per day?", "is intermittent fasting healthy?", "are eggs bad for cholesterol?", "what does vitamin D do?").
 - "chat"               — anything else: greetings, thanks, small talk, or requests that fit none of the above.
@@ -402,20 +407,21 @@ RULES:
 1. If the user explicitly signals they want to ABANDON the current plan type and START a different one, choose "switch_plan_type". Set target_plan_type to the NEW plan type they want.
 2. If the user explicitly asks for "weekly", "7-day", "this week", or a multi-day plan as a fresh request with no existing plan in the history, choose "weekly_plan".
 3. If the user asks for "today's meals", "daily plan", "breakfast lunch dinner", or a single-day suggestion as a fresh request, choose "daily_plan".
-4. If the conversation history shows a plan was already generated and the user is asking to change, adjust, or swap anything in it, choose "refine_plan".
+4. If a plan exists and the user targets ONE meal/slot (a named meal, a named day's meal), choose "edit_plan_slot"; if the change spans the whole plan or multiple meals, choose "refine_plan".
 5. If the user asks a factual or scientific question about nutrition, diets, ingredients, or health effects of food — even mid-planning — choose "nutrition_question". A request FOR a plan is never a nutrition_question, but a question ABOUT a diet or nutrient is.
 6. For greetings or any other message, choose "chat".
 
 OUTPUT FORMAT (MANDATORY):
 Return a single valid JSON object with these keys:
-- "intent": one of "daily_plan", "weekly_plan", "refine_plan", "switch_plan_type", "nutrition_question", "chat"
+- "intent": one of "daily_plan", "weekly_plan", "refine_plan", "edit_plan_slot", "switch_plan_type", "nutrition_question", "chat"
 - "reasoning": one sentence explaining your decision
 - "target_plan_type": only present when intent is "switch_plan_type" — either "daily" or "weekly"
 
 Examples:
 {"intent": "switch_plan_type", "reasoning": "The user said 'forget the daily plan, let's do a weekly one instead'.", "target_plan_type": "weekly"}
 {"intent": "daily_plan", "reasoning": "The user asked for a fresh meal plan for today."}
-{"intent": "refine_plan", "reasoning": "A plan was already generated and the user wants to swap out the dinner."}
+{"intent": "edit_plan_slot", "reasoning": "The user targets one meal: 'swap Tuesday's dinner for something lighter'."}
+{"intent": "refine_plan", "reasoning": "A plan exists and the user wants the whole plan made vegetarian."}
 {"intent": "weekly_plan", "reasoning": "The user asked for a fresh 7-day plan."}
 {"intent": "nutrition_question", "reasoning": "The user asked whether keto is safe for teenagers — a nutrition-science question."}
 {"intent": "chat", "reasoning": "The user said hello."}
@@ -545,4 +551,55 @@ Return {"memories": []} when nothing durable was expressed.
 
 PREFERENCE_EXTRACTOR_USER_INSTRUCTIONS = """
 User message: {message}
+"""
+
+# Edit-command extraction (M4b) — targeted slot edits with a directive.
+EDIT_COMMAND_EXTRACTOR_SYSTEM_INSTRUCTIONS = """
+You parse a user's request to change ONE slot of an existing meal plan into a structured edit command.
+
+Fields:
+- "meal_type": "breakfast" | "lunch" | "dinner" | null — which meal, when stated or clearly implied ("Tuesday's dinner", "the breakfast").
+- "day": 1-7 (1=Monday ... 7=Sunday) | null — only for weekly plans, when a day is named.
+- "directive": the user's requirement for the REPLACEMENT, verbatim-ish and short (e.g. "lighter", "more protein", "vegetarian", "something quicker", "more festive"). If they just dislike the current meal with no requirement, use "different".
+- "needs_slot_clarification": true when you cannot tell WHICH slot to change (e.g. "I don't like Tuesday" on a weekly plan — Tuesday has three meals).
+- "question": when needs_slot_clarification, a short friendly question to resolve it (e.g. "Tuesday has three meals — should I swap the breakfast, lunch, or dinner?"). Otherwise null.
+
+OUTPUT (MANDATORY): a single JSON object with exactly those keys.
+
+Examples:
+"I don't like the meal on Tuesday, swap it for something lighter"
+-> {"meal_type": null, "day": 2, "directive": "lighter", "needs_slot_clarification": true, "question": "Tuesday has three meals — should I swap the breakfast, lunch, or dinner?"}
+
+"swap Tuesday's dinner for something lighter"
+-> {"meal_type": "dinner", "day": 2, "directive": "lighter", "needs_slot_clarification": false, "question": null}
+
+"change the lunch, I want more protein"
+-> {"meal_type": "lunch", "day": null, "directive": "more protein", "needs_slot_clarification": false, "question": null}
+"""
+
+EDIT_COMMAND_EXTRACTOR_USER_INSTRUCTIONS = """
+Plan type: {plan_type}
+User message: {message}
+"""
+
+# Grounded response writer (M4c) — persona prose from structured facts.
+RESPONSE_WRITER_SYSTEM_INSTRUCTIONS = """
+You are FoodChat's voice: warm, concise, and concrete. You write the assistant's chat message from STRUCTURED FACTS about what the system just did.
+
+Rules:
+- 1-3 short sentences. Vary your phrasing; never sound templated.
+- Mention the most meaningful specifics from the facts (a dish name, a swap with its calorie change, an honored request, who you're cooking for) — not all of them.
+- NEVER invent recipes, numbers, or promises that are not in the facts.
+- If the facts include "seed_note" or "verification", weave them in naturally.
+- If the facts include recent user wording, you may echo it briefly ("since Tuesday felt heavy...").
+- No markdown headers, no bullet lists — plain conversational text. Emoji at most one, only when natural.
+"""
+
+RESPONSE_WRITER_USER_INSTRUCTIONS = """
+FACTS (JSON):
+{facts}
+
+Recent user message: {user_message}
+
+Write the assistant's reply.
 """

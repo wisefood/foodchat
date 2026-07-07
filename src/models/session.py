@@ -43,6 +43,11 @@ class MealCourse:
     title: str
     ingredients: str
     directions: str
+    # M4 enrichment (RecipeWrangler batch details; None/[] when unavailable)
+    nutrition: Optional[dict] = None       # {kcal, protein_g, carbs_g, fat_g, nutri_score_label}
+    image_url: Optional[str] = None
+    # Why this recipe was chosen — transparency chips in the UI
+    match_reasons: list = field(default_factory=list)   # [{kind, label}]
 
     @classmethod
     def from_candidate(cls, candidate: CandidateRecipe) -> "MealCourse":
@@ -51,6 +56,13 @@ class MealCourse:
             title=candidate.title,
             ingredients=candidate.ingredients,
             directions=candidate.directions,
+        )
+
+    def to_candidate(self) -> CandidateRecipe:
+        """Back-convert for patch edits (unchanged slots of a new version)."""
+        return CandidateRecipe(
+            recipe_id=self.recipe_id, title=self.title,
+            ingredients=self.ingredients, directions=self.directions,
         )
 
 
@@ -73,6 +85,10 @@ class MealPlan:
     diversity_llm_reasoning: str = ""
     guideline_adherence_score: int = 0
     guideline_adherence_reasoning: str = ""
+    # M4 transparency: the constraint ledger and personalization counts the
+    # UI renders above the plan ([{constraint, type, status, source}]).
+    constraints_applied: list = field(default_factory=list)
+    personalization_summary: Optional[dict] = None
 
     @classmethod
     def from_courses(

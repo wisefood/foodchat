@@ -2,6 +2,68 @@
 
 ---
 
+# M4 — Rich Plans, Transparency, Verified Slot Editing, Natural Voice
+
+> **Date:** 2026-07-07
+> **Branch:** main
+> No DB migration (plan payloads gain optional fields; old payloads
+> deserialize with nulls). RecipeWrangler gains POST /recipes/details.
+
+## Rich, explained plans
+
+- **Enrichment**: every plan course now carries per-serving `nutrition`
+  (kcal/protein/carbs/fat, Nutri-Score label) and `image_url`, fetched in ONE
+  RecipeWrangler batch call (`POST /api/v1/recipes/details`, cached
+  server-side). Weekly entries enriched the same way (21 recipes, one call).
+- **Transparency (structured, not prose)** — `services/transparency.py`:
+  per-course `match_reasons` chips (pinned / favorite / memory / profile /
+  feedback / diner), a plan-level `constraints_applied` ledger (hard/soft,
+  with diner attribution), and `personalization_summary` counts linking to
+  the memory panel. The four quality scores were already returned — the UI
+  now renders them as a plan-quality card.
+- **Weekly selection is preference-aware**: `build_preference_scorer`
+  replaces uniform-random candidate choice — favorites dominate (+5), liked
+  ingredients boost (+1 each), title-token overlap with already-planned
+  meals penalizes (−2/token) for variety. Zero extra LLM cost; the per-step
+  LLM reward is still recorded per entry.
+
+## Verified slot editing ("swap Tuesday's dinner for something lighter")
+
+- New `edit_plan_slot` intent (one targeted meal ≠ whole-plan `refine_plan`)
+  + `EditCommandExtractor` (slot + directive; one conversational follow-up
+  when the slot is ambiguous, persisted as clarification kind="edit_slot").
+- **Directive predicates** (`services/edit_service.py`): measurable
+  directives are verified against RecipeWrangler nutrition BEFORE selection
+  — lighter ⇒ kcal ≤ 0.85×old, more protein ⇒ strictly greater, quicker ⇒
+  shorter duration, diet words ⇒ tag present. Missing measurements FAIL
+  CLOSED (an unverifiable swap never claims compliance). Unmeasurable
+  directives ("more festive") pick best-effort and say so.
+- **Honest failure**: when nothing passes, the reply says so and offers the
+  nearest miss with numbers ("closest is X at 610 kcal — want it?").
+- **Patch semantics**: the new version keeps every untouched slot (daily:
+  courses carried over with their enrichment; weekly: 20 entries copied,
+  ONE replaced — no more 21-meal regeneration on a single swap). Response
+  carries `changed_slots` with the before/after kcal proof; the UI renders
+  the diff chip ("700 → 420 kcal, verified").
+
+## Natural voice + never-ask-twice
+
+- **ResponseWriter agent**: every plan/edit reply is composed from
+  structured facts (action, meals, seed notes, diners, constraints honored,
+  swap proof) — grounded persona prose with a canned fallback on LLM
+  failure. The era of "Here's your meal plan for today!" ×100 is over.
+- **Never-ask-twice clarifier**: the reconciler now receives the profile's
+  known facts and is instructed not to mark them missing; clarification
+  questions are capped at 2 per request.
+
+## Tests
+
++12 (predicates incl. fail-closed, daily/weekly patch edits, ambiguity
+round-trip, honest failure with nearest miss, transparency attachment,
+weekly scorer) — 72 total.
+
+---
+
 # M3 — Consented Memory, Feedback Loop, Household Diners (+ platform consent bar)
 
 > **Date:** 2026-07-07

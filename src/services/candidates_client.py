@@ -22,7 +22,7 @@ from typing import Optional
 
 import httpx
 
-from models.recipe import CandidateRecipe, CandidatesBySlot, ResolvedRecipe
+from models.recipe import CandidateRecipe, CandidatesBySlot, RecipeEnrichment, ResolvedRecipe
 
 logger = logging.getLogger(__name__)
 
@@ -214,6 +214,47 @@ class RecipeCandidatesClient:
             allergens=[str(a).lower() for a in (data.get("allergens") or [])],
             tags=[str(t).lower() for t in (data.get("tags") or [])],
         )
+
+
+    def fetch_details(self, recipe_ids: list[str]) -> dict[str, RecipeEnrichment]:
+        """Batch nutrition/image/tag details (M4 enrichment + edit predicates).
+
+        Wraps ``POST /api/v1/recipes/details``. Best-effort: failures return
+        {} and unknown ids are simply absent — enrichment must never block a
+        plan response.
+        """
+        ids = [str(r) for r in recipe_ids if r]
+        if not ids:
+            return {}
+        try:
+            with httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS) as client:
+                response = client.post(
+                    f"{self.base_url}/api/v1/recipes/details",
+                    json={"recipe_ids": ids[:30]},
+                )
+                response.raise_for_status()
+                results = response.json().get("results", {})
+        except httpx.HTTPError as e:
+            logger.warning("Batch details fetch failed (%d ids): %s", len(ids), e)
+            return {}
+
+        enriched: dict[str, RecipeEnrichment] = {}
+        for rid, r in results.items():
+            enriched[str(rid)] = RecipeEnrichment(
+                recipe_id=str(r.get("recipe_id") or rid),
+                title=r.get("title") or "",
+                image_url=r.get("image_url"),
+                duration=r.get("duration"),
+                kcal=r.get("kcal_per_serving"),
+                protein_g=r.get("protein_g_per_serving"),
+                carbs_g=r.get("carbs_g_per_serving"),
+                fat_g=r.get("fat_g_per_serving"),
+                nutri_score_label=r.get("nutri_score_label"),
+                tags=[str(t).lower() for t in (r.get("tags") or [])],
+                dish_types=[str(d).lower() for d in (r.get("dish_types") or [])],
+                allergens=[str(a).lower() for a in (r.get("allergens") or [])],
+            )
+        return enriched
 
 
 # Module-level singleton — the client is stateless, so sharing is safe.

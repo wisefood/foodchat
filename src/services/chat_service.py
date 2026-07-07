@@ -22,13 +22,15 @@ import re
 from pathlib import Path
 from typing import Optional, Tuple
 
-from agents import GuidelineAdherenceGrader, MealDiversityGrader, SimpleChatBot
+from agents import GuidelineAdherenceGrader, MealDiversityGrader, ResponseWriter, SimpleChatBot
 from models.recipe import CandidateRecipe, ScoredPlan
 from models.session import MealPlan
+from services.candidates_client import CANDIDATES
 from services.clarification import ClarificationManager, ClarificationState
 from services.feedback_service import FeedbackService
 from services.planning_pipeline import PlanningPipeline
 from services.seed_service import SeedService
+from services.transparency import apply_transparency
 from .session_service import SessionService
 
 logger = logging.getLogger(__name__)
@@ -105,6 +107,7 @@ class ChatService:
         self.chatbot = SimpleChatBot()
         self.seed_service = SeedService()
         self.feedback_service = FeedbackService()
+        self.response_writer = ResponseWriter()
         self.diversity_grader = MealDiversityGrader()
         self.guideline_grader = GuidelineAdherenceGrader()
         logger.info("ChatService initialized.")
@@ -276,7 +279,7 @@ class ChatService:
                 "[%s] Refined daily plan → %s (v%d, parent=%s).",
                 session_id, meal_plan.id, meal_plan.version, meal_plan.parent_id,
             )
-            formatted = (
+            fallback = (
                 "Here's your updated meal plan! I've made the adjustments you asked for. "
                 "Let me know if you'd like anything else changed."
             )
@@ -285,14 +288,38 @@ class ChatService:
                 session_id, best.courses, best.reasoning, metrics
             )
             logger.info("[%s] New daily plan %s stored (metrics=%s).", session_id, meal_plan.id, metrics)
-            formatted = (
+            fallback = (
                 "Here's your meal plan for today! "
                 "I've picked out breakfast, lunch, and dinner based on your preferences. "
                 "Let me know if you'd like to swap something out."
             )
 
-        if seed_note:
-            formatted = f"{formatted} {seed_note}"
+        # M4 enrichment + transparency: nutrition/images per course, reason
+        # chips, constraint ledger — then re-persist the enriched payload.
+        pinned_ids = {r.recipe_id for r in pinned.values()}
+        enrichment = CANDIDATES.fetch_details([c.recipe_id for c in best.courses])
+        apply_transparency(
+            meal_plan, profile, pinned_ids, enrichment,
+            downvoted_count=len(signals.downvoted_recipe_ids),
+            feedback_lines=len(signals.history_text.splitlines()) if signals.history_text else 0,
+        )
+        self.session_service.resave_meal_plan(meal_plan)
+
+        # Grounded response writer (M4c): prose from facts, canned fallback.
+        facts = {
+            "action": "refined_daily_plan" if is_refinement else "new_daily_plan",
+            "meals": {
+                "breakfast": meal_plan.breakfast.title,
+                "lunch": meal_plan.lunch.title,
+                "dinner": meal_plan.dinner.title,
+            },
+            "seed_note": seed_note,
+            "cooking_for": profile.get("cooking_for_names") or [],
+            "constraints_honored": [c["constraint"] for c in meal_plan.constraints_applied[:4]],
+        }
+        formatted = self.response_writer.write(
+            facts, final_query, fallback=f"{fallback} {seed_note}".strip() if seed_note else fallback,
+        )
 
         self.session_service.add_message(session_id, "assistant", formatted)
         return formatted, False, meal_plan

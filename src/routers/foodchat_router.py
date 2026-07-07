@@ -59,11 +59,21 @@ class SessionResponse(BaseModel):
     created_at: datetime
 
 
+class MatchReasonResponse(BaseModel):
+    """Why a recipe is in the plan — transparency chip (M4a)."""
+    kind: str        # pinned | favorite | memory | profile | feedback | diner | guideline
+    label: str
+
+
 class MealCourseResponse(BaseModel):
     recipe_id: str
     title: str
     ingredients: str
     directions: str
+    # M4 enrichment — null/[] when RecipeWrangler data is unavailable
+    nutrition: Optional[dict] = None      # {kcal, protein_g, carbs_g, fat_g, nutri_score_label}
+    image_url: Optional[str] = None
+    match_reasons: List[MatchReasonResponse] = []
 
     @classmethod
     def from_meal_course(cls, course: MealCourse) -> "MealCourseResponse":
@@ -72,6 +82,9 @@ class MealCourseResponse(BaseModel):
             title=course.title,
             ingredients=course.ingredients,
             directions=course.directions,
+            nutrition=course.nutrition,
+            image_url=course.image_url,
+            match_reasons=[MatchReasonResponse(**r) for r in (course.match_reasons or [])],
         )
 
 
@@ -92,6 +105,9 @@ class MealPlanResponse(BaseModel):
     diversity_llm_reasoning: str | None = None
     guideline_adherence_score: int | None = None
     guideline_adherence_reasoning: str | None = None
+    # M4a transparency: constraint ledger + personalization counts
+    constraints_applied: List[dict] = []
+    personalization_summary: Optional[dict] = None
 
     @classmethod
     def from_meal_plan(cls, mp) -> "MealPlanResponse":
@@ -112,6 +128,8 @@ class MealPlanResponse(BaseModel):
             diversity_llm_reasoning=mp.diversity_llm_reasoning,
             guideline_adherence_score=mp.guideline_adherence_score,
             guideline_adherence_reasoning=mp.guideline_adherence_reasoning,
+            constraints_applied=mp.constraints_applied or [],
+            personalization_summary=mp.personalization_summary,
         )
 
 
@@ -203,6 +221,8 @@ class ChatTurnResponse(BaseModel):
     # Consent nudges detected in the user's turn (M3); answered via
     # POST /sessions/{id}/memory
     memory_suggestions: Optional[List[MemorySuggestionModel]] = None
+    # Slot-edit proof (M4b): what changed, with before/after kcal when known
+    changed_slots: Optional[List[dict]] = None
 
 
 class ConversationPage(BaseModel):
@@ -424,6 +444,7 @@ async def unified_chat(session_id: str, request: ChatRequest):
             [MemorySuggestionModel(**s) for s in turn.memory_suggestions]
             if turn.memory_suggestions else None
         ),
+        changed_slots=turn.changed_slots,
     )
 
 

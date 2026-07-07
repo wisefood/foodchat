@@ -305,6 +305,14 @@ def db_get_meal_plan(db: DBSession, plan_id: str) -> Optional[MealPlanRow]:
     return db.query(MealPlanRow).filter(MealPlanRow.id == plan_id).first()
 
 
+def db_update_meal_plan_payload(db: DBSession, plan_id: str, payload: dict) -> None:
+    """Rewrite a stored plan payload (post-storage enrichment/transparency)."""
+    row = db.query(MealPlanRow).filter(MealPlanRow.id == plan_id).first()
+    if row:
+        row.payload = json.dumps(payload)
+        db.commit()
+
+
 def db_get_session_meal_plans(
     db: DBSession,
     session_id: str,

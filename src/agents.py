@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import random
+from typing import Optional
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
@@ -46,6 +47,10 @@ from prompts import (
     SEED_EXTRACTOR_USER_INSTRUCTIONS,
     PREFERENCE_EXTRACTOR_SYSTEM_INSTRUCTIONS,
     PREFERENCE_EXTRACTOR_USER_INSTRUCTIONS,
+    EDIT_COMMAND_EXTRACTOR_SYSTEM_INSTRUCTIONS,
+    EDIT_COMMAND_EXTRACTOR_USER_INSTRUCTIONS,
+    RESPONSE_WRITER_SYSTEM_INSTRUCTIONS,
+    RESPONSE_WRITER_USER_INSTRUCTIONS,
 )
 from schemas import (
     ScoringSchema,
@@ -54,6 +59,7 @@ from schemas import (
     DietaryTagsSchema,
     SeedExtractionSchema,
     PreferenceExtractionSchema,
+    EditCommandSchema,
 )
 
 logger = logging.getLogger(__name__)
@@ -223,12 +229,21 @@ class QueryReconciler:
         )
 
     def reconcile(self, query: str, user_profile: dict) -> dict:
+        # Never-ask-twice (M4c): everything the profile already answers is
+        # surfaced to the reconciler so it cannot mark it "missing".
+        known_facts = "; ".join(filter(None, [
+            ", ".join(user_profile.get("preferences") or []),
+            user_profile.get("history") or "",
+            ", ".join(f"likes {l}" for l in (user_profile.get("food_likes") or [])[:5]),
+        ])) or "(nothing on file)"
+
         result = self.query_reconciler.invoke([
             SystemMessage(content=QUERY_RECONCILER_SYSTEM_INSTRUCTIONS),
             HumanMessage(content=QUERY_RECONCILER_USER_INSTRUCTIONS.format(
                 query=query,
                 diet=user_profile.get("diet", []),
                 allergies=user_profile.get("allergies", []),
+                known_facts=known_facts,
             )),
         ])
         return json.loads(result.content)
@@ -311,16 +326,80 @@ class SeedExtractor:
             return []
 
 
+class EditCommandExtractor:
+    """Parses a targeted slot-edit request into a structured command (M4b)."""
+
+    def __init__(self, model: str = None, temperature: float = 0.0):
+        self.llm = GROQ_CHAT.get_client(
+            model=model or DEFAULT_MODEL,
+            temperature=temperature,
+            format=EditCommandSchema.model_json_schema(),
+        )
+
+    def extract(self, message: str, plan_type: str) -> Optional[dict]:
+        """Returns the command dict, or None when parsing fails (caller
+        degrades to a whole-plan refinement)."""
+        try:
+            result = self.llm.invoke([
+                SystemMessage(content=EDIT_COMMAND_EXTRACTOR_SYSTEM_INSTRUCTIONS),
+                HumanMessage(content=EDIT_COMMAND_EXTRACTOR_USER_INSTRUCTIONS.format(
+                    plan_type=plan_type, message=message,
+                )),
+            ])
+            command = json.loads(result.content)
+            if not command.get("directive"):
+                command["directive"] = "different"
+            return command
+        except Exception as e:
+            logger.warning("EditCommandExtractor failed: %s", e)
+            return None
+
+
+class ResponseWriter:
+    """Grounded persona voice (M4c) — writes chat prose from structured facts.
+
+    It can phrase, emphasize, and echo the user's wording, but every concrete
+    claim must come from the facts dict. Callers keep a canned fallback for
+    LLM failures — a broken writer must never block a plan response.
+    """
+
+    def __init__(self, model: str = None, temperature: float = None):
+        self.llm = GROQ_CHAT.get_client(
+            model=model or DEFAULT_MODEL,
+            temperature=temperature if temperature is not None else CHATBOT_TEMPERATURE,
+        )
+
+    def write(self, facts: dict, user_message: str, fallback: str) -> str:
+        try:
+            result = self.llm.invoke([
+                SystemMessage(content=RESPONSE_WRITER_SYSTEM_INSTRUCTIONS),
+                HumanMessage(content=RESPONSE_WRITER_USER_INSTRUCTIONS.format(
+                    facts=json.dumps(facts, ensure_ascii=False),
+                    user_message=user_message[:400],
+                )),
+            ])
+            text = (result.content or "").strip()
+            # Guard against runaway or empty generations.
+            if not text or len(text) > 900:
+                return fallback
+            return text
+        except Exception as e:
+            logger.warning("ResponseWriter failed, using fallback: %s", e)
+            return fallback
+
+
 class OrchestratorAgent:
     """Single intent classifier per turn — the ONLY router in the pipeline.
 
-    Valid intents: daily_plan | weekly_plan | refine_plan | switch_plan_type
-    | nutrition_question | chat. ``target_plan_type`` is populated only for
-    switch_plan_type; nutrition_question turns are delegated to FoodScholar.
+    Valid intents: daily_plan | weekly_plan | refine_plan | edit_plan_slot
+    | switch_plan_type | nutrition_question | chat. ``target_plan_type`` is
+    populated only for switch_plan_type; nutrition_question turns are
+    delegated to FoodScholar; edit_plan_slot targets ONE slot of the active
+    canvas with a verified directive.
     """
 
     VALID_INTENTS = {
-        "daily_plan", "weekly_plan", "refine_plan",
+        "daily_plan", "weekly_plan", "refine_plan", "edit_plan_slot",
         "switch_plan_type", "nutrition_question", "chat",
     }
 

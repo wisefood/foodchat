@@ -6,6 +6,7 @@ both of those import from here. Keep this module dependency-free.
 """
 
 from dataclasses import dataclass
+from typing import Optional
 
 
 @dataclass(frozen=True)
@@ -24,6 +25,41 @@ class CandidateRecipe:
 
 # Slot name ("breakfast"/"lunch"/"dinner") → candidates for that slot.
 CandidatesBySlot = dict[str, list[CandidateRecipe]]
+
+
+@dataclass(frozen=True)
+class RecipeEnrichment:
+    """Per-recipe card data from RecipeWrangler's batch details endpoint (M4).
+
+    Used to enrich plan payloads (nutrition chips, images in the UI) and to
+    VERIFY edit directives ("lighter" ⇒ kcal comparison) — macros are
+    per-serving from the nutrition store, None when unknown.
+    """
+
+    recipe_id: str
+    title: str
+    image_url: Optional[str] = None
+    duration: Optional[float] = None
+    kcal: Optional[float] = None
+    protein_g: Optional[float] = None
+    carbs_g: Optional[float] = None
+    fat_g: Optional[float] = None
+    nutri_score_label: Optional[str] = None
+    tags: list[str] = None
+    dish_types: list[str] = None
+    allergens: list[str] = None
+
+    def nutrition_dict(self) -> Optional[dict]:
+        """Compact nutrition payload for API responses (None if all unknown)."""
+        if self.kcal is None and self.protein_g is None:
+            return None
+        return {
+            "kcal": self.kcal,
+            "protein_g": self.protein_g,
+            "carbs_g": self.carbs_g,
+            "fat_g": self.fat_g,
+            "nutri_score_label": self.nutri_score_label,
+        }
 
 
 @dataclass(frozen=True)
