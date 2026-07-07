@@ -1,16 +1,49 @@
+"""
+ChatService — daily-plan generation and small-talk handling.
+
+Called exclusively by ``OrchestratorService`` after intent classification
+(this service does NOT classify — the orchestrator is the single router):
+
+    process_plan_request()      — "daily_plan" / "refine_plan" intents
+    process_smalltalk()         — "chat" intent
+    continue_clarification()    — any turn while session.state == "clarifying"
+
+Plan flow: ClarificationManager (ask/skip questions, reconcile profile)
+→ PlanningPipeline (RecipeWrangler candidates + LLM grading)
+→ quality metrics (variety count, LLM diversity, guideline adherence)
+→ SessionService (versioned canvas storage).
+
+Clarification state is plain data persisted on the session row, so this flow
+survives restarts and works across replicas (see ``services.clarification``).
+"""
+
 import logging
+import re
+from pathlib import Path
 from typing import Optional, Tuple
 
-from src.agents import QueryClassifier, RAGReadyPreparator, SimpleChatBot, MealDiversityGrader, GuidelineAdherenceGrader
-from .session_service import SessionService
-from . import profile_service
+from agents import GuidelineAdherenceGrader, MealDiversityGrader, SimpleChatBot
+from models.recipe import ScoredPlan
 from models.session import MealPlan
+from services.clarification import ClarificationManager, ClarificationState
+from services.planning_pipeline import PlanningPipeline
+from .session_service import SessionService
 
 logger = logging.getLogger(__name__)
 
+# National dietary guidelines used by the adherence grader. Optional: when the
+# file is absent the grader scores against an empty context (logged once per call).
+GUIDELINES_PATH = Path(__file__).resolve().parents[2] / "belgium_dietary_guidelines_augmentation.cypher"
+
+NO_PLAN_APOLOGY = (
+    "I'm sorry, I couldn't find enough recipes to build a "
+    "complete meal plan matching your preferences. "
+    "Could you try adjusting your requirements?"
+)
+
 
 def _format_plan_as_context(plan: MealPlan) -> str:
-    """Serialise the current canvas plan into a text block for the LLM."""
+    """Serialize the current canvas plan into a text block for refinement prompts."""
     lines = [f"[Current daily meal plan — version {plan.version}]"]
     for name, course in [("Breakfast", plan.breakfast), ("Lunch", plan.lunch), ("Dinner", plan.dinner)]:
         if course.recipe_id:
@@ -23,48 +56,94 @@ def _format_plan_as_context(plan: MealPlan) -> str:
     return "\n".join(lines)
 
 
-class ChatService:
-    """Orchestrates chat interactions and RAG chain flow."""
+def _extract_ingredient_names(ingredients_text: str) -> list[str]:
+    """Normalize a free-text ingredients blob into comparable item names."""
+    if not isinstance(ingredients_text, str):
+        return []
+    cleaned = []
+    for part in re.split(r"[\n,;•\-]+", ingredients_text):
+        t = part.strip().lower()
+        t = re.sub(r"\([^\)]*\)", "", t)
+        t = re.sub(r"[^a-zA-Z\s]", " ", t)
+        t = re.sub(r"\s+", " ", t).strip()
+        if t:
+            cleaned.append(t)
+    return cleaned
 
-    def __init__(self, foodchat, config, session_service: SessionService):
-        self.foodchat = foodchat
-        self.config = config
+
+def _food_variety_score(plan: ScoredPlan) -> tuple[int, str]:
+    """Count unique food items across the plan's three courses (FVS metric)."""
+    items: list[str] = []
+    for course in plan.courses:
+        items.extend(_extract_ingredient_names(course.ingredients))
+    unique_items = sorted(set(items))
+    reasoning = (
+        f"Unique food items across meals: {len(unique_items)} "
+        f"(e.g., {', '.join(unique_items[:8])}{'...' if len(unique_items) > 8 else ''})"
+    )
+    return len(unique_items), reasoning
+
+
+def _plan_as_text(plan: ScoredPlan) -> str:
+    return "\n".join(
+        f"{name}: {course.title}\nIngredients: {course.ingredients}\nDirections: {course.directions}\n"
+        for name, course in (
+            ("Breakfast", plan.breakfast), ("Lunch", plan.lunch), ("Dinner", plan.dinner),
+        )
+    )
+
+
+class ChatService:
+    """Daily-plan conversation flows (generation, refinement, clarification, small talk)."""
+
+    def __init__(self, session_service: SessionService):
         self.session_service = session_service
-        self.rag_preparator = RAGReadyPreparator()
-        self.rag_chain_part1 = foodchat.create_pre_clarification_chain(config)
-        self.rag_chain_part2 = foodchat.create_post_clarification_chain()
+        self.pipeline = PlanningPipeline()
+        self.clarifier = ClarificationManager()
         self.chatbot = SimpleChatBot()
-        self.classifier = QueryClassifier()
+        self.diversity_grader = MealDiversityGrader()
+        self.guideline_grader = GuidelineAdherenceGrader()
         logger.info("ChatService initialized.")
 
-    def process_message(
+    # ------------------------------------------------------------------ #
+    # Entry points (called by OrchestratorService)                         #
+    # ------------------------------------------------------------------ #
+
+    def process_smalltalk(self, session_id: str, message: str) -> Tuple[str, bool, Optional[MealPlan]]:
+        """Handle a 'chat' intent turn — no plan generation."""
+        session = self._get_session(session_id)
+        self.session_service.add_message(session_id, "user", message)
+
+        history = [(m.role, m.content) for m in session.conversation[:-1]]
+        response = self.chatbot.chat(message, history)
+        self.session_service.add_message(session_id, "assistant", response)
+        return response, False, None
+
+    def process_plan_request(
         self,
         session_id: str,
         message: str,
         is_refinement: bool = False,
     ) -> Tuple[str, bool, Optional[MealPlan]]:
-        session = self.session_service.get_session(session_id)
-        if not session:
-            raise ValueError(f"Session {session_id} not found")
+        """Handle a 'daily_plan' or 'refine_plan' intent turn.
 
+        Returns (response_text, needs_clarification, meal_plan|None).
+        """
+        session = self._get_session(session_id)
         logger.info(
-            "[%s] Incoming message (state=%s, refinement=%s): %.120s",
+            "[%s] Plan request (state=%s, refinement=%s): %.120s",
             session_id, session.state, is_refinement, message,
         )
         self.session_service.add_message(session_id, "user", message)
 
-        if session.state == "clarifying":
-            logger.info("[%s] Resuming clarification flow.", session_id)
-            return self._handle_clarification(session_id, message)
-
-        # For refinements, prepend the current plan so the RAG chain has context
+        # For refinements, prepend the current canvas plan so the pipeline
+        # sees what it is being asked to change.
         effective_message = message
         if is_refinement and session.daily_canvas:
             current_plan = session.get_current_daily_plan()
             if current_plan:
-                plan_context = _format_plan_as_context(current_plan)
                 effective_message = (
-                    f"{plan_context}\n\n"
+                    f"{_format_plan_as_context(current_plan)}\n\n"
                     f"User refinement request: {message}"
                 )
                 logger.info(
@@ -72,214 +151,94 @@ class ChatService:
                     session_id, current_plan.version,
                 )
 
-        routing = self.classifier.router(effective_message)
-        logger.info("[%s] Query classified → source=%s", session_id, routing.get("source"))
+        origin_intent = "refine_plan" if is_refinement else "daily_plan"
+        outcome = self.clarifier.start(effective_message, session.user_profile, origin_intent)
 
-        if routing["source"] == "vectorstore":
-            return self._handle_rag_query(session_id, effective_message, is_refinement=is_refinement)
-        else:
-            logger.info("[%s] Routing to chatbot (non-RAG).", session_id)
-            response = self.chatbot.chat(message)
-            self.session_service.add_message(session_id, "assistant", response)
-            return response, False, None
+        if outcome.needs_clarification:
+            logger.info("[%s] Clarification needed — persisting clarification state.", session_id)
+            self.session_service.set_clarification_state(session_id, outcome.state.to_dict())
+            self.session_service.add_message(session_id, "assistant", outcome.question)
+            return outcome.question, True, None
 
-    def _handle_rag_query(
-        self,
-        session_id: str,
-        message: str,
-        is_refinement: bool = False,
-    ) -> Tuple[str, bool, Optional[MealPlan]]:
-        session = self.session_service.get_session(session_id)
-        logger.info("[%s] Running pre-clarification RAG chain.", session_id)
-
-        pending_rag_data = self.rag_chain_part1.invoke(
-            {
-                "question": message,
-                "user_id": session.member_id,
-                "user_profile_data": session.user_profile,
-            }
-        )
-        logger.debug("[%s] Pre-clarification chain output keys: %s", session_id, list(pending_rag_data.keys()))
-
-        generator = self.rag_preparator.query_check(
-            pending_rag_data.get("question", message),
-            pending_rag_data.get("modified_user_data", session.user_profile)
+        return self._generate_and_store(
+            session_id, outcome.final_query, outcome.profile, is_refinement
         )
 
-        try:
-            first_question = next(generator)
-            logger.info("[%s] Clarification needed — entering clarification state.", session_id)
-            pending_intent = "refine_plan" if is_refinement else "daily_plan"
-            self.session_service.set_clarification_state(session_id, generator, pending_rag_data, pending_intent=pending_intent)
-            self.session_service.add_message(session_id, "assistant", first_question)
-            return first_question, True, None
+    def continue_clarification(self, session_id: str, message: str) -> Tuple[str, bool, Optional[MealPlan], str]:
+        """Consume a user answer while session.state == "clarifying".
 
-        except StopIteration as e:
-            final_query = e.value or pending_rag_data.get("question", message)
-            logger.info("[%s] No clarification needed — proceeding to post-clarification chain.", session_id)
-            return self._run_post_clarification(session_id, final_query, pending_rag_data, is_refinement=is_refinement)
+        Returns (response_text, needs_clarification, meal_plan|None, origin_intent).
+        The origin intent ("daily_plan"/"refine_plan") is restored from the
+        persisted state so the orchestrator can tag the turn correctly.
+        """
+        session = self._get_session(session_id)
+        self.session_service.add_message(session_id, "user", message)
 
-        except Exception as ex:
-            logger.error("[%s] Error in clarification generator: %s", session_id, ex, exc_info=True)
-            return self._run_post_clarification(session_id, message, pending_rag_data, is_refinement=is_refinement)
-
-    def _handle_clarification(
-        self, session_id: str, message: str
-    ) -> Tuple[str, bool, Optional[MealPlan]]:
-        session = self.session_service.get_session(session_id)
-        generator = session.clarification_generator
-
-        if not generator:
-            logger.warning("[%s] Clarification state set but generator is missing — resetting.", session_id)
+        if not session.clarification:
+            # Recoverable inconsistency (e.g. state row said "clarifying" but no
+            # payload). Reset and treat the message as a fresh plan request.
+            logger.warning("[%s] Clarifying state without payload — resetting.", session_id)
             self.session_service.clear_clarification_state(session_id)
-            return self.process_message(session_id, message)
+            text, needs, plan = self.process_plan_request(session_id, message)
+            return text, needs, plan, "daily_plan"
 
-        try:
-            next_question = generator.send(message)
-            logger.info("[%s] Clarification continuing — next question sent.", session_id)
-            self.session_service.add_message(session_id, "assistant", next_question)
-            return next_question, True, None
+        state = ClarificationState.from_dict(session.clarification)
+        origin_intent = state.origin_intent
+        outcome = self.clarifier.step(state, message)
 
-        except StopIteration as e:
-            final_query = e.value or message
-            logger.info("[%s] Clarification complete — final query: %.120s", session_id, final_query)
-            return self._run_post_clarification(session_id, final_query, session.pending_rag_data)
+        if outcome.needs_clarification:
+            self.session_service.set_clarification_state(session_id, outcome.state.to_dict())
+            self.session_service.add_message(session_id, "assistant", outcome.question)
+            return outcome.question, True, None, origin_intent
 
-    def _run_post_clarification(
+        self.session_service.clear_clarification_state(session_id)
+        is_refinement = origin_intent == "refine_plan"
+        text, needs, plan = self._generate_and_store(
+            session_id, outcome.final_query, outcome.profile, is_refinement
+        )
+        return text, needs, plan, origin_intent
+
+    # ------------------------------------------------------------------ #
+    # Generation                                                           #
+    # ------------------------------------------------------------------ #
+
+    def _generate_and_store(
         self,
         session_id: str,
         final_query: str,
-        pending_data: dict,
-        is_refinement: bool = False,
+        profile: dict,
+        is_refinement: bool,
     ) -> Tuple[str, bool, Optional[MealPlan]]:
-        logger.info("[%s] Running post-clarification chain (final_query=%.120s).", session_id, final_query)
+        """Run the pipeline, compute quality metrics, and store the plan version."""
         self.session_service.clear_clarification_state(session_id)
+        logger.info("[%s] Generating plan (query=%.120s)", session_id, final_query)
 
-        chain_input = {**pending_data, "reformulated_query": final_query}
-        response = self.rag_chain_part2.invoke(chain_input)
+        plans = self.pipeline.generate(final_query, profile)
+        if not plans:
+            logger.warning("[%s] No candidate plans — returning apology.", session_id)
+            self.session_service.add_message(session_id, "assistant", NO_PLAN_APOLOGY)
+            return NO_PLAN_APOLOGY, False, None
 
-        docs = response.get("docs") or []
-        logger.info("[%s] Post-clarification chain returned %d candidate plan(s).", session_id, len(docs))
-        if not docs:
-            logger.warning("[%s] No candidate recipes found — returning empty plan response.", session_id)
-            msg = (
-                "I'm sorry, I couldn't find enough recipes to build a "
-                "complete meal plan matching your preferences. "
-                "Could you try adjusting your requirements?"
-            )
-            self.session_service.add_message(session_id, "assistant", msg)
-            return msg, False, None
+        best = plans[0]
+        metrics = self._compute_metrics(session_id, best)
 
-        raw_plan = docs[0][0]
-        llm_reasoning = docs[0][1].get("reasoning", "")
-        llm_score = int(docs[0][1].get("score", 0))
-        logger.info("[%s] Top plan selected (llm_score=%d).", session_id, llm_score)
-
-        # Food Variety Score
-        import re
-
-        def _extract_ingredients(ing_str: str) -> list[str]:
-            if not isinstance(ing_str, str):
-                return []
-            parts = re.split(r"[\n,;•\-]+", ing_str)
-            cleaned = []
-            for p in parts:
-                t = p.strip().lower()
-                t = re.sub(r"\([^\)]*\)", "", t)
-                t = re.sub(r"[^a-zA-Z\s]", " ", t)
-                t = re.sub(r"\s+", " ", t).strip()
-                if t:
-                    cleaned.append(t)
-            return cleaned
-
-        def _unique_variety_count(raw_plan_tuple: tuple) -> tuple[int, str]:
-            items = []
-            for idx in range(min(3, len(raw_plan_tuple))):
-                try:
-                    _, _, ingredients, _ = raw_plan_tuple[idx]
-                    items.extend(_extract_ingredients(ingredients))
-                except Exception:
-                    pass
-            unique_items = sorted(set(items))
-            reasoning = (
-                f"Unique food items across meals: {len(unique_items)} "
-                f"(e.g., {', '.join(unique_items[:8])}{'...' if len(unique_items) > 8 else ''})"
-            )
-            return len(unique_items), reasoning
-
-        def _course_to_text(name: str, data) -> str:
-            try:
-                rid, title, ingredients, directions = data
-            except Exception:
-                title = ingredients = directions = ""
-            return f"{name}: {title}\nIngredients: {ingredients}\nDirections: {directions}\n"
-
-        plan_text = "\n".join([
-            _course_to_text("Breakfast", raw_plan[0] if len(raw_plan) > 0 else []),
-            _course_to_text("Lunch", raw_plan[1] if len(raw_plan) > 1 else []),
-            _course_to_text("Dinner", raw_plan[2] if len(raw_plan) > 2 else []),
-        ])
-
-        fvs_count, fvs_reasoning = _unique_variety_count(raw_plan)
-        logger.info("[%s] FVS score: %d unique ingredients.", session_id, fvs_count)
-
-        logger.info("[%s] Running LLM diversity grader.", session_id)
-        diversity_grader = MealDiversityGrader()
-        diversity_res = diversity_grader.score(plan_text)
-        diversity_score = int(diversity_res.get("score", 0))
-        diversity_reason = str(diversity_res.get("reasoning", ""))
-        logger.info("[%s] Diversity score: %d.", session_id, diversity_score)
-
-        logger.info("[%s] Running guideline adherence grader.", session_id)
-        try:
-            from pathlib import Path as _Path
-            guidelines_path = _Path(__file__).resolve().parents[2] / "belgium_dietary_guidelines_augmentation.cypher"
-            with open(guidelines_path, "r", encoding="utf-8") as f:
-                guidelines_text = f.read()
-        except Exception as e:
-            logger.warning("[%s] Could not load guidelines file: %s", session_id, e)
-            guidelines_text = ""
-        guidelines_grader = GuidelineAdherenceGrader()
-        guidelines_res = guidelines_grader.score(plan_text, guidelines_text)
-        guideline_score = int(guidelines_res.get("score", 0))
-        guideline_reason = str(guidelines_res.get("reasoning", ""))
-        logger.info("[%s] Guideline adherence score: %d.", session_id, guideline_score)
-
-        metrics = {
-            "llm_score": llm_score,
-            "llm_reasoning": llm_reasoning,
-            "fvs_count": fvs_count,
-            "fvs_reasoning": fvs_reasoning,
-            "diversity_llm_score": diversity_score,
-            "diversity_llm_reasoning": diversity_reason,
-            "guideline_adherence_score": guideline_score,
-            "guideline_adherence_reasoning": guideline_reason,
-        }
-
-        # Use refine vs. add depending on whether we're updating the canvas
         if is_refinement:
             meal_plan = self.session_service.refine_meal_plan(
-                session_id, raw_plan, llm_reasoning, metrics
+                session_id, best.courses, best.reasoning, metrics
             )
             logger.info(
                 "[%s] Refined daily plan → %s (v%d, parent=%s).",
                 session_id, meal_plan.id, meal_plan.version, meal_plan.parent_id,
             )
-        else:
-            meal_plan = self.session_service.add_meal_plan(
-                session_id, raw_plan, llm_reasoning, metrics
-            )
-            logger.info(
-                "[%s] New daily plan %s stored (scores: llm=%d, fvs=%d, diversity=%d, guidelines=%d).",
-                session_id, meal_plan.id, llm_score, fvs_count, diversity_score, guideline_score,
-            )
-
-        if is_refinement:
             formatted = (
                 "Here's your updated meal plan! I've made the adjustments you asked for. "
                 "Let me know if you'd like anything else changed."
             )
         else:
+            meal_plan = self.session_service.add_meal_plan(
+                session_id, best.courses, best.reasoning, metrics
+            )
+            logger.info("[%s] New daily plan %s stored (metrics=%s).", session_id, meal_plan.id, metrics)
             formatted = (
                 "Here's your meal plan for today! "
                 "I've picked out breakfast, lunch, and dinner based on your preferences. "
@@ -287,5 +246,41 @@ class ChatService:
             )
 
         self.session_service.add_message(session_id, "assistant", formatted)
-
         return formatted, False, meal_plan
+
+    def _compute_metrics(self, session_id: str, plan: ScoredPlan) -> dict:
+        """Compute the four plan-quality metrics surfaced in the API response."""
+        plan_text = _plan_as_text(plan)
+
+        fvs_count, fvs_reasoning = _food_variety_score(plan)
+        logger.info("[%s] FVS: %d unique ingredients.", session_id, fvs_count)
+
+        diversity = self.diversity_grader.score(plan_text)
+
+        guidelines_text = ""
+        try:
+            guidelines_text = GUIDELINES_PATH.read_text(encoding="utf-8")
+        except OSError as e:
+            logger.warning("[%s] Guidelines file unavailable (%s) — scoring without it.", session_id, e)
+        adherence = self.guideline_grader.score(plan_text, guidelines_text)
+
+        return {
+            "llm_score": plan.score,
+            "llm_reasoning": plan.reasoning,
+            "fvs_count": fvs_count,
+            "fvs_reasoning": fvs_reasoning,
+            "diversity_llm_score": int(diversity.get("score", 0)),
+            "diversity_llm_reasoning": str(diversity.get("reasoning", "")),
+            "guideline_adherence_score": int(adherence.get("score", 0)),
+            "guideline_adherence_reasoning": str(adherence.get("reasoning", "")),
+        }
+
+    # ------------------------------------------------------------------ #
+    # Helpers                                                              #
+    # ------------------------------------------------------------------ #
+
+    def _get_session(self, session_id: str):
+        session = self.session_service.get_session(session_id)
+        if not session:
+            raise ValueError(f"Session {session_id} not found")
+        return session

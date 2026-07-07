@@ -1,24 +1,32 @@
+"""
+Service singletons and startup wiring.
+
+Initialization order (main.py): session/profile services are import-time
+singletons; chat → weekly → orchestrator are created by the init_* functions
+in that order (the orchestrator requires the other two). Since M0 there is no
+data-file dependency, so all services initialize unconditionally at startup.
+"""
+
 from .session_service import SessionService
 from .profile_service import ProfileService
 from .chat_service import ChatService
 from .weekly_plan_service import WeeklyPlanService
 from .orchestrator_service import OrchestratorService
 
-# Singleton instances
+# Import-time singletons
 session_service = SessionService()
 profile_service = ProfileService()
 
-# Services initialized lazily or after other dependencies
+# Created at startup via the init_* functions below
 chat_service: ChatService | None = None
 weekly_plan_service: WeeklyPlanService | None = None
 orchestrator_service: OrchestratorService | None = None
 
 
-def init_chat_service(foodchat, config) -> ChatService | None:
-    """Initialize the chat service singleton (requires foodchat to be loaded)."""
+def init_chat_service() -> ChatService:
+    """Initialize the chat service singleton."""
     global chat_service
-    if foodchat is not None:
-        chat_service = ChatService(foodchat, config, session_service)
+    chat_service = ChatService(session_service)
     return chat_service
 
 
@@ -29,15 +37,16 @@ def init_weekly_plan_service() -> WeeklyPlanService:
     return weekly_plan_service
 
 
-def init_orchestrator_service() -> OrchestratorService | None:
-    """Initialize the orchestrator service singleton (requires chat + weekly services)."""
+def init_orchestrator_service() -> OrchestratorService:
+    """Initialize the orchestrator singleton (requires chat + weekly services)."""
     global orchestrator_service
-    if chat_service is not None and weekly_plan_service is not None:
-        orchestrator_service = OrchestratorService(
-            session_service=session_service,
-            chat_service=chat_service,
-            weekly_plan_service=weekly_plan_service,
-        )
+    if chat_service is None or weekly_plan_service is None:
+        raise RuntimeError("init_chat_service/init_weekly_plan_service must run first")
+    orchestrator_service = OrchestratorService(
+        session_service=session_service,
+        chat_service=chat_service,
+        weekly_plan_service=weekly_plan_service,
+    )
     return orchestrator_service
 
 

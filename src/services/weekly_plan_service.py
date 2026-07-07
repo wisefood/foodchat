@@ -1,5 +1,5 @@
 import logging
-from typing import List, Tuple, Optional
+from typing import Tuple
 
 from .session_service import SessionService
 from .weekly_planner.action_adapter import RecipeActionSpace
@@ -7,7 +7,7 @@ from .weekly_planner.reward_logic import RewardCalculator
 from .weekly_planner.environment import WeeklyMealPlanEnv
 from .weekly_planner.planner import WeeklyPlanner
 from agents import DietaryIntentExtractor
-from models.session import WeeklyMealPlan, Message
+from models.session import WeeklyMealPlan
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +53,7 @@ class WeeklyPlanService:
             "[%s] Weekly plan requested (refinement=%s): %.120s",
             session_id, is_refinement, content,
         )
-        self.session_service.add_weekly_message(session_id, "user", content)
+        self.session_service.add_message(session_id, "user", content)
 
         # Inject existing canvas plan as context for the planner when refining
         effective_query = content
@@ -108,18 +108,6 @@ class WeeklyPlanService:
                 "Let me know if you'd like to swap anything out or adjust it."
             )
 
-        self.session_service.add_weekly_message(session_id, "assistant", response_text)
+        self.session_service.add_message(session_id, "assistant", response_text)
 
         return response_text, weekly_plan
-
-    def get_weekly_messages(self, session_id: str) -> List[Message]:
-        session = self.session_service.get_session(session_id)
-        if not session:
-            raise ValueError(f"Session {session_id} not found")
-        return session.weekly_messages
-
-    def get_weekly_meal_plans(self, session_id: str) -> List[WeeklyMealPlan]:
-        session = self.session_service.get_session(session_id)
-        if not session:
-            raise ValueError(f"Session {session_id} not found")
-        return session.weekly_meal_plans

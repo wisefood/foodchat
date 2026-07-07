@@ -1,9 +1,11 @@
 """
-SessionService — persists sessions and messages to SQLite via db.py.
+SessionService — session/message/plan persistence via db.py.
 
 Conversation messages are written to the DB immediately on creation.
 MealPlan / WeeklyMealPlan objects are kept in-memory and also persisted
-as JSON blobs in the meal_plans table.
+as JSON blobs in the meal_plans table. The in-memory dict is a cache in
+front of the DB (``_load_from_db`` repopulates it on demand); the DB row is
+the source of truth, including the serialized clarification state.
 
 Each plan type maintains an independent "canvas": a versioned lineage of
 plans generated and refined within a session.  When the user asks to
@@ -13,15 +15,14 @@ is frozen and a fresh canvas for the new type is started.
 
 import json
 import logging
-from datetime import datetime as dt
-from typing import Dict, Optional, List
 import uuid
+from datetime import datetime as dt
+from typing import Dict, List, Optional
 
 from db import (
     SessionLocal,
     db_create_session,
     db_get_session,
-    db_get_session_scoped,
     db_delete_session,
     db_get_member_sessions,
     db_add_message,
@@ -31,8 +32,8 @@ from db import (
     db_save_meal_plan,
     db_get_session_meal_plans,
     db_get_meal_plan,
-    db_get_plan_lineage,
 )
+from models.recipe import CandidateRecipe
 from models.session import (
     Message,
     MealPlan,
@@ -95,11 +96,16 @@ class SessionService:
 
             user_profile = json.loads(row.user_profile)
 
+            clarification = None
+            if getattr(row, "clarification_state", None):
+                clarification = json.loads(row.clarification_state)
+
             session = Session(
                 session_id=row.session_id,
                 member_id=row.member_id,
                 user_profile=user_profile,
                 state=row.state,
+                clarification=clarification,
                 max_messages=row.max_messages,
                 created_at=row.created_at,
             )
@@ -207,9 +213,6 @@ class SessionService:
 
         return message
 
-    def add_weekly_message(self, session_id: str, role: str, content: str) -> Message:
-        return self.add_message(session_id, role, content)
-
     def get_messages_page(
         self,
         session_id: str,
@@ -241,7 +244,7 @@ class SessionService:
     def add_meal_plan(
         self,
         session_id: str,
-        meal_plan_tuple: tuple,
+        courses: List[CandidateRecipe],
         reasoning: str,
         metrics: dict | None = None,
     ) -> MealPlan:
@@ -250,7 +253,7 @@ class SessionService:
         if not session:
             raise ValueError(f"Session {session_id} not found")
 
-        meal_plan = MealPlan.from_response(meal_plan_tuple, reasoning, metrics, version=1, parent_id=None)
+        meal_plan = MealPlan.from_courses(courses, reasoning, metrics, version=1, parent_id=None)
         session.meal_plans.append(meal_plan)
 
         db = SessionLocal()
@@ -276,7 +279,7 @@ class SessionService:
     def refine_meal_plan(
         self,
         session_id: str,
-        meal_plan_tuple: tuple,
+        courses: List[CandidateRecipe],
         reasoning: str,
         metrics: dict | None = None,
     ) -> MealPlan:
@@ -287,14 +290,14 @@ class SessionService:
 
         if session.daily_canvas is None:
             # No existing canvas — treat as a fresh plan
-            return self.add_meal_plan(session_id, meal_plan_tuple, reasoning, metrics)
+            return self.add_meal_plan(session_id, courses, reasoning, metrics)
 
         parent = session.get_current_daily_plan()
         parent_id = parent.id if parent else None
         next_version = (parent.version + 1) if parent else 1
 
-        meal_plan = MealPlan.from_response(
-            meal_plan_tuple, reasoning, metrics,
+        meal_plan = MealPlan.from_courses(
+            courses, reasoning, metrics,
             version=next_version, parent_id=parent_id,
         )
         session.meal_plans.append(meal_plan)
@@ -447,21 +450,20 @@ class SessionService:
             db.close()
 
     # ------------------------------------------------------------------ #
-    # Clarification state (in-memory only — generator not serialisable)   #
+    # Clarification state (serialized dict — persisted, restart-safe)     #
     # ------------------------------------------------------------------ #
 
-    def set_clarification_state(self, session_id: str, generator, pending_data: dict, pending_intent: str = "daily_plan") -> None:
+    def set_clarification_state(self, session_id: str, state_dict: dict) -> None:
+        """Persist an in-progress clarification (serialized ClarificationState)."""
         session = self._sessions.get(session_id)
         if not session:
             raise ValueError(f"Session {session_id} not found")
         session.state = "clarifying"
-        session.clarification_generator = generator
-        session.pending_rag_data = pending_data
-        session.pending_intent = pending_intent
+        session.clarification = state_dict
 
         db = SessionLocal()
         try:
-            db_update_state(db, session_id, "clarifying")
+            db_update_state(db, session_id, "clarifying", clarification_state=json.dumps(state_dict))
         finally:
             db.close()
 
@@ -470,13 +472,11 @@ class SessionService:
         if not session:
             raise ValueError(f"Session {session_id} not found")
         session.state = "ready"
-        session.clarification_generator = None
-        session.pending_rag_data = None
-        session.pending_intent = None
+        session.clarification = None
 
         db = SessionLocal()
         try:
-            db_update_state(db, session_id, "ready")
+            db_update_state(db, session_id, "ready", clarification_state=None)
         finally:
             db.close()
 

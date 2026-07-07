@@ -61,6 +61,9 @@ class SessionRow(Base):
     daily_canvas = Column(Text, nullable=True)
     weekly_canvas = Column(Text, nullable=True)
     state = Column(String, default="ready")
+    # Serialized ClarificationState (JSON) while state == "clarifying" — makes
+    # the clarification flow restart-safe (see services/clarification.py).
+    clarification_state = Column(Text, nullable=True)
     max_messages = Column(Integer, default=200)
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -121,6 +124,7 @@ def _migrate_existing_db() -> None:
         session_migrations = [
             ("daily_canvas", "TEXT"),
             ("weekly_canvas", "TEXT"),
+            ("clarification_state", "TEXT"),
         ]
         for col_name, col_type in session_migrations:
             if col_name not in existing_session_cols:
@@ -206,10 +210,21 @@ def db_update_canvases(
         db.commit()
 
 
-def db_update_state(db: DBSession, session_id: str, state: str) -> None:
+def db_update_state(
+    db: DBSession,
+    session_id: str,
+    state: str,
+    clarification_state: Optional[str] = None,
+) -> None:
+    """Update the session state and its clarification payload atomically.
+
+    ``clarification_state`` is the serialized JSON while clarifying and must
+    be explicitly None when returning to "ready" (the two always change together).
+    """
     row = db.query(SessionRow).filter(SessionRow.session_id == session_id).first()
     if row:
         row.state = state
+        row.clarification_state = clarification_state
         db.commit()
 
 
@@ -392,13 +407,3 @@ def db_upsert_feedback(
 
 def db_get_feedback(db: DBSession, message_id: int) -> list[FeedbackRow]:
     return db.query(FeedbackRow).filter(FeedbackRow.message_id == message_id).all()
-
-
-# ------------------------------------------------------------------ #
-# Legacy shim — kept so any direct callers of db_update_active_context
-# don't crash until they are updated.
-# ------------------------------------------------------------------ #
-
-def db_update_active_context(db: DBSession, session_id: str, active_context: Optional[dict]) -> None:
-    """Deprecated — use db_update_canvases instead. No-op stub."""
-    pass

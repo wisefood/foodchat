@@ -1,3 +1,23 @@
+"""
+FoodChat HTTP API.
+
+All conversational traffic goes through ONE endpoint —
+``POST /foodchat/sessions/{session_id}/chat`` — which classifies intent
+server-side and routes internally (see services/orchestrator_service.py).
+The remaining endpoints are session lifecycle, plan/canvas reads,
+paginated conversation history, and message feedback.
+
+Authorization model: FoodChat sits behind the wisefood-api gateway, which
+authenticates the Keycloak user and passes the household member's
+``member_id`` as data. Every session-scoped endpoint therefore REQUIRES the
+member_id and verifies it matches the session owner — this is the only
+access control at this layer, so never make it optional.
+
+Removed in M0 (see CHANGES.md): the legacy pre-orchestrator endpoints
+``POST/GET /sessions/{id}/messages`` and ``POST/GET /sessions/{id}/weekly``.
+Their gateway proxies were removed in the same change.
+"""
+
 import logging
 from datetime import datetime
 from typing import List, Optional
@@ -6,10 +26,10 @@ from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel
 
 import services
-
-logger = logging.getLogger(__name__)
 from db import SessionLocal, db_upsert_feedback, db_get_message_by_id
 from models.session import MealCourse
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/foodchat",
@@ -33,10 +53,6 @@ class SessionResponse(BaseModel):
     state: str
     message_count: int
     created_at: datetime
-
-
-class MessageRequest(BaseModel):
-    content: str
 
 
 class MealCourseResponse(BaseModel):
@@ -78,28 +94,21 @@ class MealPlanResponse(BaseModel):
         return cls(
             id=mp.id,
             created_at=mp.created_at,
-            version=getattr(mp, "version", 1),
-            parent_id=getattr(mp, "parent_id", None),
+            version=mp.version,
+            parent_id=mp.parent_id,
             breakfast=MealCourseResponse.from_meal_course(mp.breakfast),
             lunch=MealCourseResponse.from_meal_course(mp.lunch),
             dinner=MealCourseResponse.from_meal_course(mp.dinner),
             reasoning=mp.reasoning,
-            llm_score=getattr(mp, "llm_score", None),
-            llm_reasoning=getattr(mp, "llm_reasoning", None),
-            fvs_count=getattr(mp, "fvs_count", None),
-            fvs_reasoning=getattr(mp, "fvs_reasoning", None),
-            diversity_llm_score=getattr(mp, "diversity_llm_score", None),
-            diversity_llm_reasoning=getattr(mp, "diversity_llm_reasoning", None),
-            guideline_adherence_score=getattr(mp, "guideline_adherence_score", None),
-            guideline_adherence_reasoning=getattr(mp, "guideline_adherence_reasoning", None),
+            llm_score=mp.llm_score,
+            llm_reasoning=mp.llm_reasoning,
+            fvs_count=mp.fvs_count,
+            fvs_reasoning=mp.fvs_reasoning,
+            diversity_llm_score=mp.diversity_llm_score,
+            diversity_llm_reasoning=mp.diversity_llm_reasoning,
+            guideline_adherence_score=mp.guideline_adherence_score,
+            guideline_adherence_reasoning=mp.guideline_adherence_reasoning,
         )
-
-
-class MessageResponse(BaseModel):
-    role: str
-    content: str
-    needs_clarification: bool = False
-    meal_plan: Optional[MealPlanResponse] = None
 
 
 class WeeklyMealPlanEntryResponse(BaseModel):
@@ -122,25 +131,10 @@ class WeeklyMealPlanResponse(BaseModel):
         return cls(
             id=wmp.id,
             created_at=wmp.created_at,
-            version=getattr(wmp, "version", 1),
-            parent_id=getattr(wmp, "parent_id", None),
+            version=wmp.version,
+            parent_id=wmp.parent_id,
             entries=[WeeklyMealPlanEntryResponse(**entry) for entry in wmp.entries],
         )
-
-
-class WeeklyMessageResponse(BaseModel):
-    role: str
-    content: str
-    weekly_meal_plan: Optional[WeeklyMealPlanResponse] = None
-
-
-class MessageHistoryItem(BaseModel):
-    role: str
-    content: str
-    timestamp: datetime
-
-
-# --- Unified chat models ---
 
 
 class ChatRequest(BaseModel):
@@ -180,49 +174,35 @@ class FeedbackResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Service guards
+# Service guard
 # ---------------------------------------------------------------------------
 
 
 def _require_orchestrator_service():
+    """Defensive guard — the orchestrator is initialized unconditionally at
+    startup since M0 (no data-file dependency), so this should never fire."""
     if services.orchestrator_service is None:
-        logger.error(
-            "Request reached /chat but orchestrator_service is None. "
-            "Root cause: FoodChat failed to initialize at startup (missing CSV data or embeddings). "
-            "Check startup logs for 'CSV file not found' or embedding errors."
-        )
+        logger.error("orchestrator_service is None — startup initialization failed.")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Orchestrator service unavailable — recipe data not loaded at startup. Check server logs.",
+            detail="Orchestrator service unavailable. Check server logs.",
         )
     return services.orchestrator_service
 
 
-def _require_chat_service():
-    if services.chat_service is None:
-        logger.error(
-            "Request reached a chat endpoint but chat_service is None. "
-            "FoodChat system was not initialized — CSV data missing or embeddings failed."
-        )
+def _require_session(session_id: str, member_id: str):
+    """Load a session and enforce owner access (404 on mismatch, never 403 —
+    a mismatched member must not learn that the session exists)."""
+    session = services.session_service.get_session(session_id, member_id=member_id)
+    if not session:
         raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Chat service unavailable — CSV data not loaded. Check server logs.",
+            status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or access denied"
         )
-    return services.chat_service
-
-
-def _require_weekly_plan_service():
-    if services.weekly_plan_service is None:
-        logger.error("weekly_plan_service is None — this should not happen after startup.")
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Weekly plan service unavailable. Check server logs.",
-        )
-    return services.weekly_plan_service
+    return session
 
 
 # ---------------------------------------------------------------------------
-# Endpoints
+# Session lifecycle
 # ---------------------------------------------------------------------------
 
 
@@ -230,7 +210,7 @@ def _require_weekly_plan_service():
     "/sessions", response_model=SessionResponse, status_code=status.HTTP_201_CREATED
 )
 async def create_session(request: CreateSessionRequest):
-    """Create a new chat session for a household member."""
+    """Create a new chat session; fetches the member's profile from WiseFood."""
     try:
         user_profile = services.profile_service.get_member_profile(request.member_id)
         session = services.session_service.create_session(request.member_id, user_profile)
@@ -239,7 +219,7 @@ async def create_session(request: CreateSessionRequest):
             session_id=session.session_id,
             member_id=session.member_id,
             state=session.state,
-            message_count=len(session.messages),
+            message_count=len(session.conversation),
             created_at=session.created_at,
         )
     except Exception as e:
@@ -255,11 +235,7 @@ async def get_session(
     member_id: str = Query(..., description="Must match session owner"),
 ):
     """Get session state and metadata. Only the owning member may read it."""
-    session = services.session_service.get_session(session_id, member_id=member_id)
-    if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or access denied"
-        )
+    session = _require_session(session_id, member_id)
     return SessionResponse(
         session_id=session.session_id,
         member_id=session.member_id,
@@ -281,201 +257,6 @@ async def delete_session(
         )
 
 
-@router.post("/sessions/{session_id}/messages", response_model=MessageResponse)
-async def send_message(
-    session_id: str,
-    request: MessageRequest,
-    member_id: str = Query(..., description="Must match session owner"),
-):
-    """Send a message and get a response (legacy daily-plan endpoint)."""
-    chat_svc = _require_chat_service()
-
-    session = services.session_service.get_session(session_id, member_id=member_id)
-    if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or access denied"
-        )
-
-    try:
-        response_text, needs_clarification, meal_plan = chat_svc.process_message(
-            session_id, request.content
-        )
-        meal_plan_resp = MealPlanResponse.from_meal_plan(meal_plan) if meal_plan else None
-        return MessageResponse(
-            role="assistant",
-            content=response_text,
-            needs_clarification=needs_clarification,
-            meal_plan=meal_plan_resp,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
-
-
-@router.get("/sessions/{session_id}/messages", response_model=List[MessageHistoryItem])
-async def get_messages(
-    session_id: str,
-    limit: Optional[int] = None,
-    member_id: str = Query(..., description="Must match session owner"),
-):
-    """Get message history for a session. Only the owning member may read it."""
-    session = services.session_service.get_session(session_id, member_id=member_id)
-    if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or access denied"
-        )
-
-    messages = session.messages
-    if limit:
-        messages = messages[-limit:]
-
-    return [
-        MessageHistoryItem(role=msg.role, content=msg.content, timestamp=msg.timestamp)
-        for msg in messages
-    ]
-
-
-@router.get("/sessions/{session_id}/meal-plans", response_model=List[MealPlanResponse])
-async def get_meal_plans(
-    session_id: str,
-    member_id: str = Query(..., description="Must match session owner"),
-):
-    """Get all daily meal plan versions in this session (canvas history)."""
-    session = services.session_service.get_session(session_id, member_id=member_id)
-    if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or access denied"
-        )
-    return [MealPlanResponse.from_meal_plan(mp) for mp in session.meal_plans]
-
-
-@router.get("/sessions/{session_id}/meal-plans/current", response_model=Optional[MealPlanResponse])
-async def get_current_meal_plan(
-    session_id: str,
-    member_id: str = Query(..., description="Must match session owner"),
-):
-    """Get the current (latest) daily meal plan on the canvas."""
-    session = services.session_service.get_session(session_id, member_id=member_id)
-    if not session:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or access denied")
-    plan = session.get_current_daily_plan()
-    if plan is None:
-        return None
-    return MealPlanResponse.from_meal_plan(plan)
-
-
-@router.get("/sessions/{session_id}/meal-plans/history", response_model=List[MealPlanResponse])
-async def get_daily_plan_history(
-    session_id: str,
-    member_id: str = Query(..., description="Must match session owner"),
-):
-    """
-    Get the full version history of daily meal plans for this session,
-    ordered oldest to newest. Each entry has version and parent_id set,
-    so the caller can reconstruct the refinement chain.
-    """
-    session = services.session_service.get_session(session_id, member_id=member_id)
-    if not session:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or access denied")
-    plans = services.session_service.get_daily_plan_history(session_id)
-    return [MealPlanResponse.from_meal_plan(mp) for mp in plans]
-
-
-@router.post("/sessions/{session_id}/weekly", response_model=WeeklyMessageResponse)
-async def send_weekly_message(
-    session_id: str,
-    request: MessageRequest,
-    member_id: str = Query(..., description="Must match session owner"),
-):
-    """Send a message to generate a 7-day weekly meal plan (legacy endpoint)."""
-    weekly_svc = _require_weekly_plan_service()
-
-    session = services.session_service.get_session(session_id, member_id=member_id)
-    if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or access denied"
-        )
-
-    try:
-        response_text, weekly_plan = weekly_svc.process_message(
-            session_id, request.content
-        )
-        return WeeklyMessageResponse(
-            role="assistant",
-            content=response_text,
-            weekly_meal_plan=WeeklyMealPlanResponse.from_weekly_meal_plan(weekly_plan),
-        )
-    except Exception as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
-
-
-@router.get("/sessions/{session_id}/weekly", response_model=List[MessageHistoryItem])
-async def get_weekly_messages(
-    session_id: str,
-    limit: Optional[int] = None,
-    member_id: str = Query(..., description="Must match session owner"),
-):
-    """Get weekly message history for a session. Only the owning member may read it."""
-    session = services.session_service.get_session(session_id, member_id=member_id)
-    if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or access denied"
-        )
-
-    messages = session.weekly_messages
-    if limit:
-        messages = messages[-limit:]
-
-    return [
-        MessageHistoryItem(role=msg.role, content=msg.content, timestamp=msg.timestamp)
-        for msg in messages
-    ]
-
-
-@router.get("/sessions/{session_id}/weekly-meal-plans", response_model=List[WeeklyMealPlanResponse])
-async def get_weekly_meal_plans(
-    session_id: str,
-    member_id: str = Query(..., description="Must match session owner"),
-):
-    """Get all weekly meal plan versions in this session (canvas history)."""
-    session = services.session_service.get_session(session_id, member_id=member_id)
-    if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or access denied"
-        )
-    return [WeeklyMealPlanResponse.from_weekly_meal_plan(wmp) for wmp in session.weekly_meal_plans]
-
-
-@router.get("/sessions/{session_id}/weekly-meal-plans/current", response_model=Optional[WeeklyMealPlanResponse])
-async def get_current_weekly_meal_plan(
-    session_id: str,
-    member_id: str = Query(..., description="Must match session owner"),
-):
-    """Get the current (latest) weekly meal plan on the canvas."""
-    session = services.session_service.get_session(session_id, member_id=member_id)
-    if not session:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or access denied")
-    plan = session.get_current_weekly_plan()
-    if plan is None:
-        return None
-    return WeeklyMealPlanResponse.from_weekly_meal_plan(plan)
-
-
-@router.get("/sessions/{session_id}/weekly-meal-plans/history", response_model=List[WeeklyMealPlanResponse])
-async def get_weekly_plan_history(
-    session_id: str,
-    member_id: str = Query(..., description="Must match session owner"),
-):
-    """
-    Get the full version history of weekly meal plans for this session,
-    ordered oldest to newest. Each entry has version and parent_id set.
-    """
-    session = services.session_service.get_session(session_id, member_id=member_id)
-    if not session:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or access denied")
-    plans = services.session_service.get_weekly_plan_history(session_id)
-    return [WeeklyMealPlanResponse.from_weekly_meal_plan(wmp) for wmp in plans]
-
-
 @router.get("/members/{member_id}/sessions", response_model=List[SessionResponse])
 async def get_member_sessions(member_id: str):
     """Get all sessions for a specific member."""
@@ -485,11 +266,16 @@ async def get_member_sessions(member_id: str):
             session_id=s.session_id,
             member_id=s.member_id,
             state=s.state,
-            message_count=len(s.messages),
+            message_count=len(s.conversation),
             created_at=s.created_at,
         )
         for s in sessions
     ]
+
+
+# ---------------------------------------------------------------------------
+# Unified chat
+# ---------------------------------------------------------------------------
 
 
 @router.post("/sessions/{session_id}/chat", response_model=ChatTurnResponse)
@@ -502,7 +288,7 @@ async def unified_chat(session_id: str, request: ChatRequest):
       - weekly_plan      → new weekly meal plan (fresh canvas)
       - refine_plan      → update the active canvas plan in-place (version++)
       - switch_plan_type → freeze current canvas type, start fresh canvas of the other type
-      - chat             → general nutrition / cooking conversation
+      - chat             → general conversation
 
     The caller must supply member_id to prove session ownership.
 
@@ -528,21 +314,16 @@ async def unified_chat(session_id: str, request: ChatRequest):
         logger.error("[%s] /chat 500: %s", session_id, e, exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
-    meal_plan_resp = None
-    if turn.meal_plan is not None:
-        meal_plan_resp = MealPlanResponse.from_meal_plan(turn.meal_plan)
-
-    weekly_resp = None
-    if turn.weekly_meal_plan is not None:
-        weekly_resp = WeeklyMealPlanResponse.from_weekly_meal_plan(turn.weekly_meal_plan)
-
     return ChatTurnResponse(
         role=turn.role,
         content=turn.content,
         intent=turn.intent,
         needs_clarification=turn.needs_clarification,
-        meal_plan=meal_plan_resp,
-        weekly_meal_plan=weekly_resp,
+        meal_plan=MealPlanResponse.from_meal_plan(turn.meal_plan) if turn.meal_plan else None,
+        weekly_meal_plan=(
+            WeeklyMealPlanResponse.from_weekly_meal_plan(turn.weekly_meal_plan)
+            if turn.weekly_meal_plan else None
+        ),
         at_message_limit=turn.at_message_limit,
         plan_version=turn.plan_version,
         plan_parent_id=turn.plan_parent_id,
@@ -565,9 +346,7 @@ async def get_conversation(
 
     Returns messages oldest-first so the UI can prepend to the top of the chat.
     """
-    session = services.session_service.get_session(session_id, member_id=member_id)
-    if not session:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or access denied")
+    _require_session(session_id, member_id)
 
     page = services.session_service.get_messages_page(session_id, before_id=before_id, limit=limit)
 
@@ -591,6 +370,83 @@ async def get_conversation(
     )
 
 
+# ---------------------------------------------------------------------------
+# Plan / canvas reads
+# ---------------------------------------------------------------------------
+
+
+@router.get("/sessions/{session_id}/meal-plans", response_model=List[MealPlanResponse])
+async def get_meal_plans(
+    session_id: str,
+    member_id: str = Query(..., description="Must match session owner"),
+):
+    """Get all daily meal plan versions in this session (canvas history)."""
+    session = _require_session(session_id, member_id)
+    return [MealPlanResponse.from_meal_plan(mp) for mp in session.meal_plans]
+
+
+@router.get("/sessions/{session_id}/meal-plans/current", response_model=Optional[MealPlanResponse])
+async def get_current_meal_plan(
+    session_id: str,
+    member_id: str = Query(..., description="Must match session owner"),
+):
+    """Get the current (latest) daily meal plan on the canvas."""
+    session = _require_session(session_id, member_id)
+    plan = session.get_current_daily_plan()
+    return MealPlanResponse.from_meal_plan(plan) if plan else None
+
+
+@router.get("/sessions/{session_id}/meal-plans/history", response_model=List[MealPlanResponse])
+async def get_daily_plan_history(
+    session_id: str,
+    member_id: str = Query(..., description="Must match session owner"),
+):
+    """
+    Full version history of daily meal plans, oldest first. Each entry has
+    version and parent_id set so the caller can reconstruct the refinement chain.
+    """
+    _require_session(session_id, member_id)
+    plans = services.session_service.get_daily_plan_history(session_id)
+    return [MealPlanResponse.from_meal_plan(mp) for mp in plans]
+
+
+@router.get("/sessions/{session_id}/weekly-meal-plans", response_model=List[WeeklyMealPlanResponse])
+async def get_weekly_meal_plans(
+    session_id: str,
+    member_id: str = Query(..., description="Must match session owner"),
+):
+    """Get all weekly meal plan versions in this session (canvas history)."""
+    session = _require_session(session_id, member_id)
+    return [WeeklyMealPlanResponse.from_weekly_meal_plan(wmp) for wmp in session.weekly_meal_plans]
+
+
+@router.get("/sessions/{session_id}/weekly-meal-plans/current", response_model=Optional[WeeklyMealPlanResponse])
+async def get_current_weekly_meal_plan(
+    session_id: str,
+    member_id: str = Query(..., description="Must match session owner"),
+):
+    """Get the current (latest) weekly meal plan on the canvas."""
+    session = _require_session(session_id, member_id)
+    plan = session.get_current_weekly_plan()
+    return WeeklyMealPlanResponse.from_weekly_meal_plan(plan) if plan else None
+
+
+@router.get("/sessions/{session_id}/weekly-meal-plans/history", response_model=List[WeeklyMealPlanResponse])
+async def get_weekly_plan_history(
+    session_id: str,
+    member_id: str = Query(..., description="Must match session owner"),
+):
+    """Full version history of weekly meal plans, oldest first."""
+    _require_session(session_id, member_id)
+    plans = services.session_service.get_weekly_plan_history(session_id)
+    return [WeeklyMealPlanResponse.from_weekly_meal_plan(wmp) for wmp in plans]
+
+
+# ---------------------------------------------------------------------------
+# Feedback
+# ---------------------------------------------------------------------------
+
+
 @router.post(
     "/sessions/{session_id}/messages/{message_id}/feedback",
     response_model=FeedbackResponse,
@@ -607,9 +463,7 @@ async def submit_feedback(session_id: str, message_id: int, request: FeedbackReq
             detail="rating must be 'up' or 'down'",
         )
 
-    session = services.session_service.get_session(session_id, member_id=request.member_id)
-    if not session:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or access denied")
+    _require_session(session_id, request.member_id)
 
     db = SessionLocal()
     try:

@@ -42,7 +42,6 @@ RUN pip install --no-cache-dir \
 
 # Copy application code
 COPY src/ ./src/
-COPY KG_neo4j/ ./KG_neo4j/
 
 # Set working directory to src
 WORKDIR /app/src
@@ -70,10 +69,6 @@ RUN groupadd -r foodchat && useradd -r -g foodchat foodchat
 
 # Copy application code
 COPY src/ ./src/
-COPY KG_neo4j/ ./KG_neo4j/
-
-# Create data directory (mount volume in prod)
-RUN mkdir -p ./data
 
 # Set ownership
 RUN chown -R foodchat:foodchat /app
@@ -98,5 +93,5 @@ ENV PYTHONUNBUFFERED=1
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:8000/foodchat/health || exit 1
 
-# Run with single worker (ChromaDB PersistentClient doesn't support concurrent access)
+# Single worker until the session cache is replica-safe (planned Postgres milestone)
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

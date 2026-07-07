@@ -3,9 +3,9 @@ import logging
 from typing import Dict, Any, List, Optional, TYPE_CHECKING
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from src.backend.groq import GROQ_CHAT
-from src.prompts import GRADER_SYSTEM_INSTRUCTIONS, GRADER_USER_INSTRUCTIONS
-from src.schemas import ScoringSchema
+from backend.groq import GROQ_CHAT
+from prompts import GRADER_SYSTEM_INSTRUCTIONS, GRADER_USER_INSTRUCTIONS
+from schemas import ScoringSchema
 
 if TYPE_CHECKING:
     from .state_tracking import WeeklyNutritionalTracker

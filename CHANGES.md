@@ -1,6 +1,84 @@
-# FoodChat — Canvas & Version History Refactor
+# FoodChat — Change Log (newest first)
 
-> **Date:** 2026-04-22  
+---
+
+# M0 — Clean Foundation
+
+> **Date:** 2026-07-07
+> **Branch:** main
+> Prepared for handoff. DB migration is idempotent (adds `sessions.clarification_state`).
+> Removed endpoints were deleted from the wisefood-api gateway in the same change.
+
+## Why
+
+Structural debt removal before the RecSys '26 feature milestones: the service
+carried a dead local-RAG stack that gated startup, an unserializable
+clarification flow, a cross-user memory leak, and double intent
+classification. Full rationale lives in the internal roadmap (milestone M0).
+
+## Removed
+
+- **Legacy RAG stack** — `src/foodchat.py` (Retriever/Chroma/BM25/MMR chains),
+  `src/utils.py` (embedding backends), `src/csv_processor.py`,
+  `src/pdf_processor.py`, `src/foodchat_init.py`, `src/VECTORSTORE/`,
+  `Modelfile`, `migrate.py`. Recipe candidates come exclusively from
+  RecipeWrangler. The service now boots with **no data files**; the
+  503-at-startup failure mode is gone.
+- **`KG_neo4j/`** — direct-Neo4j fallback + importer. Survivor: the RW API
+  client, rewritten as `src/services/candidates_client.py` (typed).
+  `RECIPE_SOURCE`, `NEO4J_*`, `CHROMA_*` env vars no longer exist.
+- **Offline eval harnesses** — `src/multiple_evaluation.py`, `src/ragas_eval.py`,
+  `llm_eval_res.json`, `trace.json` (Ollama-era; recoverable from git history)
+  and their agents (`FoodChatResponseEvaluator`, `QueryRewriter`, `FeedBackRewriter`).
+- **`QueryClassifier`** — the orchestrator is now the single intent router;
+  ChatService no longer re-classifies.
+- **Legacy endpoints** — `POST/GET /sessions/{id}/messages`,
+  `POST/GET /sessions/{id}/weekly` (superseded by `/chat` + `/conversation`;
+  gateway proxies removed in lockstep).
+- Dead shims: `db_update_active_context`, `Session.active_context`,
+  `Session.messages`/`weekly_messages` aliases, `MealCourse.from_list`.
+- Dependencies: chromadb, rank-bm25, langchain/-community/-ollama, neo4j,
+  pandas, numpy, pdfplumber, unstructured, colorama dropped from requirements.
+
+## Added / changed
+
+- **`services/clarification.py`** — clarification is now an explicit,
+  JSON-serializable state machine (`ClarificationState` persisted in the new
+  `sessions.clarification_state` column). Mid-clarification sessions survive
+  restarts and replicas. Same conversational behaviour as the old generator.
+- **`services/planning_pipeline.py`** — typed replacement for the LangChain
+  runnable chains: candidates → LLM-graded combinations → `ScoredPlan`s.
+- **`models/recipe.py`** — `CandidateRecipe` / `ScoredPlan` domain models;
+  tuple plumbing eliminated end to end (`MealPlan.from_courses`).
+- **`SimpleChatBot` is stateless** — history passed per call from the session
+  conversation. Pre-M0 it held ONE process-global memory shared by all users
+  (cross-user context leak).
+- **ChatService split** — `process_plan_request` / `process_smalltalk` /
+  `continue_clarification`; orchestrator routes to them by intent.
+- **Bug fix:** `QUERY_CHECKER_USER_INSTRUCTIONS` had unescaped `{...}` braces,
+  so the query-specificity check raised `KeyError` on every call and was
+  silently swallowed by a broad except — it never actually ran. Fixed and
+  covered by tests; all remaining templates are format-validated in CI.
+- **Tests** — new `tests/` suite (28 tests, LLM-free via fakes): session
+  lifecycle/ownership, canvas versioning, clarification state machine +
+  restart scenarios, candidates client contract, pipeline plumbing.
+- Import scheme standardized (src-rooted, no `src.` prefixes; the old mixed
+  scheme only worked via a `sys.path` hack in the deleted `foodchat.py`).
+- Docs rewritten: `README.md`, `CHAT_ENDPOINT_PIPELINE.md`, `.env.example`.
+
+## Deployment notes
+
+- Env vars removed from `platform-deployment/lib/foodchat.libsonnet`:
+  `CHROMA_*`, `NEO4J_*`, `CSV_HUMMUS_PATH`, `RECIPE_SOURCE`; added
+  `DATABASE_URL`. Validated with `tk eval`.
+- Rebuild the image (`wisefood/foodchat`) — it is substantially smaller
+  (torch/chromadb/pandas gone).
+
+---
+
+# Canvas & Version History Refactor
+
+> **Date:** 2026-04-22
 > **Branch:** main  
 > Prepared for handoff. All changes are backward-compatible with existing sessions
 > (the DB migration is idempotent and adds columns with safe defaults).

@@ -1,9 +1,28 @@
+"""
+Session domain models — conversation, meal plans, and plan canvases.
+
+A *canvas* is the versioned lineage of plans of one type (daily or weekly)
+within a session: ``current_id`` points at the version shown to the user,
+``root_id`` at the first version of the lineage. Refinements create new
+versions (``version`` + ``parent_id``); switching plan types freezes the old
+canvas without deleting it, so history stays retrievable.
+
+Clarification state is a plain JSON-able dict (see
+``services.clarification.ClarificationState``) persisted on the session row —
+never a live object — so sessions survive restarts and replicas.
+"""
+
+import os
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Literal, Optional, Any
-import uuid
+from typing import Literal, Optional
 
-MAX_MESSAGES_PER_SESSION = int(__import__("os").getenv("SESSION_MAX_MESSAGES", "200"))
+from models.recipe import CandidateRecipe
+
+MAX_MESSAGES_PER_SESSION = int(os.getenv("SESSION_MAX_MESSAGES", "200"))
+
+Intent = Literal["daily_plan", "weekly_plan", "refine_plan", "switch_plan_type", "chat"]
 
 
 @dataclass
@@ -11,7 +30,7 @@ class Message:
     role: Literal["user", "assistant"]
     content: str
     timestamp: datetime = field(default_factory=datetime.utcnow)
-    intent: Optional[Literal["daily_plan", "weekly_plan", "refine_plan", "switch_plan_type", "chat"]] = None
+    intent: Optional[Intent] = None
     plan_id: Optional[str] = None  # references MealPlan.id or WeeklyMealPlan.id
 
 
@@ -23,15 +42,13 @@ class MealCourse:
     directions: str
 
     @classmethod
-    def from_list(cls, data) -> "MealCourse":
-        if isinstance(data, (list, tuple)) and len(data) >= 4:
-            return cls(
-                recipe_id=str(data[0]),
-                title=str(data[1]),
-                ingredients=str(data[2]),
-                directions=str(data[3]),
-            )
-        return cls(recipe_id="", title="", ingredients="", directions="")
+    def from_candidate(cls, candidate: CandidateRecipe) -> "MealCourse":
+        return cls(
+            recipe_id=candidate.recipe_id,
+            title=candidate.title,
+            ingredients=candidate.ingredients,
+            directions=candidate.directions,
+        )
 
 
 @dataclass
@@ -55,21 +72,24 @@ class MealPlan:
     guideline_adherence_reasoning: str = ""
 
     @classmethod
-    def from_response(
+    def from_courses(
         cls,
-        meal_plan_tuple: tuple,
+        courses: list[CandidateRecipe],
         reasoning: str,
         metrics: Optional[dict] = None,
         version: int = 1,
         parent_id: Optional[str] = None,
     ) -> "MealPlan":
+        """Build a plan from [breakfast, lunch, dinner] candidates + quality metrics."""
+        if len(courses) != 3:
+            raise ValueError(f"A daily plan needs exactly 3 courses, got {len(courses)}")
         metrics = metrics or {}
         return cls(
             id=str(uuid.uuid4()),
             created_at=datetime.now(),
-            breakfast=MealCourse.from_list(meal_plan_tuple[0] if len(meal_plan_tuple) > 0 else []),
-            lunch=MealCourse.from_list(meal_plan_tuple[1] if len(meal_plan_tuple) > 1 else []),
-            dinner=MealCourse.from_list(meal_plan_tuple[2] if len(meal_plan_tuple) > 2 else []),
+            breakfast=MealCourse.from_candidate(courses[0]),
+            lunch=MealCourse.from_candidate(courses[1]),
+            dinner=MealCourse.from_candidate(courses[2]),
             reasoning=reasoning,
             version=version,
             parent_id=parent_id,
@@ -96,13 +116,8 @@ class WeeklyMealPlan:
 
 @dataclass
 class PlanCanvas:
-    """
-    Tracks the live canvas for one plan type.
+    """Live canvas pointer for one plan type (see module docstring)."""
 
-    current_id — the latest version currently shown to the user
-    root_id    — the first plan ever generated in this canvas lineage
-    plan_type  — "daily" | "weekly"
-    """
     plan_type: Literal["daily", "weekly"]
     current_id: str
     root_id: str
@@ -114,7 +129,7 @@ class Session:
     member_id: str
     user_profile: dict
 
-    # Unified conversation thread
+    # Unified conversation thread (user + assistant turns, all intents)
     conversation: list[Message] = field(default_factory=list)
 
     # Plan stores (separate for typed access)
@@ -127,12 +142,10 @@ class Session:
 
     max_messages: int = MAX_MESSAGES_PER_SESSION
 
-    # Daily-plan clarification state (generator not serialisable)
+    # Clarification flow: "clarifying" while a question is outstanding.
+    # ``clarification`` is the serialized ClarificationState dict (or None).
     state: Literal["ready", "clarifying"] = "ready"
-    clarification_generator: Optional[Any] = field(default=None, repr=False)
-    pending_rag_data: Optional[dict] = field(default=None, repr=False)
-    # Intent that triggered clarification — restored after clarification completes
-    pending_intent: Optional[Literal["daily_plan", "weekly_plan", "refine_plan"]] = None
+    clarification: Optional[dict] = None
 
     created_at: datetime = field(default_factory=datetime.utcnow)
 
@@ -173,32 +186,6 @@ class Session:
         if self.weekly_canvas is None:
             return None
         return self._find_plan("weekly", self.weekly_canvas.current_id)
-
-    # ------------------------------------------------------------------ #
-    # Backward-compat shims                                                #
-    # ------------------------------------------------------------------ #
-
-    @property
-    def active_context(self) -> Optional[Any]:
-        """Shim used by OrchestratorService — returns duck-typed object."""
-        canvas = self.active_canvas
-        if canvas is None:
-            return None
-
-        class _Compat:
-            def __init__(self, plan_type, plan_id):
-                self.plan_type = plan_type
-                self.plan_id = plan_id
-
-        return _Compat(canvas.plan_type, canvas.current_id)
-
-    @property
-    def messages(self) -> list[Message]:
-        return self.conversation
-
-    @property
-    def weekly_messages(self) -> list[Message]:
-        return self.conversation
 
     @property
     def is_at_message_limit(self) -> bool:

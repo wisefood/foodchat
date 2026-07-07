@@ -1,6 +1,6 @@
 import logging
 from typing import Dict, Any, List, Tuple, Optional
-from src.models.session import MealCourse
+from models.session import MealCourse
 from .state_tracking import WeeklyNutritionalTracker
 from .action_adapter import RecipeActionSpace
 from .reward_logic import RewardCalculator

@@ -1,21 +1,19 @@
 # FoodChat `/chat` Endpoint Pipeline
 
-This document illustrates how a user message flows through `POST /foodchat/sessions/{session_id}/chat`.
+How a user message flows through `POST /foodchat/sessions/{session_id}/chat`
+(post-M0 architecture — single intent router, persisted clarification state).
 
-## 1. End-to-End Request Flow
+## 1. End-to-end request flow
 
 ```text
-Client
+Client (wisefood-api gateway)
   |
   | POST /foodchat/sessions/{session_id}/chat
   | body: { "member_id": "...", "content": "..." }
   v
 [foodchat_router.unified_chat]
   |
-  +--> _require_orchestrator_service()
-  |      |
-  |      +--> orchestrator missing
-  |             -> HTTP 503
+  +--> _require_orchestrator_service()          -> 503 if startup failed
   |
   +--> orch_svc.process(session_id, member_id, content)
          |
@@ -23,237 +21,155 @@ Client
       [OrchestratorService.process]
          |
          +--> session_service.get_session(session_id, member_id)
-         |      |
-         |      +--> session missing / wrong owner
-         |             -> ValueError -> router returns HTTP 404
+         |      +--> missing / wrong owner -> ValueError -> HTTP 404
          |
          +--> session.is_at_message_limit ?
-         |      |
-         |      +--> yes
-         |             -> return ChatTurn(
-         |                  role="assistant",
-         |                  intent="chat",
-         |                  at_message_limit=True
-         |                )
+         |      +--> yes -> ChatTurn(at_message_limit=True)
          |
          +--> session.state == "clarifying" ?
          |      |
-         |      +--> yes
-         |      |      -> force intent = "daily_plan"
+         |      +--> yes -> ChatService.continue_clarification(...)
+         |      |          (NO intent classification — the user is answering
+         |      |           our question; origin intent restored from the
+         |      |           persisted ClarificationState)
          |      |
-         |      +--> no
-         |             -> OrchestratorAgent.classify(message, recent history snapshot)
+         |      +--> no  -> OrchestratorAgent.classify(message, last 12 turns)
+         |                  (the ONLY intent classification in the pipeline)
          |
          +--> route by intent
                 |
-                +--> "daily_plan"
-                |      -> ChatService.process_message(..., is_refinement=False)
-                |
-                +--> "weekly_plan"
-                |      -> WeeklyPlanService.process_message(..., is_refinement=False)
-                |
+                +--> "daily_plan"        -> ChatService.process_plan_request(is_refinement=False)
+                +--> "weekly_plan"       -> WeeklyPlanService.process_message(is_refinement=False)
                 +--> "refine_plan"
-                |      |
-                |      +--> no active canvas
-                |      |      -> ChatService fresh daily plan
-                |      |
-                |      +--> active weekly canvas
-                |      |      -> WeeklyPlanService.process_message(..., is_refinement=True)
-                |      |
-                |      +--> active daily canvas
-                |             -> ChatService.process_message(..., is_refinement=True)
-                |
-                +--> "switch_plan_type"
-                |      |
-                |      +--> add assistant acknowledgement
-                |      |
-                |      +--> target = "weekly"
-                |      |      -> WeeklyPlanService fresh weekly plan
-                |      |
-                |      +--> target = "daily"
-                |             -> ChatService fresh daily plan
-                |
-                +--> "chat" or fallback
-                       -> ChatService.process_message(..., is_refinement=False)
+                |      +--> no active canvas      -> fresh daily plan
+                |      +--> active weekly canvas  -> WeeklyPlanService(is_refinement=True)
+                |      +--> active daily canvas   -> ChatService(is_refinement=True)
+                +--> "switch_plan_type"  -> ack message, then fresh plan of target type
+                |                           (old canvas frozen, history retained)
+                +--> "chat" / fallback   -> ChatService.process_smalltalk
 ```
 
-## 2. Daily Plan and General Chat Branch
+## 2. Daily plan branch
 
 ```text
-[ChatService.process_message]
+[ChatService.process_plan_request]
   |
-  +--> session_service.get_session(session_id)
+  +--> add user message
   |
-  +--> session_service.add_message("user", message)
+  +--> is_refinement and daily canvas exists ?
+  |      +--> yes -> prepend current plan text to the effective message
   |
-  +--> session.state == "clarifying" ?
-  |      |
-  |      +--> yes
-  |             -> _handle_clarification(session_id, message)
-  |
-  +--> is_refinement and current daily canvas exists ?
-  |      |
-  |      +--> yes
-  |             -> inject current daily plan into effective_message
-  |
-  +--> QueryClassifier.router(effective_message)
+  +--> ClarificationManager.start(effective_message, session.user_profile, origin_intent)
          |
-         +--> source = "chatbot"
+         |  (reconciles query vs profile; merged profile rides on the outcome)
+         |
+         +--> outcome.question set ?
          |      |
-         |      +--> SimpleChatBot.chat(message)
-         |      +--> session_service.add_message("assistant", response)
-         |      +--> return plain chat response
-         |
-         +--> source = "vectorstore"
-                |
-                +--> _handle_rag_query(session_id, effective_message, is_refinement)
+         |      +--> yes -> session_service.set_clarification_state(state.to_dict())
+         |      |          -> persisted to sessions.clarification_state (JSON)
+         |      |          -> return question, needs_clarification=True
+         |      |
+         |      +--> no  -> _generate_and_store(final_query, outcome.profile)
 ```
 
-## 3. Daily Plan RAG and Clarification Loop
+## 3. Clarification loop (restart-safe)
 
 ```text
-[_handle_rag_query]
-  |
-  +--> rag_chain_part1.invoke({
-  |      "question": message,
-  |      "user_id": session.member_id,
-  |      "user_profile_data": session.user_profile
-  |    })
-  |
-  +--> RAGReadyPreparator.query_check(...)
-         |
-         +--> clarification needed ?
-         |      |
-         |      +--> yes
-         |             -> yield warning / follow-up question(s)
-         |             -> session_service.set_clarification_state(...)
-         |             -> session_service.add_message("assistant", first_question)
-         |             -> return needs_clarification=True
-         |
-         +--> no
-                -> final_query ready
-                -> _run_post_clarification(...)
+Any subsequent message while state == "clarifying":
 
+[ChatService.continue_clarification]
+  |
+  +--> session.clarification (dict) missing ?
+  |      +--> yes -> reset to "ready", treat message as a fresh plan request
+  |                  (recovers sessions stranded by old bugs / manual edits)
+  |
+  +--> state = ClarificationState.from_dict(session.clarification)
+  +--> ClarificationManager.step(state, user_answer)
+         |
+         +--> more questions -> persist updated state, ask next
+         +--> done           -> clear state, _generate_and_store(final_query, profile)
 
-[_handle_clarification]
-  |
-  +--> generator.send(user_reply)
-         |
-         +--> more questions
-         |      -> session_service.add_message("assistant", next_question)
-         |      -> return needs_clarification=True
-         |
-         +--> StopIteration(final_query)
-                -> _run_post_clarification(...)
-
-
-[_run_post_clarification]
-  |
-  +--> session_service.clear_clarification_state()
-  |
-  +--> rag_chain_part2.invoke({
-  |      ...pending_data,
-  |      "reformulated_query": final_query
-  |    })
-  |
-  +--> docs found ?
-         |
-         +--> no
-         |      -> apology response
-         |      -> session_service.add_message("assistant", msg)
-         |      -> return no plan
-         |
-         +--> yes
-                |
-                +--> choose top candidate plan
-                +--> compute metrics:
-                |      - llm_score / llm_reasoning
-                |      - fvs_count / fvs_reasoning
-                |      - diversity_llm_score / diversity_llm_reasoning
-                |      - guideline_adherence_score / reasoning
-                |
-                +--> store plan
-                |      |
-                |      +--> is_refinement=True
-                |      |      -> session_service.refine_meal_plan(...)
-                |      |
-                |      +--> is_refinement=False
-                |             -> session_service.add_meal_plan(...)
-                |
-                +--> format assistant response text
-                +--> session_service.add_message("assistant", formatted)
-                +--> return meal_plan + version + parent_id
+Because the state is plain JSON on the session row, this loop continues
+correctly after a process restart or on a different replica.
 ```
 
-## 4. Weekly Plan Branch
+## 4. Generation and storage
+
+```text
+[_generate_and_store]
+  |
+  +--> PlanningPipeline.generate(final_query, profile)
+  |      |
+  |      +--> RecipeCandidatesClient.fetch_candidates(...)
+  |      |      hard filters server-side at RecipeWrangler:
+  |      |      allergens (FoodOn taxonomy), diet tags, exclude ingredients/ids
+  |      |
+  |      +--> any slot empty ? -> [] -> apology response, no plan
+  |      |
+  |      +--> DocumentGrader.grade_daily_plans
+  |             sample <= FOODCHAT_MAX_PLANS_TO_SCORE combos of B x L x D,
+  |             one LLM grade each -> top 3 ScoredPlans
+  |
+  +--> metrics for the best plan:
+  |      llm_score / llm_reasoning            (from grading)
+  |      fvs_count / fvs_reasoning            (unique-ingredient count, no LLM)
+  |      diversity_llm_score / _reasoning     (MealDiversityGrader)
+  |      guideline_adherence_score / _reason  (GuidelineAdherenceGrader)
+  |
+  +--> store:
+  |      is_refinement -> session_service.refine_meal_plan  (version+1, parent_id)
+  |      else          -> session_service.add_meal_plan     (version 1, fresh canvas)
+  |
+  +--> add assistant message, return (text, needs_clarification=False, meal_plan)
+```
+
+## 5. Weekly plan branch
 
 ```text
 [WeeklyPlanService.process_message]
   |
-  +--> session_service.get_session(session_id)
-  |
-  +--> session_service.add_weekly_message("user", content)
-  |
-  +--> is_refinement and current weekly canvas exists ?
-  |      |
-  |      +--> yes
-  |             -> inject current weekly plan into effective_query
-  |
-  +--> RecipeActionSpace(session.user_profile)
-  +--> WeeklyMealPlanEnv(user_profile, action_space, reward_calculator, user_query)
-  +--> WeeklyPlanner.generate_full_plan(user_query)
-  |
-  +--> store weekly plan
-  |      |
-  |      +--> is_refinement=True
-  |      |      -> session_service.refine_weekly_meal_plan(...)
-  |      |
-  |      +--> is_refinement=False
-  |             -> session_service.add_weekly_meal_plan(...)
-  |
-  +--> session_service.add_weekly_message("assistant", response_text)
-  +--> return weekly_meal_plan + version + parent_id
+  +--> add user message; inject current weekly canvas text when refining
+  +--> DietaryIntentExtractor.extract(content)      -> query-level diet tags
+  +--> RecipeActionSpace(profile, extra diet tags)  -> per-day candidate pools
+  |      (RecipeWrangler fetch once per day, selected ids excluded -> no repeats)
+  +--> WeeklyMealPlanEnv + WeeklyPlanner.generate_full_plan
+  |      21 steps (7 days x 3 meals); RewardCalculator scores each step
+  +--> store (refine -> version+1 | fresh -> version 1) + assistant message
 ```
 
-## 5. Router Response Assembly
+## 6. Router response assembly
 
 ```text
-[foodchat_router.unified_chat]
-  |
-  +--> if turn.meal_plan exists
-  |      -> MealPlanResponse.from_meal_plan(...)
-  |
-  +--> if turn.weekly_meal_plan exists
-  |      -> WeeklyMealPlanResponse.from_weekly_meal_plan(...)
-  |
-  +--> return ChatTurnResponse {
-         role,
-         content,
-         intent,
-         needs_clarification,
-         meal_plan?,
-         weekly_meal_plan?,
-         at_message_limit,
-         plan_version,
-         plan_parent_id
-      }
+ChatTurnResponse {
+  role, content, intent,
+  needs_clarification,
+  meal_plan?              (id, courses, reasoning, 4 quality metrics,
+                           version, parent_id),
+  weekly_meal_plan?       (id, entries[day, meal_type, recipe, reward],
+                           version, parent_id),
+  at_message_limit,
+  plan_version, plan_parent_id
+}
 ```
 
-## 6. Error Mapping at the Router Boundary
+## 7. Error mapping at the router boundary
 
 ```text
-ValueError   -> HTTP 404
-RuntimeError -> HTTP 429
+ValueError   -> HTTP 404   (session missing / access denied)
+RuntimeError -> HTTP 429   (message limit)
 Exception    -> HTTP 500
 ```
 
-## 7. Source Files Behind This Diagram
+## 8. Source files behind this diagram
 
 - [src/main.py](src/main.py)
 - [src/routers/foodchat_router.py](src/routers/foodchat_router.py)
 - [src/services/orchestrator_service.py](src/services/orchestrator_service.py)
 - [src/services/chat_service.py](src/services/chat_service.py)
+- [src/services/clarification.py](src/services/clarification.py)
+- [src/services/planning_pipeline.py](src/services/planning_pipeline.py)
+- [src/services/candidates_client.py](src/services/candidates_client.py)
 - [src/services/weekly_plan_service.py](src/services/weekly_plan_service.py)
 - [src/services/session_service.py](src/services/session_service.py)
-- [src/models/session.py](src/models/session.py)
+- [src/models/session.py](src/models/session.py) · [src/models/recipe.py](src/models/recipe.py)
 - [src/agents.py](src/agents.py)

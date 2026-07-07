@@ -1,5 +1,5 @@
 from typing import Dict, Any, List
-from src.models.session import MealCourse
+from models.session import MealCourse
 
 class WeeklyNutritionalTracker:
     """
