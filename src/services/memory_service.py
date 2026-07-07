@@ -1,0 +1,166 @@
+"""
+Consented memory (M3) — "It seems you don't like blueberries. Remember this?"
+
+Principle: **session-scoped adaptation is automatic; durable memory requires
+an explicit yes.** The PreferenceExtractor detects candidates in each user
+turn; this service applies the nudge policy and, on the user's decision
+(POST /sessions/{id}/memory), writes to the durable member profile with
+provenance — or records an opt-out so the same thing is never suggested again.
+
+Nudge policy (deliberately conservative):
+  - only high-confidence, explicitly-stated candidates are suggested —
+    EXCEPT allergy hints, which are suggested at any confidence and are the
+    ONLY path that ever touches the allergies field (safety data demands
+    explicit consent);
+  - nothing already in the profile (likes/dislikes/allergies/standing seeds)
+    is re-suggested;
+  - nothing the user previously declined (properties.memory_optouts) is
+    re-suggested;
+  - one-off constraints never nudge (the extractor filters them, this
+    service double-checks kind validity).
+
+Cross-app payoff: FoodScholar reads the same profile, so an accepted memory
+personalizes its answers with no extra work.
+"""
+
+import logging
+import uuid
+from typing import Optional
+
+from agents import PreferenceExtractor
+from .profile_service import ProfileService
+from .session_service import SessionService
+
+logger = logging.getLogger(__name__)
+
+VALID_KINDS = {"like", "dislike", "cuisine", "constraint", "allergy_hint", "standing_seed"}
+# At most this many nudges per turn — more reads as surveillance, not help.
+MAX_SUGGESTIONS_PER_TURN = 2
+
+
+class MemoryService:
+    """Suggestion policy + consented write-back for durable preferences."""
+
+    def __init__(
+        self,
+        session_service: SessionService,
+        profile_service: ProfileService,
+        extractor: Optional[PreferenceExtractor] = None,
+    ):
+        self.session_service = session_service
+        self.profile_service = profile_service
+        self.extractor = extractor or PreferenceExtractor()
+
+    # ------------------------------------------------------------------ #
+    # Suggestion (attached to chat turns by the orchestrator)              #
+    # ------------------------------------------------------------------ #
+
+    def suggest(self, session, message: str) -> list[dict]:
+        """Return nudge-worthy memory suggestions for this user turn."""
+        candidates = self.extractor.extract(message)
+        if not candidates:
+            return []
+
+        profile = session.user_profile
+        known = {
+            str(v).lower()
+            for key in ("food_likes", "food_dislikes", "allergies")
+            for v in (profile.get(key) or [])
+        }
+        known |= {
+            str(s.get("name", "")).lower()
+            for s in (profile.get("standing_seeds") or [])
+        }
+        optouts = {str(v).lower() for v in (profile.get("memory_optouts") or [])}
+
+        suggestions = []
+        for cand in candidates:
+            kind = cand.get("kind")
+            value = str(cand.get("value", "")).strip().lower()
+            if kind not in VALID_KINDS or not value:
+                continue
+            if value in known or value in optouts:
+                continue
+            # Allergy hints always nudge; everything else needs an explicit statement.
+            if kind != "allergy_hint" and cand.get("confidence") != "high":
+                continue
+            suggestions.append({
+                "id": str(uuid.uuid4()),
+                "kind": kind,
+                "value": value,
+                "statement": cand.get("statement")
+                or f"It seems “{value}” matters to you — want me to remember this?",
+            })
+            if len(suggestions) >= MAX_SUGGESTIONS_PER_TURN:
+                break
+
+        if suggestions:
+            logger.info(
+                "[%s] %d memory suggestion(s): %s",
+                session.session_id, len(suggestions),
+                [(s["kind"], s["value"]) for s in suggestions],
+            )
+        return suggestions
+
+    # ------------------------------------------------------------------ #
+    # Decision (POST /sessions/{id}/memory)                                #
+    # ------------------------------------------------------------------ #
+
+    def decide(self, session, suggestion: dict, decision: str) -> bool:
+        """Apply an accepted suggestion or record a declined one.
+
+        The client echoes the suggestion payload back (no server-side pending
+        store) — kind/value are re-validated here before any write.
+        Returns True if a durable change was persisted.
+        """
+        kind = suggestion.get("kind")
+        value = str(suggestion.get("value", "")).strip().lower()
+        if kind not in VALID_KINDS or not value:
+            raise ValueError("Invalid memory suggestion payload")
+
+        if decision == "accept":
+            applied = self.profile_service.apply_memory(
+                session.member_id, kind, value, session_id=session.session_id
+            )
+            if applied:
+                # Keep the live session consistent so the very next plan
+                # already honors the new memory.
+                self._apply_to_session_profile(session, kind, value)
+            return applied
+
+        # decline → never suggest this value again
+        declined = self.profile_service.record_memory_optout(session.member_id, value)
+        if declined:
+            optouts = list(session.user_profile.get("memory_optouts") or [])
+            if value not in optouts:
+                optouts.append(value)
+            session.user_profile["memory_optouts"] = optouts
+            self.session_service.persist_profile(session.session_id)
+        return False
+
+    def _apply_to_session_profile(self, session, kind: str, value: str) -> None:
+        profile = session.user_profile
+        if kind in ("like", "cuisine"):
+            items = list(profile.get("food_likes") or [])
+            if value not in [str(v).lower() for v in items]:
+                items.append(value)
+            profile["food_likes"] = items
+        elif kind == "dislike":
+            items = list(profile.get("food_dislikes") or [])
+            if value not in [str(v).lower() for v in items]:
+                items.append(value)
+            profile["food_dislikes"] = items
+        elif kind == "allergy_hint":
+            items = list(profile.get("allergies") or [])
+            if value not in [str(v).lower() for v in items]:
+                items.append(value)
+            profile["allergies"] = items
+        elif kind == "standing_seed":
+            seeds = list(profile.get("standing_seeds") or [])
+            if value not in [s.get("name", "").lower() for s in seeds]:
+                seeds.append({"name": value})
+            profile["standing_seeds"] = seeds
+        elif kind == "constraint":
+            history = profile.get("history", "") or ""
+            profile["history"] = (history + "\n" if history else "") + value
+        self.session_service.persist_profile(session.session_id)

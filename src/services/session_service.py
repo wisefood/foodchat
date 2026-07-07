@@ -29,6 +29,7 @@ from db import (
     db_get_messages,
     db_update_canvases,
     db_update_state,
+    db_update_profile,
     db_save_meal_plan,
     db_get_session_meal_plans,
     db_get_meal_plan,
@@ -180,6 +181,21 @@ class SessionService:
 
     def list_sessions(self) -> list[Session]:
         return list(self._sessions.values())
+
+    def persist_profile(self, session_id: str) -> None:
+        """Write the session's (mutated) profile snapshot back to the DB.
+
+        Called after accepted memories or diner changes so the snapshot a
+        restarted replica loads matches what the conversation already knows.
+        """
+        session = self._sessions.get(session_id)
+        if not session:
+            raise ValueError(f"Session {session_id} not found")
+        db = SessionLocal()
+        try:
+            db_update_profile(db, session_id, session.user_profile)
+        finally:
+            db.close()
 
     # ------------------------------------------------------------------ #
     # Message management                                                   #

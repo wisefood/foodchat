@@ -151,6 +151,7 @@ class TestOrchestratorRouting:
         orch.session_service = session_service
         orch.chat_service = None          # must not be touched in these paths
         orch.weekly_plan_service = None
+        orch.memory_service = None        # nudges off in these routing tests
         orch.foodscholar_service = fs_service
 
         class FixedClassifier:

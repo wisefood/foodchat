@@ -19,7 +19,7 @@ def _slot(prefix, n):
 class FakeGrader:
     """DocumentGrader stand-in: deterministic scores keyed by breakfast id."""
 
-    def grade_daily_plans(self, query, candidates, profile):
+    def grade_daily_plans(self, query, candidates, profile, feedback_history=""):
         plans = []
         for i, b in enumerate(candidates["breakfast"]):
             plans.append(ScoredPlan(

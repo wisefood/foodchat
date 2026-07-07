@@ -24,7 +24,12 @@ from fastapi import FastAPI
 
 from db import init_db
 from routers import foodchat_router
-from services import init_chat_service, init_weekly_plan_service, init_orchestrator_service
+from services import (
+    init_chat_service,
+    init_weekly_plan_service,
+    init_memory_service,
+    init_orchestrator_service,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,11 +47,12 @@ logger.info("Initializing database...")
 init_db()
 logger.info("Database initialized.")
 
-# Order matters: the orchestrator requires chat + weekly services.
+# Order matters: the orchestrator requires chat + weekly + memory services.
 init_chat_service()
 init_weekly_plan_service()
+init_memory_service()
 init_orchestrator_service()
-logger.info("Services initialized (chat, weekly, orchestrator).")
+logger.info("Services initialized (chat, weekly, memory, orchestrator).")
 
 app.include_router(foodchat_router.router)
 

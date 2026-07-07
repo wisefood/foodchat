@@ -1,6 +1,7 @@
 import logging
 from typing import Optional, Tuple
 
+from .feedback_service import FeedbackService
 from .seed_service import SeedService
 from .session_service import SessionService
 from .weekly_planner.action_adapter import RecipeActionSpace
@@ -39,6 +40,7 @@ class WeeklyPlanService:
         self.reward_calculator = RewardCalculator()
         self.diet_extractor = DietaryIntentExtractor()
         self.seed_service = SeedService()
+        self.feedback_service = FeedbackService()
         logger.info("WeeklyPlanService initialized.")
 
     def process_message(
@@ -78,6 +80,14 @@ class WeeklyPlanService:
         if query_diet_tags:
             logger.info("[%s] Extracted diet tags from query: %s", session_id, query_diet_tags)
 
+        # Standing seeds (M3): dishes the user consented to "always include"
+        # auto-anchor into fresh weekly plans when no explicit seeds compete.
+        if not seeds and not is_refinement:
+            standing = session.user_profile.get("standing_seeds") or []
+            if standing:
+                seeds = [{"name": s["name"]} for s in standing[:3] if s.get("name")]
+                logger.info("[%s] Auto-seeding %d standing dish(es).", session_id, len(seeds))
+
         # Resolve user-named anchor dishes into pinned (day, meal) slots (M2).
         seed_note = ""
         pinned: dict = {}
@@ -98,6 +108,9 @@ class WeeklyPlanService:
         # Anchored recipes must never repeat elsewhere in the week.
         for entry in pinned.values():
             action_space.mark_selected(entry["recipe_id"])
+        # Downvoted recipes never come back (M3 feedback loop).
+        for recipe_id in self.feedback_service.get_signals(session.member_id).downvoted_recipe_ids:
+            action_space.mark_selected(recipe_id)
         env = WeeklyMealPlanEnv(
             user_profile=session.user_profile,
             action_space=action_space,

@@ -60,6 +60,23 @@ class DietaryTagsSchema(BaseModel):
     dietary_tags: list[str]
 
 
+class CandidateMemorySchema(BaseModel):
+    """One durable preference candidate detected in a user turn (M3).
+
+    Candidates are SUGGESTED to the user, never written silently — the
+    consent flow (memory nudges) owns durable profile writes.
+    """
+    kind: Literal["like", "dislike", "cuisine", "constraint", "allergy_hint", "standing_seed"]
+    value: str                       # canonical item, e.g. "blueberries"
+    statement: str                   # user-facing nudge text
+    evidence: str                    # what in the message supports this
+    confidence: Literal["low", "medium", "high"]
+
+
+class PreferenceExtractionSchema(BaseModel):
+    memories: list[CandidateMemorySchema]
+
+
 class SeedDishSchema(BaseModel):
     """One dish the user explicitly asked to include in the plan."""
     name: str

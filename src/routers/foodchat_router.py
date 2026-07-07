@@ -45,6 +45,10 @@ router = APIRouter(
 
 class CreateSessionRequest(BaseModel):
     member_id: str
+    # Household members this session cooks for (M3). The primary member is
+    # always included; extra diners contribute hard constraints (allergies,
+    # diets — union) and soft preferences (weighted below the primary's).
+    cooking_for: Optional[List[str]] = None
 
 
 class SessionResponse(BaseModel):
@@ -142,6 +146,14 @@ class ChatRequest(BaseModel):
     member_id: str
 
 
+class MemorySuggestionModel(BaseModel):
+    """A consent nudge shown under an assistant message (M3)."""
+    id: str
+    kind: str            # like | dislike | cuisine | constraint | allergy_hint | standing_seed
+    value: str
+    statement: str
+
+
 class CitationResponse(BaseModel):
     title: str
     source_type: str            # "article" | "guideline"
@@ -188,6 +200,9 @@ class ChatTurnResponse(BaseModel):
     plan_parent_id: Optional[str] = None
     # Set when the answer came from another WiseFood app (nutrition_question)
     attribution: Optional[AttributionResponse] = None
+    # Consent nudges detected in the user's turn (M3); answered via
+    # POST /sessions/{id}/memory
+    memory_suggestions: Optional[List[MemorySuggestionModel]] = None
 
 
 class ConversationPage(BaseModel):
@@ -200,6 +215,26 @@ class FeedbackRequest(BaseModel):
     member_id: str
     rating: str          # "up" | "down"
     comment: Optional[str] = None
+
+
+class MemoryDecisionRequest(BaseModel):
+    member_id: str
+    decision: str        # "accept" | "decline"
+    suggestion: MemorySuggestionModel
+
+
+class MemoryDecisionResponse(BaseModel):
+    applied: bool        # True when a durable profile change was persisted
+
+
+class SetDinersRequest(BaseModel):
+    member_id: str
+    cooking_for: List[str]
+
+
+class DinersResponse(BaseModel):
+    cooking_for: List[str]
+    cooking_for_names: List[str]
 
 
 class FeedbackResponse(BaseModel):
@@ -253,6 +288,19 @@ async def create_session(request: CreateSessionRequest):
         user_profile["favorite_recipe_ids"] = services.profile_service.get_member_favorites(
             request.member_id
         )
+
+        # Household diners (M3): merge extra diners' hard constraints and
+        # soft preferences into the session profile.
+        diners = [m for m in (request.cooking_for or []) if m and m != request.member_id]
+        if diners:
+            other_profiles = [services.profile_service.get_member_profile(d) for d in diners]
+            names = [services.profile_service.get_member_name(m)
+                     for m in [request.member_id, *diners]]
+            user_profile = services.profile_service.merge_profiles(
+                user_profile, other_profiles, names
+            )
+            user_profile["cooking_for"] = [request.member_id, *diners]
+
         session = services.session_service.create_session(request.member_id, user_profile)
         logger.info("Session %s created for member %s.", session.session_id, request.member_id)
         return SessionResponse(
@@ -371,6 +419,10 @@ async def unified_chat(session_id: str, request: ChatRequest):
         attribution=(
             AttributionResponse.from_attribution(turn.attribution)
             if turn.attribution else None
+        ),
+        memory_suggestions=(
+            [MemorySuggestionModel(**s) for s in turn.memory_suggestions]
+            if turn.memory_suggestions else None
         ),
     )
 
@@ -531,6 +583,72 @@ async def submit_feedback(session_id: str, message_id: int, request: FeedbackReq
         return FeedbackResponse(message_id=fb.message_id, rating=fb.rating, comment=fb.comment)
     finally:
         db.close()
+
+
+# ---------------------------------------------------------------------------
+# Consented memory (M3)
+# ---------------------------------------------------------------------------
+
+
+@router.post("/sessions/{session_id}/memory", response_model=MemoryDecisionResponse)
+async def decide_memory(session_id: str, request: MemoryDecisionRequest):
+    """
+    Answer a memory nudge ("It seems you don't like blueberries — remember?").
+
+    accept  → the preference is written to the durable member profile with
+              provenance (properties.memory_log) and takes effect immediately
+              in this session.
+    decline → recorded in properties.memory_optouts; never suggested again.
+
+    The suggestion payload is echoed back by the client and re-validated here
+    — there is no server-side pending store.
+    """
+    if request.decision not in ("accept", "decline"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="decision must be 'accept' or 'decline'",
+        )
+    session = _require_session(session_id, request.member_id)
+
+    try:
+        applied = services.memory_service.decide(
+            session, request.suggestion.model_dump(), request.decision
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
+    return MemoryDecisionResponse(applied=applied)
+
+
+# ---------------------------------------------------------------------------
+# Household diners (M3)
+# ---------------------------------------------------------------------------
+
+
+@router.put("/sessions/{session_id}/diners", response_model=DinersResponse)
+async def set_diners(session_id: str, request: SetDinersRequest):
+    """
+    Update who this session cooks for. Rebuilds the merged session profile
+    (hard constraints = union of allergies/diets; soft preferences keep the
+    owner's weighting). The owner is always included.
+    """
+    session = _require_session(session_id, request.member_id)
+
+    diners = [m for m in request.cooking_for if m and m != request.member_id]
+    profile = services.profile_service.get_member_profile(request.member_id)
+    profile["favorite_recipe_ids"] = services.profile_service.get_member_favorites(request.member_id)
+
+    names = [services.profile_service.get_member_name(request.member_id)]
+    if diners:
+        other_profiles = [services.profile_service.get_member_profile(d) for d in diners]
+        names += [services.profile_service.get_member_name(d) for d in diners]
+        profile = services.profile_service.merge_profiles(profile, other_profiles, names)
+    profile["cooking_for"] = [request.member_id, *diners]
+    profile["cooking_for_names"] = names
+
+    session.user_profile = profile
+    services.session_service.persist_profile(session_id)
+    logger.info("[%s] Diners set: %s", session_id, names)
+    return DinersResponse(cooking_for=profile["cooking_for"], cooking_for_names=names)
 
 
 @router.get("/health")

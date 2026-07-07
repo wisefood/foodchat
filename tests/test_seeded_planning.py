@@ -112,7 +112,7 @@ class TestPipelinePinning:
                 return {"breakfast": slot("b"), "lunch": slot("l"), "dinner": slot("d")}
 
         class PassGrader:
-            def grade_daily_plans(self, query, candidates, profile):
+            def grade_daily_plans(self, query, candidates, profile, feedback_history=""):
                 from models.recipe import ScoredPlan
                 return [ScoredPlan(
                     breakfast=candidates["breakfast"][0], lunch=candidates["lunch"][0],
@@ -179,6 +179,7 @@ class TestFavoritesOffer:
         orch.session_service = session_service
         orch.foodscholar_service = None
         orch.weekly_plan_service = None
+        orch.memory_service = None        # nudges off in these routing tests
 
         class FakeChatService:
             def process_plan_request(self, session_id, message, is_refinement=False, seeds=None):

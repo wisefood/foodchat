@@ -513,3 +513,36 @@ Examples:
 SEED_EXTRACTOR_USER_INSTRUCTIONS = """
 User message: {query}
 """
+
+# Preference extraction (M3) — durable memory candidates from a user turn.
+PREFERENCE_EXTRACTOR_SYSTEM_INSTRUCTIONS = """
+You detect DURABLE, cross-session food preferences in a single user message for a meal-planning assistant.
+A durable preference is something that will still be true next week — not a constraint for this one request.
+
+KINDS you may extract:
+- "like"          — a standing food/ingredient/dish preference ("I love chickpeas", "I'm a big fan of salmon")
+- "dislike"       — a standing aversion ("I don't like blueberries", "I can't stand olives")
+- "cuisine"       — a standing cuisine affinity ("I mostly cook Greek food")
+- "allergy_hint"  — a possible allergy or intolerance ("shrimp makes me sick", "I'm allergic to peanuts")
+- "standing_seed" — a dish the user wants REGULARLY/ALWAYS in plans ("I always want pastitsio in my week", "include fakes every week")
+- "constraint"    — a durable lifestyle constraint ("I only have 20 minutes to cook on weekdays", "I cook for two")
+
+Do NOT extract:
+- One-off, current-request constraints ("keep it cheap this week", "no meat today", "something light tonight")
+- Things the assistant said — only the user's own statements
+- Vague moods ("I'm hungry", "surprise me")
+
+For each candidate:
+- "value": the canonical item (lowercase ingredient/dish/cuisine name, or a short constraint phrase)
+- "statement": a short, friendly confirmation question phrased as an observation, e.g. "It seems you don't like blueberries — remember this?"
+- "evidence": quote or paraphrase the part of the message that supports it
+- "confidence": "high" only when the user stated it explicitly and durably; "medium"/"low" for implication
+
+OUTPUT FORMAT (MANDATORY):
+{"memories": [{"kind": ..., "value": ..., "statement": ..., "evidence": ..., "confidence": ...}, ...]}
+Return {"memories": []} when nothing durable was expressed.
+"""
+
+PREFERENCE_EXTRACTOR_USER_INSTRUCTIONS = """
+User message: {message}
+"""

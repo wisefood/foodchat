@@ -26,6 +26,7 @@ from agents import GuidelineAdherenceGrader, MealDiversityGrader, SimpleChatBot
 from models.recipe import CandidateRecipe, ScoredPlan
 from models.session import MealPlan
 from services.clarification import ClarificationManager, ClarificationState
+from services.feedback_service import FeedbackService
 from services.planning_pipeline import PlanningPipeline
 from services.seed_service import SeedService
 from .session_service import SessionService
@@ -103,6 +104,7 @@ class ChatService:
         self.clarifier = ClarificationManager()
         self.chatbot = SimpleChatBot()
         self.seed_service = SeedService()
+        self.feedback_service = FeedbackService()
         self.diversity_grader = MealDiversityGrader()
         self.guideline_grader = GuidelineAdherenceGrader()
         logger.info("ChatService initialized.")
@@ -248,7 +250,16 @@ class ChatService:
             slot: CandidateRecipe(**fields) for slot, fields in pinned_raw.items()
         }
 
-        plans = self.pipeline.generate(final_query, profile, pinned=pinned)
+        # Feedback finally drives recommendations (M3): downvoted recipes are
+        # excluded and the rating history reaches the grader prompts.
+        session = self._get_session(session_id)
+        signals = self.feedback_service.get_signals(session.member_id)
+
+        plans = self.pipeline.generate(
+            final_query, profile, pinned=pinned,
+            exclude_recipe_ids=signals.downvoted_recipe_ids,
+            feedback_history=signals.history_text,
+        )
         if not plans:
             logger.warning("[%s] No candidate plans — returning apology.", session_id)
             self.session_service.add_message(session_id, "assistant", NO_PLAN_APOLOGY)

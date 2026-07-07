@@ -60,6 +60,8 @@ class ChatTurn:
     plan_parent_id: Optional[str] = None
     # Provenance when the answer came from another WiseFood app (FoodScholar)
     attribution: Optional[Attribution] = None
+    # Consent nudges ("remember this?") detected in the user's turn (M3)
+    memory_suggestions: Optional[list] = None
 
 
 class OrchestratorService:
@@ -70,12 +72,14 @@ class OrchestratorService:
         chat_service: Any,
         weekly_plan_service: Any,
         foodscholar_service: Optional[FoodScholarService] = None,
+        memory_service: Any = None,
     ):
         self.session_service = session_service
         self.chat_service = chat_service
         self.weekly_plan_service = weekly_plan_service
         self.foodscholar_service = foodscholar_service or FoodScholarService(session_service)
         self.seed_service = SeedService()
+        self.memory_service = memory_service
         self.orchestrator = OrchestratorAgent()
 
     def process(self, session_id: str, member_id: str, message: str) -> ChatTurn:
@@ -108,6 +112,23 @@ class OrchestratorService:
         intent = classification["intent"]
         target_plan_type = classification.get("target_plan_type")
         logger.info("[%s] intent=%s target=%s", session_id, intent, target_plan_type)
+
+        turn = self._route(session, session_id, message, intent, target_plan_type)
+
+        # Consent nudges (M3): detect durable preferences in the user's turn
+        # and ATTACH suggestions — durable writes happen only when the user
+        # answers via POST /sessions/{id}/memory. Best-effort by design.
+        if self.memory_service is not None and not turn.at_message_limit:
+            try:
+                suggestions = self.memory_service.suggest(session, message)
+                if suggestions:
+                    turn.memory_suggestions = suggestions
+            except Exception as e:
+                logger.warning("[%s] Memory suggestion failed: %s", session_id, e)
+        return turn
+
+    def _route(self, session, session_id: str, message: str, intent: str,
+               target_plan_type: Optional[str]) -> ChatTurn:
 
         if intent == "switch_plan_type":
             return self._handle_switch(session_id, message, target_plan_type)

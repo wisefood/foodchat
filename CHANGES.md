@@ -2,6 +2,74 @@
 
 ---
 
+# M3 — Consented Memory, Feedback Loop, Household Diners (+ platform consent bar)
+
+> **Date:** 2026-07-07
+> **Branch:** main
+> No FoodChat DB migration. Gateway gains the `user_consent` table (init-db
+> re-run needed on existing deployments, same as member_favorite) and proxies
+> for the new /memory and /diners endpoints.
+
+## Consented memory ("remember this?")
+
+Principle: session adaptation is automatic; **durable memory requires an
+explicit yes**, and everything remembered is visible and deletable.
+
+- `PreferenceExtractor` agent detects durable preference candidates per user
+  turn (likes/dislikes/cuisines/allergy hints/standing dishes/constraints —
+  never one-off requests). `services/memory_service.py` applies the nudge
+  policy: only explicit high-confidence candidates are suggested (allergy
+  hints at any confidence — and they are the ONLY path that ever touches the
+  allergies field); known values and previously-declined values
+  (`properties.memory_optouts`) are never re-suggested; max 2 nudges/turn.
+- `ChatTurnResponse.memory_suggestions[]` + `POST /sessions/{id}/memory`
+  {decision, suggestion}. Accept → durable profile write via the SDK with
+  provenance (`properties.memory_log[{kind, value, source, session_id,
+  recorded_at}]`) AND immediate effect in the live session. Decline →
+  opt-out recorded.
+- UI: nudge chips under assistant messages ([Remember]/[No thanks]) and a
+  **memory panel** on my-profile ("What WiseFood remembers") with per-entry
+  forget. FoodScholar reads the same profile → accepted memories personalize
+  its answers too.
+- **Standing seeds** (deferred from M2): "always include pastitsio" →
+  consent nudge → `properties.standing_seeds`; fresh weekly plans auto-pin
+  them when no explicit dishes compete.
+
+## Feedback finally drives recommendations
+
+- `services/feedback_service.py` joins feedback → messages.plan_id →
+  meal_plans across the member's sessions: recipes with more downvotes than
+  upvotes are excluded from candidate fetches (daily + weekly), and the
+  rating history (with comments) replaces the hardcoded `""` in the daily
+  grader prompts.
+
+## Household diners ("who are we cooking for?")
+
+- `CreateSessionRequest.cooking_for` + `PUT /sessions/{id}/diners` rebuild
+  the session profile via `ProfileService.merge_profiles`: **hard = union**
+  (allergies, diets, dislikes-as-exclusions) — one vegetarian diner makes the
+  plan vegetarian, any diner's allergy excludes everywhere; **soft =
+  weighted** (owner's likes lead, other diners' follow); macro targets and
+  favorites stay the owner's. UI: avatar-chip diner picker + "Cooking for:"
+  banner; hidden for single-member households.
+
+## Platform consent bar (gateway + UI)
+
+- `wisefood.user_consent` append-only ledger (user_id = Keycloak sub,
+  consent_type `service_data_processing`, version, granted_at, ip_address
+  from X-Forwarded-For) + `GET/POST /api/v1/users/me/consent`.
+- UI: small fixed bottom bar after login (any user incl. guests) — "cookies
+  + personal data processed solely to provide the service", Privacy Policy
+  link, one Accept button; hidden once the current consent version is
+  granted; sessionStorage cache prevents flicker.
+
+## Tests
+
++13 (nudge policy incl. allergy exception and opt-outs, decisions with
+session/DB persistence, feedback aggregation up/down, diner merge) — 60 total.
+
+---
+
 # M2 — Favorites & Seeded Planning
 
 > **Date:** 2026-07-07

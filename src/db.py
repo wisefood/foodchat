@@ -407,3 +407,38 @@ def db_upsert_feedback(
 
 def db_get_feedback(db: DBSession, message_id: int) -> list[FeedbackRow]:
     return db.query(FeedbackRow).filter(FeedbackRow.message_id == message_id).all()
+
+
+def db_get_member_feedback_with_plans(db: DBSession, member_id: str, limit: int = 100) -> list[dict]:
+    """A member's feedback joined to the plans it rated, newest first.
+
+    feedback → messages (plan_id) → meal_plans: only feedback on assistant
+    messages that carried a plan contributes recommendation signals.
+    """
+    rows = (
+        db.query(FeedbackRow, MessageRow, MealPlanRow)
+        .join(MessageRow, FeedbackRow.message_id == MessageRow.id)
+        .join(MealPlanRow, MessageRow.plan_id == MealPlanRow.id)
+        .filter(FeedbackRow.member_id == member_id)
+        .order_by(FeedbackRow.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return [
+        {
+            "rating": fb.rating,
+            "comment": fb.comment,
+            "created_at": fb.created_at,
+            "plan_type": plan.plan_type,
+            "payload": plan.payload,
+        }
+        for fb, _msg, plan in rows
+    ]
+
+
+def db_update_profile(db: DBSession, session_id: str, user_profile: dict) -> None:
+    """Persist an updated profile snapshot (accepted memories, diner merges)."""
+    row = db.query(SessionRow).filter(SessionRow.session_id == session_id).first()
+    if row:
+        row.user_profile = json.dumps(user_profile)
+        db.commit()

@@ -11,6 +11,7 @@ from .session_service import SessionService
 from .profile_service import ProfileService
 from .chat_service import ChatService
 from .weekly_plan_service import WeeklyPlanService
+from .memory_service import MemoryService
 from .orchestrator_service import OrchestratorService
 
 # Import-time singletons
@@ -20,6 +21,7 @@ profile_service = ProfileService()
 # Created at startup via the init_* functions below
 chat_service: ChatService | None = None
 weekly_plan_service: WeeklyPlanService | None = None
+memory_service: MemoryService | None = None
 orchestrator_service: OrchestratorService | None = None
 
 
@@ -37,8 +39,15 @@ def init_weekly_plan_service() -> WeeklyPlanService:
     return weekly_plan_service
 
 
+def init_memory_service() -> MemoryService:
+    """Initialize the consented-memory service singleton (M3)."""
+    global memory_service
+    memory_service = MemoryService(session_service, profile_service)
+    return memory_service
+
+
 def init_orchestrator_service() -> OrchestratorService:
-    """Initialize the orchestrator singleton (requires chat + weekly services)."""
+    """Initialize the orchestrator singleton (requires chat/weekly/memory services)."""
     global orchestrator_service
     if chat_service is None or weekly_plan_service is None:
         raise RuntimeError("init_chat_service/init_weekly_plan_service must run first")
@@ -46,6 +55,7 @@ def init_orchestrator_service() -> OrchestratorService:
         session_service=session_service,
         chat_service=chat_service,
         weekly_plan_service=weekly_plan_service,
+        memory_service=memory_service,
     )
     return orchestrator_service
 
@@ -61,7 +71,9 @@ __all__ = [
     "chat_service",
     "weekly_plan_service",
     "orchestrator_service",
+    "memory_service",
     "init_chat_service",
     "init_weekly_plan_service",
+    "init_memory_service",
     "init_orchestrator_service",
 ]

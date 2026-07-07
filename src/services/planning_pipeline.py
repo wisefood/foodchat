@@ -42,6 +42,8 @@ class PlanningPipeline:
         query: str,
         profile: dict,
         pinned: dict[str, "CandidateRecipe"] | None = None,
+        exclude_recipe_ids: list[str] | None = None,
+        feedback_history: str = "",
     ) -> list[ScoredPlan]:
         """Produce ranked daily-plan combinations for the reformulated query.
 
@@ -63,7 +65,7 @@ class PlanningPipeline:
                 (profile.get("food_likes") or []) + (profile.get("include_ingredients") or [])
             )),
             exclude_ingredients=profile.get("food_dislikes") or [],
-            exclude_recipe_ids=[r.recipe_id for r in pinned.values()],
+            exclude_recipe_ids=[r.recipe_id for r in pinned.values()] + list(exclude_recipe_ids or []),
             favorite_recipe_ids=profile.get("favorite_recipe_ids") or [],
             nutrition_profile=profile.get("nutrition_profile") or None,
             limit_per_slot=CANDIDATE_LIMIT,
@@ -78,7 +80,7 @@ class PlanningPipeline:
             logger.warning("No candidates for slot(s) %s — cannot build a full plan", empty_slots)
             return []
 
-        scored = self.grader.grade_daily_plans(query, candidates, profile)
+        scored = self.grader.grade_daily_plans(query, candidates, profile, feedback_history)
         logger.info(
             "Pipeline produced %d scored plan(s); best score=%s",
             len(scored), scored[0].score if scored else "n/a",

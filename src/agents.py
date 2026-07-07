@@ -44,6 +44,8 @@ from prompts import (
     DIETARY_INTENT_EXTRACTOR_USER_INSTRUCTIONS,
     SEED_EXTRACTOR_SYSTEM_INSTRUCTIONS,
     SEED_EXTRACTOR_USER_INSTRUCTIONS,
+    PREFERENCE_EXTRACTOR_SYSTEM_INSTRUCTIONS,
+    PREFERENCE_EXTRACTOR_USER_INSTRUCTIONS,
 )
 from schemas import (
     ScoringSchema,
@@ -51,6 +53,7 @@ from schemas import (
     OrchestratorSchema,
     DietaryTagsSchema,
     SeedExtractionSchema,
+    PreferenceExtractionSchema,
 )
 
 logger = logging.getLogger(__name__)
@@ -75,7 +78,8 @@ class DocumentGrader:
         self.max_plans_to_score = max_plans_to_score or MAX_PLANS_TO_SCORE
 
     def grade_daily_plans(
-        self, query: str, candidates: CandidatesBySlot, user_profile: dict
+        self, query: str, candidates: CandidatesBySlot, user_profile: dict,
+        feedback_history: str = "",
     ) -> list[ScoredPlan]:
         """Return the top-scored combinations, best first (at most 3).
 
@@ -107,7 +111,7 @@ class DocumentGrader:
                     query=query,
                     daily_plan=plan_text,
                     preferences=",".join(user_profile.get("preferences", [])),
-                    feedback_history="",  # wired to real member feedback in milestone M3
+                    feedback_history=feedback_history or "No prior feedback.",
                 )),
             ])
             grade = json.loads(result.content)
@@ -249,6 +253,33 @@ class DietaryIntentExtractor:
             return json.loads(result.content).get("dietary_tags", [])
         except Exception as e:
             logger.warning("DietaryIntentExtractor failed: %s", e)
+            return []
+
+
+class PreferenceExtractor:
+    """Detects durable preference candidates in a user turn (M3 memory).
+
+    Output feeds ``services.memory_service`` which applies the consent
+    policy — this agent only detects; it NEVER writes memory itself.
+    """
+
+    def __init__(self, model: str = None, temperature: float = 0.0):
+        self.llm = GROQ_CHAT.get_client(
+            model=model or DEFAULT_MODEL,
+            temperature=temperature,
+            format=PreferenceExtractionSchema.model_json_schema(),
+        )
+
+    def extract(self, message: str) -> list[dict]:
+        try:
+            result = self.llm.invoke([
+                SystemMessage(content=PREFERENCE_EXTRACTOR_SYSTEM_INSTRUCTIONS),
+                HumanMessage(content=PREFERENCE_EXTRACTOR_USER_INSTRUCTIONS.format(message=message)),
+            ])
+            memories = json.loads(result.content).get("memories", [])
+            return [m for m in memories if isinstance(m, dict) and m.get("value") and m.get("kind")]
+        except Exception as e:
+            logger.warning("PreferenceExtractor failed: %s", e)
             return []
 
 
