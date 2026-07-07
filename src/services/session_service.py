@@ -16,8 +16,16 @@ is frozen and a fresh canvas for the new type is started.
 import json
 import logging
 import uuid
-from datetime import datetime as dt
+from datetime import datetime as dt, timezone as _tz
 from typing import Dict, List, Optional
+
+
+def _aware(value):
+    """Coerce pre-M5 naive timestamps (assumed UTC) to aware — mixing naive
+    and aware datetimes in sort keys raises TypeError."""
+    if value is not None and value.tzinfo is None:
+        return value.replace(tzinfo=_tz.utc)
+    return value
 
 from db import (
     SessionLocal,
@@ -109,7 +117,7 @@ class SessionService:
                 state=row.state,
                 clarification=clarification,
                 max_messages=row.max_messages,
-                created_at=row.created_at,
+                created_at=_aware(row.created_at),
             )
 
             # Restore canvases
@@ -144,7 +152,7 @@ class SessionService:
                     Message(
                         role=m.role,
                         content=m.content,
-                        timestamp=m.timestamp,
+                        timestamp=_aware(m.timestamp),
                         intent=m.intent,
                         plan_id=m.plan_id,
                     )
@@ -189,7 +197,7 @@ class SessionService:
         Called after accepted memories or diner changes so the snapshot a
         restarted replica loads matches what the conversation already knows.
         """
-        session = self._sessions.get(session_id)
+        session = self.get_session(session_id)  # load-through (replica-safe)
         if not session:
             raise ValueError(f"Session {session_id} not found")
         db = SessionLocal()
@@ -210,7 +218,7 @@ class SessionService:
         intent: Optional[str] = None,
         plan_id: Optional[str] = None,
     ) -> Message:
-        session = self._sessions.get(session_id)
+        session = self.get_session(session_id)  # load-through (replica-safe)
         if not session:
             raise ValueError(f"Session {session_id} not found")
 
@@ -266,7 +274,7 @@ class SessionService:
         metrics: dict | None = None,
     ) -> MealPlan:
         """Create a brand-new daily plan (version 1, no parent)."""
-        session = self._sessions.get(session_id)
+        session = self.get_session(session_id)  # load-through (replica-safe)
         if not session:
             raise ValueError(f"Session {session_id} not found")
 
@@ -301,7 +309,7 @@ class SessionService:
         metrics: dict | None = None,
     ) -> MealPlan:
         """Create a refined version of the current daily canvas plan."""
-        session = self._sessions.get(session_id)
+        session = self.get_session(session_id)  # load-through (replica-safe)
         if not session:
             raise ValueError(f"Session {session_id} not found")
 
@@ -341,13 +349,13 @@ class SessionService:
 
     def add_weekly_meal_plan(self, session_id: str, plan_entries: List[dict]) -> WeeklyMealPlan:
         """Create a brand-new weekly plan (version 1, no parent)."""
-        session = self._sessions.get(session_id)
+        session = self.get_session(session_id)  # load-through (replica-safe)
         if not session:
             raise ValueError(f"Session {session_id} not found")
 
         weekly_plan = WeeklyMealPlan(
             id=str(uuid.uuid4()),
-            created_at=dt.now(),
+            created_at=dt.now(_tz.utc),
             entries=plan_entries,
             version=1,
             parent_id=None,
@@ -375,7 +383,7 @@ class SessionService:
 
     def refine_weekly_meal_plan(self, session_id: str, plan_entries: List[dict]) -> WeeklyMealPlan:
         """Create a refined version of the current weekly canvas plan."""
-        session = self._sessions.get(session_id)
+        session = self.get_session(session_id)  # load-through (replica-safe)
         if not session:
             raise ValueError(f"Session {session_id} not found")
 
@@ -388,7 +396,7 @@ class SessionService:
 
         weekly_plan = WeeklyMealPlan(
             id=str(uuid.uuid4()),
-            created_at=dt.now(),
+            created_at=dt.now(_tz.utc),
             entries=plan_entries,
             version=next_version,
             parent_id=parent_id,
@@ -480,7 +488,7 @@ class SessionService:
 
     def set_clarification_state(self, session_id: str, state_dict: dict) -> None:
         """Persist an in-progress clarification (serialized ClarificationState)."""
-        session = self._sessions.get(session_id)
+        session = self.get_session(session_id)  # load-through (replica-safe)
         if not session:
             raise ValueError(f"Session {session_id} not found")
         session.state = "clarifying"
@@ -493,7 +501,7 @@ class SessionService:
             db.close()
 
     def clear_clarification_state(self, session_id: str) -> None:
-        session = self._sessions.get(session_id)
+        session = self.get_session(session_id)  # load-through (replica-safe)
         if not session:
             raise ValueError(f"Session {session_id} not found")
         session.state = "ready"
@@ -569,7 +577,7 @@ def _deserialize_meal_plan(plan_id: str, payload: dict) -> MealPlan:
 
     return MealPlan(
         id=plan_id,
-        created_at=dt.fromisoformat(payload["created_at"]),
+        created_at=_aware(dt.fromisoformat(payload["created_at"])),
         version=payload.get("version", 1),
         parent_id=payload.get("parent_id"),
         constraints_applied=payload.get("constraints_applied", []) or [],
@@ -592,7 +600,7 @@ def _deserialize_meal_plan(plan_id: str, payload: dict) -> MealPlan:
 def _deserialize_weekly_plan(plan_id: str, payload: dict) -> WeeklyMealPlan:
     return WeeklyMealPlan(
         id=plan_id,
-        created_at=dt.fromisoformat(payload["created_at"]),
+        created_at=_aware(dt.fromisoformat(payload["created_at"])),
         version=payload.get("version", 1),
         parent_id=payload.get("parent_id"),
         entries=payload.get("entries", []),

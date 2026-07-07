@@ -15,7 +15,7 @@ feedback   — thumbs up/down + optional comment per assistant message
 
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import (
@@ -32,14 +32,32 @@ from sqlalchemy import (
 from sqlalchemy.orm import DeclarativeBase, Session as DBSession, sessionmaker
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./foodchat.db")
+_IS_SQLITE = DATABASE_URL.startswith("sqlite")
 
-engine = create_engine(
-    DATABASE_URL,
-    connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {},
-)
+
+def utcnow() -> datetime:
+    """Timezone-aware UTC now — ALL timestamps in this service are aware.
+
+    Naive datetimes from pre-M5 rows are coerced on load (session_service),
+    never written anymore.
+    """
+    return datetime.now(timezone.utc)
+
+
+if _IS_SQLITE:
+    engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+else:
+    # PostgreSQL (M5): verified connections + bounded pool, tunable via env.
+    engine = create_engine(
+        DATABASE_URL,
+        pool_pre_ping=True,
+        pool_size=int(os.getenv("DB_POOL_SIZE", "5")),
+        max_overflow=int(os.getenv("DB_MAX_OVERFLOW", "10")),
+        pool_recycle=int(os.getenv("DB_POOL_RECYCLE", "1800")),
+    )
 
 # Enable foreign keys for SQLite
-if DATABASE_URL.startswith("sqlite"):
+if _IS_SQLITE:
     @event.listens_for(engine, "connect")
     def _set_sqlite_pragma(dbapi_conn, _):
         dbapi_conn.execute("PRAGMA foreign_keys=ON")
@@ -65,7 +83,7 @@ class SessionRow(Base):
     # the clarification flow restart-safe (see services/clarification.py).
     clarification_state = Column(Text, nullable=True)
     max_messages = Column(Integer, default=200)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=utcnow)
 
 
 class MessageRow(Base):
@@ -77,7 +95,7 @@ class MessageRow(Base):
     content = Column(Text, nullable=False)
     intent = Column(String, nullable=True)
     plan_id = Column(String, nullable=True)
-    timestamp = Column(DateTime, default=datetime.utcnow)
+    timestamp = Column(DateTime(timezone=True), default=utcnow)
 
 
 class MealPlanRow(Base):
@@ -89,7 +107,7 @@ class MealPlanRow(Base):
     version = Column(Integer, nullable=False, default=1)
     parent_id = Column(String, nullable=True)        # id of previous version, NULL for v1
     payload = Column(Text, nullable=False)           # full plan as JSON
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=utcnow)
 
 
 class FeedbackRow(Base):
@@ -101,7 +119,7 @@ class FeedbackRow(Base):
     member_id = Column(String, nullable=False, index=True)
     rating = Column(String, nullable=False)          # "up" | "down"
     comment = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=utcnow)
 
 
 def init_db() -> None:
@@ -201,12 +219,13 @@ def db_update_canvases(
     daily_canvas: Optional[dict],
     weekly_canvas: Optional[dict],
 ) -> None:
+    """Persist BOTH canvas pointers — None clears the column (the in-memory
+    session is the source of truth; pre-M5 this skipped None and a cleared
+    canvas could resurrect after a restart)."""
     row = db.query(SessionRow).filter(SessionRow.session_id == session_id).first()
     if row:
-        if daily_canvas is not None:
-            row.daily_canvas = json.dumps(daily_canvas)
-        if weekly_canvas is not None:
-            row.weekly_canvas = json.dumps(weekly_canvas)
+        row.daily_canvas = json.dumps(daily_canvas) if daily_canvas is not None else None
+        row.weekly_canvas = json.dumps(weekly_canvas) if weekly_canvas is not None else None
         db.commit()
 
 

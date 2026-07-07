@@ -15,8 +15,13 @@ never a live object — so sessions survive restarts and replicas.
 import os
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Literal, Optional
+
+
+def _utcnow() -> datetime:
+    """Aware UTC now — every timestamp in the domain model carries tzinfo."""
+    return datetime.now(timezone.utc)
 
 from models.recipe import CandidateRecipe
 
@@ -32,7 +37,7 @@ Intent = Literal[
 class Message:
     role: Literal["user", "assistant"]
     content: str
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=_utcnow)
     intent: Optional[Intent] = None
     plan_id: Optional[str] = None  # references MealPlan.id or WeeklyMealPlan.id
 
@@ -105,7 +110,7 @@ class MealPlan:
         metrics = metrics or {}
         return cls(
             id=str(uuid.uuid4()),
-            created_at=datetime.now(),
+            created_at=_utcnow(),
             breakfast=MealCourse.from_candidate(courses[0]),
             lunch=MealCourse.from_candidate(courses[1]),
             dinner=MealCourse.from_candidate(courses[2]),
@@ -166,7 +171,7 @@ class Session:
     state: Literal["ready", "clarifying"] = "ready"
     clarification: Optional[dict] = None
 
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=_utcnow)
 
     # ------------------------------------------------------------------ #
     # Canvas helpers                                                       #

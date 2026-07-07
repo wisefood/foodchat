@@ -2,6 +2,56 @@
 
 ---
 
+# M5 — Platform Hardening & Demo Readiness
+
+> **Date:** 2026-07-07
+> **Branch:** main
+> Deployment: foodchat moves to the platform PostgreSQL (dedicated
+> `foodchat` database — created idempotently by the core-components init
+> script; re-run init-db or create it manually on existing clusters) and
+> gains Langfuse tracing env. Rebuild the image (new deps: psycopg2-binary,
+> langfuse).
+
+## Postgres-ready persistence
+
+- **Timezone-aware everywhere**: all column defaults and domain-model
+  timestamps are aware UTC (`DateTime(timezone=True)`); pre-M5 naive rows
+  are coerced on load (`_aware`) so mixed sorts can't raise.
+- **Replica-safe mutations**: every SessionService mutator is load-through —
+  a write landing on a replica that never saw the session loads it from the
+  DB instead of raising (8 call sites).
+- **Canvas clears persist**: `db_update_canvases` now NULLs cleared
+  canvases (pre-M5 a cleared canvas resurrected after restart).
+- Bounded, verified connection pool for PostgreSQL
+  (`pool_pre_ping`, `DB_POOL_SIZE`/`DB_MAX_OVERFLOW`/`DB_POOL_RECYCLE`).
+- SQLite remains the zero-config dev default; tests run on it unchanged.
+
+## Observability
+
+- **Langfuse tracing on every Groq call** (`backend/observability.py`):
+  env-gated (`LANGFUSE_PUBLIC_KEY`/`SECRET_KEY`/`HOST`), attaches a LangChain
+  callback to the pooled clients — orchestrator, graders, extractors, and the
+  response writer all appear as traces in the platform Langfuse (same
+  instance FoodScholar reports to). No keys → silent no-op, never affects chat.
+
+## Demo readiness
+
+- `scripts/seed_demo.py` — idempotent gateway-driven seeding of the demo
+  household (Dimitris omnivore/high-protein, Anna vegetarian, Tom child with
+  a peanut allergy) + favorites for the Greek anchor dishes; doubles as the
+  preflight check that pastitsio/fakes/moussaka resolve in RecipeWrangler
+  (non-zero exit when a prerequisite is missing).
+- `DEMO_SCRIPT.md` — the beat-by-beat RecSys walkthrough with feature
+  mapping, failure-mode recovery lines, and research talking points.
+- FoodScholar `Dockerfile` EXPOSE fixed to the deployed port (8001).
+
+## Tests
+
++6 (cold-replica mutations for messages/plans/clarification, canvas-clear
+persistence, naive→aware coercion, mixed-timestamp sorting) — 78 total.
+
+---
+
 # M4 — Rich Plans, Transparency, Verified Slot Editing, Natural Voice
 
 > **Date:** 2026-07-07

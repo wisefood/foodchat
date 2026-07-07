@@ -152,6 +152,12 @@ class GroqConnectionPool:
                 # Merge kwargs with json config
                 final_kwargs = {**kwargs, **json_config}
 
+                # Langfuse tracing (M5) — no-op unless keys are configured.
+                from backend.observability import langchain_callbacks
+                callbacks = langchain_callbacks()
+                if callbacks:
+                    final_kwargs.setdefault("callbacks", callbacks)
+
                 self._pool[pool_key] = ChatGroq(
                     model=model,
                     temperature=temperature,
