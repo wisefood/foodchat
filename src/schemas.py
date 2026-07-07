@@ -46,7 +46,10 @@ class QueryReformulatorSchema(BaseModel):
 
 class OrchestratorSchema(BaseModel):
     """Per-turn intent classification (the single router of the pipeline)."""
-    intent: Literal["daily_plan", "weekly_plan", "refine_plan", "switch_plan_type", "chat"]
+    intent: Literal[
+        "daily_plan", "weekly_plan", "refine_plan",
+        "switch_plan_type", "nutrition_question", "chat",
+    ]
     reasoning: str
     # Populated only when intent == "switch_plan_type"
     target_plan_type: Optional[Literal["daily", "weekly"]] = None

@@ -28,25 +28,29 @@ Client (wisefood-api gateway)
          |
          +--> session.state == "clarifying" ?
          |      |
-         |      +--> yes -> ChatService.continue_clarification(...)
+         |      +--> yes -> route by persisted clarification kind
          |      |          (NO intent classification — the user is answering
-         |      |           our question; origin intent restored from the
-         |      |           persisted ClarificationState)
+         |      |           our question)
+         |      |          +--> kind == "foodscholar" -> FoodScholarService.continue_clarification
+         |      |          +--> else (plan flow)      -> ChatService.continue_clarification
+         |      |                                        (origin intent restored from state)
          |      |
          |      +--> no  -> OrchestratorAgent.classify(message, last 12 turns)
          |                  (the ONLY intent classification in the pipeline)
          |
          +--> route by intent
                 |
-                +--> "daily_plan"        -> ChatService.process_plan_request(is_refinement=False)
-                +--> "weekly_plan"       -> WeeklyPlanService.process_message(is_refinement=False)
+                +--> "daily_plan"          -> ChatService.process_plan_request(is_refinement=False)
+                +--> "weekly_plan"         -> WeeklyPlanService.process_message(is_refinement=False)
                 +--> "refine_plan"
                 |      +--> no active canvas      -> fresh daily plan
                 |      +--> active weekly canvas  -> WeeklyPlanService(is_refinement=True)
                 |      +--> active daily canvas   -> ChatService(is_refinement=True)
-                +--> "switch_plan_type"  -> ack message, then fresh plan of target type
-                |                           (old canvas frozen, history retained)
-                +--> "chat" / fallback   -> ChatService.process_smalltalk
+                +--> "switch_plan_type"    -> ack message, then fresh plan of target type
+                |                             (old canvas frozen, history retained)
+                +--> "nutrition_question"  -> FoodScholarService.process_question
+                |                             (see section 5a — cited answer + attribution)
+                +--> "chat" / fallback     -> ChatService.process_smalltalk
 ```
 
 ## 2. Daily plan branch
@@ -121,6 +125,35 @@ correctly after a process restart or on a different replica.
   |      else          -> session_service.add_meal_plan     (version 1, fresh canvas)
   |
   +--> add assistant message, return (text, needs_clarification=False, meal_plan)
+```
+
+## 5a. Nutrition question branch (FoodScholar bridge)
+
+```text
+[FoodScholarService.process_question]
+  |
+  +--> add user message
+  +--> POST {FOODSCHOLAR_API_URL}/api/v1/qa/ask
+  |      { question, mode: "simple", member_id, top_k }
+  |      (FoodScholar personalizes with the same member profile)
+  |
+  +--> HTTP failure ?
+  |      +--> yes -> in-chat apology, no attribution, never a 500
+  |
+  +--> needs_clarification ?
+  |      |
+  |      +--> yes -> render question (+ options flattened into text)
+  |      |          -> persist {"kind": "foodscholar", qa_thread_id,
+  |      |                      clarification_id, original_question}
+  |      |             in sessions.clarification_state
+  |      |          -> return needs_clarification=True
+  |      |          (next user turn resumes the thread with the answer
+  |      |           as free text — restart-safe)
+  |      |
+  |      +--> no  -> answer text (markdown) + Attribution:
+  |                  { source: "foodscholar", confidence,
+  |                    citations[{title, source_type, url, label}],
+  |                    learn_more_url: "/foodscholar?q=<question>" }
 ```
 
 ## 5. Weekly plan branch

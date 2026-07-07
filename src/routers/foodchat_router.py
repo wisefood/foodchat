@@ -142,6 +142,39 @@ class ChatRequest(BaseModel):
     member_id: str
 
 
+class CitationResponse(BaseModel):
+    title: str
+    source_type: str            # "article" | "guideline"
+    url: Optional[str] = None
+    label: Optional[str] = None  # short inline label, e.g. "G1"
+
+
+class AttributionResponse(BaseModel):
+    """Provenance of an answer delegated to another WiseFood app (FoodScholar).
+
+    ``learn_more_url`` is a UI-relative path (e.g. ``/foodscholar?q=...``).
+    """
+
+    source: str                  # "foodscholar"
+    confidence: Optional[str] = None
+    citations: List[CitationResponse] = []
+    learn_more_url: Optional[str] = None
+
+    @classmethod
+    def from_attribution(cls, a) -> "AttributionResponse":
+        return cls(
+            source=a.source,
+            confidence=a.confidence,
+            citations=[
+                CitationResponse(
+                    title=c.title, source_type=c.source_type, url=c.url, label=c.label,
+                )
+                for c in a.citations
+            ],
+            learn_more_url=a.learn_more_url,
+        )
+
+
 class ChatTurnResponse(BaseModel):
     role: str
     content: str
@@ -153,6 +186,8 @@ class ChatTurnResponse(BaseModel):
     # Version metadata so the UI knows which canvas version was just produced
     plan_version: Optional[int] = None
     plan_parent_id: Optional[str] = None
+    # Set when the answer came from another WiseFood app (nutrition_question)
+    attribution: Optional[AttributionResponse] = None
 
 
 class ConversationPage(BaseModel):
@@ -284,11 +319,12 @@ async def unified_chat(session_id: str, request: ChatRequest):
     Unified conversational endpoint.
 
     Accepts any message and routes to the correct sub-service based on intent:
-      - daily_plan       → new daily meal plan (fresh canvas)
-      - weekly_plan      → new weekly meal plan (fresh canvas)
-      - refine_plan      → update the active canvas plan in-place (version++)
-      - switch_plan_type → freeze current canvas type, start fresh canvas of the other type
-      - chat             → general conversation
+      - daily_plan         → new daily meal plan (fresh canvas)
+      - weekly_plan        → new weekly meal plan (fresh canvas)
+      - refine_plan        → update the active canvas plan in-place (version++)
+      - switch_plan_type   → freeze current canvas type, start fresh canvas of the other type
+      - nutrition_question → evidence-based answer via FoodScholar (with attribution)
+      - chat               → general conversation
 
     The caller must supply member_id to prove session ownership.
 
@@ -327,6 +363,10 @@ async def unified_chat(session_id: str, request: ChatRequest):
         at_message_limit=turn.at_message_limit,
         plan_version=turn.plan_version,
         plan_parent_id=turn.plan_parent_id,
+        attribution=(
+            AttributionResponse.from_attribution(turn.attribution)
+            if turn.attribution else None
+        ),
     )
 
 

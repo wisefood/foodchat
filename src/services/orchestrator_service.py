@@ -4,17 +4,19 @@ OrchestratorService — unified conversational entry point.
 The ONLY intent classification in the pipeline happens here (one
 ``OrchestratorAgent.classify`` call per turn), then the turn is routed:
 
-  daily_plan       → ChatService.process_plan_request (fresh canvas)
-  refine_plan      → ChatService / WeeklyPlanService with is_refinement=True,
-                     targeting whichever canvas was most recently updated
-  weekly_plan      → WeeklyPlanService (fresh canvas)
-  switch_plan_type → acknowledge, then fresh canvas of the target type
-  chat             → ChatService.process_smalltalk
+  daily_plan         → ChatService.process_plan_request (fresh canvas)
+  refine_plan        → ChatService / WeeklyPlanService with is_refinement=True,
+                       targeting whichever canvas was most recently updated
+  weekly_plan        → WeeklyPlanService (fresh canvas)
+  switch_plan_type   → acknowledge, then fresh canvas of the target type
+  nutrition_question → FoodScholarService (evidence-based answer + attribution)
+  chat               → ChatService.process_smalltalk
 
 While a session is mid-clarification (session.state == "clarifying"), the
-classifier is skipped entirely and the message is fed to
-``ChatService.continue_clarification`` — the original intent is restored from
-the persisted clarification state (restart-safe; see services/clarification.py).
+classifier is skipped entirely — the user is answering our question. The
+persisted clarification dict routes the turn: ``kind == "foodscholar"`` goes
+back to FoodScholarService, anything else to ChatService (plan flow, whose
+state carries the original intent). Both are restart-safe (data, not objects).
 
 Returns a unified ChatTurn so the router needs one response model.
 """
@@ -24,7 +26,9 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from agents import OrchestratorAgent
+from models.attribution import Attribution
 from models.session import MealPlan, WeeklyMealPlan
+from .foodscholar_service import FoodScholarService
 from .session_service import SessionService
 
 logger = logging.getLogger(__name__)
@@ -42,14 +46,23 @@ class ChatTurn:
     # Version metadata surfaced to the caller (canvas tracking in the UI)
     plan_version: Optional[int] = None
     plan_parent_id: Optional[str] = None
+    # Provenance when the answer came from another WiseFood app (FoodScholar)
+    attribution: Optional[Attribution] = None
 
 
 class OrchestratorService:
 
-    def __init__(self, session_service: SessionService, chat_service: Any, weekly_plan_service: Any):
+    def __init__(
+        self,
+        session_service: SessionService,
+        chat_service: Any,
+        weekly_plan_service: Any,
+        foodscholar_service: Optional[FoodScholarService] = None,
+    ):
         self.session_service = session_service
         self.chat_service = chat_service
         self.weekly_plan_service = weekly_plan_service
+        self.foodscholar_service = foodscholar_service or FoodScholarService(session_service)
         self.orchestrator = OrchestratorAgent()
 
     def process(self, session_id: str, member_id: str, message: str) -> ChatTurn:
@@ -102,6 +115,9 @@ class OrchestratorService:
                 return self._handle_weekly(session_id, message, intent, is_refinement=True)
             return self._handle_plan(session_id, message, intent, is_refinement=True)
 
+        if intent == "nutrition_question":
+            return self._handle_nutrition_question(session_id, message)
+
         # "chat" and any unexpected values
         return self._handle_smalltalk(session_id, message)
 
@@ -110,6 +126,22 @@ class OrchestratorService:
     # ------------------------------------------------------------------ #
 
     def _handle_clarification_turn(self, session_id: str, message: str) -> ChatTurn:
+        session = self.session_service.get_session(session_id)
+        pending = (session.clarification or {}) if session else {}
+
+        # FoodScholar clarifications are tagged with kind="foodscholar";
+        # plan-flow states (ClarificationState.to_dict) have no "kind" key.
+        if pending.get("kind") == FoodScholarService.CLARIFICATION_KIND:
+            fs_turn = self.foodscholar_service.continue_clarification(session_id, message)
+            self._tag_last_message(session_id, "nutrition_question", None)
+            return ChatTurn(
+                role="assistant",
+                content=fs_turn.text,
+                intent="nutrition_question",
+                needs_clarification=fs_turn.needs_clarification,
+                attribution=fs_turn.attribution,
+            )
+
         response_text, needs_clarification, meal_plan, origin_intent = (
             self.chat_service.continue_clarification(session_id, message)
         )
@@ -122,6 +154,18 @@ class OrchestratorService:
             meal_plan=meal_plan,
             plan_version=meal_plan.version if meal_plan else None,
             plan_parent_id=meal_plan.parent_id if meal_plan else None,
+        )
+
+    def _handle_nutrition_question(self, session_id: str, message: str) -> ChatTurn:
+        """Delegate a nutrition-science question to FoodScholar (M1 bridge)."""
+        fs_turn = self.foodscholar_service.process_question(session_id, message)
+        self._tag_last_message(session_id, "nutrition_question", None)
+        return ChatTurn(
+            role="assistant",
+            content=fs_turn.text,
+            intent="nutrition_question",
+            needs_clarification=fs_turn.needs_clarification,
+            attribution=fs_turn.attribution,
         )
 
     def _handle_smalltalk(self, session_id: str, message: str) -> ChatTurn:

@@ -171,14 +171,20 @@ class SimpleChatBot:
     a cross-user context leak. Do not reintroduce instance-level history.
     """
 
-    # NOTE: prompt is rewritten in M1 to delegate nutrition-science questions
-    # to FoodScholar instead of refusing them (milestone M1).
+    # Nutrition-science questions never reach this prompt — the orchestrator
+    # routes them to FoodScholar (nutrition_question intent). This bot only
+    # sees greetings, small talk, and the leftovers; it must never claim it
+    # "can't answer" something — it redirects warmly instead.
     SYSTEM_PROMPT = (
-        "You are FoodChat, a friendly meal-planning assistant. "
-        "I specialize exclusively in creating daily or weekly meal plans and providing specific recipes. "
-        "I cannot answer generic nutrition questions, provide general cooking tips, or discuss food history. "
-        "If you ask me something outside of meal planning, I will politely remind you of my focus. "
-        "Try asking me: 'Get me a plan for today' or 'I need a vegetarian weekly plan'."
+        "You are FoodChat, the friendly meal-planning assistant of the WiseFood platform. "
+        "You help people plan what to eat: daily meal plans, weekly meal plans, and "
+        "refinements to plans you've already made ('swap the dinner', 'make it lighter'). "
+        "Nutrition-science questions are answered for you by FoodScholar, WiseFood's "
+        "evidence-based Q&A service, so never tell the user a question can't be answered here. "
+        "For this conversation: respond warmly and briefly, stay food-related where natural, "
+        "and when the user seems unsure what to do next, suggest something concrete like "
+        "'want a plan for today?' or 'shall we plan your week around something you love?'. "
+        "Never invent recipes or plans in this mode — offer to create one instead."
     )
 
     def __init__(self, model: str = None, temperature: float = None):
@@ -246,11 +252,15 @@ class DietaryIntentExtractor:
 class OrchestratorAgent:
     """Single intent classifier per turn — the ONLY router in the pipeline.
 
-    Valid intents: daily_plan | weekly_plan | refine_plan | switch_plan_type | chat.
-    ``target_plan_type`` is populated only for switch_plan_type.
+    Valid intents: daily_plan | weekly_plan | refine_plan | switch_plan_type
+    | nutrition_question | chat. ``target_plan_type`` is populated only for
+    switch_plan_type; nutrition_question turns are delegated to FoodScholar.
     """
 
-    VALID_INTENTS = {"daily_plan", "weekly_plan", "refine_plan", "switch_plan_type", "chat"}
+    VALID_INTENTS = {
+        "daily_plan", "weekly_plan", "refine_plan",
+        "switch_plan_type", "nutrition_question", "chat",
+    }
 
     def __init__(self, model: str = None, temperature: float = None):
         self.llm = GROQ_CHAT.get_client(

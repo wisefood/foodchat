@@ -2,6 +2,52 @@
 
 ---
 
+# M1 — FoodScholar Bridge
+
+> **Date:** 2026-07-07
+> **Branch:** main
+> No DB migration. New env var: `FOODSCHOLAR_API_URL` (+ optional
+> `FOODSCHOLAR_TIMEOUT`, `FOODSCHOLAR_TOP_K`). Gateway and UI updated in the
+> same release (attribution passthrough / rendering).
+
+## What changed
+
+FoodChat no longer refuses nutrition-science questions — it answers them
+**via FoodScholar** and shows its sources:
+
+- **New intent `nutrition_question`** (orchestrator prompt + schema): factual
+  questions about nutrition, diets, ingredients, or health effects of food.
+  A request FOR a plan is never a nutrition_question; a question ABOUT a
+  diet is.
+- **`services/foodscholar_service.py`** — bridge to FoodScholar
+  `POST /api/v1/qa/ask` (mode=simple, member_id passed through so FoodScholar
+  personalizes with the same profile). Handles FoodScholar's clarification
+  flow: the question is surfaced conversationally (options flattened into the
+  text) and the pending `qa_thread_id` is persisted in the session's
+  clarification state as `{"kind": "foodscholar", ...}` — restart-safe, same
+  mechanism as the plan flow. FoodScholar unreachable → graceful in-chat
+  apology, never a 500.
+- **`models/attribution.py`** + `ChatTurnResponse.attribution` —
+  `{source, confidence, citations[{title, source_type, url, label}],
+  learn_more_url}`. `learn_more_url` is a UI-relative deep link
+  (`/foodscholar?q=<question>`); the frontend prefills and auto-asks.
+- **SimpleChatBot prompt rewritten** — never claims it "can't answer";
+  warmly steers toward planning; nutrition questions never reach it anymore.
+- **Gateway (wisefood-api):** `FoodChatAttribution`/`FoodChatCitation`
+  mirrored on the proxied chat-turn model; fixed a latent bug where
+  FoodScholar session creation with a `member_id` called nonexistent methods
+  on `HOUSEHOLD` (now `HOUSEHOLD_MEMBER.get/get_member_profile`) and 500'd.
+- **UI (wisefood-ui):** "Answered with FoodScholar" badge, citation chips,
+  "Learn more in FoodScholar →" link on attributed messages; `/foodscholar`
+  accepts `?q=` to prefill + auto-ask.
+- **Deployment:** `FOODSCHOLAR_API_URL=http://foodscholar:8001` added to the
+  foodchat container env (tk-validated).
+- **Tests:** +6 (answer/attribution mapping, clarification round-trip incl.
+  restart, graceful degradation, orchestrator routing + classifier bypass
+  while clarifying).
+
+---
+
 # M0 — Clean Foundation
 
 > **Date:** 2026-07-07
