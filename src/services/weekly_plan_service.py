@@ -1,6 +1,7 @@
 import logging
-from typing import Tuple
+from typing import Optional, Tuple
 
+from .seed_service import SeedService
 from .session_service import SessionService
 from .weekly_planner.action_adapter import RecipeActionSpace
 from .weekly_planner.reward_logic import RewardCalculator
@@ -37,6 +38,7 @@ class WeeklyPlanService:
         self.session_service = session_service
         self.reward_calculator = RewardCalculator()
         self.diet_extractor = DietaryIntentExtractor()
+        self.seed_service = SeedService()
         logger.info("WeeklyPlanService initialized.")
 
     def process_message(
@@ -44,6 +46,7 @@ class WeeklyPlanService:
         session_id: str,
         content: str,
         is_refinement: bool = False,
+        seeds: Optional[list[dict]] = None,
     ) -> Tuple[str, WeeklyMealPlan]:
         session = self.session_service.get_session(session_id)
         if not session:
@@ -75,8 +78,26 @@ class WeeklyPlanService:
         if query_diet_tags:
             logger.info("[%s] Extracted diet tags from query: %s", session_id, query_diet_tags)
 
+        # Resolve user-named anchor dishes into pinned (day, meal) slots (M2).
+        seed_note = ""
+        pinned: dict = {}
+        if seeds:
+            resolutions = self.seed_service.resolve_seeds(seeds, session.user_profile)
+            placements = self.seed_service.place_weekly(resolutions)
+            pinned = {
+                slot: {
+                    "recipe_id": r.recipe_id, "recipe_title": r.title,
+                    "recipe_ingredients": r.ingredients, "recipe_directions": r.directions,
+                }
+                for slot, r in placements.items()
+            }
+            seed_note = self.seed_service.describe(resolutions)
+
         logger.info("[%s] Initializing action space and environment.", session_id)
         action_space = RecipeActionSpace(session.user_profile, additional_diet=query_diet_tags)
+        # Anchored recipes must never repeat elsewhere in the week.
+        for entry in pinned.values():
+            action_space.mark_selected(entry["recipe_id"])
         env = WeeklyMealPlanEnv(
             user_profile=session.user_profile,
             action_space=action_space,
@@ -85,8 +106,10 @@ class WeeklyPlanService:
         )
         planner = WeeklyPlanner(env)
 
-        logger.info("[%s] Generating 7-day plan (21 meals).", session_id)
-        plan_entries = planner.generate_full_plan(user_query=effective_query)
+        logger.info(
+            "[%s] Generating 7-day plan (21 meals, %d pinned).", session_id, len(pinned)
+        )
+        plan_entries = planner.generate_full_plan(user_query=effective_query, pinned=pinned)
         logger.info("[%s] Plan generation complete — %d entries.", session_id, len(plan_entries))
 
         if is_refinement:
@@ -107,6 +130,9 @@ class WeeklyPlanService:
                 "I've picked out breakfast, lunch, and dinner for each day based on your profile. "
                 "Let me know if you'd like to swap anything out or adjust it."
             )
+
+        if seed_note:
+            response_text = f"{response_text} {seed_note}"
 
         self.session_service.add_message(session_id, "assistant", response_text)
 

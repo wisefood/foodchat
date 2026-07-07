@@ -22,6 +22,7 @@ Returns a unified ChatTurn so the router needs one response model.
 """
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -29,9 +30,20 @@ from agents import OrchestratorAgent
 from models.attribution import Attribution
 from models.session import MealPlan, WeeklyMealPlan
 from .foodscholar_service import FoodScholarService
+from .seed_service import SeedService
 from .session_service import SessionService
 
 logger = logging.getLogger(__name__)
+
+# Words that count as accepting the favorites offer. Kept deliberately simple
+# for M2 — anything else is treated as a decline and the original request
+# proceeds unchanged, so a misread costs nothing but the boost.
+_AFFIRMATIVE = re.compile(
+    r"^\s*(yes|yeah|yep|sure|ok(ay)?|please|sounds good|do it|why not|go for it)\b",
+    re.IGNORECASE,
+)
+# Favorites shown by title in the offer message (each needs a detail fetch).
+MAX_OFFERED_FAVORITES = 3
 
 
 @dataclass
@@ -63,6 +75,7 @@ class OrchestratorService:
         self.chat_service = chat_service
         self.weekly_plan_service = weekly_plan_service
         self.foodscholar_service = foodscholar_service or FoodScholarService(session_service)
+        self.seed_service = SeedService()
         self.orchestrator = OrchestratorAgent()
 
     def process(self, session_id: str, member_id: str, message: str) -> ChatTurn:
@@ -99,11 +112,19 @@ class OrchestratorService:
         if intent == "switch_plan_type":
             return self._handle_switch(session_id, message, target_plan_type)
 
-        if intent == "weekly_plan":
-            return self._handle_weekly(session_id, message, intent, is_refinement=False)
+        if intent in ("weekly_plan", "daily_plan"):
+            # Named anchor dishes are extracted once per plan turn: they feed
+            # pinned-slot planning AND gate the favorites offer (an explicit
+            # dish request means the user already has a starting point).
+            seeds = self.seed_service.extract_seeds(message)
 
-        if intent == "daily_plan":
-            return self._handle_plan(session_id, message, intent, is_refinement=False)
+            offer = self._maybe_offer_favorites(session, message, intent, seeds)
+            if offer is not None:
+                return offer
+
+            if intent == "weekly_plan":
+                return self._handle_weekly(session_id, message, intent, is_refinement=False, seeds=seeds)
+            return self._handle_plan(session_id, message, intent, is_refinement=False, seeds=seeds)
 
         if intent == "refine_plan":
             canvas = session.active_canvas
@@ -125,9 +146,87 @@ class OrchestratorService:
     # Handlers                                                             #
     # ------------------------------------------------------------------ #
 
+    def _maybe_offer_favorites(
+        self, session, message: str, intent: str, seeds: list[dict]
+    ) -> Optional[ChatTurn]:
+        """One-time proactive offer to work the member's favorites into the plan.
+
+        Fires only when ALL hold: first plan of the session (no canvases yet),
+        the member has favorites, the request names no dishes itself, and no
+        offer was made before in this session (offer messages are tagged with
+        intent="favorites_offer" — the tag is the dedupe record, persisted
+        with the message). Declining is safe: the original request proceeds
+        unchanged on the next turn.
+        """
+        if seeds:
+            return None
+        if session.meal_plans or session.weekly_meal_plans:
+            return None
+        favorites = session.user_profile.get("favorite_recipe_ids") or []
+        if not favorites:
+            return None
+        if any(m.intent == "favorites_offer" for m in session.conversation):
+            return None
+
+        # Show up to a few favorites by title (best-effort detail fetches).
+        titles = []
+        for recipe_id in favorites[:MAX_OFFERED_FAVORITES]:
+            resolved = self.seed_service.client.fetch_recipe(recipe_id)
+            if resolved and resolved.recipe.title:
+                titles.append(resolved.recipe.title)
+        named = ", ".join(f"“{t}”" for t in titles) if titles else "some favorite recipes"
+
+        offer_text = (
+            f"Before I plan — I noticed you've favorited {named}. "
+            "Want me to work them into this plan? (yes / no)"
+        )
+        self.session_service.set_clarification_state(session.session_id, {
+            "kind": "favorites_offer",
+            "original_message": message,
+            "origin_intent": intent,
+        })
+        self.session_service.add_message(
+            session.session_id, "assistant", offer_text, intent="favorites_offer"
+        )
+        logger.info("[%s] Favorites offer made (%d favorites).", session.session_id, len(favorites))
+        return ChatTurn(
+            role="assistant", content=offer_text,
+            intent="favorites_offer", needs_clarification=True,
+        )
+
+    def _handle_favorites_offer_reply(self, session_id: str, message: str) -> ChatTurn:
+        """Consume the yes/no reply to the favorites offer and generate the plan."""
+        session = self.session_service.get_session(session_id)
+        pending = session.clarification or {}
+        self.session_service.clear_clarification_state(session_id)
+
+        original_message = pending.get("original_message", message)
+        intent = pending.get("origin_intent", "daily_plan")
+        accepted = bool(_AFFIRMATIVE.match(message or ""))
+        logger.info("[%s] Favorites offer %s.", session_id, "accepted" if accepted else "declined")
+
+        seeds: list[dict] = []
+        if accepted:
+            # Pin the favorites themselves as anchors (resolution re-checks
+            # allergies/diet, so an unsafe favorite is skipped with a note).
+            favorites = session.user_profile.get("favorite_recipe_ids") or []
+            for recipe_id in favorites[:MAX_OFFERED_FAVORITES]:
+                resolved = self.seed_service.client.fetch_recipe(recipe_id)
+                if resolved and resolved.recipe.title:
+                    seeds.append({"name": resolved.recipe.title})
+
+        if intent == "weekly_plan":
+            return self._handle_weekly(session_id, original_message, intent, is_refinement=False, seeds=seeds)
+        return self._handle_plan(session_id, original_message, intent, is_refinement=False, seeds=seeds)
+
     def _handle_clarification_turn(self, session_id: str, message: str) -> ChatTurn:
         session = self.session_service.get_session(session_id)
         pending = (session.clarification or {}) if session else {}
+
+        if pending.get("kind") == "favorites_offer":
+            # The user is answering the favorites offer, not a plan question.
+            self.session_service.add_message(session_id, "user", message)
+            return self._handle_favorites_offer_reply(session_id, message)
 
         # FoodScholar clarifications are tagged with kind="foodscholar";
         # plan-flow states (ClarificationState.to_dict) have no "kind" key.
@@ -173,9 +272,12 @@ class OrchestratorService:
         self._tag_last_message(session_id, "chat", None)
         return ChatTurn(role="assistant", content=response_text, intent="chat")
 
-    def _handle_plan(self, session_id: str, message: str, intent: str, is_refinement: bool) -> ChatTurn:
+    def _handle_plan(
+        self, session_id: str, message: str, intent: str, is_refinement: bool,
+        seeds: Optional[list[dict]] = None,
+    ) -> ChatTurn:
         response_text, needs_clarification, meal_plan = self.chat_service.process_plan_request(
-            session_id, message, is_refinement=is_refinement
+            session_id, message, is_refinement=is_refinement, seeds=seeds
         )
         self._tag_last_message(session_id, intent, meal_plan.id if meal_plan else None)
 
@@ -189,9 +291,12 @@ class OrchestratorService:
             plan_parent_id=meal_plan.parent_id if meal_plan else None,
         )
 
-    def _handle_weekly(self, session_id: str, message: str, intent: str, is_refinement: bool) -> ChatTurn:
+    def _handle_weekly(
+        self, session_id: str, message: str, intent: str, is_refinement: bool,
+        seeds: Optional[list[dict]] = None,
+    ) -> ChatTurn:
         response_text, weekly_plan = self.weekly_plan_service.process_message(
-            session_id, message, is_refinement=is_refinement
+            session_id, message, is_refinement=is_refinement, seeds=seeds
         )
         self._tag_last_message(session_id, intent, weekly_plan.id if weekly_plan else None)
 

@@ -27,6 +27,21 @@ CandidatesBySlot = dict[str, list[CandidateRecipe]]
 
 
 @dataclass(frozen=True)
+class ResolvedRecipe:
+    """A recipe resolved by name/id from RecipeWrangler's detail endpoint.
+
+    Carries the metadata needed to place and safety-check a user-requested
+    anchor dish (seeded planning, M2): dish types for slot placement and
+    allergens for hard-constraint checks.
+    """
+
+    recipe: CandidateRecipe
+    dish_types: list[str]
+    allergens: list[str]
+    tags: list[str]
+
+
+@dataclass(frozen=True)
 class ScoredPlan:
     """One LLM-graded daily-plan combination."""
 

@@ -31,6 +31,24 @@ class ProfileService:
             logger.error("Failed to fetch profile for member %s: %s", member_id, e, exc_info=True)
             raise
 
+    def get_member_favorites(self, member_id: str) -> list[str]:
+        """Fetch the member's favorited recipe ids from the gateway (M2).
+
+        Best-effort: favorites are a soft personalization signal, so any
+        failure degrades to an empty list rather than blocking the session.
+        """
+        try:
+            with self.client_pool.client() as client:
+                response = client.get(f"members/{member_id}/favorites")
+                payload = response.json()
+            rows = payload.get("result", payload) or []
+            favorites = [r["recipe_id"] for r in rows if isinstance(r, dict) and r.get("recipe_id")]
+            logger.info("Fetched %d favorites for member %s.", len(favorites), member_id)
+            return favorites
+        except Exception as e:
+            logger.warning("Could not fetch favorites for member %s: %s", member_id, e)
+            return []
+
     def update_member_history(self, member_id: str, history_update: str) -> dict:
         logger.info("Updating history for member %s.", member_id)
         try:

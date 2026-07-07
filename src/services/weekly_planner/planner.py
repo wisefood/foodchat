@@ -1,57 +1,68 @@
+import logging
 import random
-from typing import List, Dict, Any
+from typing import Any, Dict, List, Optional, Tuple
+
 from .environment import WeeklyMealPlanEnv
+
+logger = logging.getLogger(__name__)
+
 
 class WeeklyPlanner:
     """
     Orchestration pipeline to generate a full 7-day meal plan.
-    Strictly additive and does not impact existing standalone daily meal plan services.
+
+    Supports pinned anchor slots (seeded planning, M2): a pinned (day,
+    meal_idx) slot always receives its anchor recipe; only free slots are
+    filled from the action space.
     """
 
     def __init__(self, env: WeeklyMealPlanEnv):
-        """
-        Initialize the planner with a configured environment.
-        
-        Args:
-            env: The WeeklyMealPlanEnv to operate on.
-        """
         self.env = env
 
-    def generate_full_plan(self, user_query: str = None) -> List[Dict[str, Any]]:
+    def generate_full_plan(
+        self,
+        user_query: str = None,
+        pinned: Optional[Dict[Tuple[int, int], Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
         """
-        Runs a 'while not done' loop over the environment to generate a full 7-day plan.
-        
+        Run the 21-step (7 days × 3 meals) planning loop.
+
         Args:
-            user_query: Optional user query to guide the planning process.
-            
+            user_query: Optional user query to guide reward evaluation.
+            pinned: {(day, meal_idx): recipe-action dict} anchor slots.
+
         Returns:
-            A list of 21 generated meal entries containing the day, meal type, recipe, and reward.
+            The 21 generated entries with day, meal type, recipe, and reward.
         """
+        pinned = pinned or {}
         state = self.env.reset(user_query=user_query)
         done = False
-        
+
         while not done:
-            # 1. Get candidate actions for the current state from the action space
-            # The action space uses the meal_type and state to filter candidates
-            candidates = self.env.action_space.get_candidate_actions(
-                state["meal_type"], 
-                state
-            )
-            
-            if not candidates:
-                # If no recipes are found for the specific course, we signal a failure.
-                # In a robust system, we might relax constraints here.
-                raise ValueError(f"No candidate recipes found for {state['meal_type']} on day {state['day']}")
-            
-            # 2. Strategy: Select a recipe from candidates.
-            # To keep the plan generation efficient (given LLM scoring in env.step),
-            # we pick a random candidate. For a more advanced version, we could 
-            # implement a greedy lookahead or MCTS.
-            chosen_recipe = random.choice(candidates)
-            
-            # 3. Advance the environment state
-            # This method updates the tracker, calculates the reward (with LLM feedback),
-            # and moves to the next time step.
+            slot_key = (state["day"], state["meal_idx"])
+            if slot_key in pinned:
+                # User-requested anchor — bypass candidate selection entirely.
+                chosen_recipe = {**pinned[slot_key], "pinned": True}
+                logger.info(
+                    "Day %d %s pinned to %r",
+                    state["day"], state["meal_type"], chosen_recipe.get("recipe_title"),
+                )
+            else:
+                candidates = self.env.action_space.get_candidate_actions(
+                    state["meal_type"], state
+                )
+                if not candidates:
+                    # No recipes for this course — fail loudly rather than
+                    # produce a plan with holes. (Constraint relaxation is a
+                    # planned improvement.)
+                    raise ValueError(
+                        f"No candidate recipes found for {state['meal_type']} on day {state['day']}"
+                    )
+                # Selection is random to bound LLM cost; reward-based
+                # selection lands with the M3 feedback milestone.
+                chosen_recipe = random.choice(candidates)
+
+            # Advance the environment (updates tracker, computes reward).
             state, reward, done, info = self.env.step(chosen_recipe)
-            
+
         return self.env.plan

@@ -20,7 +20,7 @@ import logging
 import os
 
 from agents import DocumentGrader
-from models.recipe import ScoredPlan
+from models.recipe import CandidateRecipe, ScoredPlan
 from services.candidates_client import CANDIDATES
 
 logger = logging.getLogger(__name__)
@@ -37,13 +37,25 @@ class PlanningPipeline:
     def __init__(self):
         self.grader = DocumentGrader()
 
-    def generate(self, query: str, profile: dict) -> list[ScoredPlan]:
+    def generate(
+        self,
+        query: str,
+        profile: dict,
+        pinned: dict[str, "CandidateRecipe"] | None = None,
+    ) -> list[ScoredPlan]:
         """Produce ranked daily-plan combinations for the reformulated query.
 
         Hard constraints (allergies, diet, dislikes) are enforced server-side
         by RecipeWrangler; the LLM grader ranks the surviving combinations
-        against the query and soft preferences.
+        against the query and soft preferences. Profile favorites are passed
+        as a server-side ranking boost.
+
+        ``pinned`` maps slot names ("breakfast"/"lunch"/"dinner") to anchor
+        recipes the user explicitly requested (seeded planning, M2): a pinned
+        slot has exactly one candidate — its anchor — so every graded
+        combination contains it, and the other slots are ranked around it.
         """
+        pinned = pinned or {}
         candidates = CANDIDATES.fetch_candidates(
             allergens=profile.get("allergies", []),
             diet=profile.get("diet", []),
@@ -51,10 +63,15 @@ class PlanningPipeline:
                 (profile.get("food_likes") or []) + (profile.get("include_ingredients") or [])
             )),
             exclude_ingredients=profile.get("food_dislikes") or [],
+            exclude_recipe_ids=[r.recipe_id for r in pinned.values()],
+            favorite_recipe_ids=profile.get("favorite_recipe_ids") or [],
             nutrition_profile=profile.get("nutrition_profile") or None,
             limit_per_slot=CANDIDATE_LIMIT,
             randomize=False,
         )
+        for slot, anchor in pinned.items():
+            candidates[slot] = [anchor]
+            logger.info("Slot %s pinned to %r", slot, anchor.title)
 
         empty_slots = [slot for slot, recipes in candidates.items() if not recipes]
         if empty_slots:

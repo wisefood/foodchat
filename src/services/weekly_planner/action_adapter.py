@@ -45,6 +45,7 @@ class RecipeActionSpace:
                 allergens=self.allergens,
                 diet=self.diet,
                 exclude_recipe_ids=list(self._selected_ids),
+                favorite_recipe_ids=self.user_profile.get("favorite_recipe_ids") or [],
                 limit_per_slot=DAILY_POOL_LIMIT,
                 randomize=True,
             )

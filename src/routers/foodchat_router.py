@@ -248,6 +248,11 @@ async def create_session(request: CreateSessionRequest):
     """Create a new chat session; fetches the member's profile from WiseFood."""
     try:
         user_profile = services.profile_service.get_member_profile(request.member_id)
+        # Favorites ride in the profile snapshot: RecipeWrangler boosts them
+        # in candidate ranking, and the proactive offer (M2) reads them.
+        user_profile["favorite_recipe_ids"] = services.profile_service.get_member_favorites(
+            request.member_id
+        )
         session = services.session_service.create_session(request.member_id, user_profile)
         logger.info("Session %s created for member %s.", session.session_id, request.member_id)
         return SessionResponse(

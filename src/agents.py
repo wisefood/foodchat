@@ -42,12 +42,15 @@ from prompts import (
     ORCHESTRATOR_USER_INSTRUCTIONS,
     DIETARY_INTENT_EXTRACTOR_SYSTEM_INSTRUCTIONS,
     DIETARY_INTENT_EXTRACTOR_USER_INSTRUCTIONS,
+    SEED_EXTRACTOR_SYSTEM_INSTRUCTIONS,
+    SEED_EXTRACTOR_USER_INSTRUCTIONS,
 )
 from schemas import (
     ScoringSchema,
     QueryReconcilerSchema,
     OrchestratorSchema,
     DietaryTagsSchema,
+    SeedExtractionSchema,
 )
 
 logger = logging.getLogger(__name__)
@@ -246,6 +249,34 @@ class DietaryIntentExtractor:
             return json.loads(result.content).get("dietary_tags", [])
         except Exception as e:
             logger.warning("DietaryIntentExtractor failed: %s", e)
+            return []
+
+
+class SeedExtractor:
+    """Extracts named anchor dishes ("pastitsio", "fakes") from a plan request.
+
+    Returns [{"name", "meal_type"|None, "day"|None}] — empty when the user
+    named no specific dish. Consumers: seed_service (resolution + pinning)
+    and the favorites-offer gate (an explicit dish request suppresses the offer).
+    """
+
+    def __init__(self, model: str = None, temperature: float = 0.0):
+        self.llm = GROQ_CHAT.get_client(
+            model=model or DEFAULT_MODEL,
+            temperature=temperature,
+            format=SeedExtractionSchema.model_json_schema(),
+        )
+
+    def extract(self, query: str) -> list[dict]:
+        try:
+            result = self.llm.invoke([
+                SystemMessage(content=SEED_EXTRACTOR_SYSTEM_INSTRUCTIONS),
+                HumanMessage(content=SEED_EXTRACTOR_USER_INSTRUCTIONS.format(query=query)),
+            ])
+            seeds = json.loads(result.content).get("seeds", [])
+            return [s for s in seeds if isinstance(s, dict) and s.get("name")]
+        except Exception as e:
+            logger.warning("SeedExtractor failed: %s", e)
             return []
 
 

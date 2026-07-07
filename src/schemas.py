@@ -58,3 +58,15 @@ class OrchestratorSchema(BaseModel):
 class DietaryTagsSchema(BaseModel):
     """Diet tags detected in a user query (vegan, low-carb, …)."""
     dietary_tags: list[str]
+
+
+class SeedDishSchema(BaseModel):
+    """One dish the user explicitly asked to include in the plan."""
+    name: str
+    meal_type: Optional[Literal["breakfast", "lunch", "dinner"]] = None
+    day: Optional[conint(ge=1, le=7)] = None   # 1 = Monday … 7 = Sunday
+
+
+class SeedExtractionSchema(BaseModel):
+    """Named dishes to anchor into the plan (empty when none requested)."""
+    seeds: list[SeedDishSchema]

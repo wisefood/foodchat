@@ -23,10 +23,11 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 from agents import GuidelineAdherenceGrader, MealDiversityGrader, SimpleChatBot
-from models.recipe import ScoredPlan
+from models.recipe import CandidateRecipe, ScoredPlan
 from models.session import MealPlan
 from services.clarification import ClarificationManager, ClarificationState
 from services.planning_pipeline import PlanningPipeline
+from services.seed_service import SeedService
 from .session_service import SessionService
 
 logger = logging.getLogger(__name__)
@@ -101,6 +102,7 @@ class ChatService:
         self.pipeline = PlanningPipeline()
         self.clarifier = ClarificationManager()
         self.chatbot = SimpleChatBot()
+        self.seed_service = SeedService()
         self.diversity_grader = MealDiversityGrader()
         self.guideline_grader = GuidelineAdherenceGrader()
         logger.info("ChatService initialized.")
@@ -124,8 +126,14 @@ class ChatService:
         session_id: str,
         message: str,
         is_refinement: bool = False,
+        seeds: Optional[list[dict]] = None,
     ) -> Tuple[str, bool, Optional[MealPlan]]:
         """Handle a 'daily_plan' or 'refine_plan' intent turn.
+
+        ``seeds`` are named anchor dishes extracted upstream by the
+        orchestrator (M2); they are resolved and pinned here so the pins
+        survive an intervening clarification round-trip (they ride inside
+        the persisted profile snapshot under ``_pinned_slots``).
 
         Returns (response_text, needs_clarification, meal_plan|None).
         """
@@ -151,8 +159,27 @@ class ChatService:
                     session_id, current_plan.version,
                 )
 
+        # Resolve anchors before clarification and stash them in the profile
+        # snapshot — the profile is what the clarification state persists, so
+        # pins survive restarts mid-clarification.
+        profile = dict(session.user_profile)
+        if seeds:
+            resolutions = self.seed_service.resolve_seeds(seeds, profile)
+            pinned = self.seed_service.place_daily(resolutions)
+            if pinned:
+                profile["_pinned_slots"] = {
+                    slot: {
+                        "recipe_id": r.recipe_id, "title": r.title,
+                        "ingredients": r.ingredients, "directions": r.directions,
+                    }
+                    for slot, r in pinned.items()
+                }
+            note = self.seed_service.describe(resolutions)
+            if note:
+                profile["_seed_note"] = note
+
         origin_intent = "refine_plan" if is_refinement else "daily_plan"
-        outcome = self.clarifier.start(effective_message, session.user_profile, origin_intent)
+        outcome = self.clarifier.start(effective_message, profile, origin_intent)
 
         if outcome.needs_clarification:
             logger.info("[%s] Clarification needed — persisting clarification state.", session_id)
@@ -213,7 +240,15 @@ class ChatService:
         self.session_service.clear_clarification_state(session_id)
         logger.info("[%s] Generating plan (query=%.120s)", session_id, final_query)
 
-        plans = self.pipeline.generate(final_query, profile)
+        # Anchor pins ride in the profile snapshot (see process_plan_request);
+        # pop the transient keys so they never leak into grader prompts.
+        pinned_raw = profile.pop("_pinned_slots", None) or {}
+        seed_note = profile.pop("_seed_note", None)
+        pinned = {
+            slot: CandidateRecipe(**fields) for slot, fields in pinned_raw.items()
+        }
+
+        plans = self.pipeline.generate(final_query, profile, pinned=pinned)
         if not plans:
             logger.warning("[%s] No candidate plans — returning apology.", session_id)
             self.session_service.add_message(session_id, "assistant", NO_PLAN_APOLOGY)
@@ -244,6 +279,9 @@ class ChatService:
                 "I've picked out breakfast, lunch, and dinner based on your preferences. "
                 "Let me know if you'd like to swap something out."
             )
+
+        if seed_note:
+            formatted = f"{formatted} {seed_note}"
 
         self.session_service.add_message(session_id, "assistant", formatted)
         return formatted, False, meal_plan

@@ -2,6 +2,55 @@
 
 ---
 
+# M2 — Favorites & Seeded Planning
+
+> **Date:** 2026-07-07
+> **Branch:** main
+> No FoodChat DB migration. Gateway gains the `member_favorite` table
+> (DDL is `IF NOT EXISTS`; existing deployments must re-run init-db or apply
+> it manually — the gateway has no migration framework). RecipeWrangler and
+> the UI updated in the same release.
+
+## What changed
+
+Plans no longer start from a blank slate — favorites and user-named dishes
+become starting points:
+
+- **Server-side favorites** (gateway): `member_favorite` table +
+  `GET/PUT/DELETE /api/v1/members/{id}/favorites[/{recipe_id}]` (idempotent,
+  owner/agent/admin authz). The UI recipe store is now API-backed with a
+  one-time localStorage migration.
+- **Favorites boost in candidates**: FoodChat fetches the member's favorites
+  at session creation (`profile["favorite_recipe_ids"]`, best-effort) and
+  passes them to RecipeWrangler's `foodchat_candidates`, which ranks
+  favorites to the top of their slot (weight 10 vs 1 per include-ingredient
+  hit). Hard filters always win — an allergy-violating favorite never appears.
+- **Seeded / anchored planning**: new `SeedExtractor` agent pulls named
+  dishes ("pastitsio and fakes in my weekly meals") from plan requests;
+  `services/seed_service.py` resolves them via RecipeWrangler
+  (autocomplete → detail), enforces the allergy hard constraint (a
+  conflicting seed is skipped with an explanation, never pinned), and places
+  them: explicit hints ("Sunday dinner") honored, otherwise dish-type tags
+  decide the slot and weekly anchors spread across the week.
+- **Pinned slots**: daily pipeline — a pinned slot's anchor is the sole
+  candidate, so every graded combination contains it; weekly planner — pinned
+  (day, meal) slots bypass candidate selection, anchors are excluded from
+  the pools so they never repeat, and entries carry `"pinned": true`.
+  Daily pins survive mid-clarification restarts (they ride inside the
+  persisted profile snapshot under `_pinned_slots`).
+- **Proactive favorites offer**: on the first plan request of a session — if
+  the member has favorites, named no dishes, and wasn't asked before — the
+  assistant offers once ("I noticed you've favorited Pastitsio… work them
+  in? yes/no") via a `favorites_offer` clarification state. Yes → favorites
+  pinned as anchors; anything else → the original request proceeds
+  unchanged. Dedupe is the persisted `favorites_offer` intent tag on the
+  offer message. Affirmative detection is a deliberate keyword heuristic
+  for M2 (misreads cost only the boost).
+- **Tests:** +13 (resolution, allergy conflicts, weekly spread + hint
+  placement, pipeline/planner pinning, offer lifecycle) — 47 total.
+
+---
+
 # M1 — FoodScholar Bridge
 
 > **Date:** 2026-07-07
