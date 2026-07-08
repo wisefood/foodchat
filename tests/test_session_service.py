@@ -76,6 +76,26 @@ class TestPlanCanvas:
         assert w2.parent_id == w1.id
         assert session.weekly_canvas.current_id == w2.id
 
+    def test_member_current_plans_picks_newest_canvas(self, session_service, sample_profile):
+        """Dashboard lookup: the member's most recently planned session wins."""
+        member_id = f"member-{uuid.uuid4()}"
+        older = session_service.create_session(member_id, sample_profile)
+        session_service.add_meal_plan(older.session_id, make_candidates("old"), "r", {})
+
+        newer = session_service.create_session(member_id, sample_profile)
+        entries = [{"day": 1, "meal_idx": 0, "meal_type": "breakfast", "recipe": {}, "reward": 1.0}]
+        weekly = session_service.add_weekly_meal_plan(newer.session_id, entries)
+
+        best = session_service.get_member_current_plans(member_id)
+        assert best.session_id == newer.session_id
+        assert best.active_canvas.plan_type == "weekly"
+        assert best.get_current_weekly_plan().id == weekly.id
+
+    def test_member_current_plans_none_without_plans(self, session_service, sample_profile):
+        member_id = f"member-{uuid.uuid4()}"
+        session_service.create_session(member_id, sample_profile)
+        assert session_service.get_member_current_plans(member_id) is None
+
     def test_plans_survive_reload(self, session_service, sample_profile):
         from services.session_service import SessionService
 

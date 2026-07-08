@@ -381,6 +381,46 @@ async def get_member_sessions(member_id: str):
     ]
 
 
+class MemberCurrentPlansResponse(BaseModel):
+    """Latest saved plan canvases for a member, across all their sessions.
+
+    FoodChat plans are versioned canvases, not calendar entries — this is the
+    member-scoped view the dashboard renders as "Recent Meal Plans".
+    ``cooking_for`` echoes the session's diner selection so the UI can show
+    who the plan covers.
+    """
+
+    session_id: Optional[str] = None
+    plan_type: Optional[str] = None            # "daily" | "weekly" | None
+    meal_plan: Optional[MealPlanResponse] = None
+    weekly_meal_plan: Optional[WeeklyMealPlanResponse] = None
+    cooking_for: List[str] = []
+
+
+@router.get(
+    "/members/{member_id}/current-plans",
+    response_model=MemberCurrentPlansResponse,
+)
+async def get_member_current_plans(member_id: str):
+    """Most recent daily/weekly plans for a member (dashboard widget)."""
+    session = services.session_service.get_member_current_plans(member_id)
+    if session is None:
+        return MemberCurrentPlansResponse()
+
+    daily = session.get_current_daily_plan()
+    weekly = session.get_current_weekly_plan()
+    canvas = session.active_canvas
+    return MemberCurrentPlansResponse(
+        session_id=session.session_id,
+        plan_type=canvas.plan_type if canvas else None,
+        meal_plan=MealPlanResponse.from_meal_plan(daily) if daily else None,
+        weekly_meal_plan=(
+            WeeklyMealPlanResponse.from_weekly_meal_plan(weekly) if weekly else None
+        ),
+        cooking_for=list(session.user_profile.get("cooking_for") or []),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Unified chat
 # ---------------------------------------------------------------------------

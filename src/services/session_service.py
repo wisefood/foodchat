@@ -188,6 +188,24 @@ class SessionService:
                 sessions.append(s)
         return sessions
 
+    def get_member_current_plans(self, member_id: str) -> Optional[Session]:
+        """The member's session with the most recently updated plan canvas.
+
+        Powers the dashboard's "Recent Meal Plans" widget: FoodChat plans are
+        saved canvases (daily/weekly), not date-scheduled entries, so "what
+        should this member cook today" means "their newest canvas". Returns
+        None when no session has a plan yet.
+        """
+        best: Optional[Session] = None
+        best_ts = None
+        for session in self.get_member_sessions(member_id):
+            ts = session.active_canvas_updated_at
+            if ts is None:
+                continue
+            if best_ts is None or ts > best_ts:
+                best, best_ts = session, ts
+        return best
+
     def list_sessions(self) -> list[Session]:
         return list(self._sessions.values())
 

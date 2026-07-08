@@ -197,6 +197,12 @@ class Session:
         plan = self._find_plan(canvas.plan_type, canvas.current_id)
         return plan.created_at if plan else None
 
+    @property
+    def active_canvas_updated_at(self) -> Optional[datetime]:
+        """Timestamp of the active canvas's current plan (recency ordering
+        across a member's sessions — see the dashboard current-plans lookup)."""
+        return self._canvas_ts(self.active_canvas)
+
     def _find_plan(self, plan_type: str, plan_id: str):
         if plan_type == "daily":
             return next((p for p in self.meal_plans if p.id == plan_id), None)

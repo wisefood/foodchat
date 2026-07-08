@@ -9,6 +9,17 @@
 > Fixes driven by live demo testing on demo.wisefood-project.eu. Rebuild the
 > image to deploy.
 
+## Member-scoped current plans (dashboard widget)
+
+`GET /members/{member_id}/current-plans` returns the member's most recently
+updated plan canvases across ALL their sessions (daily and/or weekly plus the
+session's `cooking_for` diners). Replaces the UI dashboard's dependency on
+the legacy per-date member meal-plan store, which nothing populates anymore —
+FoodChat plans are versioned canvases, not calendar entries. Backed by
+`SessionService.get_member_current_plans` /
+`Session.active_canvas_updated_at` (recency = the active canvas's current
+plan timestamp).
+
 ## Allergen defense-in-depth (SAFETY)
 
 Live incident: RecipeWrangler served "Almond crumbed chicken" to a tree-nut-
