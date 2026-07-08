@@ -25,7 +25,8 @@ curl -X POST http://localhost:8000/foodchat/sessions/{session_id}/chat \
   -d '{"member_id": "member-123", "content": "I want a healthy meal plan for tomorrow"}'
 ```
 
-Docker: `make docker-build && make docker-run`. The service needs **no data
+Docker: `make build` (produces `wisefood/foodchat:latest`, the tag the
+platform deployment pulls) and `make push`. The service needs **no data
 files, vector stores, or embedding models** — external dependencies are the
 Groq API, RecipeWrangler, the WiseFood API, and a `DATABASE_URL`.
 
