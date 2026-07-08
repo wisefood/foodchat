@@ -34,6 +34,7 @@ from backend.groq import GROQ_CHAT
 from models.recipe import CandidatesBySlot, ScoredPlan
 from prompts import (
     GRADER_SYSTEM_INSTRUCTIONS,
+    PLAN_ANALYST_SYSTEM_INSTRUCTIONS,
     GRADER_USER_INSTRUCTIONS,
     MEAL_DIVERSITY_SYSTEM_INSTRUCTIONS,
     GUIDELINE_ADHERENCE_SYSTEM_INSTRUCTIONS,
@@ -388,14 +389,44 @@ class ResponseWriter:
             return fallback
 
 
+class PlanAnalyst:
+    """Answers questions ABOUT the active plan ("does it adhere to that?").
+
+    Grounded in a serialized plan summary (titles + per-meal nutrition) and
+    recent conversation (so "that" resolves to e.g. the protein guidance the
+    user just read). Read-only by design: it never generates or edits a plan.
+    """
+
+    def __init__(self, model: str = None, temperature: float = None):
+        self.llm = GROQ_CHAT.get_client(
+            model=model or DEFAULT_MODEL,
+            temperature=temperature if temperature is not None else CHATBOT_TEMPERATURE,
+        )
+
+    def answer(self, question: str, plan_summary: str,
+               history: list[tuple[str, str]] = None) -> str:
+        messages = [SystemMessage(content=PLAN_ANALYST_SYSTEM_INSTRUCTIONS)]
+        for role, content in (history or [])[-CHATBOT_HISTORY_TURNS:]:
+            if role == "assistant":
+                messages.append(AIMessage(content=content))
+            else:
+                messages.append(HumanMessage(content=content))
+        messages.append(HumanMessage(
+            content=f"CURRENT PLAN:\n{plan_summary}\n\nQUESTION: {question}"
+        ))
+        return self.llm.invoke(messages).content
+
+
 class OrchestratorAgent:
     """Single intent classifier per turn — the ONLY router in the pipeline.
 
     Valid intents: daily_plan | weekly_plan | refine_plan | edit_plan_slot
-    | switch_plan_type | nutrition_question | chat. ``target_plan_type`` is
-    populated only for switch_plan_type; nutrition_question turns are
-    delegated to FoodScholar; edit_plan_slot targets ONE slot of the active
-    canvas with a verified directive.
+    | switch_plan_type | nutrition_question | plan_question | chat.
+    ``target_plan_type`` is populated only for switch_plan_type;
+    nutrition_question turns are delegated to FoodScholar; plan_question
+    turns are answered by the PlanAnalyst grounded in the active canvas;
+    edit_plan_slot targets ONE slot of the active canvas with a verified
+    directive.
     """
 
     VALID_INTENTS = {

@@ -28,8 +28,9 @@ from models.recipe import CandidateRecipe
 MAX_MESSAGES_PER_SESSION = int(os.getenv("SESSION_MAX_MESSAGES", "200"))
 
 Intent = Literal[
-    "daily_plan", "weekly_plan", "refine_plan", "switch_plan_type",
-    "nutrition_question", "favorites_offer", "chat",
+    "daily_plan", "weekly_plan", "refine_plan", "edit_plan_slot",
+    "switch_plan_type", "nutrition_question", "plan_question",
+    "favorites_offer", "chat",
 ]
 
 

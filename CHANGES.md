@@ -2,6 +2,67 @@
 
 ---
 
+# Demo hardening — live-testing fixes
+
+> **Date:** 2026-07-08
+> **Branch:** main
+> Fixes driven by live demo testing on demo.wisefood-project.eu. Rebuild the
+> image to deploy.
+
+## Allergen defense-in-depth (SAFETY)
+
+Live incident: RecipeWrangler served "Almond crumbed chicken" to a tree-nut-
+allergic member — the recipe's graph node has NO allergen edges and is tagged
+`nut_free`, so RW's hard filters passed it (recipe 9319107827; data-quality
+issue reported to INFILI). FoodChat no longer trusts upstream tags with
+safety data:
+
+- `candidates_client.allergen_conflict()` — synonym-expanded ("tree nuts" →
+  almond/walnut/cashew/…; shellfish → shrimp/prawn/crab/…; dairy, gluten,
+  eggs, soy, sesame, fish), word-boundary ingredient/title scan.
+- `fetch_candidates()` post-filters every parsed candidate against the
+  member's allergies and logs each drop (`Allergen backstop dropped …`).
+- `SeedService._allergy_conflict` uses the same expansion, so "pastitsio with
+  almonds" can't be pinned for a tree-nut-allergic diner either. Previously a
+  plain substring check ("tree nuts" never matched "almond").
+
+## plan_question intent — "does my meal plan adhere to that?"
+
+Live incident: asking whether the plan met the protein guidance just
+discussed was classified `refine_plan` and silently regenerated the plan.
+New eighth intent `plan_question` (question ABOUT the plan ≠ request to
+change it) answered by the new `PlanAnalyst` agent: grounded in the active
+canvas serialized WITH per-meal nutrition enrichment plus recent conversation
+(so "that" resolves), read-only by design, honest about missing nutrition
+data. No active canvas → falls through to FoodScholar as a plain nutrition
+question.
+
+## Memory nudges: same-kind dedupe + contradiction resolution
+
+Live incident: "I think I don't like chicken" produced no nudge because
+"chicken" sat in food_LIKES and the suggestion filter used one flat "known"
+set across kinds. Now each kind dedupes only against its own field, a
+like↔dislike contradiction gets an explicit callout statement ("…currently in
+your likes, but it sounds like you've gone off it — update your profile?"),
+and accepting removes the value from the opposite list (both in the durable
+profile and the live session).
+
+## Seed resolution tolerates trailing typos
+
+"bolognesse" found nothing (RW autocomplete is a non-fuzzy ES prefix match).
+`SeedService._autocomplete_tolerant` retries with up to 3 trailing characters
+cut, recovering the common trailing-typo case ("bolognes" prefix-matches
+"bolognese"). Proper fuzziness belongs in the RW endpoint.
+
+## Tests
+
+91 passing (was 80): allergen synonym matching + word boundaries, backstop
+drop in `fetch_candidates`, untagged-almond seed conflict, typo-tolerant
+resolution, plan_question routing (answered not refined; FoodScholar
+fallback without a canvas).
+
+---
+
 # M5 — Platform Hardening & Demo Readiness
 
 > **Date:** 2026-07-07

@@ -25,7 +25,7 @@ from typing import Optional
 
 from agents import SeedExtractor
 from models.recipe import CandidateRecipe, ResolvedRecipe
-from services.candidates_client import CANDIDATES, RecipeCandidatesClient
+from services.candidates_client import CANDIDATES, RecipeCandidatesClient, allergen_conflict
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +67,7 @@ class SeedService:
         resolutions: list[SeedResolution] = []
         for seed in seeds:
             name = seed["name"]
-            suggestions = self.client.autocomplete(name)
+            suggestions = self._autocomplete_tolerant(name)
             if not suggestions:
                 resolutions.append(SeedResolution(
                     requested_name=name, status="not_found",
@@ -101,22 +101,46 @@ class SeedService:
             ))
         return resolutions
 
+    def _autocomplete_tolerant(self, name: str) -> list[tuple[str, str]]:
+        """Autocomplete with trailing-typo tolerance.
+
+        RecipeWrangler autocomplete is an ES bool_prefix match — no fuzziness,
+        so "bolognesse" finds nothing while "bolognes" prefix-matches
+        "bolognese". Retrying with progressively truncated queries recovers
+        the common trailing-typo case cheaply. (Proper fuzziness belongs in
+        the RW autocomplete endpoint.)
+        """
+        query = (name or "").strip()
+        for cut in range(0, 4):
+            attempt = query[: len(query) - cut] if cut else query
+            if len(attempt) < 4:
+                break
+            suggestions = self.client.autocomplete(attempt)
+            if suggestions:
+                if cut:
+                    logger.info("Seed %r resolved via truncated query %r", name, attempt)
+                return suggestions
+        return []
+
     @staticmethod
     def _allergy_conflict(resolved: ResolvedRecipe, profile: dict) -> Optional[str]:
         """Return the first profile allergen present in the recipe, if any.
 
-        Checks RecipeWrangler's allergen tags first, then falls back to a
-        substring scan of the ingredient text (tags can be incomplete and
-        allergies are a safety constraint — better to over-block a seed).
+        Checks RecipeWrangler's allergen tags first, then the shared
+        synonym-expanded ingredient scan (allergen_conflict) — graph tags have
+        been proven wrong in production ("nut_free" almond dishes), and
+        allergies are a safety constraint, so over-blocking a seed is the
+        correct failure mode.
         """
         allergies = [a.lower().strip() for a in profile.get("allergies", []) if a]
         if not allergies:
             return None
-        ingredients_text = resolved.recipe.ingredients.lower()
         for allergen in allergies:
-            if allergen in resolved.allergens or allergen in ingredients_text:
+            if allergen in resolved.allergens:
                 return allergen
-        return None
+        return allergen_conflict(
+            f"{resolved.recipe.title} {resolved.recipe.ingredients}", allergies
+        )
 
     # ------------------------------------------------------------------ #
     # Placement                                                            #

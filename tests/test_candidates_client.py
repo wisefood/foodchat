@@ -6,7 +6,11 @@ import httpx
 import pytest
 
 from services import candidates_client as cc
-from services.candidates_client import RecipeCandidatesClient, normalize_diet_tags
+from services.candidates_client import (
+    RecipeCandidatesClient,
+    allergen_conflict,
+    normalize_diet_tags,
+)
 
 
 class TestNormalizeDietTags:
@@ -85,3 +89,60 @@ class TestFetchCandidates:
         assert result["breakfast"][0].recipe_id == "7"  # coerced to str
         assert result["breakfast"][0].title == "Oats"
         assert result["lunch"] == [] and result["dinner"] == []
+
+
+class TestAllergenConflict:
+    """Synonym-expanded, word-boundary allergen matching."""
+
+    def test_category_expands_to_specific_ingredients(self):
+        # The live incident: "tree nuts" allergy vs an almond dish RW tagged nut_free
+        assert allergen_conflict("Almond crumbed chicken", ["Tree Nuts"]) == "almond"
+        assert allergen_conflict("garlic prawns with rice", ["Shellfish"]) == "prawn"
+
+    def test_direct_allergen_name_matches(self):
+        assert allergen_conflict("peanut butter cookies", ["peanuts"]) == "peanut"
+
+    def test_word_boundaries_prevent_false_positives(self):
+        # "eggplant" must not trip an egg allergy; "creamy" must not trip dairy
+        assert allergen_conflict("grilled eggplant with creamy tahini-free dressing",
+                                 ["eggs"]) is None
+        assert allergen_conflict("creamy-style oat drink", ["dairy"]) is None
+
+    def test_plural_forms_match(self):
+        assert allergen_conflict("topped with toasted almonds", ["tree nuts"]) == "almond"
+
+    def test_no_allergies_never_conflicts(self):
+        assert allergen_conflict("almond walnut shrimp", []) is None
+
+
+class TestAllergenBackstop:
+    """fetch_candidates drops candidates whose text contradicts upstream filters."""
+
+    def test_poisoned_tag_candidate_is_dropped(self, capture):
+        capture.response_payload = {
+            "results": {
+                "breakfast": [
+                    # RW believed this was nut_free (broken graph tags)
+                    {"recipe_id": 1, "title": "Almond crumbed chicken",
+                     "ingredients": "chicken, almond meal", "directions": "fry"},
+                    {"recipe_id": 2, "title": "Oat porridge",
+                     "ingredients": "oats, banana", "directions": "simmer"},
+                ],
+                "lunch": [], "dinner": [],
+            }
+        }
+        result = RecipeCandidatesClient(base_url="http://rw.test").fetch_candidates(
+            allergens=["tree nuts"]
+        )
+        assert [c.title for c in result["breakfast"]] == ["Oat porridge"]
+
+    def test_no_allergens_passes_everything(self, capture):
+        capture.response_payload = {
+            "results": {
+                "breakfast": [{"recipe_id": 1, "title": "Almond granola",
+                               "ingredients": "almonds", "directions": "bake"}],
+                "lunch": [], "dinner": [],
+            }
+        }
+        result = RecipeCandidatesClient(base_url="http://rw.test").fetch_candidates()
+        assert len(result["breakfast"]) == 1

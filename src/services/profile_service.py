@@ -81,12 +81,24 @@ class ProfileService:
                     if value_norm not in [v.lower() for v in likes]:
                         likes.append(value_norm)
                     prefs["food_likes"] = likes
+                    # Contradiction resolution: liking something removes it
+                    # from dislikes (the nudge called the conflict out).
+                    prefs["food_dislikes"] = [
+                        v for v in (prefs.get("food_dislikes") or [])
+                        if v.lower() != value_norm
+                    ]
                     profile.nutritional_preferences = prefs
                 elif kind == "dislike":
                     dislikes = list(prefs.get("food_dislikes") or [])
                     if value_norm not in [v.lower() for v in dislikes]:
                         dislikes.append(value_norm)
                     prefs["food_dislikes"] = dislikes
+                    # Contradiction resolution: disliking something removes it
+                    # from likes.
+                    prefs["food_likes"] = [
+                        v for v in (prefs.get("food_likes") or [])
+                        if v.lower() != value_norm
+                    ]
                     profile.nutritional_preferences = prefs
                 elif kind == "allergy_hint":
                     allergies = list(profile.allergies or [])

@@ -18,6 +18,7 @@ fallback (``RECIPE_SOURCE`` switch) that is no longer deployed anywhere.
 
 import logging
 import os
+import re
 from typing import Optional
 
 import httpx
@@ -61,6 +62,53 @@ DIET_TAG_MAP = {
     "balanced": None,
     "healthy": None,
 }
+
+
+# --------------------------------------------------------------------------- #
+# Defense-in-depth allergen screening (added after a live incident where the
+# recipe graph tagged an almond dish "nut_free" with no allergen edges — see
+# CHANGES.md). RecipeWrangler's hard filters remain the primary gate; this is
+# a client-side ingredient-text backstop so poisoned tags can't reach a plan.
+# --------------------------------------------------------------------------- #
+
+ALLERGEN_SYNONYMS = {
+    "tree nuts": ["almond", "walnut", "cashew", "pecan", "hazelnut", "pistachio",
+                  "macadamia", "brazil nut", "pine nut", "chestnut"],
+    "nuts": ["almond", "walnut", "cashew", "pecan", "hazelnut", "pistachio",
+             "macadamia", "brazil nut", "pine nut", "peanut"],
+    "peanuts": ["peanut"],
+    "shellfish": ["shrimp", "prawn", "crab", "lobster", "mussel", "oyster",
+                  "scallop", "clam", "crayfish", "squid", "octopus"],
+    "fish": ["salmon", "tuna", "cod", "haddock", "trout", "sardine", "anchovy",
+             "mackerel", "halibut", "sea bass", "tilapia"],
+    "dairy": ["milk", "cheese", "butter", "cream", "yogurt", "yoghurt", "ghee"],
+    "lactose": ["milk", "cheese", "cream", "yogurt", "yoghurt"],
+    "eggs": ["egg"],
+    "gluten": ["wheat", "flour", "barley", "rye", "semolina", "couscous"],
+    "soy": ["soy", "soya", "tofu", "edamame"],
+    "sesame": ["sesame", "tahini"],
+}
+
+
+def _allergen_terms(allergies: list[str]) -> list[str]:
+    """Expand profile allergen names into matchable ingredient terms."""
+    terms: list[str] = []
+    for allergen in allergies or []:
+        key = str(allergen).strip().lower()
+        if not key:
+            continue
+        terms.append(key)
+        terms.extend(ALLERGEN_SYNONYMS.get(key, []))
+    return list(dict.fromkeys(terms))
+
+
+def allergen_conflict(text: str, allergies: list[str]) -> Optional[str]:
+    """First allergen term found in the text (word-boundary match), or None."""
+    haystack = (text or "").lower()
+    for term in _allergen_terms(allergies):
+        if re.search(r"\b" + re.escape(term) + r"s?\b", haystack):
+            return term
+    return None
 
 
 def normalize_diet_tags(diet) -> list[str]:
@@ -142,17 +190,31 @@ class RecipeCandidatesClient:
 
         slot_results = data.get("results", {}) if isinstance(data, dict) else {}
         candidates: CandidatesBySlot = {slot: [] for slot in MEAL_SLOTS}
+        dropped = 0
         for slot in MEAL_SLOTS:
             for r in slot_results.get(slot, []):
-                candidates[slot].append(
-                    CandidateRecipe(
-                        recipe_id=str(r.get("recipe_id", "")),
-                        title=r.get("title", ""),
-                        ingredients=r.get("ingredients", ""),
-                        directions=r.get("directions", ""),
-                    )
+                candidate = CandidateRecipe(
+                    recipe_id=str(r.get("recipe_id", "")),
+                    title=r.get("title", ""),
+                    ingredients=r.get("ingredients", ""),
+                    directions=r.get("directions", ""),
                 )
+                # Backstop: never trust upstream tags with safety data.
+                conflict = allergen_conflict(
+                    f"{candidate.title} {candidate.ingredients}", allergens or []
+                )
+                if conflict:
+                    dropped += 1
+                    logger.warning(
+                        "Allergen backstop dropped %r (%s) — contains %r despite "
+                        "passing upstream filters", candidate.title, slot, conflict,
+                    )
+                    continue
+                candidates[slot].append(candidate)
             logger.info("Got %d candidates for %s", len(candidates[slot]), slot)
+        if dropped:
+            logger.warning("Allergen backstop dropped %d candidate(s) in total — "
+                           "upstream tagging needs attention", dropped)
         return candidates
 
     # ------------------------------------------------------------------ #

@@ -9,7 +9,11 @@ The ONLY intent classification in the pipeline happens here (one
                        targeting whichever canvas was most recently updated
   weekly_plan        → WeeklyPlanService (fresh canvas)
   switch_plan_type   → acknowledge, then fresh canvas of the target type
+  edit_plan_slot     → EditService (one verified slot swap on the canvas)
   nutrition_question → FoodScholarService (evidence-based answer + attribution)
+  plan_question      → PlanAnalyst (question ABOUT the active canvas — answered
+                       from its nutrition data, never modifies the plan;
+                       no canvas → falls through to FoodScholar)
   chat               → ChatService.process_smalltalk
 
 While a session is mid-clarification (session.state == "clarifying"), the
@@ -26,7 +30,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from agents import OrchestratorAgent
+from agents import OrchestratorAgent, PlanAnalyst
 from models.attribution import Attribution
 from models.session import MealPlan, WeeklyMealPlan
 from .edit_service import EditService
@@ -85,6 +89,7 @@ class OrchestratorService:
         self.edit_service = EditService(session_service)
         self.memory_service = memory_service
         self.orchestrator = OrchestratorAgent()
+        self.plan_analyst = PlanAnalyst()
 
     def process(self, session_id: str, member_id: str, message: str) -> ChatTurn:
         """Validate ownership, check the message cap, classify, and route."""
@@ -166,6 +171,9 @@ class OrchestratorService:
 
         if intent == "nutrition_question":
             return self._handle_nutrition_question(session_id, message)
+
+        if intent == "plan_question":
+            return self._handle_plan_question(session, session_id, message)
 
         # "chat" and any unexpected values
         return self._handle_smalltalk(session_id, message)
@@ -319,6 +327,84 @@ class OrchestratorService:
             needs_clarification=fs_turn.needs_clarification,
             attribution=fs_turn.attribution,
         )
+
+    def _handle_plan_question(self, session, session_id: str, message: str) -> ChatTurn:
+        """Answer a question ABOUT the active plan without touching it.
+
+        Grounded in the serialized canvas (titles + nutrition enrichment) and
+        recent conversation so references like "that" resolve to the guidance
+        just discussed. No canvas → the question is really a nutrition
+        question, so it falls through to FoodScholar.
+        """
+        summary = self._summarize_active_plan(session)
+        if summary is None:
+            return self._handle_nutrition_question(session_id, message)
+
+        self.session_service.add_message(session_id, "user", message)
+        history = [(m.role, m.content) for m in session.conversation[-8:]]
+        try:
+            answer = self.plan_analyst.answer(message, summary, history)
+        except Exception as e:
+            logger.warning("[%s] PlanAnalyst failed: %s", session_id, e)
+            answer = (
+                "I couldn't analyze the plan just now — try asking again, or "
+                "tell me what you'd like changed and I'll take it from there."
+            )
+        self.session_service.add_message(
+            session_id, "assistant", answer, intent="plan_question"
+        )
+        return ChatTurn(role="assistant", content=answer, intent="plan_question")
+
+    def _summarize_active_plan(self, session) -> Optional[str]:
+        """Serialize the active canvas for the analyst (None if no plan yet).
+
+        Includes per-meal nutrition where M4 enrichment succeeded; missing
+        data is marked so the analyst can be explicit about gaps.
+        """
+
+        def fmt_nutrition(n: Optional[dict]) -> str:
+            if not n:
+                return "(no nutrition data)"
+            parts = []
+            if n.get("kcal") is not None:
+                parts.append(f"{n['kcal']} kcal")
+            for key, unit in (("protein_g", "g protein"), ("carbs_g", "g carbs"), ("fat_g", "g fat")):
+                if n.get(key) is not None:
+                    parts.append(f"{n[key]}{unit}")
+            return "(" + ", ".join(parts) + ")" if parts else "(no nutrition data)"
+
+        canvas = session.active_canvas
+        if canvas is None:
+            return None
+        if canvas.plan_type == "weekly":
+            plan = session.get_current_weekly_plan()
+            if plan is None:
+                return None
+            day_names = ["Monday", "Tuesday", "Wednesday", "Thursday",
+                         "Friday", "Saturday", "Sunday"]
+            by_day: dict[int, list] = {}
+            for entry in plan.entries:
+                by_day.setdefault(entry.get("day", 0), []).append(entry)
+            lines = [f"7-day plan (version {plan.version}):"]
+            for day_idx in sorted(by_day):
+                label = day_names[day_idx] if day_idx < len(day_names) else f"Day {day_idx + 1}"
+                lines.append(f"{label}:")
+                for entry in sorted(by_day[day_idx], key=lambda e: e.get("meal_idx", 0)):
+                    recipe = entry.get("recipe", {})
+                    lines.append(
+                        f"  {entry.get('meal_type', 'meal')}: {recipe.get('title', '?')} "
+                        f"{fmt_nutrition(recipe.get('nutrition'))}"
+                    )
+            return "\n".join(lines)
+
+        plan = session.get_current_daily_plan()
+        if plan is None:
+            return None
+        lines = [f"Daily plan (version {plan.version}):"]
+        for slot in ("breakfast", "lunch", "dinner"):
+            course = getattr(plan, slot)
+            lines.append(f"  {slot}: {course.title} {fmt_nutrition(course.nutrition)}")
+        return "\n".join(lines)
 
     def _handle_smalltalk(self, session_id: str, message: str) -> ChatTurn:
         response_text, _, _ = self.chat_service.process_smalltalk(session_id, message)

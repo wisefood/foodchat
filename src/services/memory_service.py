@@ -62,14 +62,20 @@ class MemoryService:
             return []
 
         profile = session.user_profile
-        known = {
-            str(v).lower()
-            for key in ("food_likes", "food_dislikes", "allergies")
-            for v in (profile.get(key) or [])
-        }
-        known |= {
-            str(s.get("name", "")).lower()
-            for s in (profile.get("standing_seeds") or [])
+        # Same-KIND dedupe only: a dislike of something currently in the
+        # LIKES list must still nudge — it's a contradiction the user should
+        # resolve, and filtering it against a flat "known" set silently
+        # swallowed exactly the most valuable suggestions (pre-fix bug).
+        likes = {str(v).lower() for v in (profile.get("food_likes") or [])}
+        dislikes = {str(v).lower() for v in (profile.get("food_dislikes") or [])}
+        allergies = {str(v).lower() for v in (profile.get("allergies") or [])}
+        seeds = {str(s.get("name", "")).lower() for s in (profile.get("standing_seeds") or [])}
+        known_by_kind = {
+            "like": likes, "cuisine": likes,
+            "dislike": dislikes,
+            "allergy_hint": allergies,
+            "standing_seed": seeds,
+            "constraint": set(),
         }
         optouts = {str(v).lower() for v in (profile.get("memory_optouts") or [])}
 
@@ -79,17 +85,30 @@ class MemoryService:
             value = str(cand.get("value", "")).strip().lower()
             if kind not in VALID_KINDS or not value:
                 continue
-            if value in known or value in optouts:
+            if value in known_by_kind.get(kind, set()) or value in optouts:
                 continue
             # Allergy hints always nudge; everything else needs an explicit statement.
             if kind != "allergy_hint" and cand.get("confidence") != "high":
                 continue
+            statement = cand.get("statement") or (
+                f"It seems “{value}” matters to you — want me to remember this?"
+            )
+            # Contradiction with the existing profile deserves an explicit callout.
+            if kind == "dislike" and value in likes:
+                statement = (
+                    f"“{value}” is currently in your likes, but it sounds like "
+                    f"you've gone off it — update your profile?"
+                )
+            elif kind in ("like", "cuisine") and value in dislikes:
+                statement = (
+                    f"“{value}” is currently in your dislikes, but it sounds like "
+                    f"you enjoy it now — update your profile?"
+                )
             suggestions.append({
                 "id": str(uuid.uuid4()),
                 "kind": kind,
                 "value": value,
-                "statement": cand.get("statement")
-                or f"It seems “{value}” matters to you — want me to remember this?",
+                "statement": statement,
             })
             if len(suggestions) >= MAX_SUGGESTIONS_PER_TURN:
                 break
@@ -145,11 +164,19 @@ class MemoryService:
             if value not in [str(v).lower() for v in items]:
                 items.append(value)
             profile["food_likes"] = items
+            profile["food_dislikes"] = [
+                v for v in (profile.get("food_dislikes") or [])
+                if str(v).lower() != value
+            ]
         elif kind == "dislike":
             items = list(profile.get("food_dislikes") or [])
             if value not in [str(v).lower() for v in items]:
                 items.append(value)
             profile["food_dislikes"] = items
+            profile["food_likes"] = [
+                v for v in (profile.get("food_likes") or [])
+                if str(v).lower() != value
+            ]
         elif kind == "allergy_hint":
             items = list(profile.get("allergies") or [])
             if value not in [str(v).lower() for v in items]:

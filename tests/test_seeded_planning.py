@@ -72,6 +72,36 @@ class TestResolution:
         assert svc.place_weekly(res) == {}
         assert svc.place_daily(res) == {}
 
+    def test_allergy_synonyms_catch_untagged_ingredients(self):
+        """"tree nuts" allergy must block an almond dish even with NO allergen
+        tags from RecipeWrangler (live incident: broken graph tagging)."""
+        almond = _resolved("r-alm", "Almond Crumbed Chicken", ("dinner",),
+                           allergens=(), ingredients="chicken, almond meal, apple")
+        svc = SeedService.__new__(SeedService)
+        svc.client = FakeRecipeClient({"almond crumbed chicken": almond})
+        svc.extractor = None
+        res = svc.resolve_seeds([{"name": "almond crumbed chicken"}],
+                                {"allergies": ["Tree Nuts"]})
+        assert res[0].status == "conflict"
+
+    def test_trailing_typo_resolves_via_truncation(self, sample_profile):
+        """"bolognesse" (extra letter) still finds Bolognese via prefix retry."""
+        bolognese = _resolved("r-bol", "Spaghetti Bolognese", ("dinner",))
+
+        class PrefixClient(FakeRecipeClient):
+            def autocomplete(self, name, limit=5):
+                hits = [(r.recipe.recipe_id, r.recipe.title)
+                        for r in self.recipes.values()
+                        if r.recipe.title.lower().startswith(name.lower())]
+                return hits
+
+        svc = SeedService.__new__(SeedService)
+        svc.client = PrefixClient({"spaghetti bolognese": bolognese})
+        svc.extractor = None
+        res = svc.resolve_seeds([{"name": "spaghetti bolognesse"}], sample_profile)
+        assert res[0].status == "resolved"
+        assert res[0].recipe.recipe.title == "Spaghetti Bolognese"
+
 
 class TestPlacement:
     def test_weekly_hint_honored(self, sample_profile):
@@ -261,3 +291,78 @@ class TestFavoritesOffer:
         turn = orch.process(session.session_id, session.member_id, "plan a day with fakes")
         assert turn.intent == "daily_plan"
         assert calls[0]["seeds"] == [{"name": "fakes"}]
+
+
+class TestPlanQuestion:
+    """plan_question turns are answered ABOUT the canvas, never by refining it."""
+
+    def _orchestrator(self, session_service):
+        from services.orchestrator_service import OrchestratorService
+
+        orch = OrchestratorService.__new__(OrchestratorService)
+        orch.session_service = session_service
+        orch.weekly_plan_service = None
+        orch.chat_service = None
+        orch.memory_service = None
+
+        class Classifier:
+            def classify(self, message, history):
+                return {"intent": "plan_question", "target_plan_type": None}
+
+        orch.orchestrator = Classifier()
+
+        class FakeAnalyst:
+            def __init__(self):
+                self.calls = []
+
+            def answer(self, question, plan_summary, history=None):
+                self.calls.append({"question": question, "summary": plan_summary})
+                return "Yes — your plan averages 95g protein/day."
+
+        orch.plan_analyst = FakeAnalyst()
+
+        class FakeFoodScholar:
+            def __init__(self):
+                self.questions = []
+
+            def process_question(self, session_id, message):
+                self.questions.append(message)
+
+                class T:
+                    text = "evidence answer"
+                    needs_clarification = False
+                    attribution = None
+
+                return T()
+
+        orch.foodscholar_service = FakeFoodScholar()
+        return orch
+
+    def test_question_about_plan_is_answered_not_refined(self, session_service, sample_profile):
+        from conftest import make_candidates
+
+        session = session_service.create_session(f"member-{uuid.uuid4()}", sample_profile)
+        session_service.add_meal_plan(session.session_id, make_candidates("q"), "r", {})
+
+        orch = self._orchestrator(session_service)
+        turn = orch.process(session.session_id, session.member_id,
+                            "does my meal plan adhere to that?")
+
+        assert turn.intent == "plan_question"
+        assert "95g protein" in turn.content
+        call = orch.plan_analyst.calls[0]
+        assert "Daily plan" in call["summary"]      # grounded in the canvas
+        assert orch.foodscholar_service.questions == []
+        # The Q&A is persisted to the conversation
+        restored = session_service.get_session(session.session_id)
+        assert restored.conversation[-1].content == turn.content
+
+    def test_no_canvas_falls_through_to_foodscholar(self, session_service, sample_profile):
+        session = session_service.create_session(f"member-{uuid.uuid4()}", sample_profile)
+        orch = self._orchestrator(session_service)
+
+        turn = orch.process(session.session_id, session.member_id,
+                            "does a protein-rich diet help with satiety?")
+        assert turn.intent == "nutrition_question"
+        assert orch.foodscholar_service.questions != []
+        assert orch.plan_analyst.calls == []
