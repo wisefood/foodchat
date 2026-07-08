@@ -108,12 +108,17 @@ class ClarificationOutcome:
     ``profile`` is always populated with the reconciled profile (stored profile
     merged with query-level reconciliation) so the caller can generate the plan
     without re-running reconciliation.
+
+    ``collected_facts`` holds the Q/A pairs gathered on the way to a final
+    query — the caller appends them to the session profile's history so the
+    same things are never asked again within the session.
     """
 
     profile: dict
     state: Optional[ClarificationState] = None
     question: Optional[str] = None
     final_query: Optional[str] = None
+    collected_facts: list = field(default_factory=list)
 
     @property
     def needs_clarification(self) -> bool:
@@ -194,7 +199,10 @@ class ClarificationManager:
                 state.phase = "collect"
                 question = self._next_question(state)
                 return ClarificationOutcome(profile=state.profile, state=state, question=question)
-            return ClarificationOutcome(profile=state.profile, final_query=self._reformulate(state))
+            return ClarificationOutcome(
+                profile=state.profile, final_query=self._reformulate(state),
+                collected_facts=self._collected(state),
+            )
 
         # phase == "collect": record the answer for the topic just asked
         state.transcript.append({"question": state.current_question, "answer": answer})
@@ -205,7 +213,10 @@ class ClarificationManager:
         if state.pending_topics:
             question = self._next_question(state)
             return ClarificationOutcome(profile=state.profile, state=state, question=question)
-        return ClarificationOutcome(profile=state.profile, final_query=self._reformulate(state))
+        return ClarificationOutcome(
+            profile=state.profile, final_query=self._reformulate(state),
+            collected_facts=self._collected(state),
+        )
 
     # ------------------------------------------------------------------ #
     # Internals                                                            #
@@ -273,13 +284,19 @@ class ClarificationManager:
         state.current_question = response.content
         return response.content
 
-    def _reformulate(self, state: ClarificationState) -> str:
-        """Fold the collected answers into one retrieval-ready query."""
+    @staticmethod
+    def _collected(state: ClarificationState) -> list[str]:
+        """The gathered facts, as short lines usable for profile history."""
         collected: list[str] = []
         if state.conflict_note:
             collected.append(state.conflict_note)
         for qa in state.transcript:
             collected.append(f"Q: {qa['question']}\nA: {qa['answer']}")
+        return collected
+
+    def _reformulate(self, state: ClarificationState) -> str:
+        """Fold the collected answers into one retrieval-ready query."""
+        collected = self._collected(state)
 
         response = self.reformulator.invoke([
             SystemMessage(content=QUERY_REFORMULATOR_SYSTEM_INSTRUCTIONS),

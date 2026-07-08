@@ -159,3 +159,63 @@ class TestStateSerialization:
         mgr = make_manager(reformulate_payloads=[{"reformulated_query": "resumed"}])
         outcome = mgr.step(revived, "an hour")
         assert outcome.final_query == "resumed"
+
+
+class TestCollectedFactsRemembered:
+    def test_final_outcome_carries_collected_facts(self):
+        mgr = make_manager(
+            reconcile_result={
+                "needs_clarification": True,
+                "has_dietary_conflict": False,
+                "missing_info": ["cooking time"],
+            },
+            question_payloads=["How long can you cook?"],
+            reformulate_payloads=[{"reformulated_query": "quick plan"}],
+        )
+        outcome = mgr.start("plan my day", PROFILE, "daily_plan")
+        final = mgr.step(outcome.state, "30 minutes on weekdays")
+        assert final.final_query == "quick plan"
+        assert final.collected_facts == [
+            "Q: How long can you cook?\nA: 30 minutes on weekdays",
+        ]
+
+    def test_answers_land_in_session_profile_history(self, session_service, sample_profile):
+        """The whole point: what the user answered is never re-asked in-session."""
+        import uuid
+        from services.chat_service import ChatService
+        from services.session_service import SessionService
+
+        session = session_service.create_session(f"member-{uuid.uuid4()}", sample_profile)
+        state = ClarificationState(
+            original_query="plan my day", profile=dict(sample_profile),
+            origin_intent="daily_plan", phase="collect",
+            pending_topics=["cooking time"],
+            current_question="How long can you cook?",
+        )
+        session_service.set_clarification_state(session.session_id, state.to_dict())
+
+        svc = ChatService.__new__(ChatService)
+        svc.session_service = session_service
+        svc.clarifier = make_manager(
+            reformulate_payloads=[{"reformulated_query": "quick plan"}],
+        )
+
+        class NoPlanPipeline:
+            def generate(self, *a, **k):
+                return []
+
+        svc.pipeline = NoPlanPipeline()
+
+        class NoSignals:
+            def get_signals(self, member_id):
+                from services.feedback_service import FeedbackSignals
+                return FeedbackSignals()
+
+        svc.feedback_service = NoSignals()
+
+        svc.continue_clarification(session.session_id, "30 minutes tops")
+
+        assert "30 minutes tops" in session.user_profile["history"]
+        # Survives restart — the reconciler's known facts see it next time
+        restored = SessionService().get_session(session.session_id)
+        assert "30 minutes tops" in restored.user_profile["history"]

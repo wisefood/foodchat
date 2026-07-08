@@ -224,6 +224,20 @@ class ChatService:
             return outcome.question, True, None, origin_intent
 
         self.session_service.clear_clarification_state(session_id)
+
+        # Remember what the user just told us (session-scoped): the answers go
+        # into the profile history so the reconciler's known-facts check stops
+        # re-asking the same things for the rest of the session.
+        if outcome.collected_facts:
+            history = session.user_profile.get("history", "") or ""
+            addition = " | ".join(
+                fact.replace("\n", " ") for fact in outcome.collected_facts
+            )
+            session.user_profile["history"] = (
+                f"{history}\n{addition}" if history else addition
+            )
+            self.session_service.persist_profile(session_id)
+
         is_refinement = origin_intent == "refine_plan"
         text, needs, plan = self._generate_and_store(
             session_id, outcome.final_query, outcome.profile, is_refinement
