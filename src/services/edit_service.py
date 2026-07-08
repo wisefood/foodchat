@@ -57,6 +57,10 @@ class EditOutcome:
     weekly_meal_plan: Optional[object] = None   # WeeklyMealPlan on weekly edits
     changed_slots: list = field(default_factory=list)
     facts: dict = field(default_factory=dict)   # for the ResponseWriter
+    # True when a clarification reply didn't answer the slot question at all:
+    # the state is cleared, NOTHING was logged, and the orchestrator should
+    # route the message as a fresh turn instead of re-interrogating.
+    unresolved: bool = False
 
 
 class DirectivePredicate:
@@ -174,10 +178,14 @@ class EditService:
         return self._execute(session, command, message)
 
     def continue_clarification(self, session_id: str, message: str) -> EditOutcome:
-        """Resume after the slot question — re-extract over combined context."""
-        session = self._get_session(session_id)
-        self.session_service.add_message(session_id, "user", message)
+        """Resume after the slot question — re-extract over combined context.
 
+        A reply that still doesn't resolve the slot usually isn't an answer
+        at all (a preference, a new question, a topic change), so instead of
+        re-asking we return ``unresolved=True`` with no messages logged and
+        let the orchestrator classify the turn fresh.
+        """
+        session = self._get_session(session_id)
         pending = session.clarification or {}
         self.session_service.clear_clarification_state(session_id)
 
@@ -186,11 +194,9 @@ class EditService:
         if command is None or command.get("meal_type") is None or (
             pending.get("plan_type") == "weekly" and command.get("day") is None
         ):
-            text = ("I still couldn't pin down the meal to swap — try something like "
-                    "“swap Tuesday's dinner”.")
-            self.session_service.add_message(session_id, "assistant", text)
-            return EditOutcome(text=text)
+            return EditOutcome(text="", unresolved=True)
 
+        self.session_service.add_message(session_id, "user", message)
         return self._execute(session, command, pending.get("original_message", message))
 
     # ------------------------------------------------------------------ #

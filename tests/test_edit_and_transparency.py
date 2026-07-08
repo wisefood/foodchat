@@ -175,6 +175,31 @@ class TestDailySlotEdit:
         assert second.meal_plan.lunch.title == "Fruit salad"
         assert session.state == "ready"
 
+    def test_unresolvable_clarification_reply_falls_through(self, session_service, sample_profile):
+        """A reply that isn't a slot answer must NOT re-interrogate: the trap
+        is cleared, nothing is logged, and unresolved=True hands the turn
+        back to the orchestrator for fresh classification."""
+        session = _session_with_daily_plan(session_service, sample_profile)
+
+        class AlwaysAmbiguous:
+            def extract(self, message, plan_type):
+                return {"meal_type": None, "day": None, "directive": "different",
+                        "needs_slot_clarification": True, "question": "Which meal?"}
+
+        svc = EditService(session_service, client=FakeEditClient({}, {}),
+                          extractor=AlwaysAmbiguous())
+        first = svc.process(session.session_id, "swap something for me")
+        assert first.needs_clarification
+        assert session.state == "clarifying"
+        logged_before = len(session.conversation)
+
+        outcome = svc.continue_clarification(
+            session.session_id, "just remember i dont like chicken"
+        )
+        assert outcome.unresolved
+        assert session.state == "ready"                       # trap cleared
+        assert len(session.conversation) == logged_before     # nothing logged
+
 
 class TestWeeklySlotEdit:
     def test_patch_replaces_single_entry_without_regeneration(self, session_service, sample_profile):

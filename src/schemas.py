@@ -48,7 +48,8 @@ class OrchestratorSchema(BaseModel):
     """Per-turn intent classification (the single router of the pipeline)."""
     intent: Literal[
         "daily_plan", "weekly_plan", "refine_plan", "edit_plan_slot",
-        "switch_plan_type", "nutrition_question", "plan_question", "chat",
+        "switch_plan_type", "nutrition_question", "plan_question",
+        "preference_update", "chat",
     ]
     reasoning: str
     # Populated only when intent == "switch_plan_type"

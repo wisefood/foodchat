@@ -421,17 +421,20 @@ class OrchestratorAgent:
     """Single intent classifier per turn — the ONLY router in the pipeline.
 
     Valid intents: daily_plan | weekly_plan | refine_plan | edit_plan_slot
-    | switch_plan_type | nutrition_question | plan_question | chat.
+    | switch_plan_type | nutrition_question | plan_question
+    | preference_update | chat.
     ``target_plan_type`` is populated only for switch_plan_type;
     nutrition_question turns are delegated to FoodScholar; plan_question
     turns are answered by the PlanAnalyst grounded in the active canvas;
     edit_plan_slot targets ONE slot of the active canvas with a verified
-    directive.
+    directive; preference_update is a stated durable preference — it is
+    acknowledged, never interrogated (the write stays behind the M3 nudge).
     """
 
     VALID_INTENTS = {
         "daily_plan", "weekly_plan", "refine_plan", "edit_plan_slot",
-        "switch_plan_type", "nutrition_question", "chat",
+        "switch_plan_type", "nutrition_question", "plan_question",
+        "preference_update", "chat",
     }
 
     def __init__(self, model: str = None, temperature: float = None):

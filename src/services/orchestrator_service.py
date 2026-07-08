@@ -14,13 +14,22 @@ The ONLY intent classification in the pipeline happens here (one
   plan_question      → PlanAnalyst (question ABOUT the active canvas — answered
                        from its nutrition data, never modifies the plan;
                        no canvas → falls through to FoodScholar)
+  preference_update  → acknowledge a stated durable preference ("remember I
+                       don't like chicken") — the durable write stays
+                       consent-gated behind the M3 memory nudge
   chat               → ChatService.process_smalltalk
 
 While a session is mid-clarification (session.state == "clarifying"), the
-classifier is skipped entirely — the user is answering our question. The
+classifier is normally skipped — the user is answering our question. The
 persisted clarification dict routes the turn: ``kind == "foodscholar"`` goes
 back to FoodScholarService, anything else to ChatService (plan flow, whose
 state carries the original intent). Both are restart-safe (data, not objects).
+Edit-slot clarifications are the exception: when the reply still doesn't
+resolve the slot it usually isn't an answer at all, so the turn falls back to
+normal classification instead of re-interrogating.
+
+Memory nudges (M3) run on EVERY turn — including clarification turns — so a
+preference stated while answering a question is never silently dropped.
 
 Returns a unified ChatTurn so the router needs one response model.
 """
@@ -108,25 +117,19 @@ class OrchestratorService:
                 at_message_limit=True,
             )
 
-        # Mid-clarification turns bypass classification — the user is answering
-        # our question, not expressing a new intent.
+        # Mid-clarification turns usually bypass classification — the user is
+        # answering our question. Handlers may still bounce the turn back to
+        # normal routing when the reply clearly isn't an answer.
         if session.state == "clarifying":
-            return self._handle_clarification_turn(session_id, message)
-
-        history = [
-            {"role": m.role, "content": m.content}
-            for m in session.conversation[-12:]
-        ]
-        classification = self.orchestrator.classify(message, history)
-        intent = classification["intent"]
-        target_plan_type = classification.get("target_plan_type")
-        logger.info("[%s] intent=%s target=%s", session_id, intent, target_plan_type)
-
-        turn = self._route(session, session_id, message, intent, target_plan_type)
+            turn = self._handle_clarification_turn(session_id, message)
+        else:
+            turn = self._classify_and_route(session, session_id, message)
 
         # Consent nudges (M3): detect durable preferences in the user's turn
         # and ATTACH suggestions — durable writes happen only when the user
-        # answers via POST /sessions/{id}/memory. Best-effort by design.
+        # answers via POST /sessions/{id}/memory. Best-effort by design, and
+        # runs on clarification turns too: a preference stated while
+        # answering a question still counts.
         if self.memory_service is not None and not turn.at_message_limit:
             try:
                 suggestions = self.memory_service.suggest(session, message)
@@ -135,6 +138,18 @@ class OrchestratorService:
             except Exception as e:
                 logger.warning("[%s] Memory suggestion failed: %s", session_id, e)
         return turn
+
+    def _classify_and_route(self, session, session_id: str, message: str) -> ChatTurn:
+        """One classifier call, then dispatch — the only intent decision per turn."""
+        history = [
+            {"role": m.role, "content": m.content}
+            for m in session.conversation[-12:]
+        ]
+        classification = self.orchestrator.classify(message, history)
+        intent = classification["intent"]
+        target_plan_type = classification.get("target_plan_type")
+        logger.info("[%s] intent=%s target=%s", session_id, intent, target_plan_type)
+        return self._route(session, session_id, message, intent, target_plan_type)
 
     def _route(self, session, session_id: str, message: str, intent: str,
                target_plan_type: Optional[str]) -> ChatTurn:
@@ -174,6 +189,9 @@ class OrchestratorService:
 
         if intent == "plan_question":
             return self._handle_plan_question(session, session_id, message)
+
+        if intent == "preference_update":
+            return self._handle_preference_update(session_id, message)
 
         # "chat" and any unexpected values
         return self._handle_smalltalk(session_id, message)
@@ -265,8 +283,13 @@ class OrchestratorService:
             return self._handle_favorites_offer_reply(session_id, message)
 
         if pending.get("kind") == "edit_slot":
-            # The user is telling us WHICH meal to swap (M4b).
+            # The user is (probably) telling us WHICH meal to swap (M4b).
             outcome = self.edit_service.continue_clarification(session_id, message)
+            if outcome.unresolved:
+                # The reply didn't answer the slot question — the trap is
+                # cleared and nothing was logged, so route it as a fresh turn.
+                session = self.session_service.get_session(session_id)
+                return self._classify_and_route(session, session_id, message)
             return self._turn_from_edit(session_id, outcome)
 
         # FoodScholar clarifications are tagged with kind="foodscholar";
@@ -410,6 +433,17 @@ class OrchestratorService:
         response_text, _, _ = self.chat_service.process_smalltalk(session_id, message)
         self._tag_last_message(session_id, "chat", None)
         return ChatTurn(role="assistant", content=response_text, intent="chat")
+
+    def _handle_preference_update(self, session_id: str, message: str) -> ChatTurn:
+        """Acknowledge a stated durable preference without interrogating (M3).
+
+        The durable write stays consent-gated: process() attaches the memory
+        nudge and the profile only changes via POST /sessions/{id}/memory —
+        this handler just answers in the persona voice.
+        """
+        response_text, _, _ = self.chat_service.process_smalltalk(session_id, message)
+        self._tag_last_message(session_id, "preference_update", None)
+        return ChatTurn(role="assistant", content=response_text, intent="preference_update")
 
     def _handle_plan(
         self, session_id: str, message: str, intent: str, is_refinement: bool,

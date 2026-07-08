@@ -437,6 +437,8 @@ async def unified_chat(session_id: str, request: ChatRequest):
       - refine_plan        → update the active canvas plan in-place (version++)
       - switch_plan_type   → freeze current canvas type, start fresh canvas of the other type
       - nutrition_question → evidence-based answer via FoodScholar (with attribution)
+      - preference_update  → acknowledge a stated durable preference (write stays
+                             consent-gated behind the memory nudge)
       - chat               → general conversation
 
     The caller must supply member_id to prove session ownership.
