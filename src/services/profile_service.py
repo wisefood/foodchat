@@ -7,6 +7,38 @@ from backend.platform import WISEFOOD, WiseFoodPool
 logger = logging.getLogger(__name__)
 
 
+# Dietary-goal slugs (written by FoodScholar into properties.dietary_goals) that
+# map onto a RecipeWrangler hard diet tag -> applied as a structural candidate
+# filter (see candidates_client.GOAL_DIET_TAG_MAP, kept in sync with this set).
+GOAL_TO_DIET_TAG = {
+    "reduce_fat": "low-fat",
+    "reduce_carbs": "low-carb",
+    "increase_protein": "high-protein",
+}
+
+# Human-readable soft-signal strings for every goal slug, fed into the planner's
+# `preferences` list so the LLM grader steers even when there's no hard tag.
+GOAL_PREFERENCE_STRINGS = {
+    "reduce_fat": "prefers lower-fat meals",
+    "reduce_sugar": "prefers lower-sugar meals",
+    "reduce_sodium": "prefers lower-sodium meals",
+    "reduce_calories": "prefers lower-calorie meals",
+    "reduce_carbs": "prefers lower-carb meals",
+    "increase_protein": "prefers higher-protein meals",
+    "increase_fiber": "prefers higher-fiber meals",
+    "increase_hydration": "prefers hydrating meals",
+    "lose_weight": "goal: weight loss (favor lighter, filling meals)",
+    "gain_weight": "goal: weight gain (favor calorie-dense meals)",
+    "gain_muscle": "goal: muscle gain (favor high-protein meals)",
+    "maintain_weight": "goal: weight maintenance",
+}
+
+
+def goal_preference_strings(goal_slugs: list[str]) -> list[str]:
+    """Map dietary-goal slugs to soft preference strings for the LLM grader."""
+    return [GOAL_PREFERENCE_STRINGS[s] for s in goal_slugs if s in GOAL_PREFERENCE_STRINGS]
+
+
 class ProfileService:
     """Service for fetching and mapping WiseFood member profiles."""
 
@@ -227,13 +259,32 @@ class ProfileService:
             )
             properties = wisefood_profile.get("properties", {}) or {}
 
+        # Dietary goals expressed elsewhere (e.g. FoodScholar Q&A) live under
+        # properties.dietary_goals as [{"slug", "label"}]. Surface the slugs so
+        # the planner can act on them (structural diet tags + soft preferences).
+        dietary_goals = [
+            str(g.get("slug", "")).strip().lower()
+            for g in (properties.get("dietary_goals") or [])
+            if isinstance(g, dict) and g.get("slug")
+        ]
+
+        # Goals that map to a RecipeWrangler diet tag become hard candidate
+        # filters (e.g. reduce_fat -> low-fat), folded into `diet` so every
+        # planner path applies them with no extra plumbing. Goals with no tag
+        # ride the soft `preferences` channel below.
+        goal_diet_tags = [
+            GOAL_TO_DIET_TAG[s] for s in dietary_goals if s in GOAL_TO_DIET_TAG
+        ]
+
         return {
-            "diet": list(dietary_groups),
+            "diet": list(dict.fromkeys(list(dietary_groups) + goal_diet_tags)),
             "allergies": list(allergies),
-            "preferences": self._build_preferences(nutritional_preferences, properties),
+            "preferences": self._build_preferences(nutritional_preferences, properties)
+            + goal_preference_strings(dietary_goals),
             "history": properties.get("feedback_history", "") or "",
             "food_likes": list(nutritional_preferences.get("food_likes", []) or []),
             "food_dislikes": list(nutritional_preferences.get("food_dislikes", []) or []),
+            "dietary_goals": dietary_goals,
             # M3 memory fields (written only through the consent flow)
             "standing_seeds": list(properties.get("standing_seeds", []) or []),
             "memory_optouts": list(properties.get("memory_optouts", []) or []),
