@@ -28,12 +28,20 @@ import uuid
 from typing import Optional
 
 from agents import PreferenceExtractor
-from .profile_service import ProfileService
+from .profile_service import (
+    GOAL_PREFERENCE_STRINGS,
+    GOAL_TO_DIET_TAG,
+    ProfileService,
+    goal_preference_strings,
+)
 from .session_service import SessionService
 
 logger = logging.getLogger(__name__)
 
-VALID_KINDS = {"like", "dislike", "cuisine", "constraint", "allergy_hint", "standing_seed"}
+VALID_KINDS = {
+    "like", "dislike", "cuisine", "constraint", "allergy_hint",
+    "standing_seed", "dietary_goal",
+}
 # At most this many nudges per turn — more reads as surveillance, not help.
 MAX_SUGGESTIONS_PER_TURN = 2
 
@@ -70,11 +78,13 @@ class MemoryService:
         dislikes = {str(v).lower() for v in (profile.get("food_dislikes") or [])}
         allergies = {str(v).lower() for v in (profile.get("allergies") or [])}
         seeds = {str(s.get("name", "")).lower() for s in (profile.get("standing_seeds") or [])}
+        goals = {str(v).lower() for v in (profile.get("dietary_goals") or [])}
         known_by_kind = {
             "like": likes, "cuisine": likes,
             "dislike": dislikes,
             "allergy_hint": allergies,
             "standing_seed": seeds,
+            "dietary_goal": goals,
             "constraint": set(),
         }
         optouts = {str(v).lower() for v in (profile.get("memory_optouts") or [])}
@@ -84,6 +94,10 @@ class MemoryService:
             kind = cand.get("kind")
             value = str(cand.get("value", "")).strip().lower()
             if kind not in VALID_KINDS or not value:
+                continue
+            # Goals must be canonical slugs the planner understands — an
+            # off-list value would be written but never acted on.
+            if kind == "dietary_goal" and value not in GOAL_PREFERENCE_STRINGS:
                 continue
             if value in known_by_kind.get(kind, set()) or value in optouts:
                 continue
@@ -190,4 +204,23 @@ class MemoryService:
         elif kind == "constraint":
             history = profile.get("history", "") or ""
             profile["history"] = (history + "\n" if history else "") + value
+        elif kind == "dietary_goal":
+            # Mirror ProfileService._map_profile so the very next plan sees
+            # the goal exactly as a fresh profile fetch would: the slug, its
+            # soft preference string, and (when mapped) the hard diet tag.
+            goals = list(profile.get("dietary_goals") or [])
+            if value not in goals:
+                goals.append(value)
+            profile["dietary_goals"] = goals
+            prefs = list(profile.get("preferences") or [])
+            for pref in goal_preference_strings([value]):
+                if pref not in prefs:
+                    prefs.append(pref)
+            profile["preferences"] = prefs
+            tag = GOAL_TO_DIET_TAG.get(value)
+            if tag:
+                diet = list(profile.get("diet") or [])
+                if tag not in diet:
+                    diet.append(tag)
+                profile["diet"] = diet
         self.session_service.persist_profile(session.session_id)

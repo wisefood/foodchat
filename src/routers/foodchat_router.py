@@ -28,6 +28,7 @@ from pydantic import BaseModel
 import services
 from db import SessionLocal, db_upsert_feedback, db_get_message_by_id
 from models.session import MealCourse
+from services import plan_parameters
 
 logger = logging.getLogger(__name__)
 
@@ -205,6 +206,30 @@ class AttributionResponse(BaseModel):
         )
 
 
+class PlanParameterOptionModel(BaseModel):
+    value: str
+    label: str
+
+
+class PlanParameterModel(BaseModel):
+    key: str
+    label: str
+    kind: str                                   # "scale" | "choice"
+    min: Optional[int] = None                   # scale only
+    max: Optional[int] = None
+    step: Optional[int] = None
+    unit: Optional[str] = None
+    options: Optional[List[PlanParameterOptionModel]] = None  # choice only
+    default: object = None
+    value: object = None                        # currently applied, if any
+
+
+class PlanParameterCardModel(BaseModel):
+    """Optional slider card attached to fresh daily plans; the UI answers via
+    POST /sessions/{id}/plan-parameters instead of a textual question."""
+    parameters: List[PlanParameterModel]
+
+
 class ChatTurnResponse(BaseModel):
     role: str
     content: str
@@ -223,6 +248,8 @@ class ChatTurnResponse(BaseModel):
     memory_suggestions: Optional[List[MemorySuggestionModel]] = None
     # Slot-edit proof (M4b): what changed, with before/after kcal when known
     changed_slots: Optional[List[dict]] = None
+    # Interactive plan-parameter card (time/difficulty/goal sliders)
+    plan_parameters: Optional[PlanParameterCardModel] = None
 
 
 class ConversationPage(BaseModel):
@@ -241,6 +268,11 @@ class MemoryDecisionRequest(BaseModel):
     member_id: str
     decision: str        # "accept" | "decline"
     suggestion: MemorySuggestionModel
+
+
+class PlanParametersRequest(BaseModel):
+    member_id: str
+    values: dict         # {parameter_key: chosen_value} — sanitized server-side
 
 
 class MemoryDecisionResponse(BaseModel):
@@ -470,6 +502,12 @@ async def unified_chat(session_id: str, request: ChatRequest):
         logger.error("[%s] /chat 500: %s", session_id, e, exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
+    return _chat_turn_response(turn)
+
+
+def _chat_turn_response(turn) -> ChatTurnResponse:
+    """Map an orchestrator ChatTurn onto the wire model (shared by /chat and
+    /plan-parameters, which return the same turn shape)."""
     return ChatTurnResponse(
         role=turn.role,
         content=turn.content,
@@ -492,7 +530,44 @@ async def unified_chat(session_id: str, request: ChatRequest):
             if turn.memory_suggestions else None
         ),
         changed_slots=turn.changed_slots,
+        plan_parameters=(
+            PlanParameterCardModel(**turn.plan_parameters)
+            if turn.plan_parameters else None
+        ),
     )
+
+
+@router.post("/sessions/{session_id}/plan-parameters", response_model=ChatTurnResponse)
+async def apply_plan_parameters(session_id: str, request: PlanParametersRequest):
+    """
+    Apply values from the interactive plan-parameter card (time budget,
+    difficulty, goal). Deterministic alternative to typing a refinement:
+    no intent classification, no clarification round — the values become a
+    canonical refinement of the active daily plan (or a fresh plan if none).
+    """
+    orch_svc = _require_orchestrator_service()
+
+    sanitized = plan_parameters.sanitize(request.values)
+    if not sanitized:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No valid plan parameter values provided",
+        )
+
+    logger.info(
+        "[%s] /plan-parameters from member %s: %s",
+        session_id, request.member_id, sanitized,
+    )
+    try:
+        turn = orch_svc.apply_plan_parameters(session_id, request.member_id, sanitized)
+    except ValueError as e:
+        logger.warning("[%s] /plan-parameters 404: %s", session_id, e)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        logger.error("[%s] /plan-parameters 500: %s", session_id, e, exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+    return _chat_turn_response(turn)
 
 
 @router.get("/sessions/{session_id}/conversation", response_model=ConversationPage)

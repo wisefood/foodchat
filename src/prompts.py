@@ -141,12 +141,12 @@ Your task is to analyze the user's query and their dietary profile to identify:
 Instructions:
 - If an item in the query violates the user's diet or allergies, set `has_dietary_conflict` to true and provide a `conflict_explanation` that warns the user and asks if they want to proceed.
 - DEFAULT TO NOT ASKING. `missing_info` should almost always be an empty list. A meal plan can be generated from any profile signal (dietary groups, food likes/dislikes, allergies) or any qualifier in the query ("healthy", "quick", "high-protein", "for the week", a cuisine, a dish name). If ANY such signal exists, return `missing_info: []`.
-- Only add a topic to `missing_info` when BOTH the query is completely bare (no qualifier at all, e.g. just "make me a plan") AND the KNOWN USER INFORMATION provides no direction whatsoever. Even then, ask at most ONE topic — the single most useful one (usually the meal goal).
-- NEVER ask about "difficulty level". Never re-ask anything the KNOWN USER INFORMATION covers (a stated calorie goal covers "goal"; "quick meals" or a stated cooking time covers "cooking time"; food likes cover taste direction). Interrogating users who already told us things erodes trust.
+- Only add a topic to `missing_info` when BOTH the query is completely bare (no qualifier at all, e.g. just "make me a plan") AND the KNOWN USER INFORMATION provides no direction whatsoever. Even then, ask at most ONE topic — the single most useful one (usually food preferences or cravings for this plan).
+- NEVER ask about "cooking time", "difficulty level", or "goal" — the app collects these through interactive controls, never through questions. Never re-ask anything the KNOWN USER INFORMATION covers (food likes cover taste direction). Interrogating users who already told us things erodes trust.
 - Set `needs_clarification` to true if `missing_info` is not empty OR `has_dietary_conflict` is true.
 
 Return a JSON object with:
-- "missing_info" (list of strings: "cooking time", "difficulty level", "goal")
+- "missing_info" (list of strings, e.g. "food preferences or cravings for this plan")
 - "has_dietary_conflict" (boolean)
 - "conflict_explanation" (string or null)
 - "needs_clarification" (boolean)
@@ -549,6 +549,7 @@ KINDS you may extract:
 - "allergy_hint"  — a possible allergy or intolerance ("shrimp makes me sick", "I'm allergic to peanuts")
 - "standing_seed" — a dish the user wants REGULARLY/ALWAYS in plans ("I always want pastitsio in my week", "include fakes every week")
 - "constraint"    — a durable lifestyle constraint ("I only have 20 minutes to cook on weekdays", "I cook for two")
+- "dietary_goal"  — a health objective or worry that should steer meal plans ("I want to lose weight", "my cholesterol is high", "I'm worried about my blood pressure", "trying to build muscle"). The value MUST be exactly one of: reduce_fat, reduce_sugar, reduce_sodium, reduce_calories, reduce_carbs, increase_protein, increase_fiber, increase_hydration, lose_weight, gain_weight, gain_muscle, maintain_weight. Map worries to the closest goal: high cholesterol / heart health → reduce_fat; blood pressure / hypertension → reduce_sodium; blood sugar / diabetes → reduce_sugar; getting stronger / bulking → gain_muscle. The statement must name what the user said AND what the plans will do, e.g. "You mentioned watching your cholesterol — should I aim for lower-fat meal plans from now on?"
 
 Do NOT extract:
 - One-off, current-request constraints ("keep it cheap this week", "no meat today", "something light tonight")

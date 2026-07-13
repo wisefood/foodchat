@@ -123,6 +123,9 @@ class ProfileService:
           allergy_hint   → allergies (safety field — only ever via consent)
           standing_seed  → properties.standing_seeds [{name}]
           constraint     → properties.feedback_history (appended line)
+          dietary_goal   → properties.dietary_goals [{slug, label}] — the same
+                           field FoodScholar's own consent flow writes, so both
+                           apps converge on one goal store the planner reads
         """
         try:
             with self.client_pool.client() as client:
@@ -166,6 +169,19 @@ class ProfileService:
                     if value_norm not in [s.get("name", "").lower() for s in seeds]:
                         seeds.append({"name": value_norm})
                     props["standing_seeds"] = seeds
+                elif kind == "dietary_goal":
+                    if value_norm not in GOAL_PREFERENCE_STRINGS:
+                        logger.warning("Unknown dietary goal %r — not applied", value_norm)
+                        return False
+                    goals = list(props.get("dietary_goals") or [])
+                    if value_norm not in [
+                        str(g.get("slug", "")).lower() for g in goals if isinstance(g, dict)
+                    ]:
+                        goals.append({
+                            "slug": value_norm,
+                            "label": value_norm.replace("_", " ").capitalize(),
+                        })
+                    props["dietary_goals"] = goals
                 elif kind == "constraint":
                     history = props.get("feedback_history", "") or ""
                     props["feedback_history"] = (history + "\n" if history else "") + value

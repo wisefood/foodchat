@@ -133,6 +133,7 @@ class ChatService:
         message: str,
         is_refinement: bool = False,
         seeds: Optional[list[dict]] = None,
+        skip_clarification: bool = False,
     ) -> Tuple[str, bool, Optional[MealPlan]]:
         """Handle a 'daily_plan' or 'refine_plan' intent turn.
 
@@ -140,6 +141,10 @@ class ChatService:
         orchestrator (M2); they are resolved and pinned here so the pins
         survive an intervening clarification round-trip (they ride inside
         the persisted profile snapshot under ``_pinned_slots``).
+
+        ``skip_clarification`` is for messages we composed ourselves (the
+        plan-parameters card): they are explicit by construction, so the
+        reconciler/specificity LLM round is pointless.
 
         Returns (response_text, needs_clarification, meal_plan|None).
         """
@@ -183,6 +188,11 @@ class ChatService:
             note = self.seed_service.describe(resolutions)
             if note:
                 profile["_seed_note"] = note
+
+        if skip_clarification:
+            return self._generate_and_store(
+                session_id, effective_message, profile, is_refinement
+            )
 
         origin_intent = "refine_plan" if is_refinement else "daily_plan"
         outcome = self.clarifier.start(effective_message, profile, origin_intent)

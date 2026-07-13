@@ -2,6 +2,71 @@
 
 ---
 
+# dietary_goal memory kind — worries/objectives in chat steer planning
+
+> **Date:** 2026-07-13
+> **Branch:** main
+> Companion change in the foodscholar repo: worry→goal mapping in its
+> qa-memory-extractor prompt fallback. NOTE: the deployed FoodScholar reads
+> that prompt from Langfuse (existing prompts are never overwritten on
+> startup) — push the updated text as a new version of
+> `foodscholar/qa-memory-extractor` in the Langfuse UI or the change stays
+> dormant.
+
+FoodScholar already runs a full consent loop for goals expressed in Q&A
+(its own extractor + chips + `POST /qa/memory` → `properties.dietary_goals`,
+which the planner reads since "Planner: apply dietary_goals"). This change
+gives FoodChat the same ear: the PreferenceExtractor now detects
+`dietary_goal` candidates ("my cholesterol is high", "I want to build
+muscle") with canonical planner slugs, the nudge policy validates the slug
+(off-list values are dropped) and dedupes against existing goals, and an
+accepted nudge writes `properties.dietary_goals` — the SAME field FoodScholar
+writes, so both apps converge on one goal store. The live session profile is
+synced exactly as a fresh profile fetch would map it (slug + soft preference
+string + hard diet tag where applicable), so the very next plan honors it.
+Tests: `tests/test_member_memory_bridge.py`.
+
+---
+
+# Interactive plan-parameter card — sliders instead of questions
+
+> **Date:** 2026-07-13
+> **Branch:** main
+> Ships together with a wisefood-api proxy route and the wisefood-ui card
+> component — rebuild foodchat + gateway + UI together.
+
+The old textual clarification questions about cooking time / difficulty /
+goal (tuned out entirely during demo hardening — "DEFAULT TO NOT ASKING")
+return as an OPTIONAL slider card attached to every fresh daily plan turn:
+
+- `services/plan_parameters.py` — static card definition (cooking_time
+  10–90 min scale; difficulty and goal as discrete choices), value
+  sanitization (clamp/snap/whitelist), canonical refinement text, and the
+  known-facts history line. Fully deterministic, no LLM.
+- `ChatTurn.plan_parameters` / `ChatTurnResponse.plan_parameters` — card
+  payload on fresh daily plans (not on text refinements; clarification
+  completions included). Not persisted in conversation history — live
+  responses only, like memory_suggestions.
+- `POST /sessions/{id}/plan-parameters` — applies chosen values as a
+  deterministic refinement: no intent classification, no clarification
+  round (`process_plan_request(skip_clarification=True)`). Values merge
+  into `user_profile["plan_parameters"]` (card shows current settings) and
+  append to the profile history (reconciler treats them as known facts).
+  Ownership 404s like /chat; unusable values → 400.
+- Reconciler prompt now bans asking about cooking time / difficulty / goal
+  outright — the card owns those topics; textual clarification remains for
+  dietary conflicts and food-direction-on-bare-query only.
+- Gateway: `POST /api/v1/foodchat/sessions/{id}/plan-parameters`
+  (auth + member access check, extra-long timeout — it generates).
+- UI: `FoodchatPlanParameterCard` renders inside the assistant bubble
+  (draggable knobs, touched-only apply, dismissible, only the newest card
+  stays interactive); store grafts the card client-side like attribution.
+
+Tests: `tests/test_plan_parameters.py` (sanitize/card/describe + apply-flow
+wiring with a recording fake — still LLM-free).
+
+---
+
 # Demo hardening — live-testing fixes
 
 > **Date:** 2026-07-08

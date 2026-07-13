@@ -67,7 +67,8 @@ class CandidateMemorySchema(BaseModel):
     Candidates are SUGGESTED to the user, never written silently — the
     consent flow (memory nudges) owns durable profile writes.
     """
-    kind: Literal["like", "dislike", "cuisine", "constraint", "allergy_hint", "standing_seed"]
+    kind: Literal["like", "dislike", "cuisine", "constraint", "allergy_hint",
+                  "standing_seed", "dietary_goal"]
     value: str                       # canonical item, e.g. "blueberries"
     statement: str                   # user-facing nudge text
     evidence: str                    # what in the message supports this

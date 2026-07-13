@@ -42,6 +42,7 @@ from typing import Any, Optional
 from agents import OrchestratorAgent, PlanAnalyst
 from models.attribution import Attribution
 from models.session import MealPlan, WeeklyMealPlan
+from . import plan_parameters
 from .edit_service import EditService
 from .foodscholar_service import FoodScholarService
 from .seed_service import SeedService
@@ -78,6 +79,9 @@ class ChatTurn:
     memory_suggestions: Optional[list] = None
     # Slot-edit proof (M4b): [{meal_type, day, old{title,kcal}, new{...}, directive, verified}]
     changed_slots: Optional[list] = None
+    # Optional slider card (time/difficulty/goal) attached to fresh daily
+    # plans; answered via POST /sessions/{id}/plan-parameters
+    plan_parameters: Optional[dict] = None
 
 
 class OrchestratorService:
@@ -317,6 +321,7 @@ class OrchestratorService:
             meal_plan=meal_plan,
             plan_version=meal_plan.version if meal_plan else None,
             plan_parent_id=meal_plan.parent_id if meal_plan else None,
+            plan_parameters=self._parameter_card(session_id, origin_intent, meal_plan),
         )
 
     def _handle_edit(self, session_id: str, message: str) -> ChatTurn:
@@ -447,10 +452,11 @@ class OrchestratorService:
 
     def _handle_plan(
         self, session_id: str, message: str, intent: str, is_refinement: bool,
-        seeds: Optional[list[dict]] = None,
+        seeds: Optional[list[dict]] = None, skip_clarification: bool = False,
     ) -> ChatTurn:
         response_text, needs_clarification, meal_plan = self.chat_service.process_plan_request(
-            session_id, message, is_refinement=is_refinement, seeds=seeds
+            session_id, message, is_refinement=is_refinement, seeds=seeds,
+            skip_clarification=skip_clarification,
         )
         self._tag_last_message(session_id, intent, meal_plan.id if meal_plan else None)
 
@@ -462,7 +468,62 @@ class OrchestratorService:
             meal_plan=meal_plan,
             plan_version=meal_plan.version if meal_plan else None,
             plan_parent_id=meal_plan.parent_id if meal_plan else None,
+            plan_parameters=self._parameter_card(session_id, intent, meal_plan),
         )
+
+    def _parameter_card(self, session_id: str, intent: str, meal_plan) -> Optional[dict]:
+        """The slider card rides along with fresh daily plans only — showing
+        it again on every text refinement would be noise (the apply flow
+        re-attaches it explicitly with updated values)."""
+        if intent != "daily_plan" or meal_plan is None:
+            return None
+        session = self.session_service.get_session(session_id)
+        return plan_parameters.build_card(session.user_profile if session else {})
+
+    def apply_plan_parameters(self, session_id: str, member_id: str, values: dict) -> ChatTurn:
+        """Apply slider-card values (already sanitized by the router).
+
+        Deterministic counterpart of a refinement turn: the values become a
+        canonical query (no intent classification, no clarification LLM
+        round), are stored on the profile so the card shows current settings,
+        and land in the profile history so the reconciler treats them as
+        known facts for the rest of the session.
+        """
+        session = self.session_service.get_session(session_id, member_id=member_id)
+        if not session:
+            raise ValueError(f"Session {session_id} not found or access denied")
+        if session.is_at_message_limit:
+            return ChatTurn(
+                role="assistant",
+                content=(
+                    f"This conversation has reached the {session.max_messages}-message limit. "
+                    "Please start a new session to continue."
+                ),
+                intent="chat",
+                at_message_limit=True,
+            )
+
+        applied = dict(session.user_profile.get("plan_parameters") or {})
+        applied.update(values)
+        session.user_profile["plan_parameters"] = applied
+        history = session.user_profile.get("history", "") or ""
+        line = plan_parameters.history_line(values)
+        session.user_profile["history"] = f"{history}\n{line}" if history else line
+        self.session_service.persist_profile(session_id)
+
+        message = plan_parameters.describe(values)
+        is_refinement = session.get_current_daily_plan() is not None
+        intent = "refine_plan" if is_refinement else "daily_plan"
+        logger.info("[%s] Applying plan parameters %s (%s).", session_id, values, intent)
+
+        turn = self._handle_plan(
+            session_id, message, intent,
+            is_refinement=is_refinement, skip_clarification=True,
+        )
+        # Always return the card with its new current values so the UI stays
+        # in sync, even on the refine path where _handle_plan skips it.
+        turn.plan_parameters = plan_parameters.build_card(session.user_profile)
+        return turn
 
     def _handle_weekly(
         self, session_id: str, message: str, intent: str, is_refinement: bool,

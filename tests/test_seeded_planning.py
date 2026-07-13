@@ -212,7 +212,8 @@ class TestFavoritesOffer:
         orch.memory_service = None        # nudges off in these routing tests
 
         class FakeChatService:
-            def process_plan_request(self, session_id, message, is_refinement=False, seeds=None):
+            def process_plan_request(self, session_id, message, is_refinement=False,
+                                     seeds=None, skip_clarification=False):
                 plan_calls.append({"message": message, "seeds": seeds})
                 return "plan text", False, None
 
