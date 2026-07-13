@@ -82,6 +82,30 @@ class ProfileService:
             logger.warning("Could not fetch favorites for member %s: %s", member_id, e)
             return []
 
+    def get_member_adapted_recipes(self, member_id: str) -> dict[str, dict]:
+        """Fetch the member's saved adapted recipes from the gateway.
+
+        Returns {original_recipe_id: {"title": ..., "payload": {...}}}.
+        Adapted recipes are strictly owner-scoped at the gateway; this call
+        reads only the authorized member's own adaptations. Best-effort:
+        failures degrade to an empty map rather than blocking the session.
+        """
+        try:
+            with self.client_pool.client() as client:
+                response = client.get(f"members/{member_id}/adapted-recipes")
+                payload = response.json()
+            rows = payload.get("result", payload) or []
+            adapted = {
+                r["recipe_id"]: {"title": r.get("title"), "payload": r.get("payload") or {}}
+                for r in rows
+                if isinstance(r, dict) and r.get("recipe_id")
+            }
+            logger.info("Fetched %d adapted recipes for member %s.", len(adapted), member_id)
+            return adapted
+        except Exception as e:
+            logger.warning("Could not fetch adapted recipes for member %s: %s", member_id, e)
+            return {}
+
     # ------------------------------------------------------------------ #
     # Consented memory write-back (M3)                                     #
     # ------------------------------------------------------------------ #

@@ -308,6 +308,11 @@ async def create_session(request: CreateSessionRequest):
         user_profile["favorite_recipe_ids"] = services.profile_service.get_member_favorites(
             request.member_id
         )
+        # The member's saved adapted recipes (owner-scoped): plans and seed
+        # anchors use these as the starting point instead of the originals.
+        user_profile["adapted_recipes"] = services.profile_service.get_member_adapted_recipes(
+            request.member_id
+        )
 
         # Household diners (M3): merge extra diners' hard constraints and
         # soft preferences into the session profile.
@@ -699,6 +704,7 @@ async def set_diners(session_id: str, request: SetDinersRequest):
     diners = [m for m in request.cooking_for if m and m != request.member_id]
     profile = services.profile_service.get_member_profile(request.member_id)
     profile["favorite_recipe_ids"] = services.profile_service.get_member_favorites(request.member_id)
+    profile["adapted_recipes"] = services.profile_service.get_member_adapted_recipes(request.member_id)
 
     names = [services.profile_service.get_member_name(request.member_id)]
     if diners:

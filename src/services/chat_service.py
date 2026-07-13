@@ -25,6 +25,7 @@ from typing import Optional, Tuple
 from agents import GuidelineAdherenceGrader, MealDiversityGrader, ResponseWriter, SimpleChatBot
 from models.recipe import CandidateRecipe, ScoredPlan
 from models.session import MealPlan
+from services.adapted_recipes import overlay_plan
 from services.candidates_client import CANDIDATES
 from services.clarification import ClarificationManager, ClarificationState
 from services.feedback_service import FeedbackService
@@ -317,6 +318,14 @@ class ChatService:
             downvoted_count=len(signals.downvoted_recipe_ids),
             feedback_lines=len(signals.history_text.splitlines()) if signals.history_text else 0,
         )
+        # Member-saved adapted recipes replace the originals as the starting
+        # point (title/ingredients/nutrition; ids stay the original).
+        adapted_count = overlay_plan(meal_plan, profile)
+        if adapted_count:
+            logger.info(
+                "[%s] %d course(s) use the member's adapted version.",
+                session_id, adapted_count,
+            )
         self.session_service.resave_meal_plan(meal_plan)
 
         # Grounded response writer (M4c): prose from facts, canned fallback.

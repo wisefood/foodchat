@@ -8,6 +8,7 @@ from .weekly_planner.action_adapter import RecipeActionSpace
 from .weekly_planner.reward_logic import RewardCalculator
 from .weekly_planner.environment import WeeklyMealPlanEnv
 from .weekly_planner.planner import WeeklyPlanner, build_preference_scorer
+from .adapted_recipes import overlay_weekly_entries
 from .candidates_client import CANDIDATES
 from agents import DietaryIntentExtractor, ResponseWriter
 from models.session import WeeklyMealPlan
@@ -139,6 +140,14 @@ class WeeklyPlanService:
             if rich:
                 entry["recipe"]["nutrition"] = rich.nutrition_dict()
                 entry["recipe"]["image_url"] = rich.image_url
+        # Member-saved adapted recipes replace the originals as the starting
+        # point (title/ingredients/nutrition; ids stay the original).
+        adapted_count = overlay_weekly_entries(plan_entries, session.user_profile)
+        if adapted_count:
+            logger.info(
+                "[%s] %d weekly slot(s) use the member's adapted version.",
+                session_id, adapted_count,
+            )
 
         if is_refinement:
             weekly_plan = self.session_service.refine_weekly_meal_plan(session_id, plan_entries)

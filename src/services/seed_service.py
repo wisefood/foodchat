@@ -25,6 +25,7 @@ from typing import Optional
 
 from agents import SeedExtractor
 from models.recipe import CandidateRecipe, ResolvedRecipe
+from services.adapted_recipes import overlay_resolved
 from services.candidates_client import CANDIDATES, RecipeCandidatesClient, allergen_conflict
 
 logger = logging.getLogger(__name__)
@@ -83,6 +84,11 @@ class SeedService:
                     note=f"I couldn't load the details for “{name}”.",
                 ))
                 continue
+
+            # If the member saved an adapted version of this dish, anchor on
+            # that instead of the freshly fetched original (before the allergy
+            # check, so the check sees the ingredients we'll actually plan).
+            resolved = overlay_resolved(resolved, profile)
 
             conflict = self._allergy_conflict(resolved, profile)
             if conflict:
