@@ -27,6 +27,10 @@ curl -s $BASE/api/v1/recipewrangler/status
 - **Irish guidance check**: ask the red-meat question once with the demo
   member's country — confirm G-labeled citations come back from the
   guideline corpus, not only articles.
+- **Nudge check**: `python3 scripts/check_memory_nudge.py` (same env vars as
+  seed_demo.py) — runs the heart-health beat end-to-end and prints a verdict
+  naming the broken link (stale image / Langfuse prompt / suppressed by an
+  earlier accept) when the chip won't fire.
 - Rehearse the heart-health phrasing exactly: a bare *"is red meat harmful?"*
   deliberately does NOT nudge (topic ≠ concern); the stated family worry does.
 - Open Langfuse (console → operations) in a second tab for the observability beat.
