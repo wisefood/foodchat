@@ -31,8 +31,10 @@ curl -s $BASE/api/v1/recipewrangler/status
   seed_demo.py) — runs the heart-health beat end-to-end and prints a verdict
   naming the broken link (stale image / Langfuse prompt / suppressed by an
   earlier accept) when the chip won't fire.
-- Rehearse the heart-health phrasing exactly: a bare *"is red meat harmful?"*
-  deliberately does NOT nudge (topic ≠ concern); the stated family worry does.
+- Nudge phrasings that work: a stated family worry (*"we're worried about our
+  heart health — is red meat harmful?"*) or a harm question about a specific
+  food (*"is red meat harmful?"*). Diet/regimen questions (*"is keto safe?"*)
+  and positive questions (*"is salmon good for me?"*) deliberately never nudge.
 - Open Langfuse (console → operations) in a second tab for the observability beat.
 - Have a **guest-mode** tab ready as fallback identity if the demo account misbehaves.
 
