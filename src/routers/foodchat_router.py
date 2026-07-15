@@ -624,6 +624,7 @@ async def get_conversation(
                 "content": m["content"],
                 "intent": m["intent"],
                 "plan_id": m["plan_id"],
+                "attribution": m.get("attribution"),
                 "timestamp": m["timestamp"].isoformat(),
             }
             for m in page

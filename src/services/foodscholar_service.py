@@ -22,7 +22,7 @@ consistent with the platform's gateway trust model (see README).
 
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Optional
 from urllib.parse import quote
 
@@ -205,7 +205,12 @@ class FoodScholarService:
         primary = data.get("primary_answer") or {}
         text = primary.get("answer") or UNAVAILABLE_MESSAGE
         attribution = self._build_attribution(question, primary)
-        self.session_service.add_message(session_id, "assistant", text)
+        # Persist provenance WITH the message: the UI refetches the
+        # conversation after every turn, and an attribution that only rides
+        # the live response vanishes immediately (the citation box bug).
+        self.session_service.add_message(
+            session_id, "assistant", text, attribution=asdict(attribution)
+        )
         logger.info(
             "[%s] FoodScholar answered (confidence=%s, %d citations).",
             session_id, attribution.confidence, len(attribution.citations),

@@ -41,6 +41,9 @@ class Message:
     timestamp: datetime = field(default_factory=_utcnow)
     intent: Optional[Intent] = None
     plan_id: Optional[str] = None  # references MealPlan.id or WeeklyMealPlan.id
+    # FoodScholar provenance (dict form of models.attribution.Attribution) —
+    # persisted so the citation box survives conversation reloads.
+    attribution: Optional[dict] = None
 
 
 @dataclass

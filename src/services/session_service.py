@@ -155,6 +155,7 @@ class SessionService:
                         timestamp=_aware(m.timestamp),
                         intent=m.intent,
                         plan_id=m.plan_id,
+                        attribution=json.loads(m.attribution) if getattr(m, "attribution", None) else None,
                     )
                 )
 
@@ -235,6 +236,7 @@ class SessionService:
         content: str,
         intent: Optional[str] = None,
         plan_id: Optional[str] = None,
+        attribution: Optional[dict] = None,
     ) -> Message:
         session = self.get_session(session_id)  # load-through (replica-safe)
         if not session:
@@ -245,12 +247,14 @@ class SessionService:
                 f"Session {session_id} has reached the {session.max_messages}-message limit."
             )
 
-        message = Message(role=role, content=content, intent=intent, plan_id=plan_id)
+        message = Message(role=role, content=content, intent=intent, plan_id=plan_id,
+                          attribution=attribution)
         session.conversation.append(message)
 
         db = SessionLocal()
         try:
-            db_add_message(db, session_id, role, content, intent, plan_id)
+            db_add_message(db, session_id, role, content, intent, plan_id,
+                           attribution=json.dumps(attribution) if attribution else None)
         finally:
             db.close()
 
@@ -275,6 +279,7 @@ class SessionService:
                 "content": r.content,
                 "intent": r.intent,
                 "plan_id": r.plan_id,
+                "attribution": json.loads(r.attribution) if getattr(r, "attribution", None) else None,
                 "timestamp": r.timestamp,
             }
             for r in rows
