@@ -234,6 +234,27 @@ class ClarificationManager:
             return ClarificationOutcome(profile=profile, final_query=query)
 
         logger.info("Query too general — checking profile signal before asking")
+
+        # Deterministic signal gate BEFORE any LLM judgment: dietary goals,
+        # likes, favorites, standing seeds, or applied slider values are all
+        # concrete direction. With any of them we plan immediately — parameter
+        # and cuisine topics belong to the slider card shipped with the plan,
+        # not to a text interrogation the card was built to replace.
+        has_profile_signal = bool(
+            profile.get("dietary_goals")
+            or profile.get("food_likes")
+            or profile.get("favorite_recipe_ids")
+            or profile.get("standing_seeds")
+            or profile.get("plan_parameters")
+        )
+        if has_profile_signal:
+            logger.info("Profile carries concrete signal — planning without questions")
+            state = ClarificationState(
+                original_query=query, profile=profile,
+                origin_intent=origin_intent, phase="collect",
+            )
+            return ClarificationOutcome(profile=profile, final_query=self._reformulate(state))
+
         preferences = profile.get("preferences", [])
         suggestions: list[str] = []
         if preferences:
