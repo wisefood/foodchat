@@ -72,8 +72,8 @@ class TestDietaryGoalKind:
 
     def test_accept_writes_durably_and_syncs_live_session(self, session_service, sample_profile):
         """Accepted goal must shape the very next plan: slug + soft preference
-        string + hard diet tag (increase_protein → high-protein), exactly as a
-        fresh profile fetch would map it."""
+        string + numeric nutrition target (increase_protein → min_protein_g),
+        exactly as a fresh profile fetch would map it."""
         fake_profiles = FakeProfileService()
         svc = _svc(session_service, [], profile_service=fake_profiles)
         session = session_service.create_session(f"member-{uuid.uuid4()}", dict(sample_profile))
@@ -87,7 +87,9 @@ class TestDietaryGoalKind:
         ]
         assert "increase_protein" in session.user_profile["dietary_goals"]
         assert "prefers higher-protein meals" in session.user_profile["preferences"]
-        assert "high-protein" in session.user_profile["diet"]
+        assert session.user_profile["nutrition_profile"]["min_protein_g"] == 20
+        # Goals never leak into the hard diet-tag filter.
+        assert "high-protein" not in session.user_profile["diet"]
 
     def test_decline_records_optout(self, session_service, sample_profile):
         fake_profiles = FakeProfileService()

@@ -30,7 +30,7 @@ from typing import Optional
 from agents import PreferenceExtractor
 from .profile_service import (
     GOAL_PREFERENCE_STRINGS,
-    GOAL_TO_DIET_TAG,
+    goals_nutrition_profile,
     ProfileService,
     goal_preference_strings,
 )
@@ -217,10 +217,13 @@ class MemoryService:
                 if pref not in prefs:
                     prefs.append(pref)
             profile["preferences"] = prefs
-            tag = GOAL_TO_DIET_TAG.get(value)
-            if tag:
-                diet = list(profile.get("diet") or [])
-                if tag not in diet:
-                    diet.append(tag)
-                profile["diet"] = diet
+            goal_nutrition = goals_nutrition_profile(goals)
+            if goal_nutrition:
+                existing = dict(profile.get("nutrition_profile") or {})
+                for key, bound in goal_nutrition.items():
+                    if key.startswith("max_"):
+                        existing[key] = min(existing[key], bound) if key in existing else bound
+                    else:
+                        existing[key] = max(existing[key], bound) if key in existing else bound
+                profile["nutrition_profile"] = existing
         self.session_service.persist_profile(session.session_id)

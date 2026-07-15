@@ -7,14 +7,34 @@ from backend.platform import WISEFOOD, WiseFoodPool
 logger = logging.getLogger(__name__)
 
 
-# Dietary-goal slugs (written by FoodScholar into properties.dietary_goals) that
-# map onto a RecipeWrangler hard diet tag -> applied as a structural candidate
-# filter (see candidates_client.GOAL_DIET_TAG_MAP, kept in sync with this set).
-GOAL_TO_DIET_TAG = {
-    "reduce_fat": "low-fat",
-    "reduce_carbs": "low-carb",
-    "increase_protein": "high-protein",
+# Dietary-goal slugs (written by FoodScholar into properties.dietary_goals)
+# that map onto NUMERIC per-serving targets for RecipeWrangler's
+# nutrition_profile candidate filter. The corpus carries NO low-fat/low-carb/
+# high-protein tags (verified against recipes_v2: the diet-tag vocabulary is
+# vegan/vegetarian/pescatarian/dairy_free/nut_free/gluten_free), so mapping
+# goals to hard diet tags returned zero candidates for every goal-carrying
+# member. Numeric targets are the mechanism RecipeWrangler actually supports —
+# and it applies them leniently (recipes with missing nutrition pass through).
+GOAL_TO_NUTRITION_PROFILE: dict[str, dict[str, float]] = {
+    "reduce_fat": {"max_fat_g": 20},
+    "reduce_carbs": {"max_carbs_g": 45},
+    "reduce_calories": {"max_calories": 650},
+    "lose_weight": {"max_calories": 650},
+    "increase_protein": {"min_protein_g": 20},
+    "gain_muscle": {"min_protein_g": 20},
 }
+
+
+def goals_nutrition_profile(goal_slugs: list[str]) -> dict[str, float]:
+    """Merge the numeric targets of all mapped goals (strictest bound wins)."""
+    merged: dict[str, float] = {}
+    for slug in goal_slugs:
+        for key, value in GOAL_TO_NUTRITION_PROFILE.get(slug, {}).items():
+            if key.startswith("max_"):
+                merged[key] = min(merged[key], value) if key in merged else value
+            else:
+                merged[key] = max(merged[key], value) if key in merged else value
+    return merged
 
 # Human-readable soft-signal strings for every goal slug, fed into the planner's
 # `preferences` list so the LLM grader steers even when there's no hard tag.
@@ -308,16 +328,16 @@ class ProfileService:
             if isinstance(g, dict) and g.get("slug")
         ]
 
-        # Goals that map to a RecipeWrangler diet tag become hard candidate
-        # filters (e.g. reduce_fat -> low-fat), folded into `diet` so every
-        # planner path applies them with no extra plumbing. Goals with no tag
-        # ride the soft `preferences` channel below.
-        goal_diet_tags = [
-            GOAL_TO_DIET_TAG[s] for s in dietary_goals if s in GOAL_TO_DIET_TAG
-        ]
+        # Goals become NUMERIC per-serving targets (nutrition_profile) — the
+        # planner pipeline already forwards profile["nutrition_profile"] to
+        # RecipeWrangler. Hard diet tags stay reserved for real diets from
+        # dietary_groups (vegan, vegetarian, ...), which exist in the corpus.
+        # Goals with no numeric mapping ride the soft `preferences` channel.
+        goal_nutrition = goals_nutrition_profile(dietary_goals)
 
         return {
-            "diet": list(dict.fromkeys(list(dietary_groups) + goal_diet_tags)),
+            "diet": list(dict.fromkeys(dietary_groups)),
+            "nutrition_profile": goal_nutrition or None,
             "allergies": list(allergies),
             "preferences": self._build_preferences(nutritional_preferences, properties)
             + goal_preference_strings(dietary_goals),
