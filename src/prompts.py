@@ -565,7 +565,7 @@ For each candidate:
 - "evidence": quote or paraphrase the part of the message that supports it
 - "confidence": "high" only when the user stated it explicitly and durably; "medium"/"low" for implication
 
-OUTPUT FORMAT (MANDATORY):
+OUTPUT FORMAT (MANDATORY) — a single JSON object:
 {"memories": [{"kind": ..., "value": ..., "statement": ..., "evidence": ..., "confidence": ...}, ...]}
 Return {"memories": []} when nothing durable was expressed.
 """
