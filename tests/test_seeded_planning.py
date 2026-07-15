@@ -326,7 +326,7 @@ class TestPlanQuestion:
             def __init__(self):
                 self.questions = []
 
-            def process_question(self, session_id, message, question=None):
+            def process_question(self, session_id, message, question=None, raw_question=None):
                 self.questions.append(question or message)
 
                 class T:

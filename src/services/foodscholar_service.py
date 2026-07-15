@@ -112,27 +112,43 @@ class FoodScholarService:
     # ------------------------------------------------------------------ #
 
     def process_question(self, session_id: str, message: str,
-                         question: Optional[str] = None) -> FoodScholarTurn:
+                         question: Optional[str] = None,
+                         raw_question: Optional[str] = None) -> FoodScholarTurn:
         """Handle a fresh nutrition-science question.
 
         ``message`` is what the member typed (persisted to the transcript);
         ``question`` is what FoodScholar is asked — the orchestrator may
-        enrich it with plan context the transcript shouldn't display.
+        enrich it with plan context the transcript shouldn't display;
+        ``raw_question`` is the un-enriched form kept for clarification
+        continuations, which re-attach fresh context themselves.
         """
         session = self._get_session(session_id)
         self.session_service.add_message(session_id, "user", message)
-        return self._ask_and_record(session, question or message)
+        return self._ask_and_record(
+            session, question or message,
+            raw_question=raw_question or message,
+        )
 
-    def continue_clarification(self, session_id: str, message: str) -> FoodScholarTurn:
-        """Feed the user's answer back into the pending FoodScholar thread."""
+    def continue_clarification(self, session_id: str, message: str,
+                               contextualize=None) -> FoodScholarTurn:
+        """Feed the user's answer back into the pending FoodScholar thread.
+
+        ``contextualize`` (optional) rebuilds ambient context on the RAW
+        pending question — plan nutrition may have been computed since the
+        thread started, and replaying the original snapshot would keep the
+        scholar blind to it.
+        """
         session = self._get_session(session_id)
         self.session_service.add_message(session_id, "user", message)
 
         pending = session.clarification or {}
         self.session_service.clear_clarification_state(session_id)
+        raw_question = pending.get("raw_question") or pending.get("original_question", message)
+        question = contextualize(raw_question) if contextualize else raw_question
         return self._ask_and_record(
             session,
-            pending.get("original_question", message),
+            question,
+            raw_question=raw_question,
             qa_thread_id=pending.get("qa_thread_id"),
             clarification_answer=message,
             clarification_id=pending.get("clarification_id"),
@@ -146,6 +162,7 @@ class FoodScholarService:
         self,
         session,
         question: str,
+        raw_question: Optional[str] = None,
         qa_thread_id: Optional[str] = None,
         clarification_answer: Optional[str] = None,
         clarification_id: Optional[str] = None,
@@ -170,6 +187,8 @@ class FoodScholarService:
             self.session_service.set_clarification_state(session_id, {
                 "kind": self.CLARIFICATION_KIND,
                 "original_question": question,
+                # Un-enriched question: continuations re-attach FRESH context.
+                "raw_question": raw_question or question,
                 "qa_thread_id": data.get("qa_thread_id"),
                 "clarification_id": data["clarification"].get("id"),
             })

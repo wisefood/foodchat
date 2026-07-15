@@ -247,6 +247,28 @@ class OrchestratorService:
     # Handlers                                                             #
     # ------------------------------------------------------------------ #
 
+    def _resolve_favorites(self, favorite_ids: list) -> list[tuple[str, str]]:
+        """(recipe_id, title) for each resolvable favorite, junk-tolerant.
+
+        Legacy favorite rows hold titles ("Leftover Turkey Casserole") or dead
+        ids; a failed direct fetch retries through the seed path's tolerant
+        autocomplete so those still resolve to a real recipe when one exists.
+        """
+        resolved_pairs: list[tuple[str, str]] = []
+        for raw_id in list(favorite_ids)[:MAX_OFFERED_FAVORITES]:
+            raw_id = str(raw_id).strip()
+            if not raw_id:
+                continue
+            resolved = self.seed_service.client.fetch_recipe(raw_id)
+            if resolved is None:
+                suggestions = self.seed_service._autocomplete_tolerant(raw_id)
+                if suggestions:
+                    candidate_id, _title = suggestions[0]
+                    resolved = self.seed_service.client.fetch_recipe(candidate_id)
+            if resolved and resolved.recipe.title:
+                resolved_pairs.append((resolved.recipe.recipe_id, resolved.recipe.title))
+        return resolved_pairs
+
     def _maybe_offer_favorites(
         self, session, message: str, intent: str, seeds: list[dict]
     ) -> Optional[ChatTurn]:
@@ -269,13 +291,16 @@ class OrchestratorService:
         if any(m.intent == "favorites_offer" for m in session.conversation):
             return None
 
-        # Show up to a few favorites by title (best-effort detail fetches).
-        titles = []
-        for recipe_id in favorites[:MAX_OFFERED_FAVORITES]:
-            resolved = self.seed_service.client.fetch_recipe(recipe_id)
-            if resolved and resolved.recipe.title:
-                titles.append(resolved.recipe.title)
-        named = ", ".join(f"“{t}”" for t in titles) if titles else "some favorite recipes"
+        # Resolve favorites ONCE, here — legacy rows may hold titles or dead
+        # ids, so unresolvable direct fetches fall back to the same tolerant
+        # autocomplete the seed path uses. The resolved pairs are stored in
+        # the clarification state so acceptance anchors EXACTLY what was
+        # offered: offer and accept previously read the favorites list
+        # independently and could diverge, offering titles it then dropped.
+        resolved_favorites = self._resolve_favorites(favorites)
+        if not resolved_favorites:
+            return None
+        named = ", ".join(f"“{title}”" for _rid, title in resolved_favorites)
 
         offer_text = (
             f"Before I plan — I noticed you've favorited {named}. "
@@ -285,6 +310,9 @@ class OrchestratorService:
             "kind": "favorites_offer",
             "original_message": message,
             "origin_intent": intent,
+            "favorites": [
+                {"recipe_id": rid, "title": title} for rid, title in resolved_favorites
+            ],
         })
         self.session_service.add_message(
             session.session_id, "assistant", offer_text, intent="favorites_offer"
@@ -308,13 +336,19 @@ class OrchestratorService:
 
         seeds: list[dict] = []
         if accepted:
-            # Pin the favorites themselves as anchors (resolution re-checks
-            # allergies/diet, so an unsafe favorite is skipped with a note).
-            favorites = session.user_profile.get("favorite_recipe_ids") or []
-            for recipe_id in favorites[:MAX_OFFERED_FAVORITES]:
-                resolved = self.seed_service.client.fetch_recipe(recipe_id)
-                if resolved and resolved.recipe.title:
-                    seeds.append({"name": resolved.recipe.title})
+            # Anchor exactly the favorites that were OFFERED (resolved pairs
+            # stored with the offer). Seed resolution re-checks allergies and
+            # diet, so an unsafe favorite is still skipped with a note.
+            for fav in pending.get("favorites") or []:
+                title = str(fav.get("title") or "").strip()
+                if title:
+                    seeds.append({"name": title})
+            if not seeds:
+                # Offers made before this fix carry no stored pairs.
+                for rid, title in self._resolve_favorites(
+                    session.user_profile.get("favorite_recipe_ids") or []
+                ):
+                    seeds.append({"name": title})
 
         if intent == "weekly_plan":
             return self._handle_weekly(session_id, original_message, intent, is_refinement=False, seeds=seeds)
@@ -342,7 +376,12 @@ class OrchestratorService:
         # FoodScholar clarifications are tagged with kind="foodscholar";
         # plan-flow states (ClarificationState.to_dict) have no "kind" key.
         if pending.get("kind") == FoodScholarService.CLARIFICATION_KIND:
-            fs_turn = self.foodscholar_service.continue_clarification(session_id, message)
+            # Re-attach FRESH plan context: nutrition computed since the
+            # thread started (backfill, recipe visits) must reach the scholar.
+            fs_turn = self.foodscholar_service.continue_clarification(
+                session_id, message,
+                contextualize=lambda q: self._with_plan_context(session, q),
+            )
             self._tag_last_message(session_id, "nutrition_question", None)
             return ChatTurn(
                 role="assistant",
@@ -396,10 +435,11 @@ class OrchestratorService:
         dishes on the member's plan. The transcript keeps the member's own
         words (``message``); only the question sent to FoodScholar is enriched.
         """
-        ask = question or message
-        if session is not None:
-            ask = self._with_plan_context(session, ask)
-        fs_turn = self.foodscholar_service.process_question(session_id, message, question=ask)
+        base = question or message
+        ask = self._with_plan_context(session, base) if session is not None else base
+        fs_turn = self.foodscholar_service.process_question(
+            session_id, message, question=ask, raw_question=base,
+        )
         self._tag_last_message(session_id, "nutrition_question", None)
         return ChatTurn(
             role="assistant",
@@ -457,6 +497,16 @@ class OrchestratorService:
         canvas = session.active_canvas
         if canvas is None:
             return None
+
+        # Recipes may have been profiled AFTER the plan was stored (backfill,
+        # recipe-page visits) — pull any now-available nutrition in before
+        # serializing, so analysts never reason over stale "(no data)" gaps.
+        try:
+            from .plan_nutrition import refresh_plan_nutrition
+            refresh_plan_nutrition(session, self.session_service)
+        except Exception:  # noqa: BLE001
+            logger.warning("Plan nutrition refresh failed", exc_info=True)
+
         if canvas.plan_type == "weekly":
             plan = session.get_current_weekly_plan()
             if plan is None:

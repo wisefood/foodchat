@@ -111,7 +111,7 @@ class RecordingScholar:
     def __init__(self):
         self.asked = []      # (persisted_message, asked_question)
 
-    def process_question(self, session_id, message, question=None):
+    def process_question(self, session_id, message, question=None, raw_question=None):
         from types import SimpleNamespace
         self.asked.append((message, question or message))
         return SimpleNamespace(
