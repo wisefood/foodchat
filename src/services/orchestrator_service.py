@@ -143,8 +143,51 @@ class OrchestratorService:
                 logger.warning("[%s] Memory suggestion failed: %s", session_id, e)
         return turn
 
+    # Explicit FoodScholar consults bypass classification entirely: "can you
+    # check with food scholar?" is a request to ask the expert, and the
+    # classifier reliably filed it as plan_question — after which the
+    # PlanAnalyst ROLE-PLAYED the consult ("I've checked with the Food
+    # Scholar...") without the bridge ever running.
+    _SCHOLAR_CONSULT_RE = re.compile(r"\bfood\s*scholar\b", re.IGNORECASE)
+
+    def _compose_scholar_question(self, session, message: str) -> str:
+        """The question FoodScholar should answer for an explicit consult.
+
+        A bare consult ("check with food scholar?") carries no question of its
+        own — reuse the member's previous question. Either way, attach the
+        active plan's meals as context so the scholar answers about THESE
+        dishes, not in the abstract.
+        """
+        stripped = self._SCHOLAR_CONSULT_RE.sub("", message)
+        stripped = re.sub(
+            r"\b(can|could|would|will)\s+you\s+(check|ask|consult|verify)\s*(with|the)?\b",
+            "", stripped, flags=re.IGNORECASE,
+        ).strip(" ?,.!-")
+        if len(stripped.split()) >= 4:
+            return message
+        prior = next(
+            (m.content for m in reversed(session.conversation) if m.role == "user"),
+            None,
+        )
+        return prior or message
+
+    def _with_plan_context(self, session, question: str) -> str:
+        """Attach the active plan's meals so the scholar answers about THESE
+        dishes rather than in the abstract. No plan → question unchanged."""
+        summary = self._summarize_active_plan(session)
+        if summary:
+            return f"{question}\n\nContext — the meals under discussion:\n{summary}"
+        return question
+
     def _classify_and_route(self, session, session_id: str, message: str) -> ChatTurn:
         """One classifier call, then dispatch — the only intent decision per turn."""
+        if self._SCHOLAR_CONSULT_RE.search(message):
+            logger.info("Explicit FoodScholar consult — routing to the M1 bridge")
+            return self._handle_nutrition_question(
+                session_id, message, session=session,
+                question=self._compose_scholar_question(session, message),
+            )
+
         history = [
             {"role": m.role, "content": m.content}
             for m in session.conversation[-12:]
@@ -189,7 +232,7 @@ class OrchestratorService:
             return self._handle_edit(session_id, message)
 
         if intent == "nutrition_question":
-            return self._handle_nutrition_question(session_id, message)
+            return self._handle_nutrition_question(session_id, message, session=session)
 
         if intent == "plan_question":
             return self._handle_plan_question(session, session_id, message)
@@ -344,9 +387,19 @@ class OrchestratorService:
             plan_parent_id=plan.parent_id if plan else None,
         )
 
-    def _handle_nutrition_question(self, session_id: str, message: str) -> ChatTurn:
-        """Delegate a nutrition-science question to FoodScholar (M1 bridge)."""
-        fs_turn = self.foodscholar_service.process_question(session_id, message)
+    def _handle_nutrition_question(self, session_id: str, message: str,
+                                   session=None, question: Optional[str] = None) -> ChatTurn:
+        """Delegate a nutrition-science question to FoodScholar (M1 bridge).
+
+        When the session has an active plan, its meals ride along as context —
+        "is this good for heart health?" should be answered about the actual
+        dishes on the member's plan. The transcript keeps the member's own
+        words (``message``); only the question sent to FoodScholar is enriched.
+        """
+        ask = question or message
+        if session is not None:
+            ask = self._with_plan_context(session, ask)
+        fs_turn = self.foodscholar_service.process_question(session_id, message, question=ask)
         self._tag_last_message(session_id, "nutrition_question", None)
         return ChatTurn(
             role="assistant",

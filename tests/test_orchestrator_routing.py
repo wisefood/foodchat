@@ -103,3 +103,76 @@ class TestPreferenceMidClarification:
         assert classifier.calls == ["swap something for me",
                                     "just remember i dont like chicken"]
         assert session.state == "ready"
+
+
+class RecordingScholar:
+    """FoodScholar stand-in: records what it is asked, answers canned."""
+
+    def __init__(self):
+        self.asked = []      # (persisted_message, asked_question)
+
+    def process_question(self, session_id, message, question=None):
+        from types import SimpleNamespace
+        self.asked.append((message, question or message))
+        return SimpleNamespace(
+            text="Scholar verdict.", needs_clarification=False, attribution=None,
+        )
+
+
+class TestScholarRouting:
+    def test_explicit_consult_bypasses_classifier_and_reuses_prior_question(
+        self, session_service, sample_profile
+    ):
+        """'can you check with food scholar?' must hit the M1 bridge with the
+        member's PREVIOUS question — not be role-played by the PlanAnalyst
+        (the classifier is given no queued intents: calling it would crash)."""
+        session = session_service.create_session(f"member-{uuid.uuid4()}", sample_profile)
+        session_service.add_message(session.session_id, "user",
+                                    "is this meal plan good for heart health?")
+
+        classifier = QueuedClassifier()
+        orch = make_orchestrator(session_service, classifier)
+        scholar = RecordingScholar()
+        orch.foodscholar_service = scholar
+
+        turn = orch.process(session.session_id, session.member_id,
+                            "can you check with food scholar?")
+        assert turn.intent == "nutrition_question"
+        assert turn.content == "Scholar verdict."
+        assert classifier.calls == []
+        message, question = scholar.asked[0]
+        # Transcript keeps the member's words; the scholar gets the real question.
+        assert message == "can you check with food scholar?"
+        assert "heart health" in question
+
+    def test_consult_with_plan_attaches_meals_as_context(
+        self, session_service, sample_profile
+    ):
+        session = session_service.create_session(f"member-{uuid.uuid4()}", sample_profile)
+        session_service.add_meal_plan(session.session_id, make_candidates("cur"), "r", {})
+
+        orch = make_orchestrator(session_service, QueuedClassifier())
+        scholar = RecordingScholar()
+        orch.foodscholar_service = scholar
+
+        orch.process(session.session_id, session.member_id,
+                     "ask the food scholar if these meals help lower cholesterol")
+        _message, question = scholar.asked[0]
+        assert "lower cholesterol" in question
+        assert "meals under discussion" in question
+
+    def test_classified_nutrition_question_also_carries_plan_context(
+        self, session_service, sample_profile
+    ):
+        session = session_service.create_session(f"member-{uuid.uuid4()}", sample_profile)
+        session_service.add_meal_plan(session.session_id, make_candidates("cur"), "r", {})
+
+        orch = make_orchestrator(session_service, QueuedClassifier("nutrition_question"))
+        scholar = RecordingScholar()
+        orch.foodscholar_service = scholar
+
+        orch.process(session.session_id, session.member_id,
+                     "is this plan good for heart health?")
+        message, question = scholar.asked[0]
+        assert message == "is this plan good for heart health?"
+        assert "meals under discussion" in question

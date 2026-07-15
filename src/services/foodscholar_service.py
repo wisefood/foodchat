@@ -111,11 +111,17 @@ class FoodScholarService:
     # Entry points (called by OrchestratorService)                         #
     # ------------------------------------------------------------------ #
 
-    def process_question(self, session_id: str, message: str) -> FoodScholarTurn:
-        """Handle a fresh nutrition-science question."""
+    def process_question(self, session_id: str, message: str,
+                         question: Optional[str] = None) -> FoodScholarTurn:
+        """Handle a fresh nutrition-science question.
+
+        ``message`` is what the member typed (persisted to the transcript);
+        ``question`` is what FoodScholar is asked — the orchestrator may
+        enrich it with plan context the transcript shouldn't display.
+        """
         session = self._get_session(session_id)
         self.session_service.add_message(session_id, "user", message)
-        return self._ask_and_record(session, message)
+        return self._ask_and_record(session, question or message)
 
     def continue_clarification(self, session_id: str, message: str) -> FoodScholarTurn:
         """Feed the user's answer back into the pending FoodScholar thread."""
