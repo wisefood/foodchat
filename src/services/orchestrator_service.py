@@ -337,18 +337,20 @@ class OrchestratorService:
         seeds: list[dict] = []
         if accepted:
             # Anchor exactly the favorites that were OFFERED (resolved pairs
-            # stored with the offer). Seed resolution re-checks allergies and
-            # diet, so an unsafe favorite is still skipped with a note.
+            # stored with the offer). recipe_id makes resolution a DIRECT
+            # fetch — no name round-trip that could land on another recipe.
+            # Seed resolution still re-checks allergies, so an unsafe
+            # favorite is skipped with a note.
             for fav in pending.get("favorites") or []:
                 title = str(fav.get("title") or "").strip()
                 if title:
-                    seeds.append({"name": title})
+                    seeds.append({"name": title, "recipe_id": fav.get("recipe_id")})
             if not seeds:
                 # Offers made before this fix carry no stored pairs.
                 for rid, title in self._resolve_favorites(
                     session.user_profile.get("favorite_recipe_ids") or []
                 ):
-                    seeds.append({"name": title})
+                    seeds.append({"name": title, "recipe_id": rid})
 
         if intent == "weekly_plan":
             return self._handle_weekly(session_id, original_message, intent, is_refinement=False, seeds=seeds)

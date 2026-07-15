@@ -64,10 +64,25 @@ class SeedService:
     # ------------------------------------------------------------------ #
 
     def resolve_seeds(self, seeds: list[dict], profile: dict) -> list[SeedResolution]:
-        """Resolve dish names to recipes; enforce allergy hard constraints."""
+        """Resolve dish names to recipes; enforce allergy hard constraints.
+
+        A seed carrying ``recipe_id`` (favorites: the offer already resolved
+        it) is fetched DIRECTLY — no autocomplete round-trip that could land
+        on a different recipe with a similar title. Name-only seeds (dishes
+        typed in chat) still resolve through tolerant autocomplete.
+        """
         resolutions: list[SeedResolution] = []
         for seed in seeds:
             name = seed["name"]
+
+            known_id = str(seed.get("recipe_id") or "").strip()
+            if known_id:
+                resolved = self.client.fetch_recipe(known_id)
+                if resolved is not None:
+                    resolutions.append(self._finalize_resolution(seed, name, resolved, profile))
+                    continue
+                # Known id unexpectedly gone — fall through to name search.
+
             suggestions = self._autocomplete_tolerant(name)
             if not suggestions:
                 resolutions.append(SeedResolution(
@@ -92,27 +107,29 @@ class SeedService:
                 ))
                 continue
 
-            # If the member saved an adapted version of this dish, anchor on
-            # that instead of the freshly fetched original (before the allergy
-            # check, so the check sees the ingredients we'll actually plan).
-            resolved = overlay_resolved(resolved, profile)
-
-            conflict = self._allergy_conflict(resolved, profile)
-            if conflict:
-                resolutions.append(SeedResolution(
-                    requested_name=name, status="conflict", recipe=resolved,
-                    note=(
-                        f"I skipped “{resolved.recipe.title}” — it contains "
-                        f"{conflict}, which is on your allergy list."
-                    ),
-                ))
-                continue
-
-            resolutions.append(SeedResolution(
-                requested_name=name, status="resolved", recipe=resolved,
-                meal_type=seed.get("meal_type"), day=seed.get("day"),
-            ))
+            resolutions.append(self._finalize_resolution(seed, name, resolved, profile))
         return resolutions
+
+    def _finalize_resolution(self, seed: dict, name: str, resolved, profile: dict) -> SeedResolution:
+        """Adapted-version overlay + allergy gate, shared by id and name paths."""
+        # If the member saved an adapted version of this dish, anchor on
+        # that instead of the freshly fetched original (before the allergy
+        # check, so the check sees the ingredients we'll actually plan).
+        resolved = overlay_resolved(resolved, profile)
+
+        conflict = self._allergy_conflict(resolved, profile)
+        if conflict:
+            return SeedResolution(
+                requested_name=name, status="conflict", recipe=resolved,
+                note=(
+                    f"I skipped “{resolved.recipe.title}” — it contains "
+                    f"{conflict}, which is on your allergy list."
+                ),
+            )
+        return SeedResolution(
+            requested_name=name, status="resolved", recipe=resolved,
+            meal_type=seed.get("meal_type"), day=seed.get("day"),
+        )
 
     def _autocomplete_tolerant(self, name: str) -> list[tuple[str, str]]:
         """Autocomplete with trailing-typo tolerance.

@@ -251,7 +251,7 @@ class TestFavoritesOffer:
 
         turn2 = orch.process(session.session_id, session.member_id, "yes please")
         assert calls[0]["message"] == "plan my day"          # original request preserved
-        assert calls[0]["seeds"] == [{"name": "Pastitsio"}]  # favorite pinned as seed
+        assert calls[0]["seeds"] == [{"name": "Pastitsio", "recipe_id": "r-past"}]  # favorite pinned BY ID
 
     def test_decline_generates_without_seeds(self, session_service, sample_profile):
         calls = []
