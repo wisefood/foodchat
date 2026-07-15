@@ -227,7 +227,8 @@ Your task is to evaluate both sections and return:
 - "response": "YES" → if the profile contains enough information to personalize the query meaningfully
 - "response": "NO" → if the profile is too sparse or generic
 
-If you return "NO", also return a `suggestions` list with **specific missing preference areas** that the system should ask the user to clarify. Examples include: `"calorie goal"`, `"preferred cuisines"`, `"ingredients to avoid"`, `"cooking time"`, `"meal objective"`, etc.
+If you return "NO", also return a `suggestions` list with AT MOST ONE topic — always about food direction: `"food preferences or cravings for this plan"` or `"ingredients or cuisines to lean toward or avoid"`.
+NEVER suggest parameter-style topics — "calorie goal", "cooking time", "difficulty", "meal objective", "servings" — the app collects those through interactive controls and the profile, never through chat questions.
 
 If you return "YES", the `suggestions` list must be empty.
 
@@ -239,6 +240,8 @@ Return your answer strictly in this JSON format:
 
 Considerations:
 Two or more detailed elements from preferences or consistent patterns from feedback (e.g., “user liked low-carb meals with chicken and avoided dairy”) are typically sufficient.
+
+A stated calorie target, specific food likes or dislikes, a dietary goal (e.g. "prefers lower-fat meals"), or favorite dishes each count as real signal — lean strongly toward "YES" when any are present.
 
 General diet tags (e.g., "healthy", "balanced") alone are not sufficient.
 
@@ -273,7 +276,7 @@ Input:
 Output:
 {{
 "response": "NO",
-"suggestions": ["calorie goal", "cuisine preference", "ingredients to avoid or include"]
+"suggestions": ["food preferences or cravings for this plan"]
 }}
 
 Input:
@@ -322,7 +325,7 @@ You are a helpful assistant tasked with collecting missing information from a us
 You are provided with:
 - The user's current meal plan query.
 - Their known preferences and past feedback.
-- A single missing subject that needs clarification (e.g., calorie goal, preferred ingredients, cooking time).
+- A single missing subject that needs clarification (always food direction — cravings, ingredients, or cuisines for this plan; never calories, cooking time, or difficulty).
 
 Your task is to:
 1. Ask exactly **one clear, friendly, and specific question** related to the given subject.

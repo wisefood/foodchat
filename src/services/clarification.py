@@ -163,9 +163,10 @@ class ClarificationManager:
         merged = {**profile, **reconciliation}
 
         if reconciliation.get("needs_clarification"):
-            # Cap at 2 questions per request (M4c) — interrogation kills flow;
-            # the reconciler already drops profile-covered topics.
-            missing = list(reconciliation.get("missing_info") or [])[:2]
+            # Cap at ONE question per request — interrogation kills flow, and
+            # the slider card owns every parameter-style topic now; the only
+            # askable thing left is food direction.
+            missing = list(reconciliation.get("missing_info") or [])[:1]
 
             if reconciliation.get("has_dietary_conflict"):
                 warning = reconciliation.get("conflict_explanation") or (
@@ -250,7 +251,7 @@ class ClarificationManager:
                     origin_intent=origin_intent, phase="collect",
                 )
                 return ClarificationOutcome(profile=profile, final_query=self._reformulate(state))
-            suggestions = list(pc_json.get("suggestions", []))[:2]
+            suggestions = list(pc_json.get("suggestions", []))[:1]
         else:
             suggestions = ["food preferences or cravings for this plan"]
 

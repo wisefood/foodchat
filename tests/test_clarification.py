@@ -89,28 +89,31 @@ class TestStartOutcomes:
         assert done.final_query == "final query"
         assert done.state is None
 
-    def test_missing_info_collects_each_topic(self):
+    def test_missing_info_asks_at_most_one_topic(self):
+        """Interrogation cap: even when the reconciler emits several topics,
+        only the first is asked — parameter-style topics live on the slider
+        card now, so a single food-direction question is the ceiling."""
         mgr = make_manager(
             reconcile_result={
                 "needs_clarification": True,
                 "has_dietary_conflict": False,
-                "missing_info": ["cooking time", "budget"],
+                "missing_info": ["food preferences or cravings", "budget"],
             },
-            question_payloads=["How long can you cook?", "What's your budget?"],
+            question_payloads=["Any cravings for today?"],
             reformulate_payloads=[{"reformulated_query": "quick cheap vegan plan"}],
         )
         outcome = mgr.start("plan my day", PROFILE, "refine_plan")
-        assert outcome.question == "How long can you cook?"
+        assert outcome.question == "Any cravings for today?"
         assert outcome.state.origin_intent == "refine_plan"
+        assert outcome.state.pending_topics == ["food preferences or cravings"]
 
-        second = mgr.step(outcome.state, "30 minutes")
-        assert second.question == "What's your budget?"
-        assert second.state.transcript[0] == {
-            "question": "How long can you cook?", "answer": "30 minutes",
-        }
-
-        final = mgr.step(second.state, "20 euros")
+        final = mgr.step(outcome.state, "something greek")
+        assert final.question is None
         assert final.final_query == "quick cheap vegan plan"
+        assert final.state is None or not final.state.pending_topics
+        assert final.collected_facts == [
+            "Q: Any cravings for today?\nA: something greek",
+        ]
 
     def test_vague_query_with_thin_profile_asks(self):
         mgr = make_manager(
