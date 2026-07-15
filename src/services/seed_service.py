@@ -76,8 +76,15 @@ class SeedService:
                 ))
                 continue
 
-            recipe_id, _title = suggestions[0]  # best prefix match
-            resolved = self.client.fetch_recipe(recipe_id)
+            # Walk the suggestions in rank order: the legacy autocomplete
+            # index has carried corrupt docs whose stored id is a title or a
+            # dead legacy id — dying on suggestion[0] silently dropped the
+            # anchor the user just asked for.
+            resolved = None
+            for recipe_id, _title in suggestions[:3]:
+                resolved = self.client.fetch_recipe(recipe_id)
+                if resolved is not None:
+                    break
             if resolved is None:
                 resolutions.append(SeedResolution(
                     requested_name=name, status="not_found",
