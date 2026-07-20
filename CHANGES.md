@@ -2,6 +2,52 @@
 
 ---
 
+# Weekly planner: constraints steer selection + per-day summaries
+
+> **Date:** 2026-07-20
+> **Branch:** main
+> Weekly-plan scope only; daily-plan flow untouched. `WeeklyMealPlanResponse`
+> gains an additive `day_summaries` field — flat `entries` unchanged, so the
+> gateway/UI keep working without a coordinated change (rendering the
+> headlines is opt-in).
+
+Two changes from IDEAS.md, both LLM-free.
+
+## Constraints actually enforced (was: computed and thrown away)
+
+Pre-change, the weekly planner computed constraint penalties strictly AFTER
+each pick and only logged them; nutrition never existed during generation,
+so the calorie constraint compared against zeros; the meat limit was
+hardcoded to 3 for every profile; and one Groq call fired per committed
+slot (21 per plan) to grade a recipe already locked in.
+
+| File | What / Detail |
+|---|---|
+| `weekly_planner/action_adapter.py` | Each day's candidate pool is enriched with one batch `fetch_details` call at fetch time — candidates carry `nutrition`/`tags`/`dish_types` during selection (best-effort: a failed call degrades constraints to neutral, never blocks the plan). 7 HTTP calls per plan, replacing 21 LLM calls. |
+| `weekly_planner/reward_logic.py` | Per-step LLM grading REMOVED (it never affected the output). New pre-selection functions: `apply_hard_constraints` (drops meat candidates once the weekly limit is spent; relaxes with a warning rather than failing if the pool would empty) and `constraint_score` (soft penalty for kcal above the fair per-slot share of the remaining weekly budget). `calculate_step_reward` kept, now the deterministic negative penalty — the `reward` field on entries/API stays populated. |
+| `weekly_planner/planner.py` | Selection = preference score + constraint score over the hard-filtered pool (argmax, random tiebreak). Without scorer and nutrition, behavior stays uniform random as before. |
+| `weekly_planner/state_tracking.py` | Meat limit is diet-aware instead of hardcoded 3: vegetarian/vegan → 0, pescatarian profiles stop counting fish, and a "meat limit N" / "N meat meals" preference string overrides. Tracker accepts enrichment-style nutrition keys (`kcal`/`protein_g`/…) alongside the generic ones, and vegetarian/vegan RW tags override keyword meat detection. Meat/fish keywords moved to the shared taxonomy in `day_summary.py` (was a second drifting copy). |
+| `weekly_planner/environment.py` | Passes candidate `nutrition` + `tags` through to the tracker. |
+
+## Per-day summaries (presentation)
+
+| File | What / Detail |
+|---|---|
+| `weekly_planner/day_summary.py` | **New module.** Shared meat/poultry/fish taxonomy (fish reuses `ALLERGEN_SYNONYMS`, word-boundary matching — "meatless" no longer counts as meat), `classify_meal` (RW diet tags first, ingredient keywords as backstop), `summarize_day` ("dinner with red meat", "light vegetarian day", "fish day", "fish and red meat", fallback "varied meals"), `build_day_summaries` → `{day: headline}`. Composition templates are a deliberate starting point — iterate against real weeks (see IDEAS.md). |
+| `weekly_plan_service.py` | Post-plan enrichment now also copies `tags`/`dish_types` onto entries (previously discarded); `build_day_summaries` runs after enrichment + adapted-recipe overlay; summaries persist with the plan and ride into the ResponseWriter facts ("Monday: fish and red meat"). Also fixed a day-name off-by-one in the refinement context (day 1 labeled Tuesday, day 7 "Day 8"). |
+| `models/session.py`, `session_service.py` | Additive `WeeklyMealPlan.day_summaries` (default `{}`); JSON-blob persistence, no DB migration; deserialize restores int day keys and yields `{}` for pre-change plans. |
+| `routers/foodchat_router.py` | `WeeklyMealPlanResponse.day_summaries: Dict[int, str]` (additive, `{}` default). |
+| `edit_service.py` | Weekly slot patches recompute `day_summaries` and now copy the replacement's enrichment (nutrition/image/tags) onto the patched entry. |
+
+Tests: `tests/test_weekly_constraints.py` (meat limit enforced against a
+meat-preferring scorer, unsatisfiable-limit relaxation, diet-derived
+limits, pescatarian fish exemption, calorie budget kept, deterministic
+reward) and `tests/test_day_summary.py` (classifier/summarizer units +
+service-level wiring: enrichment tags reach entries, summaries survive a
+DB round-trip, pre-change plans deserialize with `{}`). Still LLM-free.
+
+---
+
 # dietary_goal memory kind — worries/objectives in chat steer planning
 
 > **Date:** 2026-07-13

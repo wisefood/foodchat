@@ -3,8 +3,11 @@ import random
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .environment import WeeklyMealPlanEnv
+from .reward_logic import apply_hard_constraints, constraint_score
 
 logger = logging.getLogger(__name__)
+
+TOTAL_SLOTS = 21  # 7 days x 3 meals
 
 
 def build_preference_scorer(user_profile: Dict[str, Any]) -> Callable:
@@ -93,13 +96,26 @@ class WeeklyPlanner:
                     raise ValueError(
                         f"No candidate recipes found for {state['meal_type']} on day {state['day']}"
                     )
-                if scorer is not None:
-                    # Preference-aware argmax; random tiebreak keeps variety.
-                    best_score = max(scorer(c, chosen_titles) for c in candidates)
-                    top = [c for c in candidates if scorer(c, chosen_titles) == best_score]
-                    chosen_recipe = random.choice(top)
-                else:
-                    chosen_recipe = random.choice(candidates)
+                # Hard constraints prune the pool BEFORE the pick (M6):
+                # e.g. meat candidates leave once the weekly limit is spent.
+                candidates = apply_hard_constraints(candidates, self.env.tracker)
+
+                # Preference score + soft constraint score (calorie budget)
+                # rank the pool; random tiebreak among equals keeps variety.
+                # Without a scorer and without nutrition data every score is
+                # 0.0 and selection stays uniformly random, as before.
+                slots_remaining = TOTAL_SLOTS - len(self.env.plan)
+                scored = [
+                    (
+                        (scorer(c, chosen_titles) if scorer is not None else 0.0)
+                        + constraint_score(c, self.env.tracker, slots_remaining),
+                        c,
+                    )
+                    for c in candidates
+                ]
+                best_score = max(s for s, _ in scored)
+                top = [c for s, c in scored if s == best_score]
+                chosen_recipe = random.choice(top)
 
             chosen_titles.append(str(chosen_recipe.get("recipe_title", "")))
             # Advance the environment (updates tracker, computes reward).

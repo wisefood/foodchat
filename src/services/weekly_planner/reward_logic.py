@@ -1,141 +1,143 @@
-import json
-import logging
-from typing import Dict, Any, List, Optional, TYPE_CHECKING
+"""
+Deterministic constraint logic for the weekly planner (M6).
 
-from langchain_core.messages import HumanMessage, SystemMessage
-from backend.groq import GROQ_CHAT
-from prompts import GRADER_SYSTEM_INSTRUCTIONS, GRADER_USER_INSTRUCTIONS
-from schemas import ScoringSchema
+Constraints now act BEFORE a recipe is picked: ``WeeklyPlanner`` calls
+``apply_hard_constraints`` (meat limit — excludes meat candidates once the
+weekly limit is spent) and ``constraint_score`` (soft calorie budget —
+penalizes candidates whose kcal exceeds the fair share of the remaining
+weekly budget) on every slot's candidate pool. Previously this module
+computed the same penalties strictly AFTER selection, so they were logged
+and stored but never changed a single pick.
+
+The former per-step Groq grading call (``get_llm_feedback``) was removed
+outright: it fired once per committed slot (21 calls per weekly plan) to
+grade a recipe that was already locked into the plan — pure cost and
+latency with zero effect on the output. Preference steering is the
+heuristic scorer's job (``planner.build_preference_scorer``); the weekly
+planning loop is now fully LLM-free.
+
+``RewardCalculator.calculate_step_reward`` is kept (same signature) so the
+per-entry ``reward`` field in plan payloads and API responses stays
+populated — it is now simply the negative constraint penalty at that step.
+"""
+
+import logging
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
+
+from .day_summary import is_meat_meal
 
 if TYPE_CHECKING:
     from .state_tracking import WeeklyNutritionalTracker
 
 logger = logging.getLogger(__name__)
 
+# Score points lost per kcal above the slot's fair share of the remaining
+# weekly budget. 0.01 => a 300 kcal overshoot costs 3.0, comparable to the
+# preference scorer's favorite boost (+5) without dominating it.
+CALORIE_OVERAGE_WEIGHT = 0.01
+
+
+def candidate_kcal(candidate: Dict[str, Any]) -> Optional[float]:
+    """Per-serving kcal from an enriched candidate dict, None when unknown."""
+    nutrition = candidate.get("nutrition") or {}
+    for key in ("kcal", "calories"):
+        value = nutrition.get(key)
+        if isinstance(value, (int, float)):
+            return float(value)
+    return None
+
+
+def is_meat_candidate(candidate: Dict[str, Any], count_fish: bool = True) -> bool:
+    return is_meat_meal(
+        str(candidate.get("recipe_title") or candidate.get("title") or ""),
+        str(candidate.get("recipe_ingredients") or candidate.get("ingredients") or ""),
+        tags=candidate.get("tags"),
+        count_fish=count_fish,
+    )
+
+
+def apply_hard_constraints(
+    candidates: List[Dict[str, Any]], tracker: "WeeklyNutritionalTracker"
+) -> List[Dict[str, Any]]:
+    """Drop candidates that would break a hard constraint.
+
+    Today that is the weekly meat limit: once ``meat_limit_left`` hits 0,
+    meat candidates leave the pool. If that would empty the pool the limit
+    is relaxed for the slot (with a warning) rather than failing the plan —
+    a plan with one extra meat meal beats no plan at all.
+    """
+    status = tracker.get_status()
+    if status["remaining"]["meat_limit_left"] <= 0:
+        meatless = [
+            c for c in candidates
+            if not is_meat_candidate(c, count_fish=tracker.counts_fish_as_meat)
+        ]
+        if meatless:
+            return meatless
+        logger.warning(
+            "Weekly meat limit (%s) reached but every candidate in this slot "
+            "contains meat — relaxing the limit for this slot.",
+            status["targets"].get("meat_limit"),
+        )
+    return candidates
+
+
+def constraint_score(
+    candidate: Dict[str, Any],
+    tracker: "WeeklyNutritionalTracker",
+    slots_remaining: int,
+) -> float:
+    """Soft calorie-budget score (<= 0), added to the preference score.
+
+    A candidate at or under the fair per-slot share of the remaining weekly
+    calorie budget scores 0; anything above is penalized proportionally.
+    Once the budget is spent the fair share is 0, steering every remaining
+    pick toward the lowest-calorie candidates. Candidates without nutrition
+    data are neutral.
+    """
+    kcal = candidate_kcal(candidate)
+    if kcal is None or slots_remaining <= 0:
+        return 0.0
+    remaining_budget = tracker.get_status()["remaining"]["calories"]
+    fair_share = max(remaining_budget, 0.0) / slots_remaining
+    overage = kcal - fair_share
+    return -overage * CALORIE_OVERAGE_WEIGHT if overage > 0 else 0.0
+
+
 class RewardCalculator:
     """
-    Calculates rewards for the weekly meal planner MDP.
-    Integrates LLM-based feedback and hard constraint penalties.
+    Deterministic per-step reward for the weekly planner — the stored
+    ``reward`` on each plan entry. No LLM involved (see module docstring).
     """
-
-    def __init__(self, model: str = None, temperature: float = 0.0):
-        """
-        Initialize the reward calculator with an LLM client.
-        
-        Args:
-            model: Optional model name override.
-            temperature: LLM temperature (default 0.0 for consistent scoring).
-        """
-        self.llm = GROQ_CHAT.get_client(
-            model=model,
-            temperature=temperature,
-            format=ScoringSchema.model_json_schema()
-        )
-
-    def get_llm_feedback(self, recipe: Dict[str, Any], preferences: List[str], user_query: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Prompt the judge (LLM) to evaluate how well a recipe matches user preferences.
-        
-        Args:
-            recipe: Dict containing 'recipe_title', 'recipe_ingredients', etc.
-            preferences: List of user preference strings.
-            user_query: Optional user-specific query to guide evaluation.
-            
-        Returns:
-            Dict containing 'reasoning' and 'score' (1-5).
-        """
-        # Format recipe for the prompt
-        recipe_text = f"Title: {recipe.get('recipe_title', 'N/A')}\n"
-        recipe_text += f"Ingredients: {recipe.get('recipe_ingredients', 'N/A')}\n"
-        recipe_text += f"Directions: {recipe.get('recipe_directions', 'N/A')}"
-
-        # Prepare messages using existing prompt templates
-        query_to_use = user_query if user_query else "Evaluate this recipe based on my preferences."
-        
-        user_content = GRADER_USER_INSTRUCTIONS.format(
-            query=query_to_use,
-            preferences=", ".join(preferences),
-            feedback_history="No prior feedback provided.",
-            daily_plan=recipe_text
-        )
-
-        messages = [
-            SystemMessage(content=GRADER_SYSTEM_INSTRUCTIONS),
-            HumanMessage(content=user_content)
-        ]
-
-        try:
-            response = self.llm.invoke(messages)
-            # ChatGroq with format='json' (or schema) might return a string or dict
-            if isinstance(response.content, str):
-                return json.loads(response.content)
-            return response.content
-        except Exception as e:
-            return {
-                "reasoning": f"Failed to get LLM feedback: {str(e)}",
-                "score": 3  # Neutral score on failure
-            }
 
     def calculate_constraint_penalty(self, tracker: "WeeklyNutritionalTracker", preferences: List[str]) -> float:
         """
         Calculate penalties for violating nutritional or dietary constraints.
-        
+
         Args:
             tracker: The WeeklyNutritionalTracker containing current cumulative state.
             preferences: List of user preference strings (for additional context).
-            
+
         Returns:
             A non-negative penalty value (to be subtracted from reward).
         """
         status = tracker.get_status()
         remaining = status["remaining"]
-        
+
         penalty = 0.0
-        
+
         # 1. Meat limit penalty
         if remaining["meat_limit_left"] < 0:
             # Significant penalty for exceeding the meat limit
             penalty += abs(remaining["meat_limit_left"]) * 15.0
-            
+
         # 2. Calorie constraint penalty
         if remaining["calories"] < 0:
             # Penalty increases with the amount of excess calories
             penalty += abs(remaining["calories"]) * 0.1
-            
+
         return penalty
 
     def calculate_step_reward(self, action: Dict[str, Any], tracker: "WeeklyNutritionalTracker", preferences: List[str], user_query: Optional[str] = None) -> float:
-        """
-        Combine LLM feedback and constraint penalties into a single scalar reward.
-        
-        Args:
-            action: The recipe action taken.
-            tracker: The updated nutritional tracker.
-            preferences: List of user preferences.
-            user_query: Optional user-specific query to guide LLM evaluation.
-            
-        Returns:
-            The total reward for the current step.
-        """
-        # Get LLM feedback score (1-5)
-        llm_feedback = self.get_llm_feedback(action, preferences, user_query=user_query)
-        llm_score = float(llm_feedback.get("score", 3))
-        llm_reasoning = llm_feedback.get("reasoning", "No reasoning provided.")
-        
-        # Center LLM score (e.g., 3 becomes 0, 5 becomes 10, 1 becomes -10)
-        base_reward = (llm_score - 3.0) * 5.0
-        
-        # Subtract constraint penalties
-        penalty = self.calculate_constraint_penalty(tracker, preferences)
-        
-        total_reward = base_reward - penalty
-        
-        # Log reward calculation details
-        logger.info(f"--- Reward Calculation for Recipe: {action.get('recipe_title', 'Unknown')} ---")
-        logger.info(f"LLM Score: {llm_score}/5")
-        logger.info(f"LLM Reasoning: {llm_reasoning}")
-        logger.info(f"Base Reward (Centered): {base_reward:.2f}")
-        logger.info(f"Constraint Penalty: {penalty:.2f}")
-        logger.info(f"Total Step Reward: {total_reward:.2f}")
-        
-        return total_reward
+        """Negative constraint penalty after committing ``action`` (<= 0)."""
+        return -self.calculate_constraint_penalty(tracker, preferences)

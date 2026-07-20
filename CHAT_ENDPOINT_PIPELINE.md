@@ -164,9 +164,18 @@ correctly after a process restart or on a different replica.
   +--> add user message; inject current weekly canvas text when refining
   +--> DietaryIntentExtractor.extract(content)      -> query-level diet tags
   +--> RecipeActionSpace(profile, extra diet tags)  -> per-day candidate pools
-  |      (RecipeWrangler fetch once per day, selected ids excluded -> no repeats)
+  |      (RecipeWrangler fetch once per day, selected ids excluded -> no
+  |       repeats; each day's pool enriched with one batch details call ->
+  |       candidates carry nutrition + diet tags during selection)
   +--> WeeklyMealPlanEnv + WeeklyPlanner.generate_full_plan
-  |      21 steps (7 days x 3 meals); RewardCalculator scores each step
+  |      21 steps (7 days x 3 meals), fully LLM-free:
+  |      apply_hard_constraints prunes the pool (weekly meat limit —
+  |      diet-aware, relaxes with a warning if it would empty the pool),
+  |      then preference score + soft calorie-budget score pick the recipe;
+  |      the tracker accumulates real kcal/macros as slots commit
+  +--> batch enrichment on the final 21 entries (nutrition, image, tags)
+  |      + adapted-recipe overlay
+  +--> build_day_summaries(entries) -> {day: "dinner with fish" headline}
   +--> store (refine -> version+1 | fresh -> version 1) + assistant message
 ```
 
@@ -179,7 +188,7 @@ ChatTurnResponse {
   meal_plan?              (id, courses, reasoning, 4 quality metrics,
                            version, parent_id),
   weekly_meal_plan?       (id, entries[day, meal_type, recipe, reward],
-                           version, parent_id),
+                           day_summaries{day -> headline}, version, parent_id),
   at_message_limit,
   plan_version, plan_parent_id
 }

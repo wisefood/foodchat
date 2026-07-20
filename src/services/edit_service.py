@@ -31,6 +31,7 @@ from agents import EditCommandExtractor
 from models.recipe import CandidateRecipe, RecipeEnrichment
 from services.candidates_client import CANDIDATES
 from .session_service import SessionService
+from .weekly_planner.day_summary import build_day_summaries
 
 logger = logging.getLogger(__name__)
 
@@ -357,20 +358,32 @@ class EditService:
         new_entries = []
         for entry in plan.entries:
             if entry is target:
+                replacement = {
+                    "recipe_id": choice.recipe_id,
+                    "recipe_title": choice.title,
+                    "recipe_ingredients": choice.ingredients,
+                    "recipe_directions": choice.directions,
+                    "pinned": True,
+                }
+                if new_rich:
+                    nutrition = new_rich.nutrition_dict()
+                    if nutrition:
+                        replacement["nutrition"] = nutrition
+                    replacement["image_url"] = new_rich.image_url
+                    replacement["tags"] = new_rich.tags or []
+                    replacement["dish_types"] = new_rich.dish_types or []
                 new_entries.append({
                     **entry,
-                    "recipe": {
-                        "recipe_id": choice.recipe_id,
-                        "recipe_title": choice.title,
-                        "recipe_ingredients": choice.ingredients,
-                        "recipe_directions": choice.directions,
-                        "pinned": True,
-                    },
+                    "recipe": replacement,
                     "reward": entry.get("reward", 0.0),
                 })
             else:
                 new_entries.append(dict(entry))
-        new_plan = self.session_service.refine_weekly_meal_plan(session.session_id, new_entries)
+        # Day summaries reflect the patched week (M6).
+        new_plan = self.session_service.refine_weekly_meal_plan(
+            session.session_id, new_entries,
+            day_summaries=build_day_summaries(new_entries),
+        )
 
         changed = [self._changed_slot(
             meal_type, day, old.get("recipe_title", ""), old_rich,

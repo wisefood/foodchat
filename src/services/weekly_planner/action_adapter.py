@@ -4,6 +4,14 @@ Action space for the weekly-plan MDP — candidate recipes per meal slot.
 Fetches a fresh candidate pool from RecipeWrangler once per plan day
 (``services.candidates_client``), excluding every recipe already committed to
 the plan so a 7-day plan never repeats a recipe.
+
+M6: each day's pool is enriched with one batch details call (nutrition,
+diet tags) at fetch time, so the nutritional tracker and the constraint
+filter see real numbers DURING selection — previously nutrition only
+existed after the full plan was generated, which made the calorie
+constraint structurally inert. Enrichment stays best-effort: a failed
+details call leaves the candidates bare and constraints degrade to
+neutral, never blocking the plan.
 """
 
 from typing import Any, Dict, List, Union
@@ -33,6 +41,8 @@ class RecipeActionSpace:
         self._day_cache: Dict[int, Dict[str, list]] = {}
         # Recipes already committed to the plan — excluded from every fetch.
         self._selected_ids: List[str] = []
+        # recipe_id -> RecipeEnrichment for every fetched pool (M6).
+        self._enrichment: Dict[str, Any] = {}
 
     def get_candidate_actions(
         self, meal_type: Union[str, int], current_state: Dict[str, Any]
@@ -41,7 +51,7 @@ class RecipeActionSpace:
         current_day = current_state.get("day", 1)
 
         if current_day not in self._day_cache:
-            self._day_cache[current_day] = CANDIDATES.fetch_candidates(
+            pool = CANDIDATES.fetch_candidates(
                 allergens=self.allergens,
                 diet=self.diet,
                 exclude_recipe_ids=list(self._selected_ids),
@@ -49,20 +59,34 @@ class RecipeActionSpace:
                 limit_per_slot=DAILY_POOL_LIMIT,
                 randomize=True,
             )
+            self._day_cache[current_day] = pool
+            # One batch details call enriches the whole day's pool (M6) —
+            # nutrition/tags feed the tracker and constraint filter during
+            # selection. Best-effort: {} on failure.
+            day_ids = [c.recipe_id for slot in pool.values() for c in slot]
+            self._enrichment.update(CANDIDATES.fetch_details(day_ids))
 
         if isinstance(meal_type, int):
             meal_type = {0: "breakfast", 1: "lunch", 2: "dinner"}.get(meal_type, "lunch")
 
         candidates = self._day_cache[current_day].get(str(meal_type).lower(), [])
-        return [
-            {
+        actions = []
+        for c in candidates:
+            action = {
                 "recipe_id": c.recipe_id,
                 "recipe_title": c.title,
                 "recipe_ingredients": c.ingredients,
                 "recipe_directions": c.directions,
             }
-            for c in candidates
-        ]
+            rich = self._enrichment.get(c.recipe_id)
+            if rich:
+                nutrition = rich.nutrition_dict()
+                if nutrition:
+                    action["nutrition"] = nutrition
+                action["tags"] = rich.tags or []
+                action["dish_types"] = rich.dish_types or []
+            actions.append(action)
+        return actions
 
     def mark_selected(self, recipe_id: str) -> None:
         """Called by the environment after a recipe is committed to the plan."""

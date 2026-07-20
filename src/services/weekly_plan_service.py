@@ -7,6 +7,7 @@ from .session_service import SessionService
 from .weekly_planner.action_adapter import RecipeActionSpace
 from .weekly_planner.reward_logic import RewardCalculator
 from .weekly_planner.environment import WeeklyMealPlanEnv
+from .weekly_planner.day_summary import build_day_summaries
 from .weekly_planner.planner import WeeklyPlanner, build_preference_scorer
 from .adapted_recipes import overlay_weekly_entries
 from .candidates_client import CANDIDATES
@@ -14,6 +15,8 @@ from agents import DietaryIntentExtractor, ResponseWriter
 from models.session import WeeklyMealPlan
 
 logger = logging.getLogger(__name__)
+
+DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
 
 def _format_weekly_plan_as_context(plan: WeeklyMealPlan) -> str:
@@ -24,9 +27,9 @@ def _format_weekly_plan_as_context(plan: WeeklyMealPlan) -> str:
         day = entry.get("day", 0)
         by_day.setdefault(day, []).append(entry)
 
-    day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
     for day_idx in sorted(by_day):
-        label = day_names[day_idx] if day_idx < len(day_names) else f"Day {day_idx + 1}"
+        # Days are 1-based (1=Monday … 7=Sunday) throughout the weekly planner.
+        label = DAY_NAMES[day_idx - 1] if 1 <= day_idx <= len(DAY_NAMES) else f"Day {day_idx}"
         lines.append(f"\n{label}:")
         for entry in sorted(by_day[day_idx], key=lambda e: e.get("meal_idx", 0)):
             recipe = entry.get("recipe", {})
@@ -132,7 +135,7 @@ class WeeklyPlanService:
         logger.info("[%s] Plan generation complete — %d entries.", session_id, len(plan_entries))
 
         # M4 enrichment: one batch details call covers all 21 recipes —
-        # nutrition chips and images for the weekly canvas.
+        # nutrition chips, images, and diet tags for the weekly canvas.
         entry_ids = [str(e.get("recipe", {}).get("recipe_id", "")) for e in plan_entries]
         enrichment = CANDIDATES.fetch_details(entry_ids)
         for entry in plan_entries:
@@ -140,6 +143,8 @@ class WeeklyPlanService:
             if rich:
                 entry["recipe"]["nutrition"] = rich.nutrition_dict()
                 entry["recipe"]["image_url"] = rich.image_url
+                entry["recipe"]["tags"] = rich.tags or []
+                entry["recipe"]["dish_types"] = rich.dish_types or []
         # Member-saved adapted recipes replace the originals as the starting
         # point (title/ingredients/nutrition; ids stay the original).
         adapted_count = overlay_weekly_entries(plan_entries, session.user_profile)
@@ -149,8 +154,15 @@ class WeeklyPlanService:
                 session_id, adapted_count,
             )
 
+        # Per-day headline summaries (M6) — computed after enrichment and
+        # after the adapted-recipe overlay so they describe what the member
+        # will actually see.
+        day_summaries = build_day_summaries(plan_entries)
+
         if is_refinement:
-            weekly_plan = self.session_service.refine_weekly_meal_plan(session_id, plan_entries)
+            weekly_plan = self.session_service.refine_weekly_meal_plan(
+                session_id, plan_entries, day_summaries=day_summaries,
+            )
             logger.info(
                 "[%s] Refined weekly plan → %s (v%d, parent=%s).",
                 session_id, weekly_plan.id, weekly_plan.version, weekly_plan.parent_id,
@@ -160,7 +172,9 @@ class WeeklyPlanService:
                 "I've adjusted it based on what you asked for — take a look and let me know if you'd like any other tweaks."
             )
         else:
-            weekly_plan = self.session_service.add_weekly_meal_plan(session_id, plan_entries)
+            weekly_plan = self.session_service.add_weekly_meal_plan(
+                session_id, plan_entries, day_summaries=day_summaries,
+            )
             logger.info("[%s] Weekly meal plan %s stored.", session_id, weekly_plan.id)
             fallback = (
                 "Here's your 7-day meal plan! "
@@ -175,6 +189,10 @@ class WeeklyPlanService:
             "anchored_dishes": pinned_titles,
             "seed_note": seed_note,
             "cooking_for": session.user_profile.get("cooking_for_names") or [],
+            "day_summaries": [
+                f"{DAY_NAMES[d - 1] if 1 <= d <= 7 else f'Day {d}'}: {s}"
+                for d, s in sorted(day_summaries.items()) if s
+            ],
         }
         response_text = self.response_writer.write(
             facts, content,

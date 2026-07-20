@@ -92,9 +92,14 @@ class WeeklyMealPlanEnv:
             directions=chosen_recipe.get("recipe_directions", "")
         )
         
-        # update_tracker handles meat detection and cumulative nutritional totals
-        # In this MDP, nutrition_info is optional; we pass it if present in chosen_recipe
-        self.tracker.update_tracker(meal, nutrition_info=chosen_recipe.get("nutrition"))
+        # update_tracker handles meat detection and cumulative nutritional totals.
+        # Candidates carry nutrition/tags from the per-day enrichment (M6);
+        # both stay optional so bare recipes (pins, fakes) still work.
+        self.tracker.update_tracker(
+            meal,
+            nutrition_info=chosen_recipe.get("nutrition"),
+            tags=chosen_recipe.get("tags"),
+        )
         
         # 2. Calculate Reward
         # reward_logic.py: calculate_step_reward(action, tracker, preferences, user_query)

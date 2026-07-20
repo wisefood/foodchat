@@ -20,7 +20,7 @@ Their gateway proxies were removed in the same change.
 
 import logging
 from datetime import datetime
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel
@@ -148,6 +148,10 @@ class WeeklyMealPlanResponse(BaseModel):
     version: int
     parent_id: Optional[str] = None
     entries: List[WeeklyMealPlanEntryResponse]
+    # M6: {day (1-7) -> short headline, e.g. "dinner with fish"}. Additive —
+    # `entries` stays flat; the UI groups by day as before and gets a
+    # headline per group. {} for plans stored before M6.
+    day_summaries: Dict[int, str] = {}
 
     @classmethod
     def from_weekly_meal_plan(cls, wmp) -> "WeeklyMealPlanResponse":
@@ -157,6 +161,7 @@ class WeeklyMealPlanResponse(BaseModel):
             version=wmp.version,
             parent_id=wmp.parent_id,
             entries=[WeeklyMealPlanEntryResponse(**entry) for entry in wmp.entries],
+            day_summaries=getattr(wmp, "day_summaries", None) or {},
         )
 
 

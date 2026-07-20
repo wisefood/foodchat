@@ -365,7 +365,10 @@ class SessionService:
 
         return meal_plan
 
-    def add_weekly_meal_plan(self, session_id: str, plan_entries: List[dict]) -> WeeklyMealPlan:
+    def add_weekly_meal_plan(
+        self, session_id: str, plan_entries: List[dict],
+        day_summaries: Optional[dict] = None,
+    ) -> WeeklyMealPlan:
         """Create a brand-new weekly plan (version 1, no parent)."""
         session = self.get_session(session_id)  # load-through (replica-safe)
         if not session:
@@ -377,6 +380,7 @@ class SessionService:
             entries=plan_entries,
             version=1,
             parent_id=None,
+            day_summaries=day_summaries or {},
         )
         session.weekly_meal_plans.append(weekly_plan)
 
@@ -399,14 +403,19 @@ class SessionService:
 
         return weekly_plan
 
-    def refine_weekly_meal_plan(self, session_id: str, plan_entries: List[dict]) -> WeeklyMealPlan:
+    def refine_weekly_meal_plan(
+        self, session_id: str, plan_entries: List[dict],
+        day_summaries: Optional[dict] = None,
+    ) -> WeeklyMealPlan:
         """Create a refined version of the current weekly canvas plan."""
         session = self.get_session(session_id)  # load-through (replica-safe)
         if not session:
             raise ValueError(f"Session {session_id} not found")
 
         if session.weekly_canvas is None:
-            return self.add_weekly_meal_plan(session_id, plan_entries)
+            return self.add_weekly_meal_plan(
+                session_id, plan_entries, day_summaries=day_summaries,
+            )
 
         parent = session.get_current_weekly_plan()
         parent_id = parent.id if parent else None
@@ -418,6 +427,7 @@ class SessionService:
             entries=plan_entries,
             version=next_version,
             parent_id=parent_id,
+            day_summaries=day_summaries or {},
         )
         session.weekly_meal_plans.append(weekly_plan)
 
@@ -578,6 +588,7 @@ def _serialize_weekly_plan(wp: WeeklyMealPlan) -> dict:
         "version": wp.version,
         "parent_id": wp.parent_id,
         "entries": wp.entries,
+        "day_summaries": wp.day_summaries,
     }
 
 
@@ -616,10 +627,18 @@ def _deserialize_meal_plan(plan_id: str, payload: dict) -> MealPlan:
 
 
 def _deserialize_weekly_plan(plan_id: str, payload: dict) -> WeeklyMealPlan:
+    # JSON round-trips dict keys as strings — restore the 1-7 day ints.
+    day_summaries = {}
+    for key, value in (payload.get("day_summaries") or {}).items():
+        try:
+            day_summaries[int(key)] = str(value)
+        except (TypeError, ValueError):
+            continue
     return WeeklyMealPlan(
         id=plan_id,
         created_at=_aware(dt.fromisoformat(payload["created_at"])),
         version=payload.get("version", 1),
         parent_id=payload.get("parent_id"),
         entries=payload.get("entries", []),
+        day_summaries=day_summaries,
     )

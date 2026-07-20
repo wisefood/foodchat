@@ -137,6 +137,9 @@ class WeeklyMealPlan:
     # Version lineage
     version: int = 1
     parent_id: Optional[str] = None
+    # M6 presentation: {day (1-7) -> short headline, e.g. "dinner with fish"}.
+    # Additive like MealPlan.constraints_applied — {} on plans stored before M6.
+    day_summaries: dict = field(default_factory=dict)
 
 
 @dataclass
