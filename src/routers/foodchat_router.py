@@ -152,6 +152,20 @@ class WeeklyMealPlanResponse(BaseModel):
     # `entries` stays flat; the UI groups by day as before and gets a
     # headline per group. {} for plans stored before M6.
     day_summaries: Dict[int, str] = {}
+    # M7 explainability (all additive, empty for pre-M7 plans):
+    # - constraints_applied: hard/soft ledger rows [{constraint, type,
+    #   status, source, detail?}] — weekly rows are MEASURED and status can
+    #   be "satisfied" | "relaxed" | "violated" (daily only ever says
+    #   "satisfied"; treat unknown statuses as informational).
+    # - metrics: {variety, guideline_checklist, nutrition, days,
+    #   selection_events} — deterministic weekly trackers (meat count,
+    #   calorie budget, category distribution, per-day breakdown).
+    # - reasoning: whole-week justification prose. Per-meal reasons ride on
+    #   each entry's recipe dict as match_reasons [{kind, label}].
+    constraints_applied: List[dict] = []
+    personalization_summary: Optional[dict] = None
+    metrics: dict = {}
+    reasoning: str = ""
 
     @classmethod
     def from_weekly_meal_plan(cls, wmp) -> "WeeklyMealPlanResponse":
@@ -162,6 +176,10 @@ class WeeklyMealPlanResponse(BaseModel):
             parent_id=wmp.parent_id,
             entries=[WeeklyMealPlanEntryResponse(**entry) for entry in wmp.entries],
             day_summaries=getattr(wmp, "day_summaries", None) or {},
+            constraints_applied=getattr(wmp, "constraints_applied", None) or [],
+            personalization_summary=getattr(wmp, "personalization_summary", None),
+            metrics=getattr(wmp, "metrics", None) or {},
+            reasoning=getattr(wmp, "reasoning", None) or "",
         )
 
 

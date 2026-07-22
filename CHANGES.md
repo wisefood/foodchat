@@ -2,6 +2,45 @@
 
 ---
 
+# Weekly plan explainability — measured ledger, metrics, per-meal reasons
+
+> **Date:** 2026-07-22
+> **Branch:** main
+> Weekly-plan scope only; daily-plan flow untouched. All response fields
+> are additive (empty defaults for pre-change plans) — gateway/UI keep
+> working untouched. One heads-up for the UI: weekly ledger rows can now
+> carry `status: "relaxed" | "violated"` (daily rows only ever say
+> "satisfied") plus an optional `detail` string — treat unknown statuses
+> as informational. Entirely LLM-free: IDEAS.md's "optional LLM grades
+> for parity" phase was deliberately skipped (the deterministic checklist
+> covers it).
+
+Implements the "Weekly plan explainability" plan from IDEAS.md. Because
+the weekly planner is deterministic since the M6 constraints rework, the
+ledger REPORTS measured numbers (meat meals used, kcal planned vs budget)
+instead of declaring "satisfied", and constraint relaxations are recorded
+AT DECISION TIME by the planner rather than reconstructed afterwards.
+
+| File | What / Detail |
+|---|---|
+| `weekly_planner/explainability.py` | **New module**, pure functions (no LLM/IO). `build_weekly_explainability` is the entry point: attaches per-entry `recipe.match_reasons` chips in place (reusing `transparency.match_reasons`; `pinned` flag → "requested by you", `adapted` flag → the `ADAPTED_REASON` chip — the weekly overlay previously only set the flag), and returns `constraints_applied` (profile rows from `transparency.constraints_ledger` + measured weekly rows: meat limit with `satisfied`/`relaxed`/`violated` status and slot-level detail, soft calorie-budget row with % used and coverage caveat), `personalization_summary`, `metrics` (variety: distinct recipes / unique ingredients / category distribution; deterministic weekly guideline frequency checklist: fish 1–2×, red meat ≤3, mostly plant-based; nutrition trackers: weekly totals + daily average vs target with "based on N of 21 meals" honesty; per-day breakdown with headline, kcal, and reason highlights; raw selection events), and `reasoning` — a composed whole-week justification. Targets re-derived from the profile via `WeeklyNutritionalTracker`, so it also works for patched plans with no env. Nutrition totals computed from the FINAL entries (post-enrichment, post-adapted-overlay), not the selection-time tracker. |
+| `weekly_planner/reward_logic.py` | `apply_hard_constraints` optionally records selection events (`meat_pool_pruned` with dropped count, `meat_limit_relaxed`) into a caller-provided list with the slot attached — at decision time, so explanations reflect actual causes. Signature is backward-compatible (new optional `events`/`slot` params). |
+| `weekly_planner/environment.py`, `weekly_planner/planner.py` | `env.selection_events` accumulator (reset per cycle); the planner passes it + the current slot into `apply_hard_constraints`. |
+| `weekly_plan_service.py` | Calls `build_weekly_explainability` after enrichment/overlay/day-summaries; passes it to persistence; ResponseWriter facts gain `constraints_honored` (same key the daily flow uses) and `week_summary` so the reply can say "kept within your 3-meat-meal limit, 90% of your calorie budget". |
+| `edit_service.py` | Weekly slot patches recompute explainability so it never goes stale (no selection events there; statuses come from final counts alone, and feedback rows stay out because a patch doesn't consult feedback exclusions — claiming them would be unverified). |
+| `models/session.py`, `session_service.py` | Additive `WeeklyMealPlan.constraints_applied` / `.personalization_summary` / `.metrics` / `.reasoning` (same JSON-blob pattern as `day_summaries`: no DB migration, empty defaults on deserialize for pre-change plans). |
+| `routers/foodchat_router.py` | The four fields exposed additively on `WeeklyMealPlanResponse`; per-meal `match_reasons` ride inside each entry's `recipe` dict (no entry-model change). |
+
+Tests: `tests/test_weekly_explainability.py` — chip attachment
+(pinned/favorite/like/adapted, adapted display keys), variety/category
+math, guideline checklist, nutrition coverage honesty, measured ledger
+statuses (satisfied/relaxed/violated, calorie % detail), decision-time
+event recording, per-day breakdown, full-payload build, pescatarian meat
+counting, and service-level wiring (populated → persisted → exposed;
+pre-change plans deserialize empty). All LLM-free; suite: 172 passed.
+
+---
+
 # Weekly planner: constraints steer selection + per-day summaries
 
 > **Date:** 2026-07-20

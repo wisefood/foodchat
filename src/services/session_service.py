@@ -368,12 +368,14 @@ class SessionService:
     def add_weekly_meal_plan(
         self, session_id: str, plan_entries: List[dict],
         day_summaries: Optional[dict] = None,
+        explainability: Optional[dict] = None,
     ) -> WeeklyMealPlan:
         """Create a brand-new weekly plan (version 1, no parent)."""
         session = self.get_session(session_id)  # load-through (replica-safe)
         if not session:
             raise ValueError(f"Session {session_id} not found")
 
+        explainability = explainability or {}
         weekly_plan = WeeklyMealPlan(
             id=str(uuid.uuid4()),
             created_at=dt.now(_tz.utc),
@@ -381,6 +383,10 @@ class SessionService:
             version=1,
             parent_id=None,
             day_summaries=day_summaries or {},
+            constraints_applied=explainability.get("constraints_applied") or [],
+            personalization_summary=explainability.get("personalization_summary"),
+            metrics=explainability.get("metrics") or {},
+            reasoning=explainability.get("reasoning") or "",
         )
         session.weekly_meal_plans.append(weekly_plan)
 
@@ -406,6 +412,7 @@ class SessionService:
     def refine_weekly_meal_plan(
         self, session_id: str, plan_entries: List[dict],
         day_summaries: Optional[dict] = None,
+        explainability: Optional[dict] = None,
     ) -> WeeklyMealPlan:
         """Create a refined version of the current weekly canvas plan."""
         session = self.get_session(session_id)  # load-through (replica-safe)
@@ -415,12 +422,14 @@ class SessionService:
         if session.weekly_canvas is None:
             return self.add_weekly_meal_plan(
                 session_id, plan_entries, day_summaries=day_summaries,
+                explainability=explainability,
             )
 
         parent = session.get_current_weekly_plan()
         parent_id = parent.id if parent else None
         next_version = (parent.version + 1) if parent else 1
 
+        explainability = explainability or {}
         weekly_plan = WeeklyMealPlan(
             id=str(uuid.uuid4()),
             created_at=dt.now(_tz.utc),
@@ -428,6 +437,10 @@ class SessionService:
             version=next_version,
             parent_id=parent_id,
             day_summaries=day_summaries or {},
+            constraints_applied=explainability.get("constraints_applied") or [],
+            personalization_summary=explainability.get("personalization_summary"),
+            metrics=explainability.get("metrics") or {},
+            reasoning=explainability.get("reasoning") or "",
         )
         session.weekly_meal_plans.append(weekly_plan)
 
@@ -589,6 +602,10 @@ def _serialize_weekly_plan(wp: WeeklyMealPlan) -> dict:
         "parent_id": wp.parent_id,
         "entries": wp.entries,
         "day_summaries": wp.day_summaries,
+        "constraints_applied": wp.constraints_applied,
+        "personalization_summary": wp.personalization_summary,
+        "metrics": wp.metrics,
+        "reasoning": wp.reasoning,
     }
 
 
@@ -641,4 +658,8 @@ def _deserialize_weekly_plan(plan_id: str, payload: dict) -> WeeklyMealPlan:
         parent_id=payload.get("parent_id"),
         entries=payload.get("entries", []),
         day_summaries=day_summaries,
+        constraints_applied=payload.get("constraints_applied") or [],
+        personalization_summary=payload.get("personalization_summary"),
+        metrics=payload.get("metrics") or {},
+        reasoning=payload.get("reasoning") or "",
     )

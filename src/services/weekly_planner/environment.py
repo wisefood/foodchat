@@ -42,6 +42,9 @@ class WeeklyMealPlanEnv:
         self.meal_types = ["breakfast", "lunch", "dinner"]
         self.done = False
         self.plan = [] # To store the generated plan details
+        # Selection events recorded while picking (M7 explainability) —
+        # meat-pool prunes and limit relaxations, appended by the planner.
+        self.selection_events: List[Dict[str, Any]] = []
 
     def reset(self, user_query: Optional[str] = None) -> Dict[str, Any]:
         """
@@ -55,6 +58,7 @@ class WeeklyMealPlanEnv:
         self.current_meal_idx = 0
         self.done = False
         self.plan = []
+        self.selection_events = []
         if user_query is not None:
             self.user_query = user_query
         return self._get_state()

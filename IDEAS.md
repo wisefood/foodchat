@@ -291,3 +291,139 @@ daily plan (`MealPlan`, 3 courses) doesn't need day-grouping since it's a
 single day already, but a one-line "day summary" for it would reuse the same
 `classify_meal`/`summarize_day` functions from Phase 3 almost for free, if
 ever wanted later.
+
+---
+
+# Weekly plan explainability — show the user how the plan resulted
+
+**Status: implemented 2026-07-22** (see the CHANGES.md entry "Weekly plan
+explainability"). Phases 1, 2, 4, 5 shipped as planned; Phase 3 shipped
+deterministic-only — the "optional LLM grades for parity" bullet was
+deliberately skipped (LLM-free where possible), the frequency checklist
+and category distribution cover it. Selection events are recorded at
+decision time in `apply_hard_constraints` (prunes + relaxations); the
+`status: "relaxed"`/`"violated"` values and a `detail` string are additive
+on ledger rows — UI should treat unknown statuses as informational.
+
+Bring the daily plan's
+transparency/metrics story to the weekly plan — and go further, because
+since the constraints rework (see the CHANGES.md entry of 2026-07-20) the
+weekly planner is fully deterministic: we can record the ACTUAL reasons
+each pick won at decision time, instead of asking an LLM to rationalize a
+finished plan the way parts of the daily metrics do.
+
+## What daily plans have today (the baseline to mirror)
+
+- Four quality metrics (`chat_service._compute_metrics`,
+  `chat_service.py:360-385`): `llm_score`/`llm_reasoning` from the grader,
+  `fvs_count` (deterministic unique-ingredient count), LLM diversity
+  score, LLM guideline-adherence score (graded against
+  `belgium_dietary_guidelines_augmentation.cypher` when present).
+- `services/transparency.py` (pure functions, no LLM/IO): per-course
+  `match_reasons` chips (kinds: pinned | favorite | memory | profile |
+  feedback | diner | guideline), plan-level `constraints_applied` ledger
+  (hard/soft rows with `source`), `personalization_summary` counts.
+- The ledger's top rows feed the ResponseWriter facts
+  (`constraints_honored`), so the chat reply mentions them.
+
+The weekly plan currently exposes none of this — only `day_summaries` and
+the internal per-entry `reward` scalar.
+
+## Plan
+
+### Phase 1 — Direct ports (reuse `transparency.py`, no new logic)
+
+- `constraints_ledger(profile, downvoted_count)` and
+  `personalization_summary(profile, feedback_lines)` are profile-driven
+  pure functions — call them from `WeeklyPlanService.process_message` and
+  store on new additive fields `WeeklyMealPlan.constraints_applied` /
+  `.personalization_summary` (same JSON-blob pattern as `day_summaries`:
+  no DB migration, `.get(..., default)` on deserialize, additive on
+  `WeeklyMealPlanResponse`).
+- Per-entry `match_reasons`: `match_reasons(recipe_id, ingredients_text,
+  profile, pinned_ids)` needs nothing an entry doesn't have. Attach as
+  `entry["recipe"]["match_reasons"]`, mirroring `MealCourse`. Existing
+  markers map to existing chip kinds: `recipe["pinned"]` → the "requested
+  by you" chip, `recipe["adapted"]` → the `ADAPTED_REASON` chip
+  (`adapted_recipes.py:23` — daily overlay adds it, weekly overlay
+  currently only sets the flag; unify while here).
+
+### Phase 2 — Measured constraint ledger (the weekly-specific win)
+
+The daily ledger statically declares `status: "satisfied"`. The weekly
+tracker has real numbers, so the weekly ledger can REPORT instead of
+declare:
+
+- Meat limit row from the tracker: "Meat limit (3/week): 3 of 3 used —
+  Thursday onward planned meat-free" (`meat_meals_count` vs
+  `targets["meat_limit"]`, plus the slot where `apply_hard_constraints`
+  first pruned).
+- Calorie budget row: "13,450 of 14,000 kcal planned (96%)"
+  (`weekly_calories` vs `targets["calories"]`).
+- A new `status: "relaxed"` value for honest failure: when the
+  all-meat-pool fallback fires (`reward_logic.apply_hard_constraints` —
+  today it only logs a warning), the ledger should say "meat limit
+  couldn't be fully honored on Friday dinner — every available candidate
+  contained meat". Same honesty principle as the edit service's
+  nearest-miss responses. NOTE: `status` today is only ever "satisfied" —
+  check the UI tolerates a new value before shipping (additive enum).
+
+To keep this truthful rather than reconstructed, the planner loop should
+record small "selection events" AS IT DECIDES (pool pruned by the meat
+filter + how many dropped; calorie score flipped the argmax; tiebreak
+among N equals; relaxation fired). `WeeklyPlanner.generate_full_plan` has
+all of this in hand at pick time — return it alongside the entries (or
+accumulate on the env) rather than re-deriving post-hoc, otherwise
+explanations can diverge from actual causes (e.g. random tiebreaks).
+
+### Phase 3 — Weekly quality metrics
+
+- **Deterministic variety:** extend the daily FVS (unique-ingredient
+  count) to 21 meals; state "21 distinct recipes" (already guaranteed by
+  `mark_selected` exclusion — say so instead of leaving it implicit); and
+  the freebie: a category distribution from `day_summary.classify_meal`
+  ("9 vegetarian, 3 fish, 2 red meat, …") — zero cost, arguably the most
+  user-meaningful weekly variety statement.
+- **Deterministic guideline checks:** food-based dietary guidelines
+  (including the Belgian set the daily grader uses) are largely WEEKLY
+  frequency rules — "fish 1-2×/week", "limit red meat per week". A day
+  can barely be graded against those; a week genuinely can, and the
+  frequency-type rules are checkable straight from the category counts,
+  no LLM. Ship a small deterministic checklist (rule, target, actual,
+  met?) for the frequency rules.
+- **Optional LLM grades for parity:** one diversity + one adherence call
+  per weekly plan over a compact plan text — the day summaries are a good
+  compact input. 1-2 calls per plan vs the 21 removed in the constraints
+  rework; decide if the parity is worth the cost/latency (the
+  deterministic checklist above may be enough).
+- **Nutrition summary from the tracker:** weekly totals + per-day average
+  vs target (kcal, protein). Daily plans can't offer this; weekly can.
+  Caveat: totals are only as complete as enrichment coverage — carry a
+  "based on N of 21 meals with nutrition data" qualifier when coverage is
+  partial.
+
+### Phase 4 — Chat reply integration
+
+Feed the measured ledger + metrics into the ResponseWriter facts (same
+pattern as `constraints_honored` on daily and `day_summaries` on weekly),
+so the reply itself can say "kept within your 3-meat-meal limit, 96% of
+your calorie budget."
+
+### Phase 5 — Tests + docs
+
+- Unit tests: ledger rows from a tracker in known states (satisfied /
+  reached / relaxed), category-distribution + guideline-checklist math,
+  match_reasons on entry dicts (pinned/adapted/favorite/like). All
+  deterministic, LLM-free per `tests/conftest.py`.
+- Service-level test extending `tests/test_day_summary.py`'s faked
+  `CANDIDATES` setup: assert ledger/summary fields populated, persisted,
+  and exposed on `WeeklyMealPlanResponse`.
+- `CHAT_ENDPOINT_PIPELINE.md` section 5/6 + `CHANGES.md` handoff entry
+  once implemented.
+
+## Explicitly NOT doing
+
+- Surfacing the per-entry `reward` scalar in the UI — internal penalty
+  number, meaningless to users (kept in the payload for compatibility).
+- Per-meal LLM grading — same reason it was removed from the planning
+  loop: cost with no decision value.

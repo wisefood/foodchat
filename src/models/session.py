@@ -140,6 +140,15 @@ class WeeklyMealPlan:
     # M6 presentation: {day (1-7) -> short headline, e.g. "dinner with fish"}.
     # Additive like MealPlan.constraints_applied — {} on plans stored before M6.
     day_summaries: dict = field(default_factory=dict)
+    # M7 explainability — measured constraint ledger (statuses: satisfied |
+    # relaxed | violated), personalization counts, deterministic weekly
+    # metrics (variety, guideline checklist, nutrition trackers, per-day
+    # breakdown, selection events), and a whole-week justification.
+    # All additive: empty defaults on plans stored before M7.
+    constraints_applied: list = field(default_factory=list)
+    personalization_summary: Optional[dict] = None
+    metrics: dict = field(default_factory=dict)
+    reasoning: str = ""
 
 
 @dataclass

@@ -170,13 +170,22 @@ correctly after a process restart or on a different replica.
   +--> WeeklyMealPlanEnv + WeeklyPlanner.generate_full_plan
   |      21 steps (7 days x 3 meals), fully LLM-free:
   |      apply_hard_constraints prunes the pool (weekly meat limit —
-  |      diet-aware, relaxes with a warning if it would empty the pool),
-  |      then preference score + soft calorie-budget score pick the recipe;
-  |      the tracker accumulates real kcal/macros as slots commit
+  |      diet-aware, relaxes with a warning if it would empty the pool;
+  |      prunes/relaxations recorded on env.selection_events at decision
+  |      time), then preference score + soft calorie-budget score pick the
+  |      recipe; the tracker accumulates real kcal/macros as slots commit
   +--> batch enrichment on the final 21 entries (nutrition, image, tags)
   |      + adapted-recipe overlay
   +--> build_day_summaries(entries) -> {day: "dinner with fish" headline}
+  +--> build_weekly_explainability(entries, profile, selection_events, ...)
+  |      LLM-free: attaches per-entry recipe.match_reasons chips, builds
+  |      the MEASURED constraint ledger (meat count / calorie budget with
+  |      status satisfied | relaxed | violated), personalization counts,
+  |      weekly metrics (variety + category distribution, deterministic
+  |      guideline frequency checklist, nutrition trackers with coverage,
+  |      per-day breakdown) and the whole-week justification prose
   +--> store (refine -> version+1 | fresh -> version 1) + assistant message
+  |      (ResponseWriter facts include constraints_honored + week_summary)
 ```
 
 ## 6. Router response assembly
@@ -187,8 +196,14 @@ ChatTurnResponse {
   needs_clarification,
   meal_plan?              (id, courses, reasoning, 4 quality metrics,
                            version, parent_id),
-  weekly_meal_plan?       (id, entries[day, meal_type, recipe, reward],
-                           day_summaries{day -> headline}, version, parent_id),
+  weekly_meal_plan?       (id, entries[day, meal_type, recipe{...,
+                           match_reasons}, reward],
+                           day_summaries{day -> headline},
+                           constraints_applied[{constraint, type, status,
+                           source, detail?}], personalization_summary,
+                           metrics{variety, guideline_checklist, nutrition,
+                           days, selection_events}, reasoning,
+                           version, parent_id),
   at_message_limit,
   plan_version, plan_parent_id
 }

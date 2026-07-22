@@ -32,6 +32,7 @@ from models.recipe import CandidateRecipe, RecipeEnrichment
 from services.candidates_client import CANDIDATES
 from .session_service import SessionService
 from .weekly_planner.day_summary import build_day_summaries
+from .weekly_planner.explainability import build_weekly_explainability
 
 logger = logging.getLogger(__name__)
 
@@ -379,10 +380,19 @@ class EditService:
                 })
             else:
                 new_entries.append(dict(entry))
-        # Day summaries reflect the patched week (M6).
+        # Day summaries + explainability reflect the patched week (M6/M7).
+        # No planner ran, so there are no selection events; ledger statuses
+        # come from the final counts alone, and the feedback rows stay out
+        # (a patch doesn't consult feedback exclusions — claiming them
+        # here would be unverified).
+        day_summaries = build_day_summaries(new_entries)
+        explainability = build_weekly_explainability(
+            new_entries, session.user_profile,
+            selection_events=[], day_summaries=day_summaries,
+        )
         new_plan = self.session_service.refine_weekly_meal_plan(
             session.session_id, new_entries,
-            day_summaries=build_day_summaries(new_entries),
+            day_summaries=day_summaries, explainability=explainability,
         )
 
         changed = [self._changed_slot(

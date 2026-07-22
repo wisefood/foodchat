@@ -8,6 +8,7 @@ from .weekly_planner.action_adapter import RecipeActionSpace
 from .weekly_planner.reward_logic import RewardCalculator
 from .weekly_planner.environment import WeeklyMealPlanEnv
 from .weekly_planner.day_summary import build_day_summaries
+from .weekly_planner.explainability import build_weekly_explainability
 from .weekly_planner.planner import WeeklyPlanner, build_preference_scorer
 from .adapted_recipes import overlay_weekly_entries
 from .candidates_client import CANDIDATES
@@ -115,7 +116,8 @@ class WeeklyPlanService:
         for entry in pinned.values():
             action_space.mark_selected(entry["recipe_id"])
         # Downvoted recipes never come back (M3 feedback loop).
-        for recipe_id in self.feedback_service.get_signals(session.member_id).downvoted_recipe_ids:
+        signals = self.feedback_service.get_signals(session.member_id)
+        for recipe_id in signals.downvoted_recipe_ids:
             action_space.mark_selected(recipe_id)
         env = WeeklyMealPlanEnv(
             user_profile=session.user_profile,
@@ -159,9 +161,24 @@ class WeeklyPlanService:
         # will actually see.
         day_summaries = build_day_summaries(plan_entries)
 
+        # Explainability (M7) — attaches per-entry match_reasons in place
+        # and builds the measured ledger, weekly metrics (meat count,
+        # calorie budget, guideline checklist), per-day breakdown, and the
+        # whole-week justification. LLM-free; selection events were
+        # recorded by the planner at decision time.
+        history_text = getattr(signals, "history_text", "") or ""
+        explainability = build_weekly_explainability(
+            plan_entries, session.user_profile,
+            selection_events=env.selection_events,
+            day_summaries=day_summaries,
+            downvoted_count=len(signals.downvoted_recipe_ids),
+            feedback_lines=len(history_text.splitlines()) if history_text else 0,
+        )
+
         if is_refinement:
             weekly_plan = self.session_service.refine_weekly_meal_plan(
                 session_id, plan_entries, day_summaries=day_summaries,
+                explainability=explainability,
             )
             logger.info(
                 "[%s] Refined weekly plan → %s (v%d, parent=%s).",
@@ -174,6 +191,7 @@ class WeeklyPlanService:
         else:
             weekly_plan = self.session_service.add_weekly_meal_plan(
                 session_id, plan_entries, day_summaries=day_summaries,
+                explainability=explainability,
             )
             logger.info("[%s] Weekly meal plan %s stored.", session_id, weekly_plan.id)
             fallback = (
@@ -193,6 +211,13 @@ class WeeklyPlanService:
                 f"{DAY_NAMES[d - 1] if 1 <= d <= 7 else f'Day {d}'}: {s}"
                 for d, s in sorted(day_summaries.items()) if s
             ],
+            # M7: same fact key the daily flow uses, plus the measured
+            # week summary ("kept within your 3-meat-meal limit, 96% of
+            # your calorie budget") so the reply can mention it.
+            "constraints_honored": [
+                c["constraint"] for c in explainability["constraints_applied"][:4]
+            ],
+            "week_summary": explainability["reasoning"],
         }
         response_text = self.response_writer.write(
             facts, content,

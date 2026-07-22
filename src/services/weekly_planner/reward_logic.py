@@ -57,7 +57,10 @@ def is_meat_candidate(candidate: Dict[str, Any], count_fish: bool = True) -> boo
 
 
 def apply_hard_constraints(
-    candidates: List[Dict[str, Any]], tracker: "WeeklyNutritionalTracker"
+    candidates: List[Dict[str, Any]],
+    tracker: "WeeklyNutritionalTracker",
+    events: Optional[List[Dict[str, Any]]] = None,
+    slot: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Drop candidates that would break a hard constraint.
 
@@ -65,6 +68,12 @@ def apply_hard_constraints(
     meat candidates leave the pool. If that would empty the pool the limit
     is relaxed for the slot (with a warning) rather than failing the plan —
     a plan with one extra meat meal beats no plan at all.
+
+    When ``events`` is given, selection events are recorded AT DECISION
+    TIME (M7 explainability — explanations must reflect actual causes, not
+    a post-hoc reconstruction): ``{"type": "meat_pool_pruned", "dropped":
+    n, **slot}`` when meat candidates leave the pool, ``{"type":
+    "meat_limit_relaxed", **slot}`` when the fallback fires.
     """
     status = tracker.get_status()
     if status["remaining"]["meat_limit_left"] <= 0:
@@ -73,12 +82,20 @@ def apply_hard_constraints(
             if not is_meat_candidate(c, count_fish=tracker.counts_fish_as_meat)
         ]
         if meatless:
+            if events is not None and len(meatless) < len(candidates):
+                events.append({
+                    "type": "meat_pool_pruned",
+                    "dropped": len(candidates) - len(meatless),
+                    **(slot or {}),
+                })
             return meatless
         logger.warning(
             "Weekly meat limit (%s) reached but every candidate in this slot "
             "contains meat — relaxing the limit for this slot.",
             status["targets"].get("meat_limit"),
         )
+        if events is not None:
+            events.append({"type": "meat_limit_relaxed", **(slot or {})})
     return candidates
 
 

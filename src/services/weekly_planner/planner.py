@@ -98,7 +98,13 @@ class WeeklyPlanner:
                     )
                 # Hard constraints prune the pool BEFORE the pick (M6):
                 # e.g. meat candidates leave once the weekly limit is spent.
-                candidates = apply_hard_constraints(candidates, self.env.tracker)
+                # Prunes/relaxations are recorded on env.selection_events at
+                # decision time (M7 explainability).
+                candidates = apply_hard_constraints(
+                    candidates, self.env.tracker,
+                    events=self.env.selection_events,
+                    slot={"day": state["day"], "meal_type": state["meal_type"]},
+                )
 
                 # Preference score + soft constraint score (calorie budget)
                 # rank the pool; random tiebreak among equals keeps variety.
