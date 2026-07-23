@@ -470,3 +470,28 @@ The single-course slot assumption is load-bearing across every layer:
 
 Slider-card tie-in: "meals per day" belongs on the plan-parameter card
 (scale 2-5), NOT in chat questions, per the no-interrogation rule.
+
+---
+
+# N-day plan horizon ("plan meals for 2 days")
+
+**Status: open (recorded 2026-07-23).**
+
+Today there is no middle ground between one day and seven: the weekly
+planner is hard-coded to 21 slots (`planner.py: TOTAL_SLOTS = 21`), so a
+"plan meals for 2 days" request gets classified as either daily_plan
+(one day) or weekly_plan (a full week) — the "2 days" is silently
+ignored either way.
+
+Tractability: HIGH compared to multi-plate meals. The redesigned UI day
+list already renders whatever days exist; seeds/pins are day-addressed;
+the planner loop can take `num_days`. The real work:
+- classifier/orchestrator: extract the horizon (1-7) from the request
+  and pass it through (or put "days" on the plan-parameter slider card
+  — consistent with the no-interrogation rule);
+- trackers/budgets: meat limit and calorie budget must scale to N days
+  instead of assuming 7;
+- explainability: the guideline frequency checklist ("fish 1-2× a week")
+  must either rescale or honestly annotate "checked over N days";
+- weekly refinement context and day summaries already iterate actual
+  entries — should hold as-is.
