@@ -507,3 +507,26 @@ Slovenian UIs show English fragments inside a localized page. Options:
 key-based payloads the UI translates (preferred; the checklist is already
 structured enough), or backend localization by household region. Fine for
 the EN demo video; needed before the living-lab study.
+
+---
+
+# Weekly refinements discard verified slot edits
+
+**Status: open (recorded 2026-07-23, from the code review).**
+
+Any weekly refinement — text ("make it lighter") or a slider apply —
+regenerates all 21 slots. Only stored manual picks are re-pinned, so a
+slot the member approved via a verified edit ("swap Tuesday's dinner for
+something lighter") is silently replaced.
+
+The daily flow has the same shape but hurts less (3 slots, cheap to
+redo). Options, roughly in order of appeal:
+1. Record verified-edit results as manual picks for their slot — the
+   member approved that dish, so it becomes an anchor. Cheap: the pick
+   machinery already exists. Risk: makes edited slots sticky against
+   later plan-wide instructions (same tension as
+   `_seeds_for_refinement` re-pinning vs "make the whole day
+   vegetarian"), so it needs the same "I kept X" honesty line.
+2. Weekly refinement that only re-plans slots the request touches —
+   needs the planner to accept a frozen-slot set, which is close to the
+   pinned-slot mechanism it already has.

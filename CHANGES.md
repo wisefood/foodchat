@@ -2,6 +2,34 @@
 
 ---
 
+# Review fixes — pick lifecycle, card addressing, turn concerns
+
+> **Date:** 2026-07-23
+> **Branch:** main
+> Ships with wisefood-api + wisefood-ui (`plan_type` passthrough) — rebuild
+> the trio. Wire-compatible: `plan_type` is optional everywhere and falls
+> back to the previous active-canvas behaviour.
+
+Fixes from a multi-agent review of the manual-mode/weekly-card work.
+
+| Area | Fix |
+|---|---|
+| Pick lifecycle | Picks are reconciled AFTER generation against the plan that came back (`_settle_manual_picks`), never cleared before it. A failed generation no longer strands the still-active plan without anchors; picks the pipeline refused (dead id, allergy conflict) aren't stored, so they're never retried or re-apologized for; a pick displaced by an explicit seed stops resurrecting next turn. |
+| Diners | `PUT /diners` rebuilt the profile from member records, wiping `manual_picks`, `plan_parameters` and session-collected `history`. `ProfileService.carry_session_state` carries them over. |
+| Clarification | Compose and weekly generation clear a pending clarification trap, which otherwise ate the member's next message and buried the plan they'd just made. |
+| Card addressing | The slider card carries `plan_type` and the client echoes it back, so values refine the plan the card was rendered with rather than whichever canvas is newest at click time. |
+| Honesty | A re-injected pin now says "I kept X … say the word if you'd like those changed too" instead of claiming the member asked for it this turn (`SeedResolution.kept`). |
+| Errors | Only `SessionAccessError` maps to 404; planner `ValueError`s are 500s, not "session not found" (also fixes `/chat`). |
+| Contracts | `ComposePick` declares its constraints (`Literal` meal type from the shared `MEAL_SLOTS`, day 1-7) → 422 instead of silent drops; day-less weekly picks are no longer deduped away from spread placement. |
+| Analyst | Weekly day labels were 0-indexed against 1-based entries — every day was named one late in the plan-analyst context. |
+| Structure | Shared entry-point guards replace three copies of the ownership/limit block; compose runs the every-turn memory-nudge hook; profile writes are once per operation. |
+
+Known and deliberate: a weekly slider apply regenerates the week, so
+verified slot edits are lost — same as any weekly text refinement (see
+IDEAS.md). Tests: 204 passing (`test_session_state_integrity.py` new).
+
+---
+
 # Manual mode + canvas interactions
 
 > **Date:** 2026-07-23
