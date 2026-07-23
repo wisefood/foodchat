@@ -32,11 +32,26 @@ class RecordingChatService:
         return "Filled it out.", False, plan
 
 
+class RecordingWeeklyService:
+    def __init__(self, session_service):
+        self.session_service = session_service
+        self.calls = []
+
+    def process_message(self, session_id, message, is_refinement=False, seeds=None):
+        self.calls.append({
+            "message": message, "is_refinement": is_refinement, "seeds": seeds,
+        })
+        self.session_service.add_message(session_id, "user", message)
+        self.session_service.add_message(session_id, "assistant", "Week planned.")
+        from types import SimpleNamespace
+        return "Week planned.", SimpleNamespace(id="wp-1", version=1, parent_id=None)
+
+
 def make_orchestrator(session_service):
     orch = OrchestratorService.__new__(OrchestratorService)
     orch.session_service = session_service
     orch.chat_service = RecordingChatService(session_service)
-    orch.weekly_plan_service = None
+    orch.weekly_plan_service = RecordingWeeklyService(session_service)
     orch.foodscholar_service = None
     orch.seed_service = None
     orch.plan_analyst = None
@@ -77,6 +92,30 @@ class TestComposePlan:
             message="fill out the rest, keep it light",
         )
         assert orch.chat_service.calls[0]["message"] == "fill out the rest, keep it light"
+
+    def test_weekly_picks_carry_their_day_to_exact_slots(self, session_service, sample_profile):
+        session = session_service.create_session(f"member-{uuid.uuid4()}", dict(sample_profile))
+        orch = make_orchestrator(session_service)
+
+        turn = orch.compose_plan(
+            session.session_id, session.member_id,
+            [
+                {"meal_type": "dinner", "recipe_id": "rw-7", "title": "Pastitsio", "day": 2},
+                {"meal_type": "lunch", "recipe_id": "rw-9", "title": "Fakes", "day": 5},
+            ],
+            plan_type="weekly",
+        )
+
+        call = orch.weekly_plan_service.calls[0]
+        assert call["is_refinement"] is False
+        assert call["seeds"] == [
+            {"recipe_id": "rw-7", "meal_type": "dinner", "name": "Pastitsio", "day": 2},
+            {"recipe_id": "rw-9", "meal_type": "lunch", "name": "Fakes", "day": 5},
+        ]
+        assert "for this week" in call["message"]
+        assert turn.intent == "weekly_plan"
+        assert turn.weekly_meal_plan is not None
+        assert orch.chat_service.calls == []
 
     def test_ownership_enforced(self, session_service, sample_profile):
         session = session_service.create_session(f"member-{uuid.uuid4()}", dict(sample_profile))

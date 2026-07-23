@@ -303,11 +303,13 @@ class ComposePick(BaseModel):
     meal_type: str                    # breakfast | lunch | dinner
     recipe_id: str
     title: Optional[str] = None       # display name; also the id-miss fallback
+    day: Optional[int] = None         # 1-7, weekly plans only
 
 
 class ComposeRequest(BaseModel):
     member_id: str
     picks: List[ComposePick]
+    plan_type: str = "daily"          # daily | weekly
     # Optional chat text sent alongside ("fill out the rest, keep it light");
     # empty → a canonical completion query
     message: Optional[str] = None
@@ -588,7 +590,15 @@ async def compose_plan(session_id: str, request: ComposeRequest):
     """
     orch_svc = _require_orchestrator_service()
 
+    plan_type = (request.plan_type or "daily").strip().lower()
+    if plan_type not in ("daily", "weekly"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="plan_type must be 'daily' or 'weekly'",
+        )
+
     # Whitelist meal types, drop empties, keep the first pick per slot.
+    # Daily slots key by meal_type alone; weekly slots by (day, meal_type).
     picks: list[dict] = []
     seen_slots: set = set()
     for pick in request.picks:
@@ -596,10 +606,19 @@ async def compose_plan(session_id: str, request: ComposeRequest):
         recipe_id = (pick.recipe_id or "").strip()
         if meal_type not in _COMPOSE_MEAL_TYPES or not recipe_id:
             continue
-        if meal_type in seen_slots:
+        day = None
+        if plan_type == "weekly":
+            day = pick.day
+            if day is not None and not 1 <= day <= 7:
+                continue
+        slot = (day, meal_type)
+        if slot in seen_slots:
             continue
-        seen_slots.add(meal_type)
-        picks.append({"meal_type": meal_type, "recipe_id": recipe_id, "title": pick.title})
+        seen_slots.add(slot)
+        entry = {"meal_type": meal_type, "recipe_id": recipe_id, "title": pick.title}
+        if day is not None:
+            entry["day"] = day
+        picks.append(entry)
     if not picks:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -607,12 +626,13 @@ async def compose_plan(session_id: str, request: ComposeRequest):
         )
 
     logger.info(
-        "[%s] /compose from member %s: %d pick(s)",
-        session_id, request.member_id, len(picks),
+        "[%s] /compose (%s) from member %s: %d pick(s)",
+        session_id, plan_type, request.member_id, len(picks),
     )
     try:
         turn = orch_svc.compose_plan(
-            session_id, request.member_id, picks, message=request.message
+            session_id, request.member_id, picks,
+            plan_type=plan_type, message=request.message,
         )
     except ValueError as e:
         logger.warning("[%s] /compose 404: %s", session_id, e)
