@@ -298,6 +298,21 @@ class PlanParametersRequest(BaseModel):
     values: dict         # {parameter_key: chosen_value} — sanitized server-side
 
 
+class ComposePick(BaseModel):
+    """One hand-picked recipe on the manual-mode canvas."""
+    meal_type: str                    # breakfast | lunch | dinner
+    recipe_id: str
+    title: Optional[str] = None       # display name; also the id-miss fallback
+
+
+class ComposeRequest(BaseModel):
+    member_id: str
+    picks: List[ComposePick]
+    # Optional chat text sent alongside ("fill out the rest, keep it light");
+    # empty → a canonical completion query
+    message: Optional[str] = None
+
+
 class MemoryDecisionResponse(BaseModel):
     applied: bool        # True when a durable profile change was persisted
 
@@ -558,6 +573,55 @@ def _chat_turn_response(turn) -> ChatTurnResponse:
             if turn.plan_parameters else None
         ),
     )
+
+
+_COMPOSE_MEAL_TYPES = ("breakfast", "lunch", "dinner")
+
+
+@router.post("/sessions/{session_id}/compose", response_model=ChatTurnResponse)
+async def compose_plan(session_id: str, request: ComposeRequest):
+    """
+    Manual mode: complete a hand-started daily plan. The user picked recipes
+    for some slots on a blank canvas; FoodChat pins them (id-resolved,
+    allergy/diet re-checked) and fills the remaining slots — deterministic,
+    no intent classification.
+    """
+    orch_svc = _require_orchestrator_service()
+
+    # Whitelist meal types, drop empties, keep the first pick per slot.
+    picks: list[dict] = []
+    seen_slots: set = set()
+    for pick in request.picks:
+        meal_type = (pick.meal_type or "").strip().lower()
+        recipe_id = (pick.recipe_id or "").strip()
+        if meal_type not in _COMPOSE_MEAL_TYPES or not recipe_id:
+            continue
+        if meal_type in seen_slots:
+            continue
+        seen_slots.add(meal_type)
+        picks.append({"meal_type": meal_type, "recipe_id": recipe_id, "title": pick.title})
+    if not picks:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No valid picks provided (need meal_type breakfast|lunch|dinner and recipe_id)",
+        )
+
+    logger.info(
+        "[%s] /compose from member %s: %d pick(s)",
+        session_id, request.member_id, len(picks),
+    )
+    try:
+        turn = orch_svc.compose_plan(
+            session_id, request.member_id, picks, message=request.message
+        )
+    except ValueError as e:
+        logger.warning("[%s] /compose 404: %s", session_id, e)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        logger.error("[%s] /compose 500: %s", session_id, e, exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+    return _chat_turn_response(turn)
 
 
 @router.post("/sessions/{session_id}/plan-parameters", response_model=ChatTurnResponse)

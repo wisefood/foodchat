@@ -630,6 +630,53 @@ class OrchestratorService:
         turn.plan_parameters = plan_parameters.build_card(session.user_profile)
         return turn
 
+    def compose_plan(
+        self, session_id: str, member_id: str, picks: list[dict],
+        message: Optional[str] = None,
+    ) -> ChatTurn:
+        """Manual mode: the user hand-picked recipes on a blank canvas and
+        asks FoodChat to fill out the rest.
+
+        Picks are already validated by the router ({meal_type, recipe_id,
+        title?}). They become seed anchors — resolved by id, allergy/diet
+        re-checked (an unsafe pick is skipped with a note, never silently
+        planned), pinned to their slots — and generation composes the rest
+        deterministically: no intent classification, no clarification round.
+        """
+        session = self.session_service.get_session(session_id, member_id=member_id)
+        if not session:
+            raise ValueError(f"Session {session_id} not found or access denied")
+        if session.is_at_message_limit:
+            return ChatTurn(
+                role="assistant",
+                content=(
+                    f"This conversation has reached the {session.max_messages}-message limit. "
+                    "Please start a new session to continue."
+                ),
+                intent="chat",
+                at_message_limit=True,
+            )
+
+        seeds = [
+            {
+                "recipe_id": pick["recipe_id"],
+                "meal_type": pick["meal_type"],
+                "name": pick.get("title") or "",
+            }
+            for pick in picks
+        ]
+        text = (message or "").strip() or (
+            "Complete my meal plan for today around the dishes I picked."
+        )
+        logger.info(
+            "[%s] Manual compose: %d pick(s) → %s",
+            session_id, len(seeds), [(s["meal_type"], s["recipe_id"]) for s in seeds],
+        )
+        return self._handle_plan(
+            session_id, text, "daily_plan",
+            is_refinement=False, seeds=seeds, skip_clarification=True,
+        )
+
     def _handle_weekly(
         self, session_id: str, message: str, intent: str, is_refinement: bool,
         seeds: Optional[list[dict]] = None,
