@@ -427,3 +427,46 @@ your calorie budget."
   number, meaningless to users (kept in the payload for compatibility).
 - Per-meal LLM grading — same reason it was removed from the planning
   loop: cost with no decision value.
+---
+
+# Multi-plate meals & dynamic meal structure
+
+**Status: open (recorded 2026-07-23).** User-requested during demo prep.
+
+The ask: "I want pasta AND a salad for lunch" — meals composed of several
+plates, and days with a user-chosen number of meals (2-5 instead of the
+fixed breakfast/lunch/dinner). More realistic than one-recipe-per-slot.
+
+## Why this is a deep change, not a feature flag
+
+The single-course slot assumption is load-bearing across every layer:
+
+- `MealPlan` model: exactly `breakfast/lunch/dinner`, each ONE `MealCourse`
+  (weekly: `meal_idx` 0-2). Multi-plate needs `slot -> list[course]` and
+  dynamic slot lists, with a DB-compatible serialization (JSON blobs are
+  already the pattern — no migration needed, but every reader changes).
+- Planning pipeline & weekly planner: candidate selection, kcal budgeting,
+  and the diversity/guideline graders all assume 3 courses/day (21/week).
+  Plate counts change nutrition math (a plate is not a meal — kcal targets
+  must split across plates, not multiply).
+- Verified slot editing: predicates address (day, meal_type); they'd need
+  (day, meal_type, plate_idx) plus "remove/add a plate" directives.
+- Transparency: per-meal chips/ledger/summaries become per-plate.
+- UI: daily cards, weekly day rows, manual-mode compose slots, dashboard
+  "today" widget, apply-to-dashboard flow.
+
+## Suggested staging
+
+1. **Cheap conversational start**: multiple seeds per slot already parse
+   ("pastitsio and a salad for lunch" yields two seeds); today the second
+   pin is dropped. Interim: fold the extra dish into the query as a soft
+   side-dish request so the reply acknowledges it honestly.
+2. **Model v2**: courses-as-list with `plate` role (main/side/dessert),
+   fixed 3 meals — unlocks "pasta + salad" without touching meal count.
+   Manual mode gets "add a plate" on a slot.
+3. **Dynamic meal count** (2-5 meals/day) last — it perturbs guideline
+   grading ("most meals plant-based" et al. are frequency rules over a
+   meal denominator) and the RL-ish weekly tracker the most.
+
+Slider-card tie-in: "meals per day" belongs on the plan-parameter card
+(scale 2-5), NOT in chat questions, per the no-interrogation rule.
