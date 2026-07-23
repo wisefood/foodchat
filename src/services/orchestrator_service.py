@@ -614,10 +614,13 @@ class OrchestratorService:
         if not session:
             return
         store = dict(session.user_profile.get("manual_picks") or {})
+        before = store.get(plan_type) or []
         if picks:
             store[plan_type] = picks
         else:
             store.pop(plan_type, None)
+        if (store.get(plan_type) or []) == before:
+            return  # no-op (e.g. the routine clear on every fresh plan) — don't touch the DB
         session.user_profile["manual_picks"] = store
         self.session_service.persist_profile(session_id)
 
@@ -639,6 +642,10 @@ class OrchestratorService:
         return seeds
 
     def _drop_manual_picks_for_slots(self, session_id: str, changed_slots: list) -> None:
+        # Matches picks by (day, meal_type). A day-less weekly pick (spread
+        # placement — possible via the API, never via the compose UI) can't
+        # be slot-matched and survives edits; acceptable until spread picks
+        # record their placement.
         session = self.session_service.get_session(session_id)
         if not session:
             return
