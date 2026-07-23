@@ -45,6 +45,7 @@ class SeedResolution:
     meal_type: Optional[str] = None          # user hint, if any
     day: Optional[int] = None                # user hint (1–7), if any
     note: Optional[str] = None               # human-readable skip reason
+    kept: bool = False                       # carried over from an earlier turn
 
 
 class SeedService:
@@ -129,6 +130,7 @@ class SeedService:
         return SeedResolution(
             requested_name=name, status="resolved", recipe=resolved,
             meal_type=seed.get("meal_type"), day=seed.get("day"),
+            kept=bool(seed.get("kept")),
         )
 
     def _autocomplete_tolerant(self, name: str) -> list[tuple[str, str]]:
@@ -234,11 +236,25 @@ class SeedService:
 
     @staticmethod
     def describe(resolutions: list[SeedResolution]) -> str:
-        """One-line summary of pinned/skipped seeds for the assistant response."""
-        pinned = [r.recipe.recipe.title for r in resolutions if r.status == "resolved"]
+        """One-line summary of pinned/skipped seeds for the assistant response.
+
+        Dishes carried over from an earlier turn (``kept``) are announced
+        separately: the member didn't ask for them THIS turn, so claiming
+        they did reads as a misunderstanding — and saying nothing would hide
+        that a pin outranked the refinement they just typed.
+        """
+        asked = [r.recipe.recipe.title for r in resolutions
+                 if r.status == "resolved" and not r.kept]
+        kept = [r.recipe.recipe.title for r in resolutions
+                if r.status == "resolved" and r.kept]
         notes = [r.note for r in resolutions if r.note]
         parts = []
-        if pinned:
-            parts.append("I've worked in " + ", ".join(f"“{t}”" for t in pinned) + " as you asked.")
+        if asked:
+            parts.append("I've worked in " + ", ".join(f"“{t}”" for t in asked) + " as you asked.")
+        if kept:
+            parts.append(
+                "I kept " + ", ".join(f"“{t}”" for t in kept)
+                + " that you picked — say the word if you'd like those changed too."
+            )
         parts.extend(notes)
         return " ".join(parts)

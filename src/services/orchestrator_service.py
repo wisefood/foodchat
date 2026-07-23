@@ -61,6 +61,15 @@ _AFFIRMATIVE = re.compile(
 MAX_OFFERED_FAVORITES = 3
 
 
+class SessionAccessError(ValueError):
+    """Session missing or owned by another member.
+
+    Subclasses ValueError so existing ``except ValueError`` handlers keep
+    working, but lets routers map ONLY lookup failures to 404 — a ValueError
+    raised deep in the planning stack is a 500, not "session not found".
+    """
+
+
 @dataclass
 class ChatTurn:
     role: str
@@ -104,22 +113,58 @@ class OrchestratorService:
         self.orchestrator = OrchestratorAgent()
         self.plan_analyst = PlanAnalyst()
 
-    def process(self, session_id: str, member_id: str, message: str) -> ChatTurn:
-        """Validate ownership, check the message cap, classify, and route."""
+    # ------------------------------------------------------------------ #
+    # Entry-point guards (shared by every public entry point)              #
+    # ------------------------------------------------------------------ #
+
+    def _owned_session(self, session_id: str, member_id: str):
+        """Load a session, proving ownership. Raises SessionAccessError."""
         session = self.session_service.get_session(session_id, member_id=member_id)
         if not session:
-            raise ValueError(f"Session {session_id} not found or access denied")
+            raise SessionAccessError(f"Session {session_id} not found or access denied")
+        return session
 
-        if session.is_at_message_limit:
-            return ChatTurn(
-                role="assistant",
-                content=(
-                    f"This conversation has reached the {session.max_messages}-message limit. "
-                    "Please start a new session to continue."
-                ),
-                intent="chat",
-                at_message_limit=True,
-            )
+    @staticmethod
+    def _limit_turn(session) -> Optional[ChatTurn]:
+        """The refusal turn when the session hit its message cap, else None."""
+        if not session.is_at_message_limit:
+            return None
+        return ChatTurn(
+            role="assistant",
+            content=(
+                f"This conversation has reached the {session.max_messages}-message limit. "
+                "Please start a new session to continue."
+            ),
+            intent="chat",
+            at_message_limit=True,
+        )
+
+    def _attach_memory_suggestions(self, session, turn: ChatTurn, message: str) -> ChatTurn:
+        """Consent nudges (M3): detect durable preferences in the user's turn
+        and ATTACH suggestions — durable writes happen only when the user
+        answers via POST /sessions/{id}/memory.
+
+        Runs on EVERY turn carrying the member's own words, including
+        clarification answers and manual-compose messages: a preference
+        stated while doing something else still counts. Best-effort by
+        design — a nudge failure must never break an answered turn.
+        """
+        if self.memory_service is None or turn.at_message_limit or not (message or "").strip():
+            return turn
+        try:
+            suggestions = self.memory_service.suggest(session, message)
+            if suggestions:
+                turn.memory_suggestions = suggestions
+        except Exception as e:
+            logger.warning("[%s] Memory suggestion failed: %s", session.session_id, e)
+        return turn
+
+    def process(self, session_id: str, member_id: str, message: str) -> ChatTurn:
+        """Validate ownership, check the message cap, classify, and route."""
+        session = self._owned_session(session_id, member_id)
+        limit_turn = self._limit_turn(session)
+        if limit_turn is not None:
+            return limit_turn
 
         # Mid-clarification turns usually bypass classification — the user is
         # answering our question. Handlers may still bounce the turn back to
@@ -129,19 +174,7 @@ class OrchestratorService:
         else:
             turn = self._classify_and_route(session, session_id, message)
 
-        # Consent nudges (M3): detect durable preferences in the user's turn
-        # and ATTACH suggestions — durable writes happen only when the user
-        # answers via POST /sessions/{id}/memory. Best-effort by design, and
-        # runs on clarification turns too: a preference stated while
-        # answering a question still counts.
-        if self.memory_service is not None and not turn.at_message_limit:
-            try:
-                suggestions = self.memory_service.suggest(session, message)
-                if suggestions:
-                    turn.memory_suggestions = suggestions
-            except Exception as e:
-                logger.warning("[%s] Memory suggestion failed: %s", session_id, e)
-        return turn
+        return self._attach_memory_suggestions(session, turn, message)
 
     # Explicit FoodScholar consults bypass classification entirely: "can you
     # check with food scholar?" is a request to ask the expert, and the
@@ -524,7 +557,13 @@ class OrchestratorService:
                 by_day.setdefault(entry.get("day", 0), []).append(entry)
             lines = [f"7-day plan (version {plan.version}):"]
             for day_idx in sorted(by_day):
-                label = day_names[day_idx] if day_idx < len(day_names) else f"Day {day_idx + 1}"
+                # Entry days are 1-based (1=Monday) everywhere in the weekly
+                # stack; indexing day_names directly labeled every day one
+                # late, so the analyst answered about the wrong day.
+                label = (
+                    day_names[day_idx - 1] if 1 <= day_idx <= len(day_names)
+                    else f"Day {day_idx}"
+                )
                 lines.append(f"{label}:")
                 for entry in sorted(by_day[day_idx], key=lambda e: e.get("meal_idx", 0)):
                     recipe = entry.get("recipe", {})
@@ -562,16 +601,16 @@ class OrchestratorService:
     def _handle_plan(
         self, session_id: str, message: str, intent: str, is_refinement: bool,
         seeds: Optional[list[dict]] = None, skip_clarification: bool = False,
+        persist_seeds: bool = False,
     ) -> ChatTurn:
         if is_refinement:
             seeds = self._seeds_for_refinement(session_id, "daily", seeds)
-        else:
-            # A fresh plan starts a new lineage — old manual picks don't
-            # follow it (compose re-stores its own picks after this call).
-            self._store_manual_picks(session_id, "daily", [])
         response_text, needs_clarification, meal_plan = self.chat_service.process_plan_request(
             session_id, message, is_refinement=is_refinement, seeds=seeds,
             skip_clarification=skip_clarification,
+        )
+        self._settle_manual_picks(
+            session_id, "daily", meal_plan, seeds, is_refinement, persist_seeds,
         )
         self._tag_last_message(session_id, intent, meal_plan.id if meal_plan else None)
 
@@ -593,24 +632,41 @@ class OrchestratorService:
         if intent not in ("daily_plan", "weekly_plan") or plan is None:
             return None
         session = self.session_service.get_session(session_id)
-        return plan_parameters.build_card(session.user_profile if session else {})
+        plan_type = "weekly" if intent == "weekly_plan" else "daily"
+        return plan_parameters.build_card(
+            session.user_profile if session else {}, plan_type,
+        )
 
     # ------------------------------------------------------------------ #
     # Manual picks (compose mode) — survive refinements, die honestly      #
     # ------------------------------------------------------------------ #
     # Hand-picked dishes are a stronger signal than anything inferred: a
-    # text refinement must not silently replace them. They are stored in
-    # seed shape per plan type, re-injected on refinements (re-resolved and
-    # safety-rechecked each time — diners may have changed), cleared by a
-    # fresh plan request, and dropped per slot when a verified edit swaps
-    # that slot (the user changed their mind about that pick).
+    # text refinement must not silently replace them. Lifecycle, all of it
+    # driven by what actually landed on the plan (never by intent alone):
+    #   - compose stores the picks that REACHED the plan (a pick that failed
+    #     id lookup or the allergy gate is dropped, so it is never retried);
+    #   - refinements re-inject stored picks (re-resolved and safety-rechecked
+    #     each time — diners may have changed), then keep only those still on
+    #     the resulting plan, so an explicit seed that displaced one doesn't
+    #     let the old pick resurrect next turn;
+    #   - a fresh plan request starts a new lineage and clears them — but only
+    #     once generation SUCCEEDED, so a failed generation never strands the
+    #     still-active plan without its anchors;
+    #   - a verified edit unpins the slot it replaced (the user changed their
+    #     mind about that pick).
+    #
+    # Seed precedence, deliberately: explicit per-turn seeds > stored manual
+    # picks > weekly standing_seeds (the last applies only to fresh weekly
+    # plans, inside weekly_plan_service, and is skipped whenever seeds are
+    # already present).
 
     def _manual_picks(self, session, plan_type: str) -> list:
         store = session.user_profile.get("manual_picks") or {}
         return list(store.get(plan_type) or [])
 
-    def _store_manual_picks(self, session_id: str, plan_type: str, picks: list) -> None:
-        session = self.session_service.get_session(session_id)
+    def _store_manual_picks(self, session_id: str, plan_type: str, picks: list,
+                            session=None) -> None:
+        session = session or self.session_service.get_session(session_id)
         if not session:
             return
         store = dict(session.user_profile.get("manual_picks") or {})
@@ -620,13 +676,18 @@ class OrchestratorService:
         else:
             store.pop(plan_type, None)
         if (store.get(plan_type) or []) == before:
-            return  # no-op (e.g. the routine clear on every fresh plan) — don't touch the DB
+            return  # no-op — don't touch the DB
         session.user_profile["manual_picks"] = store
         self.session_service.persist_profile(session_id)
 
     def _seeds_for_refinement(self, session_id: str, plan_type: str,
                               seeds: Optional[list]) -> Optional[list]:
-        """Explicit seeds win; otherwise stored manual picks anchor the turn."""
+        """Explicit seeds win; otherwise stored manual picks anchor the turn.
+
+        Re-injected picks are marked ``kept`` so the reply says "I kept X"
+        rather than "I've worked in X as you asked" — the user didn't ask
+        this turn, and claiming they did reads as a misunderstanding.
+        """
         if seeds:
             return seeds
         session = self.session_service.get_session(session_id)
@@ -638,34 +699,119 @@ class OrchestratorService:
                 "[%s] Re-injecting %d manual pick(s) into %s refinement.",
                 session_id, len(picks), plan_type,
             )
-            return picks
+            return [{**pick, "kept": True} for pick in picks]
         return seeds
 
-    def _drop_manual_picks_for_slots(self, session_id: str, changed_slots: list) -> None:
-        # Matches picks by (day, meal_type). A day-less weekly pick (spread
-        # placement — possible via the API, never via the compose UI) can't
-        # be slot-matched and survives edits; acceptable until spread picks
-        # record their placement.
+    @staticmethod
+    def _plan_recipe_ids(plan, plan_type: str) -> set:
+        """Every recipe id present on a generated plan."""
+        ids: set = set()
+        if plan is None:
+            return ids
+        if plan_type == "weekly":
+            for entry in getattr(plan, "entries", None) or []:
+                recipe = entry.get("recipe") if isinstance(entry, dict) else None
+                rid = (recipe or {}).get("recipe_id")
+                if rid:
+                    ids.add(str(rid))
+            return ids
+        for slot in ("breakfast", "lunch", "dinner"):
+            course = getattr(plan, slot, None)
+            if course is not None and getattr(course, "recipe_id", None):
+                ids.add(str(course.recipe_id))
+        return ids
+
+    def _picks_on_plan(self, plan, plan_type: str, picks: list) -> list:
+        """The subset of picks that actually made it onto the plan.
+
+        Drops picks the pipeline refused — unresolvable ids, allergy/diet
+        conflicts, slot collisions — so they are never retried, never
+        re-apologized for, and never anchor a future turn.
+        """
+        present = self._plan_recipe_ids(plan, plan_type)
+        return [
+            {k: v for k, v in pick.items() if k != "kept"}
+            for pick in picks or []
+            if str(pick.get("recipe_id") or "") in present
+        ]
+
+    def _settle_manual_picks(self, session_id: str, plan_type: str, plan,
+                             seeds: Optional[list], is_refinement: bool,
+                             persist_seeds: bool) -> None:
+        """Reconcile the stored picks with the plan that was just produced.
+
+        Never runs when generation produced nothing (failure or a pending
+        clarification): the previous picks still protect the plan the member
+        is looking at. At most ONE profile write.
+        """
+        if plan is None:
+            return
         session = self.session_service.get_session(session_id)
         if not session:
             return
+
+        if persist_seeds:
+            kept = self._picks_on_plan(plan, plan_type, seeds or [])
+            dropped = len(seeds or []) - len(kept)
+            if dropped:
+                logger.info(
+                    "[%s] %d manual pick(s) never reached the plan — not stored.",
+                    session_id, dropped,
+                )
+            self._store_manual_picks(session_id, plan_type, kept, session=session)
+            return
+
+        if not is_refinement:
+            # Fresh lineage — the previous picks belong to a plan the member
+            # has moved on from. Cleared only now that a plan exists.
+            self._store_manual_picks(session_id, plan_type, [], session=session)
+            return
+
+        stored = self._manual_picks(session, plan_type)
+        if not stored:
+            return
+        kept = self._picks_on_plan(plan, plan_type, stored)
+        if len(kept) != len(stored):
+            logger.info(
+                "[%s] %d stored pick(s) no longer on the refined plan — unpinning.",
+                session_id, len(stored) - len(kept),
+            )
+            self._store_manual_picks(session_id, plan_type, kept, session=session)
+
+    def _drop_manual_picks_for_slots(self, session_id: str, changed_slots: list) -> None:
+        """Unpin the slots a verified edit replaced — one write per plan type.
+
+        Slots are matched by (day, meal_type); ``day`` is 1-based for weekly
+        edits and None for daily ones (edit_service always sets both). A
+        day-less weekly pick (spread placement — possible via the API, never
+        via the compose UI) can't be slot-matched and survives.
+        """
+        session = self.session_service.get_session(session_id)
+        if not session:
+            return
+        by_type: dict[str, set] = {}
         for slot in changed_slots or []:
-            day = slot.get("day") or None
+            day = slot.get("day")
             plan_type = "weekly" if day is not None else "daily"
+            by_type.setdefault(plan_type, set()).add((day, slot.get("meal_type")))
+
+        for plan_type, edited in by_type.items():
             picks = self._manual_picks(session, plan_type)
+            if not picks:
+                continue
             remaining = [
                 p for p in picks
-                if not (p.get("meal_type") == slot.get("meal_type")
-                        and (p.get("day") or None) == day)
+                if (p.get("day"), p.get("meal_type")) not in edited
             ]
             if len(remaining) != len(picks):
                 logger.info(
-                    "[%s] Verified edit replaced a manual pick (%s%s) — unpinning it.",
-                    session_id, slot.get("meal_type"), f" day {day}" if day else "",
+                    "[%s] Verified edit replaced %d manual pick(s) — unpinning.",
+                    session_id, len(picks) - len(remaining),
                 )
-                self._store_manual_picks(session_id, plan_type, remaining)
+                self._store_manual_picks(session_id, plan_type, remaining, session=session)
 
-    def apply_plan_parameters(self, session_id: str, member_id: str, values: dict) -> ChatTurn:
+    def apply_plan_parameters(self, session_id: str, member_id: str, values: dict,
+                              plan_type: Optional[str] = None) -> ChatTurn:
         """Apply slider-card values (already sanitized by the router).
 
         Deterministic counterpart of a refinement turn: the values become a
@@ -673,20 +819,17 @@ class OrchestratorService:
         round), are stored on the profile so the card shows current settings,
         and land in the profile history so the reconciler treats them as
         known facts for the rest of the session.
+
+        ``plan_type`` is the card's own address — the plan it was rendered
+        with. Without it the target would be whichever canvas happens to be
+        newest AT CLICK TIME, so a card sitting above a daily plan could
+        regenerate a weekly plan created since. Omitted (older clients) →
+        the active canvas, as before.
         """
-        session = self.session_service.get_session(session_id, member_id=member_id)
-        if not session:
-            raise ValueError(f"Session {session_id} not found or access denied")
-        if session.is_at_message_limit:
-            return ChatTurn(
-                role="assistant",
-                content=(
-                    f"This conversation has reached the {session.max_messages}-message limit. "
-                    "Please start a new session to continue."
-                ),
-                intent="chat",
-                at_message_limit=True,
-            )
+        session = self._owned_session(session_id, member_id)
+        limit_turn = self._limit_turn(session)
+        if limit_turn is not None:
+            return limit_turn
 
         applied = dict(session.user_profile.get("plan_parameters") or {})
         applied.update(values)
@@ -696,11 +839,13 @@ class OrchestratorService:
         session.user_profile["history"] = f"{history}\n{line}" if history else line
         self.session_service.persist_profile(session_id)
 
+        target = plan_type if plan_type in ("daily", "weekly") else None
+        if target is None:
+            canvas = session.active_canvas
+            target = canvas.plan_type if canvas is not None else "daily"
+
         message = plan_parameters.describe(values)
-        canvas = session.active_canvas
-        if canvas is not None and canvas.plan_type == "weekly":
-            # Weekly canvas active → the values refine THAT plan (the weekly
-            # flow has no clarification round to skip).
+        if target == "weekly" and session.get_current_weekly_plan() is not None:
             logger.info("[%s] Applying plan parameters %s (weekly refine).", session_id, values)
             turn = self._handle_weekly(
                 session_id, message, "refine_plan", is_refinement=True,
@@ -715,7 +860,7 @@ class OrchestratorService:
             )
         # Always return the card with its new current values so the UI stays
         # in sync, even on the refine paths where the handlers skip it.
-        turn.plan_parameters = plan_parameters.build_card(session.user_profile)
+        turn.plan_parameters = plan_parameters.build_card(session.user_profile, target)
         return turn
 
     def compose_plan(
@@ -732,19 +877,17 @@ class OrchestratorService:
         generation composes the rest deterministically: no intent
         classification, no clarification round.
         """
-        session = self.session_service.get_session(session_id, member_id=member_id)
-        if not session:
-            raise ValueError(f"Session {session_id} not found or access denied")
-        if session.is_at_message_limit:
-            return ChatTurn(
-                role="assistant",
-                content=(
-                    f"This conversation has reached the {session.max_messages}-message limit. "
-                    "Please start a new session to continue."
-                ),
-                intent="chat",
-                at_message_limit=True,
-            )
+        session = self._owned_session(session_id, member_id)
+        limit_turn = self._limit_turn(session)
+        if limit_turn is not None:
+            return limit_turn
+
+        # Composing is a deliberate action that supersedes any pending
+        # question — leaving the trap armed would make the member's next
+        # message answer a question they've moved on from.
+        if session.state == "clarifying":
+            logger.info("[%s] Compose supersedes a pending clarification.", session_id)
+            self.session_service.clear_clarification_state(session_id)
 
         seeds = []
         for pick in picks:
@@ -763,40 +906,45 @@ class OrchestratorService:
             [(s.get("day"), s["meal_type"], s["recipe_id"]) for s in seeds],
         )
 
+        # Picks that reach the plan are stored by _settle_manual_picks
+        # (persist_seeds=True); ones the pipeline refused are dropped there.
         if plan_type == "weekly":
             text = (message or "").strip() or (
                 "Complete my meal plan for this week around the dishes I picked."
             )
             turn = self._handle_weekly(
-                session_id, text, "weekly_plan", is_refinement=False, seeds=seeds,
+                session_id, text, "weekly_plan", is_refinement=False,
+                seeds=seeds, persist_seeds=True,
             )
         else:
             text = (message or "").strip() or (
                 "Complete my meal plan for today around the dishes I picked."
             )
             turn = self._handle_plan(
-                session_id, text, "daily_plan",
-                is_refinement=False, seeds=seeds, skip_clarification=True,
+                session_id, text, "daily_plan", is_refinement=False,
+                seeds=seeds, skip_clarification=True, persist_seeds=True,
             )
 
-        # Persist the picks (seed shape) AFTER generation — the fresh-plan
-        # path above just cleared the previous lineage's picks — so later
-        # refinements keep anchoring what the user chose by hand.
-        plan = turn.weekly_meal_plan if plan_type == "weekly" else turn.meal_plan
-        if plan is not None:
-            self._store_manual_picks(session_id, plan_type, seeds)
-        return turn
+        # The member's own words reach compose when they type instead of
+        # pressing the button — a preference stated there must still nudge.
+        return self._attach_memory_suggestions(session, turn, message or "")
 
     def _handle_weekly(
         self, session_id: str, message: str, intent: str, is_refinement: bool,
-        seeds: Optional[list[dict]] = None,
+        seeds: Optional[list[dict]] = None, persist_seeds: bool = False,
     ) -> ChatTurn:
         if is_refinement:
             seeds = self._seeds_for_refinement(session_id, "weekly", seeds)
-        else:
-            self._store_manual_picks(session_id, "weekly", [])
         response_text, weekly_plan = self.weekly_plan_service.process_message(
             session_id, message, is_refinement=is_refinement, seeds=seeds
+        )
+        if weekly_plan is not None:
+            # The weekly pipeline has no clarification round of its own, so
+            # it never clears a trap the daily flow may have armed — a
+            # pending question would otherwise eat the member's next message.
+            self.session_service.clear_clarification_state(session_id)
+        self._settle_manual_picks(
+            session_id, "weekly", weekly_plan, seeds, is_refinement, persist_seeds,
         )
         self._tag_last_message(session_id, intent, weekly_plan.id if weekly_plan else None)
 

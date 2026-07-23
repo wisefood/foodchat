@@ -70,15 +70,20 @@ _PHRASES = {
 }
 
 
-def build_card(profile: dict) -> dict:
-    """The card payload for a turn: definitions plus current applied values."""
+def build_card(profile: dict, plan_type: str = "daily") -> dict:
+    """The card payload for a turn: definitions plus current applied values.
+
+    ``plan_type`` is the card's address — the plan it was rendered with. The
+    client sends it back on apply so the values refine THAT plan, not
+    whichever canvas happens to be newest by then.
+    """
     applied = profile.get("plan_parameters") or {}
     parameters = []
     for definition in PARAMETER_DEFS:
         param = dict(definition)
         param["value"] = applied.get(definition["key"])
         parameters.append(param)
-    return {"parameters": parameters}
+    return {"parameters": parameters, "plan_type": plan_type}
 
 
 def sanitize(values: dict) -> dict:

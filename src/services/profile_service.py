@@ -276,6 +276,36 @@ class ProfileService:
         except Exception:
             return member_id
 
+    # Session-scoped profile state that is NOT derived from member records:
+    # rebuilding the profile (e.g. when diners change) must carry it over or
+    # the session silently forgets what the member did in it.
+    SESSION_SCOPED_KEYS = ("manual_picks", "plan_parameters")
+
+    @classmethod
+    def carry_session_state(cls, old_profile: dict, new_profile: dict) -> dict:
+        """Re-apply session-scoped state onto a freshly rebuilt profile.
+
+        ``history`` is special: the rebuilt profile starts from the member's
+        durable feedback history, while the session may have appended facts
+        collected during clarification or slider applies. Keep both.
+        """
+        for key in cls.SESSION_SCOPED_KEYS:
+            if old_profile.get(key):
+                new_profile[key] = old_profile[key]
+
+        old_history = (old_profile.get("history") or "").strip()
+        new_history = (new_profile.get("history") or "").strip()
+        if old_history and old_history != new_history:
+            extra = [
+                line for line in old_history.splitlines()
+                if line.strip() and line not in new_history
+            ]
+            if extra:
+                new_profile["history"] = "\n".join(
+                    part for part in [new_history, *extra] if part
+                )
+        return new_profile
+
     @staticmethod
     def merge_profiles(primary: dict, others: list[dict], diner_names: list[str]) -> dict:
         """Merge diner profiles into one plan-generation profile.

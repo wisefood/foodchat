@@ -237,6 +237,46 @@ class TestApplyPlanParameters:
                                    is_refinement=False)
         assert turn.plan_parameters is not None
 
+    def test_card_plan_type_addresses_the_apply(self, session_service, sample_profile):
+        """The card is applied to the plan it was RENDERED with — not to
+        whichever canvas happens to be newest when the member clicks."""
+        from types import SimpleNamespace
+
+        class RecordingWeekly:
+            def __init__(self, svc):
+                self.svc, self.calls = svc, []
+
+            def process_message(self, session_id, message, is_refinement=False, seeds=None):
+                self.calls.append({"is_refinement": is_refinement})
+                self.svc.add_message(session_id, "assistant", "Week updated.")
+                return "Week updated.", SimpleNamespace(id="wp-2", version=2, parent_id="wp-1")
+
+        session = make_session(session_service, sample_profile)
+        # Daily plan exists, then a NEWER weekly plan
+        session_service.add_meal_plan(session.session_id, make_candidates("d"), "r", {})
+        session_service.add_weekly_meal_plan(
+            session.session_id,
+            [{"day": 1, "meal_idx": 0, "meal_type": "breakfast", "recipe": {}, "reward": 0.0}],
+        )
+        orch = make_orchestrator(session_service)
+        orch.weekly_plan_service = RecordingWeekly(session_service)
+
+        # A card rendered with the DAILY plan must refine the daily plan
+        turn = orch.apply_plan_parameters(
+            session.session_id, session.member_id, {"cooking_time": 20},
+            plan_type="daily",
+        )
+        assert orch.chat_service.calls[0]["is_refinement"] is True
+        assert orch.weekly_plan_service.calls == []
+        assert turn.plan_parameters["plan_type"] == "daily"
+
+    def test_card_carries_its_plan_type(self, session_service, sample_profile):
+        session = make_session(session_service, sample_profile)
+        orch = make_orchestrator(session_service)
+        turn = orch._handle_plan(session.session_id, "plan my day", "daily_plan",
+                                 is_refinement=False)
+        assert turn.plan_parameters["plan_type"] == "daily"
+
     def test_apply_enforces_session_ownership(self, session_service, sample_profile):
         session = make_session(session_service, sample_profile)
         orch = make_orchestrator(session_service)

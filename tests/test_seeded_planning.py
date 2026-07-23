@@ -367,3 +367,37 @@ class TestPlanQuestion:
         assert turn.intent == "nutrition_question"
         assert orch.foodscholar_service.questions != []
         assert orch.plan_analyst.calls == []
+
+
+class TestSeedDescription:
+    """A re-injected pin must not claim the member asked for it this turn."""
+
+    @staticmethod
+    def _resolution(title, kept):
+        from types import SimpleNamespace
+        from services.seed_service import SeedResolution
+        recipe = SimpleNamespace(recipe=SimpleNamespace(title=title))
+        return SeedResolution(requested_name=title, status="resolved",
+                              recipe=recipe, kept=kept)
+
+    def test_freshly_asked_seeds_say_as_you_asked(self):
+        from services.seed_service import SeedService
+        note = SeedService.describe([self._resolution("Pastitsio", kept=False)])
+        assert "worked in “Pastitsio” as you asked" in note
+        assert "kept" not in note
+
+    def test_carried_over_pins_say_kept_and_offer_to_change(self):
+        from services.seed_service import SeedService
+        note = SeedService.describe([self._resolution("Pastitsio", kept=True)])
+        assert "I kept “Pastitsio”" in note
+        assert "as you asked" not in note
+        assert "changed too" in note
+
+    def test_mixed_turn_separates_the_two(self):
+        from services.seed_service import SeedService
+        note = SeedService.describe([
+            self._resolution("Moussaka", kept=False),
+            self._resolution("Pastitsio", kept=True),
+        ])
+        assert "worked in “Moussaka” as you asked" in note
+        assert "I kept “Pastitsio”" in note

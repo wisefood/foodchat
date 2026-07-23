@@ -20,15 +20,17 @@ Their gateway proxies were removed in the same change.
 
 import logging
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Query, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import services
 from db import SessionLocal, db_upsert_feedback, db_get_message_by_id
 from models.session import MealCourse
 from services import plan_parameters
+from services.candidates_client import MEAL_SLOTS
+from services.orchestrator_service import SessionAccessError
 
 logger = logging.getLogger(__name__)
 
@@ -248,9 +250,14 @@ class PlanParameterModel(BaseModel):
 
 
 class PlanParameterCardModel(BaseModel):
-    """Optional slider card attached to fresh daily plans; the UI answers via
-    POST /sessions/{id}/plan-parameters instead of a textual question."""
+    """Optional slider card attached to fresh plans; the UI answers via
+    POST /sessions/{id}/plan-parameters instead of a textual question.
+
+    ``plan_type`` is the card's address — echo it back on apply so the
+    values refine the plan the card belongs to.
+    """
     parameters: List[PlanParameterModel]
+    plan_type: Literal["daily", "weekly"] = "daily"
 
 
 class ChatTurnResponse(BaseModel):
@@ -296,20 +303,29 @@ class MemoryDecisionRequest(BaseModel):
 class PlanParametersRequest(BaseModel):
     member_id: str
     values: dict         # {parameter_key: chosen_value} — sanitized server-side
+    # The card's own address (echoed back from the card payload) so the
+    # values refine the plan the card was rendered with, not whichever
+    # canvas is newest by the time the member clicks. Omitted → active canvas.
+    plan_type: Optional[Literal["daily", "weekly"]] = None
 
 
 class ComposePick(BaseModel):
-    """One hand-picked recipe on the manual-mode canvas."""
-    meal_type: str                    # breakfast | lunch | dinner
-    recipe_id: str
+    """One hand-picked recipe on the manual-mode canvas.
+
+    Constraints are declared, not re-checked imperatively: an out-of-range
+    day or unknown meal type is a 422 at parse time rather than a pick that
+    silently disappears from the plan.
+    """
+    meal_type: Literal[MEAL_SLOTS]
+    recipe_id: str = Field(min_length=1)
     title: Optional[str] = None       # display name; also the id-miss fallback
-    day: Optional[int] = None         # 1-7, weekly plans only
+    day: Optional[int] = Field(default=None, ge=1, le=7)  # weekly plans only
 
 
 class ComposeRequest(BaseModel):
     member_id: str
     picks: List[ComposePick]
-    plan_type: str = "daily"          # daily | weekly
+    plan_type: Literal["daily", "weekly"] = "daily"
     # Optional chat text sent alongside ("fill out the rest, keep it light");
     # empty → a canonical completion query
     message: Optional[str] = None
@@ -532,7 +548,9 @@ async def unified_chat(session_id: str, request: ChatRequest):
             "[%s] /chat response — intent=%s v=%s needs_clarification=%s at_limit=%s",
             session_id, turn.intent, turn.plan_version, turn.needs_clarification, turn.at_message_limit,
         )
-    except ValueError as e:
+    except SessionAccessError as e:
+        # ONLY a lookup/ownership failure is a 404 — a ValueError raised deep
+        # in the planning stack is a server error, not a missing session.
         logger.warning("[%s] /chat 404: %s", session_id, e)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except RuntimeError as e:
@@ -577,52 +595,44 @@ def _chat_turn_response(turn) -> ChatTurnResponse:
     )
 
 
-_COMPOSE_MEAL_TYPES = ("breakfast", "lunch", "dinner")
-
-
 @router.post("/sessions/{session_id}/compose", response_model=ChatTurnResponse)
 async def compose_plan(session_id: str, request: ComposeRequest):
     """
-    Manual mode: complete a hand-started daily plan. The user picked recipes
-    for some slots on a blank canvas; FoodChat pins them (id-resolved,
-    allergy/diet re-checked) and fills the remaining slots — deterministic,
-    no intent classification.
+    Manual mode: complete a hand-started plan (daily or weekly). The user
+    picked recipes for some slots on a blank canvas; FoodChat pins them
+    (id-resolved, allergy/diet re-checked) and fills the remaining slots —
+    deterministic, no intent classification.
+
+    Pick shape is enforced by ``ComposePick`` (422 on a bad meal type or an
+    out-of-range day), so this only resolves slot collisions.
     """
     orch_svc = _require_orchestrator_service()
+    plan_type = request.plan_type
 
-    plan_type = (request.plan_type or "daily").strip().lower()
-    if plan_type not in ("daily", "weekly"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="plan_type must be 'daily' or 'weekly'",
-        )
-
-    # Whitelist meal types, drop empties, keep the first pick per slot.
-    # Daily slots key by meal_type alone; weekly slots by (day, meal_type).
+    # One pick per ADDRESSED slot (daily: meal_type; weekly: day+meal_type).
+    # Day-less weekly picks are spread across the week by the planner, so
+    # several of the same meal type are legitimate and must all pass.
     picks: list[dict] = []
     seen_slots: set = set()
     for pick in request.picks:
-        meal_type = (pick.meal_type or "").strip().lower()
-        recipe_id = (pick.recipe_id or "").strip()
-        if meal_type not in _COMPOSE_MEAL_TYPES or not recipe_id:
-            continue
-        day = None
-        if plan_type == "weekly":
-            day = pick.day
-            if day is not None and not 1 <= day <= 7:
+        day = pick.day if plan_type == "weekly" else None
+        if day is not None or plan_type == "daily":
+            slot = (day, pick.meal_type)
+            if slot in seen_slots:
                 continue
-        slot = (day, meal_type)
-        if slot in seen_slots:
-            continue
-        seen_slots.add(slot)
-        entry = {"meal_type": meal_type, "recipe_id": recipe_id, "title": pick.title}
+            seen_slots.add(slot)
+        entry = {
+            "meal_type": pick.meal_type,
+            "recipe_id": pick.recipe_id.strip(),
+            "title": pick.title,
+        }
         if day is not None:
             entry["day"] = day
         picks.append(entry)
     if not picks:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No valid picks provided (need meal_type breakfast|lunch|dinner and recipe_id)",
+            detail="No picks provided",
         )
 
     logger.info(
@@ -634,7 +644,7 @@ async def compose_plan(session_id: str, request: ComposeRequest):
             session_id, request.member_id, picks,
             plan_type=plan_type, message=request.message,
         )
-    except ValueError as e:
+    except SessionAccessError as e:
         logger.warning("[%s] /compose 404: %s", session_id, e)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -649,8 +659,9 @@ async def apply_plan_parameters(session_id: str, request: PlanParametersRequest)
     """
     Apply values from the interactive plan-parameter card (time budget,
     difficulty, goal). Deterministic alternative to typing a refinement:
-    no intent classification, no clarification round — the values become a
-    canonical refinement of the active daily plan (or a fresh plan if none).
+    no intent classification, no clarification round — the values refine the
+    plan the card was rendered with (``plan_type``), or the active canvas
+    when the client didn't say.
     """
     orch_svc = _require_orchestrator_service()
 
@@ -662,12 +673,14 @@ async def apply_plan_parameters(session_id: str, request: PlanParametersRequest)
         )
 
     logger.info(
-        "[%s] /plan-parameters from member %s: %s",
-        session_id, request.member_id, sanitized,
+        "[%s] /plan-parameters (%s) from member %s: %s",
+        session_id, request.plan_type or "active", request.member_id, sanitized,
     )
     try:
-        turn = orch_svc.apply_plan_parameters(session_id, request.member_id, sanitized)
-    except ValueError as e:
+        turn = orch_svc.apply_plan_parameters(
+            session_id, request.member_id, sanitized, plan_type=request.plan_type,
+        )
+    except SessionAccessError as e:
         logger.warning("[%s] /plan-parameters 404: %s", session_id, e)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -896,6 +909,11 @@ async def set_diners(session_id: str, request: SetDinersRequest):
         profile = services.profile_service.merge_profiles(profile, other_profiles, names)
     profile["cooking_for"] = [request.member_id, *diners]
     profile["cooking_for_names"] = names
+
+    # The rebuild starts from member records, so anything the member did in
+    # THIS session — hand-picked dishes, applied slider values, facts they
+    # told us — would be dropped without this carry-over.
+    profile = services.profile_service.carry_session_state(session.user_profile, profile)
 
     session.user_profile = profile
     services.session_service.persist_profile(session_id)
