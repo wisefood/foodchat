@@ -194,13 +194,21 @@ class ProfileService:
                         logger.warning("Unknown dietary goal %r — not applied", value_norm)
                         return False
                     goals = list(props.get("dietary_goals") or [])
-                    if value_norm not in [
+                    existing_slugs = [
                         str(g.get("slug", "")).lower() for g in goals if isinstance(g, dict)
-                    ]:
-                        goals.append({
-                            "slug": value_norm,
-                            "label": value_norm.replace("_", " ").capitalize(),
-                        })
+                    ]
+                    if value_norm in existing_slugs:
+                        # Already a standing goal — applying it again must not
+                        # append a second, identical memory_log entry.
+                        logger.info(
+                            "Dietary goal %r already set for member %s — no-op",
+                            value_norm, member_id,
+                        )
+                        return False
+                    goals.append({
+                        "slug": value_norm,
+                        "label": value_norm.replace("_", " ").capitalize(),
+                    })
                     props["dietary_goals"] = goals
                 elif kind == "constraint":
                     history = props.get("feedback_history", "") or ""
@@ -209,7 +217,8 @@ class ProfileService:
                     logger.warning("Unknown memory kind %r — not applied", kind)
                     return False
 
-                # Provenance: who learned what, where, when.
+                # Provenance: who learned what, where, when. Only reached when a
+                # durable change was actually made above (no-ops return early).
                 log = list(props.get("memory_log") or [])
                 log.append({
                     "kind": kind, "value": value_norm,
