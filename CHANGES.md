@@ -24,10 +24,13 @@
   adaptation assistant in an in-page popup that saves the same
   adapted-version record. Day labels are localized weekday names from the
   1-based index (fixes the off-by-one "Day N" grid labels).
-- Known v1 limits: manual picks are per-request pins — a later text
-  refinement may replace a hand-picked meal (persist + re-inject is the
-  planned fix); the compose picker is autocomplete-only (no favorites
-  shortlist yet).
+- Manual picks PERSIST: stored per plan type on the session profile,
+  re-injected (re-resolved, safety-rechecked) into every refinement with
+  no explicit seeds, cleared by a fresh plan request, and unpinned per
+  slot when a verified edit swaps that slot. The slider card also attaches
+  to fresh weekly plans, and applying values with a weekly canvas active
+  refines that weekly plan. Compose pickers show a favorites shortlist;
+  the weekly canvas gained the plan vote + personalization line.
 
 ---
 
