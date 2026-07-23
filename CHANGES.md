@@ -2,6 +2,35 @@
 
 ---
 
+# Manual mode + canvas interactions
+
+> **Date:** 2026-07-23
+> **Branch:** main
+> Ships with wisefood-api (compose proxy) and wisefood-ui (compose card,
+> weekly canvas redesign, slot menus, adapt popup) — rebuild the trio.
+
+- `POST /sessions/{id}/compose` — manual mode: hand-picked recipes from a
+  blank canvas become slot-addressed seed anchors (id-resolved,
+  allergy/diet re-checked, pinned exactly), then generation fills the
+  remaining slots with no classifier and no clarification. `plan_type`
+  daily|weekly; weekly picks carry `day` 1-7 into the planner's pinned
+  slots. Chat text may ride along as the completion query — the UI routes
+  the next message through compose while picks are staged ("fill out the
+  rest, keep it light"). Tests: `tests/test_compose.py`.
+- UI (wisefood-ui): weekly canvas is now collapsible day rows (expanded by
+  default) with the M7 measured ledger, per-meal reason chips, and a
+  "Week at a glance" panel; meal cards/cells have a ⋮ menu — Replace
+  prefills the verified-edit phrasing, Adapt opens RecipeWrangler's
+  adaptation assistant in an in-page popup that saves the same
+  adapted-version record. Day labels are localized weekday names from the
+  1-based index (fixes the off-by-one "Day N" grid labels).
+- Known v1 limits: manual picks are per-request pins — a later text
+  refinement may replace a hand-picked meal (persist + re-inject is the
+  planned fix); the compose picker is autocomplete-only (no favorites
+  shortlist yet).
+
+---
+
 # Weekly plan explainability — measured ledger, metrics, per-meal reasons
 
 > **Date:** 2026-07-22

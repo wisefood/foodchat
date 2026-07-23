@@ -495,3 +495,15 @@ the planner loop can take `num_days`. The real work:
   must either rescale or honestly annotate "checked over N days";
 - weekly refinement context and day summaries already iterate actual
   entries — should hold as-is.
+
+---
+
+# Localize weekly explainability prose
+
+**Status: open (recorded 2026-07-23).** Day summaries ("fish and red
+meat"), the guideline checklist rules, the variety sentence, and the
+coverage note are backend-generated English strings — Hungarian and
+Slovenian UIs show English fragments inside a localized page. Options:
+key-based payloads the UI translates (preferred; the checklist is already
+structured enough), or backend localization by household region. Fine for
+the EN demo video; needed before the living-lab study.
