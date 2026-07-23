@@ -155,39 +155,49 @@ class ProfileService:
                 props = dict(profile.properties or {})
 
                 value_norm = value.strip().lower()
+                # Every branch sets `changed` to whether it made a durable edit.
+                # Re-accepting a memory already on the profile must be a no-op:
+                # no second memory_log entry, no needless write. (Applies to all
+                # kinds — the original code only guarded the value lists, then
+                # logged unconditionally, producing duplicate log rows.)
+                changed = False
                 if kind in ("like", "cuisine"):
                     likes = list(prefs.get("food_likes") or [])
                     if value_norm not in [v.lower() for v in likes]:
                         likes.append(value_norm)
+                        changed = True
                     prefs["food_likes"] = likes
-                    # Contradiction resolution: liking something removes it
-                    # from dislikes (the nudge called the conflict out).
-                    prefs["food_dislikes"] = [
-                        v for v in (prefs.get("food_dislikes") or [])
-                        if v.lower() != value_norm
-                    ]
+                    # Contradiction resolution: liking something removes it from
+                    # dislikes — itself a durable change worth recording.
+                    dislikes_before = prefs.get("food_dislikes") or []
+                    dislikes_after = [v for v in dislikes_before if v.lower() != value_norm]
+                    if len(dislikes_after) != len(dislikes_before):
+                        changed = True
+                    prefs["food_dislikes"] = dislikes_after
                     profile.nutritional_preferences = prefs
                 elif kind == "dislike":
                     dislikes = list(prefs.get("food_dislikes") or [])
                     if value_norm not in [v.lower() for v in dislikes]:
                         dislikes.append(value_norm)
+                        changed = True
                     prefs["food_dislikes"] = dislikes
-                    # Contradiction resolution: disliking something removes it
-                    # from likes.
-                    prefs["food_likes"] = [
-                        v for v in (prefs.get("food_likes") or [])
-                        if v.lower() != value_norm
-                    ]
+                    likes_before = prefs.get("food_likes") or []
+                    likes_after = [v for v in likes_before if v.lower() != value_norm]
+                    if len(likes_after) != len(likes_before):
+                        changed = True
+                    prefs["food_likes"] = likes_after
                     profile.nutritional_preferences = prefs
                 elif kind == "allergy_hint":
                     allergies = list(profile.allergies or [])
                     if value_norm not in [a.lower() for a in allergies]:
                         allergies.append(value_norm)
+                        changed = True
                     profile.allergies = allergies
                 elif kind == "standing_seed":
                     seeds = list(props.get("standing_seeds") or [])
                     if value_norm not in [s.get("name", "").lower() for s in seeds]:
                         seeds.append({"name": value_norm})
+                        changed = True
                     props["standing_seeds"] = seeds
                 elif kind == "dietary_goal":
                     if value_norm not in GOAL_PREFERENCE_STRINGS:
@@ -197,28 +207,31 @@ class ProfileService:
                     existing_slugs = [
                         str(g.get("slug", "")).lower() for g in goals if isinstance(g, dict)
                     ]
-                    if value_norm in existing_slugs:
-                        # Already a standing goal — applying it again must not
-                        # append a second, identical memory_log entry.
-                        logger.info(
-                            "Dietary goal %r already set for member %s — no-op",
-                            value_norm, member_id,
-                        )
-                        return False
-                    goals.append({
-                        "slug": value_norm,
-                        "label": value_norm.replace("_", " ").capitalize(),
-                    })
+                    if value_norm not in existing_slugs:
+                        goals.append({
+                            "slug": value_norm,
+                            "label": value_norm.replace("_", " ").capitalize(),
+                        })
+                        changed = True
                     props["dietary_goals"] = goals
                 elif kind == "constraint":
+                    # Free-text feedback is always new information.
                     history = props.get("feedback_history", "") or ""
                     props["feedback_history"] = (history + "\n" if history else "") + value
+                    changed = True
                 else:
                     logger.warning("Unknown memory kind %r — not applied", kind)
                     return False
 
-                # Provenance: who learned what, where, when. Only reached when a
-                # durable change was actually made above (no-ops return early).
+                if not changed:
+                    logger.info(
+                        "Memory %s=%r already set for member %s — no-op",
+                        kind, value_norm, member_id,
+                    )
+                    return False
+
+                # Provenance: who learned what, where, when. Reached only when a
+                # durable change was actually made above.
                 log = list(props.get("memory_log") or [])
                 log.append({
                     "kind": kind, "value": value_norm,
