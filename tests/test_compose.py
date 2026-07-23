@@ -130,3 +130,74 @@ class TestComposePlan:
         turn = orch.compose_plan(session.session_id, session.member_id, PICKS)
         assert turn.at_message_limit
         assert orch.chat_service.calls == []
+
+
+class TestManualPickPersistence:
+    """Hand-picked dishes must survive text refinements — and die honestly."""
+
+    def test_picks_reinjected_on_refinement(self, session_service, sample_profile):
+        session = session_service.create_session(f"member-{uuid.uuid4()}", dict(sample_profile))
+        orch = make_orchestrator(session_service)
+        orch.compose_plan(session.session_id, session.member_id, PICKS)
+
+        orch._handle_plan(session.session_id, "make it lighter", "refine_plan",
+                          is_refinement=True)
+        refine_call = orch.chat_service.calls[1]
+        assert refine_call["seeds"] == [
+            {"recipe_id": "rw-42", "meal_type": "breakfast", "name": "Overnight oats"},
+        ]
+
+    def test_explicit_seeds_beat_stored_picks(self, session_service, sample_profile):
+        session = session_service.create_session(f"member-{uuid.uuid4()}", dict(sample_profile))
+        orch = make_orchestrator(session_service)
+        orch.compose_plan(session.session_id, session.member_id, PICKS)
+
+        explicit = [{"name": "moussaka"}]
+        orch._handle_plan(session.session_id, "work in moussaka", "refine_plan",
+                          is_refinement=True, seeds=explicit)
+        assert orch.chat_service.calls[1]["seeds"] == explicit
+
+    def test_fresh_plan_clears_the_lineage(self, session_service, sample_profile):
+        session = session_service.create_session(f"member-{uuid.uuid4()}", dict(sample_profile))
+        orch = make_orchestrator(session_service)
+        orch.compose_plan(session.session_id, session.member_id, PICKS)
+
+        orch._handle_plan(session.session_id, "plan my day from scratch", "daily_plan",
+                          is_refinement=False)
+        assert session.user_profile.get("manual_picks", {}).get("daily", []) == []
+        # A refinement after the fresh plan carries no stale picks
+        orch._handle_plan(session.session_id, "lighter", "refine_plan", is_refinement=True)
+        assert orch.chat_service.calls[2]["seeds"] is None
+
+    def test_verified_edit_unpins_the_swapped_slot(self, session_service, sample_profile):
+        from types import SimpleNamespace
+        session = session_service.create_session(f"member-{uuid.uuid4()}", dict(sample_profile))
+        orch = make_orchestrator(session_service)
+        orch.compose_plan(session.session_id, session.member_id, PICKS)
+
+        plan = session_service.refine_meal_plan(session.session_id, make_candidates("e"), "r", {})
+        session_service.add_message(session.session_id, "assistant", "Swapped it.")
+        outcome = SimpleNamespace(
+            text="Swapped it.", needs_clarification=False,
+            meal_plan=plan, weekly_meal_plan=None,
+            changed_slots=[{"meal_type": "breakfast", "day": None,
+                            "old": {}, "new": {}, "directive": "lighter", "verified": True}],
+        )
+        orch._turn_from_edit(session.session_id, outcome)
+        assert session.user_profile.get("manual_picks", {}).get("daily", []) == []
+
+    def test_weekly_picks_reinjected_on_weekly_refinement(self, session_service, sample_profile):
+        session = session_service.create_session(f"member-{uuid.uuid4()}", dict(sample_profile))
+        orch = make_orchestrator(session_service)
+        orch.compose_plan(
+            session.session_id, session.member_id,
+            [{"meal_type": "dinner", "recipe_id": "rw-7", "title": "Pastitsio", "day": 2}],
+            plan_type="weekly",
+        )
+
+        orch._handle_weekly(session.session_id, "less meat overall", "refine_plan",
+                            is_refinement=True)
+        refine_call = orch.weekly_plan_service.calls[1]
+        assert refine_call["seeds"] == [
+            {"recipe_id": "rw-7", "meal_type": "dinner", "name": "Pastitsio", "day": 2},
+        ]

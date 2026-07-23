@@ -416,6 +416,10 @@ class OrchestratorService:
     def _turn_from_edit(self, session_id: str, outcome) -> ChatTurn:
         plan = outcome.meal_plan or outcome.weekly_meal_plan
         self._tag_last_message(session_id, "edit_plan_slot", plan.id if plan else None)
+        if plan is not None and outcome.changed_slots:
+            # A verified swap of a hand-picked slot means the user changed
+            # their mind — the old pick must not resurrect on the next refine.
+            self._drop_manual_picks_for_slots(session_id, outcome.changed_slots)
         return ChatTurn(
             role="assistant",
             content=outcome.text,
@@ -559,6 +563,12 @@ class OrchestratorService:
         self, session_id: str, message: str, intent: str, is_refinement: bool,
         seeds: Optional[list[dict]] = None, skip_clarification: bool = False,
     ) -> ChatTurn:
+        if is_refinement:
+            seeds = self._seeds_for_refinement(session_id, "daily", seeds)
+        else:
+            # A fresh plan starts a new lineage — old manual picks don't
+            # follow it (compose re-stores its own picks after this call).
+            self._store_manual_picks(session_id, "daily", [])
         response_text, needs_clarification, meal_plan = self.chat_service.process_plan_request(
             session_id, message, is_refinement=is_refinement, seeds=seeds,
             skip_clarification=skip_clarification,
@@ -576,14 +586,77 @@ class OrchestratorService:
             plan_parameters=self._parameter_card(session_id, intent, meal_plan),
         )
 
-    def _parameter_card(self, session_id: str, intent: str, meal_plan) -> Optional[dict]:
-        """The slider card rides along with fresh daily plans only — showing
-        it again on every text refinement would be noise (the apply flow
-        re-attaches it explicitly with updated values)."""
-        if intent != "daily_plan" or meal_plan is None:
+    def _parameter_card(self, session_id: str, intent: str, plan) -> Optional[dict]:
+        """The slider card rides along with fresh plans only (daily AND
+        weekly) — showing it again on every text refinement would be noise
+        (the apply flow re-attaches it explicitly with updated values)."""
+        if intent not in ("daily_plan", "weekly_plan") or plan is None:
             return None
         session = self.session_service.get_session(session_id)
         return plan_parameters.build_card(session.user_profile if session else {})
+
+    # ------------------------------------------------------------------ #
+    # Manual picks (compose mode) — survive refinements, die honestly      #
+    # ------------------------------------------------------------------ #
+    # Hand-picked dishes are a stronger signal than anything inferred: a
+    # text refinement must not silently replace them. They are stored in
+    # seed shape per plan type, re-injected on refinements (re-resolved and
+    # safety-rechecked each time — diners may have changed), cleared by a
+    # fresh plan request, and dropped per slot when a verified edit swaps
+    # that slot (the user changed their mind about that pick).
+
+    def _manual_picks(self, session, plan_type: str) -> list:
+        store = session.user_profile.get("manual_picks") or {}
+        return list(store.get(plan_type) or [])
+
+    def _store_manual_picks(self, session_id: str, plan_type: str, picks: list) -> None:
+        session = self.session_service.get_session(session_id)
+        if not session:
+            return
+        store = dict(session.user_profile.get("manual_picks") or {})
+        if picks:
+            store[plan_type] = picks
+        else:
+            store.pop(plan_type, None)
+        session.user_profile["manual_picks"] = store
+        self.session_service.persist_profile(session_id)
+
+    def _seeds_for_refinement(self, session_id: str, plan_type: str,
+                              seeds: Optional[list]) -> Optional[list]:
+        """Explicit seeds win; otherwise stored manual picks anchor the turn."""
+        if seeds:
+            return seeds
+        session = self.session_service.get_session(session_id)
+        if not session:
+            return seeds
+        picks = self._manual_picks(session, plan_type)
+        if picks:
+            logger.info(
+                "[%s] Re-injecting %d manual pick(s) into %s refinement.",
+                session_id, len(picks), plan_type,
+            )
+            return picks
+        return seeds
+
+    def _drop_manual_picks_for_slots(self, session_id: str, changed_slots: list) -> None:
+        session = self.session_service.get_session(session_id)
+        if not session:
+            return
+        for slot in changed_slots or []:
+            day = slot.get("day") or None
+            plan_type = "weekly" if day is not None else "daily"
+            picks = self._manual_picks(session, plan_type)
+            remaining = [
+                p for p in picks
+                if not (p.get("meal_type") == slot.get("meal_type")
+                        and (p.get("day") or None) == day)
+            ]
+            if len(remaining) != len(picks):
+                logger.info(
+                    "[%s] Verified edit replaced a manual pick (%s%s) — unpinning it.",
+                    session_id, slot.get("meal_type"), f" day {day}" if day else "",
+                )
+                self._store_manual_picks(session_id, plan_type, remaining)
 
     def apply_plan_parameters(self, session_id: str, member_id: str, values: dict) -> ChatTurn:
         """Apply slider-card values (already sanitized by the router).
@@ -617,16 +690,24 @@ class OrchestratorService:
         self.session_service.persist_profile(session_id)
 
         message = plan_parameters.describe(values)
-        is_refinement = session.get_current_daily_plan() is not None
-        intent = "refine_plan" if is_refinement else "daily_plan"
-        logger.info("[%s] Applying plan parameters %s (%s).", session_id, values, intent)
-
-        turn = self._handle_plan(
-            session_id, message, intent,
-            is_refinement=is_refinement, skip_clarification=True,
-        )
+        canvas = session.active_canvas
+        if canvas is not None and canvas.plan_type == "weekly":
+            # Weekly canvas active → the values refine THAT plan (the weekly
+            # flow has no clarification round to skip).
+            logger.info("[%s] Applying plan parameters %s (weekly refine).", session_id, values)
+            turn = self._handle_weekly(
+                session_id, message, "refine_plan", is_refinement=True,
+            )
+        else:
+            is_refinement = session.get_current_daily_plan() is not None
+            intent = "refine_plan" if is_refinement else "daily_plan"
+            logger.info("[%s] Applying plan parameters %s (%s).", session_id, values, intent)
+            turn = self._handle_plan(
+                session_id, message, intent,
+                is_refinement=is_refinement, skip_clarification=True,
+            )
         # Always return the card with its new current values so the UI stays
-        # in sync, even on the refine path where _handle_plan skips it.
+        # in sync, even on the refine paths where the handlers skip it.
         turn.plan_parameters = plan_parameters.build_card(session.user_profile)
         return turn
 
@@ -679,22 +760,34 @@ class OrchestratorService:
             text = (message or "").strip() or (
                 "Complete my meal plan for this week around the dishes I picked."
             )
-            return self._handle_weekly(
+            turn = self._handle_weekly(
                 session_id, text, "weekly_plan", is_refinement=False, seeds=seeds,
             )
+        else:
+            text = (message or "").strip() or (
+                "Complete my meal plan for today around the dishes I picked."
+            )
+            turn = self._handle_plan(
+                session_id, text, "daily_plan",
+                is_refinement=False, seeds=seeds, skip_clarification=True,
+            )
 
-        text = (message or "").strip() or (
-            "Complete my meal plan for today around the dishes I picked."
-        )
-        return self._handle_plan(
-            session_id, text, "daily_plan",
-            is_refinement=False, seeds=seeds, skip_clarification=True,
-        )
+        # Persist the picks (seed shape) AFTER generation — the fresh-plan
+        # path above just cleared the previous lineage's picks — so later
+        # refinements keep anchoring what the user chose by hand.
+        plan = turn.weekly_meal_plan if plan_type == "weekly" else turn.meal_plan
+        if plan is not None:
+            self._store_manual_picks(session_id, plan_type, seeds)
+        return turn
 
     def _handle_weekly(
         self, session_id: str, message: str, intent: str, is_refinement: bool,
         seeds: Optional[list[dict]] = None,
     ) -> ChatTurn:
+        if is_refinement:
+            seeds = self._seeds_for_refinement(session_id, "weekly", seeds)
+        else:
+            self._store_manual_picks(session_id, "weekly", [])
         response_text, weekly_plan = self.weekly_plan_service.process_message(
             session_id, message, is_refinement=is_refinement, seeds=seeds
         )
@@ -707,6 +800,7 @@ class OrchestratorService:
             weekly_meal_plan=weekly_plan,
             plan_version=weekly_plan.version if weekly_plan else None,
             plan_parent_id=weekly_plan.parent_id if weekly_plan else None,
+            plan_parameters=self._parameter_card(session_id, intent, weekly_plan),
         )
 
     def _handle_switch(self, session_id: str, message: str, target_plan_type: Optional[str]) -> ChatTurn:

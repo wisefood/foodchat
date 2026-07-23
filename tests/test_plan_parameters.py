@@ -181,6 +181,62 @@ class TestApplyPlanParameters:
         assert by_key["cooking_time"]["value"] == 20
         assert by_key["goal"]["value"] == "energy"
 
+    def test_apply_routes_to_weekly_refine_when_weekly_canvas_active(
+        self, session_service, sample_profile
+    ):
+        """With a weekly canvas on screen, slider values must refine THAT
+        plan — not spawn a fresh daily plan next to it."""
+        from types import SimpleNamespace
+
+        class RecordingWeekly:
+            def __init__(self, svc):
+                self.svc, self.calls = svc, []
+
+            def process_message(self, session_id, message, is_refinement=False, seeds=None):
+                self.calls.append({"message": message, "is_refinement": is_refinement})
+                self.svc.add_message(session_id, "user", message)
+                self.svc.add_message(session_id, "assistant", "Week updated.")
+                return "Week updated.", SimpleNamespace(id="wp-2", version=2, parent_id="wp-1")
+
+        session = make_session(session_service, sample_profile)
+        session_service.add_weekly_meal_plan(
+            session.session_id,
+            [{"day": 1, "meal_idx": 0, "meal_type": "breakfast", "recipe": {}, "reward": 0.0}],
+        )
+        orch = make_orchestrator(session_service)
+        orch.weekly_plan_service = RecordingWeekly(session_service)
+
+        turn = orch.apply_plan_parameters(
+            session.session_id, session.member_id, {"cooking_time": 25},
+        )
+        assert orch.weekly_plan_service.calls[0]["is_refinement"] is True
+        assert "under 25 minutes" in orch.weekly_plan_service.calls[0]["message"]
+        assert orch.chat_service.calls == []
+        assert turn.intent == "refine_plan"
+        assert turn.weekly_meal_plan is not None
+        by_key = {p["key"]: p for p in turn.plan_parameters["parameters"]}
+        assert by_key["cooking_time"]["value"] == 25
+
+    def test_fresh_weekly_plan_carries_the_card(self, session_service, sample_profile):
+        from types import SimpleNamespace
+
+        class FreshWeekly:
+            def __init__(self, svc):
+                self.svc = svc
+
+            def process_message(self, session_id, message, is_refinement=False, seeds=None):
+                self.svc.add_message(session_id, "user", message)
+                self.svc.add_message(session_id, "assistant", "Here's your week.")
+                return "Here's your week.", SimpleNamespace(id="wp-1", version=1, parent_id=None)
+
+        session = make_session(session_service, sample_profile)
+        orch = make_orchestrator(session_service)
+        orch.weekly_plan_service = FreshWeekly(session_service)
+
+        turn = orch._handle_weekly(session.session_id, "plan my week", "weekly_plan",
+                                   is_refinement=False)
+        assert turn.plan_parameters is not None
+
     def test_apply_enforces_session_ownership(self, session_service, sample_profile):
         session = make_session(session_service, sample_profile)
         orch = make_orchestrator(session_service)
