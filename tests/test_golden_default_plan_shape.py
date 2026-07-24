@@ -64,6 +64,71 @@ class TestDailyGolden:
         assert not hasattr(resp, "days") or resp.__dict__.get("days") is None
 
 
+class TestPlatesAsListAdditive:
+    """Phase 1: the new day/plate view exists WITHOUT changing the default."""
+
+    def test_scalar_plan_synthesizes_a_single_day_view(self):
+        plan = _default_plan()
+        assert plan.days is None and not plan.is_multiplate
+        view = plan.day_plans
+        assert len(view) == 1 and view[0].day == 1
+        assert [m.meal_type for m in view[0].meals] == ["breakfast", "lunch", "dinner"]
+        assert all(len(m.plates) == 1 for m in view[0].meals)
+        assert view[0].meals[0].main is plan.breakfast
+
+    def test_from_days_builds_multiplate_and_mirrors_scalars(self):
+        from models.session import DayPlan, Meal, MealCourse
+        pasta = MealCourse("r-pasta", "Pasta", "i", "d")
+        salad = MealCourse("r-salad", "Salad", "i", "d", role="side")
+        day = DayPlan(day=1, meals=[
+            Meal("breakfast", [MealCourse("r-b", "Oats", "i", "d")]),
+            Meal("lunch", [pasta, salad]),
+            Meal("dinner", [MealCourse("r-d", "Stew", "i", "d")]),
+        ])
+        plan = MealPlan.from_days([day], "multi-plate day")
+        assert plan.is_multiplate
+        # Scalars mirror day-1 first main plate for legacy/back-compat readers
+        assert plan.lunch.recipe_id == "r-pasta"
+        # The lunch meal carries both plates
+        assert [p.title for p in plan.day_plans[0].meals[1].plates] == ["Pasta", "Salad"]
+
+    def test_multiplate_round_trip_through_db_serialization(self):
+        from models.session import DayPlan, Meal, MealCourse
+        day = DayPlan(day=1, meals=[
+            Meal("breakfast", [MealCourse("r-b", "Oats", "i", "d")]),
+            Meal("lunch", [MealCourse("r-pasta", "Pasta", "i", "d"),
+                           MealCourse("r-salad", "Salad", "i", "d", role="side")]),
+            Meal("dinner", [MealCourse("r-d", "Stew", "i", "d")]),
+        ])
+        plan = MealPlan.from_days([day], "multi-plate")
+        payload = _serialize_meal_plan(plan)
+        assert "days" in payload                       # only present for multi-plate
+        assert payload["days"][0]["meals"][1]["plates"][1]["role"] == "side"
+
+        restored = _deserialize_meal_plan(plan.id, payload)
+        assert restored.is_multiplate
+        lunch_plates = restored.day_plans[0].meals[1].plates
+        assert [p.title for p in lunch_plates] == ["Pasta", "Salad"]
+        assert lunch_plates[1].role == "side"
+
+    def test_wire_response_carries_days_only_for_multiplate(self):
+        from models.session import DayPlan, Meal, MealCourse
+        # Default plan → days is None
+        assert MealPlanResponse.from_meal_plan(_default_plan()).days is None
+        # Multi-plate plan → days populated with the plates
+        day = DayPlan(day=1, meals=[
+            Meal("breakfast", [MealCourse("r-b", "Oats", "i", "d")]),
+            Meal("lunch", [MealCourse("r-p", "Pasta", "i", "d"),
+                           MealCourse("r-s", "Salad", "i", "d", role="side")]),
+            Meal("dinner", [MealCourse("r-d", "Stew", "i", "d")]),
+        ])
+        resp = MealPlanResponse.from_meal_plan(MealPlan.from_days([day], "x"))
+        assert resp.days is not None
+        assert [p.role for p in resp.days[0].meals[1].plates] == ["main", "side"]
+        # Legacy scalar fields still populated (rollout back-compat)
+        assert resp.lunch.recipe_id == "r-p"
+
+
 class TestWeeklyGolden:
     def _weekly(self) -> WeeklyMealPlan:
         entries = [

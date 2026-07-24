@@ -57,6 +57,9 @@ class MealCourse:
     image_url: Optional[str] = None
     # Why this recipe was chosen — transparency chips in the UI
     match_reasons: list = field(default_factory=list)   # [{kind, label}]
+    # A MealCourse is one PLATE within a meal. Default "main" keeps every
+    # existing single-course plan a single main plate (DYNAMIC_MEALS_PLAN.md).
+    role: str = "main"                                  # main | side | dessert | drink
 
     @classmethod
     def from_candidate(cls, candidate: CandidateRecipe) -> "MealCourse":
@@ -73,6 +76,30 @@ class MealCourse:
             recipe_id=self.recipe_id, title=self.title,
             ingredients=self.ingredients, directions=self.directions,
         )
+
+
+@dataclass
+class Meal:
+    """Everything eaten at one slot — an ordered list of plates (>= 1).
+
+    Today's plans have exactly one 'main' plate per meal; multi-plate meals
+    (DYNAMIC_MEALS_PLAN.md) add sides/desserts here without touching the
+    per-meal nutrition budget (a meal is the sum of its plates)."""
+    meal_type: str
+    plates: list                                # list[MealCourse], >= 1
+
+    @property
+    def main(self) -> "MealCourse":
+        """The primary plate — the single course for a legacy meal."""
+        mains = [p for p in self.plates if getattr(p, "role", "main") == "main"]
+        return (mains or self.plates)[0]
+
+
+@dataclass
+class DayPlan:
+    """One day of meals, 1-based day index (1 = Monday for weekly)."""
+    day: int
+    meals: list                                 # list[Meal], ordered
 
 
 @dataclass
@@ -98,6 +125,66 @@ class MealPlan:
     # UI renders above the plan ([{constraint, type, status, source}]).
     constraints_applied: list = field(default_factory=list)
     personalization_summary: Optional[dict] = None
+    # Multi-plate / N-day storage (DYNAMIC_MEALS_PLAN.md phase 1, additive).
+    # None => this is a legacy single-plate, single-day plan and the three
+    # scalar courses above are canonical. When set, `days` is the source of
+    # truth and the scalars mirror day-1's first plate per meal for back-compat.
+    days: Optional[list] = None                 # list[DayPlan] | None
+
+    @property
+    def day_plans(self) -> list:
+        """Uniform plates-as-list view — every reader can iterate days →
+        meals → plates regardless of how the plan was built. Explicit `days`
+        wins; otherwise the three scalar courses become one day of
+        single-plate meals (byte-identical intent to today)."""
+        if self.days is not None:
+            return self.days
+        return [DayPlan(day=1, meals=[
+            Meal("breakfast", [self.breakfast]),
+            Meal("lunch", [self.lunch]),
+            Meal("dinner", [self.dinner]),
+        ])]
+
+    @property
+    def is_multiplate(self) -> bool:
+        return self.days is not None
+
+    @classmethod
+    def from_days(
+        cls,
+        days: list,
+        reasoning: str,
+        metrics: Optional[dict] = None,
+        version: int = 1,
+        parent_id: Optional[str] = None,
+    ) -> "MealPlan":
+        """Build a general (multi-plate / N-day) plan. The scalar
+        breakfast/lunch/dinner mirror day-1's first plate per meal so legacy
+        readers and the wire response keep working during rollout."""
+        if not days or not days[0].meals:
+            raise ValueError("from_days needs at least one day with one meal")
+        by_type = {m.meal_type: m.main for m in days[0].meals}
+        blank = MealCourse("", "", "", "")
+        metrics = metrics or {}
+        return cls(
+            id=str(uuid.uuid4()),
+            created_at=_utcnow(),
+            breakfast=by_type.get("breakfast", blank),
+            lunch=by_type.get("lunch", blank),
+            dinner=by_type.get("dinner", blank),
+            reasoning=reasoning,
+            version=version,
+            parent_id=parent_id,
+            days=days,
+            llm_score=int(metrics.get("llm_score", 0)),
+            llm_reasoning=str(metrics.get("llm_reasoning", "")),
+            fvs_count=int(metrics.get("fvs_count", 0)),
+            fvs_reasoning=str(metrics.get("fvs_reasoning", "")),
+            diversity_llm_score=int(metrics.get("diversity_llm_score", 0)),
+            diversity_llm_reasoning=str(metrics.get("diversity_llm_reasoning", "")),
+            guideline_adherence_score=int(metrics.get("guideline_adherence_score", 0)),
+            guideline_adherence_reasoning=str(metrics.get("guideline_adherence_reasoning", "")),
+        )
 
     @classmethod
     def from_courses(

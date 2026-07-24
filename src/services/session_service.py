@@ -46,8 +46,10 @@ from db import (
 from models.recipe import CandidateRecipe
 from models.session import (
     Message,
+    Meal,
     MealPlan,
     MealCourse,
+    DayPlan,
     PlanCanvas,
     Session,
     WeeklyMealPlan,
@@ -565,7 +567,7 @@ class SessionService:
 # ------------------------------------------------------------------ #
 
 def _serialize_course(course: MealCourse) -> dict:
-    return {
+    payload = {
         "recipe_id": course.recipe_id,
         "title": course.title,
         "ingredients": course.ingredients,
@@ -574,10 +576,25 @@ def _serialize_course(course: MealCourse) -> dict:
         "image_url": course.image_url,
         "match_reasons": course.match_reasons,
     }
+    # Additive: only non-default roles are written, so a legacy single-plate
+    # course serializes byte-identically to before (golden fence).
+    if getattr(course, "role", "main") != "main":
+        payload["role"] = course.role
+    return payload
+
+
+def _serialize_day(day) -> dict:
+    return {
+        "day": day.day,
+        "meals": [
+            {"meal_type": m.meal_type, "plates": [_serialize_course(p) for p in m.plates]}
+            for m in day.meals
+        ],
+    }
 
 
 def _serialize_meal_plan(mp: MealPlan) -> dict:
-    return {
+    base = {
         "id": mp.id,
         "created_at": mp.created_at.isoformat(),
         "version": mp.version,
@@ -597,6 +614,11 @@ def _serialize_meal_plan(mp: MealPlan) -> dict:
         "lunch": _serialize_course(mp.lunch),
         "dinner": _serialize_course(mp.dinner),
     }
+    # Additive: only multi-plate / N-day plans carry `days`. Legacy plans omit
+    # it, so their payload is unchanged (golden fence).
+    if getattr(mp, "days", None) is not None:
+        base["days"] = [_serialize_day(d) for d in mp.days]
+    return base
 
 
 def _serialize_weekly_plan(wp: WeeklyMealPlan) -> dict:
@@ -624,9 +646,25 @@ def _deserialize_meal_plan(plan_id: str, payload: dict) -> MealPlan:
             nutrition=d.get("nutrition"),
             image_url=d.get("image_url"),
             match_reasons=d.get("match_reasons", []) or [],
+            role=d.get("role", "main"),
         )
 
+    days = None
+    if payload.get("days") is not None:
+        days = [
+            DayPlan(
+                day=int(d.get("day", 1)),
+                meals=[
+                    Meal(meal_type=m.get("meal_type", ""),
+                         plates=[_course(p) for p in (m.get("plates") or [])])
+                    for m in (d.get("meals") or [])
+                ],
+            )
+            for d in payload["days"]
+        ]
+
     return MealPlan(
+        days=days,
         id=plan_id,
         created_at=_aware(dt.fromisoformat(payload["created_at"])),
         version=payload.get("version", 1),

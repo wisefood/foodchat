@@ -77,6 +77,7 @@ class MealCourseResponse(BaseModel):
     nutrition: Optional[dict] = None      # {kcal, protein_g, carbs_g, fat_g, nutri_score_label}
     image_url: Optional[str] = None
     match_reasons: List[MatchReasonResponse] = []
+    role: str = "main"                    # main | side | dessert | drink
 
     @classmethod
     def from_meal_course(cls, course: MealCourse) -> "MealCourseResponse":
@@ -88,7 +89,19 @@ class MealCourseResponse(BaseModel):
             nutrition=course.nutrition,
             image_url=course.image_url,
             match_reasons=[MatchReasonResponse(**r) for r in (course.match_reasons or [])],
+            role=getattr(course, "role", "main"),
         )
+
+
+class MealResponse(BaseModel):
+    """One meal = an ordered list of plates (DYNAMIC_MEALS_PLAN.md)."""
+    meal_type: str
+    plates: List[MealCourseResponse]
+
+
+class DayPlanResponse(BaseModel):
+    day: int
+    meals: List[MealResponse]
 
 
 class MealPlanResponse(BaseModel):
@@ -111,9 +124,28 @@ class MealPlanResponse(BaseModel):
     # M4a transparency: constraint ledger + personalization counts
     constraints_applied: List[dict] = []
     personalization_summary: Optional[dict] = None
+    # Plates-as-list view (DYNAMIC_MEALS_PLAN.md phase 1). Additive: null for
+    # legacy single-plate plans, so the UI keeps reading breakfast/lunch/dinner
+    # until it migrates to `days`. Populated only for multi-plate / N-day plans.
+    days: Optional[List[DayPlanResponse]] = None
 
     @classmethod
     def from_meal_plan(cls, mp) -> "MealPlanResponse":
+        days = None
+        if getattr(mp, "days", None) is not None:
+            days = [
+                DayPlanResponse(
+                    day=d.day,
+                    meals=[
+                        MealResponse(
+                            meal_type=m.meal_type,
+                            plates=[MealCourseResponse.from_meal_course(p) for p in m.plates],
+                        )
+                        for m in d.meals
+                    ],
+                )
+                for d in mp.days
+            ]
         return cls(
             id=mp.id,
             created_at=mp.created_at,
@@ -133,6 +165,7 @@ class MealPlanResponse(BaseModel):
             guideline_adherence_reasoning=mp.guideline_adherence_reasoning,
             constraints_applied=mp.constraints_applied or [],
             personalization_summary=mp.personalization_summary,
+            days=days,
         )
 
 
