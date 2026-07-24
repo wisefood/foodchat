@@ -176,7 +176,7 @@ class ChatService:
         profile = dict(session.user_profile)
         if seeds:
             resolutions = self.seed_service.resolve_seeds(seeds, profile)
-            pinned = self.seed_service.place_daily(resolutions)
+            pinned, dropped = self.seed_service.place_daily(resolutions)
             if pinned:
                 profile["_pinned_slots"] = {
                     slot: {
@@ -185,7 +185,7 @@ class ChatService:
                     }
                     for slot, r in pinned.items()
                 }
-            note = self.seed_service.describe(resolutions)
+            note = self.seed_service.describe(resolutions, dropped)
             if note:
                 profile["_seed_note"] = note
 

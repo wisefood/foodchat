@@ -100,7 +100,7 @@ class WeeklyPlanService:
         pinned: dict = {}
         if seeds:
             resolutions = self.seed_service.resolve_seeds(seeds, session.user_profile)
-            placements = self.seed_service.place_weekly(resolutions)
+            placements, dropped = self.seed_service.place_weekly(resolutions)
             pinned = {
                 slot: {
                     "recipe_id": r.recipe_id, "recipe_title": r.title,
@@ -108,7 +108,7 @@ class WeeklyPlanService:
                 }
                 for slot, r in placements.items()
             }
-            seed_note = self.seed_service.describe(resolutions)
+            seed_note = self.seed_service.describe(resolutions, dropped)
 
         logger.info("[%s] Initializing action space and environment.", session_id)
         action_space = RecipeActionSpace(session.user_profile, additional_diet=query_diet_tags)

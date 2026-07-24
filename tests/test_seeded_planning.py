@@ -69,8 +69,8 @@ class TestResolution:
         assert res[0].status == "conflict"
         assert "peanuts" in res[0].note
         # Conflicted seeds never reach placement
-        assert svc.place_weekly(res) == {}
-        assert svc.place_daily(res) == {}
+        assert svc.place_weekly(res) == ({}, [])
+        assert svc.place_daily(res) == ({}, [])
 
     def test_allergy_synonyms_catch_untagged_ingredients(self):
         """"tree nuts" allergy must block an almond dish even with NO allergen
@@ -107,13 +107,14 @@ class TestPlacement:
     def test_weekly_hint_honored(self, sample_profile):
         svc = make_seed_service()
         res = svc.resolve_seeds([{"name": "pastitsio", "meal_type": "dinner", "day": 7}], sample_profile)
-        pinned = svc.place_weekly(res)
+        pinned, dropped = svc.place_weekly(res)
         assert pinned == {(7, 2): PASTITSIO.recipe}
+        assert dropped == []
 
     def test_weekly_spread_without_hints(self, sample_profile):
         svc = make_seed_service()
         res = svc.resolve_seeds([{"name": "pastitsio"}, {"name": "fakes"}], sample_profile)
-        pinned = svc.place_weekly(res)
+        pinned, dropped = svc.place_weekly(res)
         # Both placed, on different days, in their dish-type slots
         assert len(pinned) == 2
         days = [day for (day, _idx) in pinned]
@@ -123,8 +124,29 @@ class TestPlacement:
     def test_daily_placement_uses_dish_types(self, sample_profile):
         svc = make_seed_service()
         res = svc.resolve_seeds([{"name": "fakes"}], sample_profile)
-        pinned = svc.place_daily(res)
+        pinned, dropped = svc.place_daily(res)
         assert pinned == {"lunch": FAKES.recipe}
+        assert dropped == []
+
+    def test_second_dish_for_a_slot_is_dropped_and_owned(self, sample_profile):
+        """Phase 0: 'pastitsio and fakes for dinner' can't both pin one slot
+        today — the extra is dropped, but the reply must acknowledge it
+        instead of the old describe() falsely claiming both were worked in."""
+        svc = make_seed_service()
+        res = svc.resolve_seeds(
+            [{"name": "pastitsio", "meal_type": "dinner"},
+             {"name": "fakes", "meal_type": "dinner"}],
+            sample_profile,
+        )
+        pinned, dropped = svc.place_daily(res)
+        assert pinned == {"dinner": PASTITSIO.recipe}
+        assert [d.recipe.recipe.title for d in dropped] == ["Fakes (Greek lentil soup)"]
+
+        note = svc.describe(res, dropped)
+        assert "Pastitsio" in note and "as you asked" in note
+        # The dropped dish is acknowledged, NOT claimed as worked in
+        assert "You also asked for “Fakes (Greek lentil soup)”" in note
+        assert "one dish per meal" in note
 
 
 class TestPipelinePinning:

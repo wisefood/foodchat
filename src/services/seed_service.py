@@ -7,8 +7,8 @@ safety check (allergens are hard constraints — a seed that violates one is
 NEVER pinned), and assigns each accepted seed to a plan slot:
 
     resolve_seeds(seeds, profile)                → list[SeedResolution]
-    place_weekly(resolutions)                    → {(day, meal_idx): CandidateRecipe}
-    place_daily(resolutions)                     → {slot_name: CandidateRecipe}
+    place_weekly(resolutions)                    → ({(day, meal_idx): CandidateRecipe}, dropped)
+    place_daily(resolutions)                     → ({slot_name: CandidateRecipe}, dropped)
 
 Placement rules: an explicit hint ("Sunday dinner") is honored; otherwise the
 slot comes from the recipe's dish-type tags, defaulting to dinner, and weekly
@@ -178,10 +178,17 @@ class SeedService:
     # Placement                                                            #
     # ------------------------------------------------------------------ #
 
-    def place_weekly(self, resolutions: list[SeedResolution]) -> dict[tuple[int, int], CandidateRecipe]:
-        """Assign resolved seeds to (day, meal_idx) slots for the 7-day plan."""
+    def place_weekly(
+        self, resolutions: list[SeedResolution]
+    ) -> tuple[dict[tuple[int, int], CandidateRecipe], list[SeedResolution]]:
+        """Assign resolved seeds to (day, meal_idx) slots for the 7-day plan.
+
+        Returns (pinned, dropped) — a seed with no free slot (its meal is
+        already anchored every day) is dropped and returned so the reply can
+        acknowledge it instead of silently omitting it.
+        """
         pinned: dict[tuple[int, int], CandidateRecipe] = {}
-        spread = iter(WEEKLY_DAY_SPREAD)
+        dropped: list[SeedResolution] = []
 
         for res in resolutions:
             if res.status != "resolved":
@@ -198,24 +205,35 @@ class SeedService:
                     (d for d in WEEKLY_DAY_SPREAD if (d, meal_idx) not in pinned), None,
                 )
             if day is None or (day, meal_idx) in pinned:
-                logger.info("No free slot for seed %r — skipping pin", res.requested_name)
+                logger.info("No free slot for seed %r — dropping pin", res.requested_name)
+                dropped.append(res)
                 continue
             pinned[(day, meal_idx)] = res.recipe.recipe
-        return pinned
+        return pinned, dropped
 
-    def place_daily(self, resolutions: list[SeedResolution]) -> dict[str, CandidateRecipe]:
-        """Assign resolved seeds to daily slots ("breakfast"/"lunch"/"dinner")."""
+    def place_daily(
+        self, resolutions: list[SeedResolution]
+    ) -> tuple[dict[str, CandidateRecipe], list[SeedResolution]]:
+        """Assign resolved seeds to daily slots ("breakfast"/"lunch"/"dinner").
+
+        Returns (pinned, dropped). A daily plan holds one dish per slot today,
+        so a second dish for an already-filled slot ("pasta AND a salad for
+        lunch") is DROPPED — but returned so the reply can own it honestly
+        rather than silently claiming it was worked in. (Multi-plate meals
+        will let these land — see DYNAMIC_MEALS_PLAN.md.)
+        """
         pinned: dict[str, CandidateRecipe] = {}
+        dropped: list[SeedResolution] = []
         for res in resolutions:
             if res.status != "resolved":
                 continue
             slot = res.meal_type or self._slot_from_dish_types(res.recipe)
             if slot in pinned:
-                # One anchor per slot in a daily plan; extras are dropped with a note
-                logger.info("Daily slot %s already pinned — skipping %r", slot, res.requested_name)
+                logger.info("Daily slot %s already pinned — dropping extra %r", slot, res.requested_name)
+                dropped.append(res)
                 continue
             pinned[slot] = res.recipe.recipe
-        return pinned
+        return pinned, dropped
 
     def _meal_idx_for(self, res: SeedResolution) -> int:
         slot = res.meal_type or self._slot_from_dish_types(res.recipe)
@@ -235,18 +253,40 @@ class SeedService:
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def describe(resolutions: list[SeedResolution]) -> str:
+    def describe(
+        resolutions: list[SeedResolution],
+        dropped: Optional[list[SeedResolution]] = None,
+    ) -> str:
         """One-line summary of pinned/skipped seeds for the assistant response.
 
         Dishes carried over from an earlier turn (``kept``) are announced
         separately: the member didn't ask for them THIS turn, so claiming
         they did reads as a misunderstanding — and saying nothing would hide
         that a pin outranked the refinement they just typed.
+
+        ``dropped`` are dishes that resolved but had no free slot (a second
+        dish for one meal, today's one-dish-per-meal limit). They must NOT be
+        claimed as "worked in" — the reply owns the limit honestly instead of
+        silently omitting a dish the member asked for.
         """
+        dropped = dropped or []
+        dropped_ids = {
+            getattr(r.recipe.recipe, "recipe_id", None) for r in dropped
+            if r.recipe and r.recipe.recipe
+        }
+        dropped_ids.discard(None)
+
+        def is_dropped(res: SeedResolution) -> bool:
+            if not dropped_ids or not (res.recipe and res.recipe.recipe):
+                return False
+            return getattr(res.recipe.recipe, "recipe_id", None) in dropped_ids
+
         asked = [r.recipe.recipe.title for r in resolutions
-                 if r.status == "resolved" and not r.kept]
+                 if r.status == "resolved" and not r.kept and not is_dropped(r)]
         kept = [r.recipe.recipe.title for r in resolutions
-                if r.status == "resolved" and r.kept]
+                if r.status == "resolved" and r.kept and not is_dropped(r)]
+        dropped_titles = [r.recipe.recipe.title for r in dropped
+                          if r.recipe and r.recipe.recipe]
         notes = [r.note for r in resolutions if r.note]
         parts = []
         if asked:
@@ -255,6 +295,12 @@ class SeedService:
             parts.append(
                 "I kept " + ", ".join(f"“{t}”" for t in kept)
                 + " that you picked — say the word if you'd like those changed too."
+            )
+        if dropped_titles:
+            parts.append(
+                "You also asked for " + ", ".join(f"“{t}”" for t in dropped_titles)
+                + " — I plan one dish per meal for now, so I've noted it rather than"
+                " dropping it. Multi-dish meals are on the way."
             )
         parts.extend(notes)
         return " ".join(parts)
