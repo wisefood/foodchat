@@ -624,3 +624,179 @@ Recent user message: {user_message}
 
 Write the assistant's reply.
 """
+
+# Small-talk persona (used by agents.SimpleChatBot). Kept here so ALL prompt
+# text is managed through the registry below, not scattered across agents.
+CHATBOT_SYSTEM_INSTRUCTIONS = (
+    "You are FoodChat, the friendly meal-planning assistant of the WiseFood platform. "
+    "You help people plan what to eat: daily meal plans, weekly meal plans, and "
+    "refinements to plans you've already made ('swap the dinner', 'make it lighter'). "
+    "Nutrition-science questions are answered for you by FoodScholar, WiseFood's "
+    "evidence-based Q&A service, so never tell the user a question can't be answered here. "
+    "For this conversation: respond warmly and briefly, stay food-related where natural, "
+    "and when the user seems unsure what to do next, suggest something concrete like "
+    "'want a plan for today?' or 'shall we plan your week around something you love?'. "
+    "Never invent recipes or plans in this mode — offer to create one instead."
+)
+
+
+# ===========================================================================
+# Langfuse prompt registry
+# ===========================================================================
+# Every prompt above is ALSO exposed as a managed ``_Prompt`` object below.
+# The convention (see langfuse-integration-guide.md §4): Langfuse owns the live
+# text; the in-code string is a resilience fallback AND the one-time seed.
+#
+# Variable convention: FoodChat prompts use Python ``{var}`` placeholders (and
+# double literal braces ``{{`` / ``}}`` to escape them), exactly as the code
+# always has. We substitute variables OURSELVES with ``str.format`` on both the
+# managed and fallback text — NOT via Langfuse's mustache ``{{var}}`` compile —
+# because these prompts embed literal JSON braces with inconsistent doubling
+# that mustache would misparse. Consequence: a prompt engineer editing text in
+# the Langfuse UI must keep the ``{var}`` / ``{{`` convention. Because system
+# prompts are never formatted (called as ``compile()`` with no args) their
+# single-brace JSON examples are returned verbatim.
+
+import logging as _logging  # noqa: E402
+
+from backend.observability import get_langfuse_client  # noqa: E402
+
+_prompt_logger = _logging.getLogger(__name__)
+
+# Namespace within the shared Langfuse project (FoodScholar reports to the same
+# instance). A slash renders as a folder in the Langfuse UI.
+_NS = "foodchat/"
+
+# Populated as each _Prompt is constructed; consumed by sync_prompts + the
+# seed CLI.
+ALL_PROMPTS: list = []
+
+
+class _Prompt:
+    """A single managed prompt: Langfuse text with an in-code fallback.
+
+    ``compile(**vars)`` returns the fully-substituted text. With no vars it
+    returns the template verbatim (system prompts, which are never formatted);
+    with vars it applies ``str.format`` — the same substitution the call sites
+    always used, so behavior is byte-identical whether the text came from
+    Langfuse or the fallback.
+    """
+
+    def __init__(self, name: str, fallback: str, label: str = "production",
+                 cache_ttl_seconds: int = 60):
+        self.name = f"{_NS}{name}"
+        self.fallback = fallback
+        self.label = label
+        self.cache_ttl_seconds = cache_ttl_seconds
+
+    def _text(self) -> str:
+        """The live template — Langfuse text if available, else the fallback."""
+        client = get_langfuse_client()
+        if client is None:
+            return self.fallback
+        try:
+            # ``fallback=`` makes get_prompt resilient: a fetch failure returns
+            # a client wrapping our text rather than raising. The in-process
+            # cache (ttl 60s) means a UI edit propagates within ~1 min with no
+            # per-request latency and no redeploy.
+            managed = client.get_prompt(
+                self.name,
+                fallback=self.fallback,
+                label=self.label,
+                cache_ttl_seconds=self.cache_ttl_seconds,
+            )
+            text = getattr(managed, "prompt", None) if managed is not None else None
+            return text if text else self.fallback
+        except Exception as exc:  # never let prompt fetch break a request
+            _prompt_logger.warning("get_prompt(%s) failed; using fallback: %s", self.name, exc)
+            return self.fallback
+
+    def compile(self, **variables) -> str:
+        text = self._text()
+        if not variables:
+            return text
+        try:
+            return text.format(**variables)
+        except Exception as exc:
+            # Managed text with a bad placeholder must not break the call —
+            # fall back to the known-good in-code template.
+            _prompt_logger.warning(
+                "compile(%s) failed; using in-code fallback: %s", self.name, exc
+            )
+            return self.fallback.format(**variables)
+
+
+def _reg(name: str, fallback: str) -> _Prompt:
+    prompt = _Prompt(name, fallback)
+    ALL_PROMPTS.append(prompt)
+    return prompt
+
+
+# --- managed prompt objects (one per constant above) --------------------- #
+GRADER_SYSTEM = _reg("grader_system", GRADER_SYSTEM_INSTRUCTIONS)
+GRADER_USER = _reg("grader_user", GRADER_USER_INSTRUCTIONS)
+QUERY_RECONCILER_SYSTEM = _reg("query_reconciler_system", QUERY_RECONCILER_SYSTEM_INSTRUCTIONS)
+QUERY_RECONCILER_USER = _reg("query_reconciler_user", QUERY_RECONCILER_USER_INSTRUCTIONS)
+QUERY_CHECKER_SYSTEM = _reg("query_checker_system", QUERY_CHECKER_SYSTEM_INSTRUCTIONS)
+QUERY_CHECKER_USER = _reg("query_checker_user", QUERY_CHECKER_USER_INSTRUCTIONS)
+USER_PROFILE_CHECKER_SYSTEM = _reg("user_profile_checker_system", USER_PROFILE_CHECKER_SYSTEM_INSTRUCTIONS)
+USER_PROFILE_CHECKER_USER = _reg("user_profile_checker_user", USER_PROFILE_CHECKER_USER_INSTRUCTIONS)
+USER_INFO_COLLECTOR_SYSTEM = _reg("user_info_collector_system", USER_INFO_COLLECTOR_SYSTEM_INSTRUCTIONS)
+USER_INFO_COLLECTOR_USER = _reg("user_info_collector_user", USER_INFO_COLLECTOR_USER_INSTRUCTIONS)
+QUERY_REFORMULATOR_SYSTEM = _reg("query_reformulator_system", QUERY_REFORMULATOR_SYSTEM_INSTRUCTIONS)
+QUERY_REFORMULATOR_USER = _reg("query_reformulator_user", QUERY_REFORMULATOR_USER_INSTRUCTIONS)
+ORCHESTRATOR_SYSTEM = _reg("orchestrator_system", ORCHESTRATOR_SYSTEM_INSTRUCTIONS)
+ORCHESTRATOR_USER = _reg("orchestrator_user", ORCHESTRATOR_USER_INSTRUCTIONS)
+PLAN_ANALYST_SYSTEM = _reg("plan_analyst_system", PLAN_ANALYST_SYSTEM_INSTRUCTIONS)
+DIETARY_INTENT_EXTRACTOR_SYSTEM = _reg("dietary_intent_extractor_system", DIETARY_INTENT_EXTRACTOR_SYSTEM_INSTRUCTIONS)
+DIETARY_INTENT_EXTRACTOR_USER = _reg("dietary_intent_extractor_user", DIETARY_INTENT_EXTRACTOR_USER_INSTRUCTIONS)
+MEAL_DIVERSITY_SYSTEM = _reg("meal_diversity_system", MEAL_DIVERSITY_SYSTEM_INSTRUCTIONS)
+GUIDELINE_ADHERENCE_SYSTEM = _reg("guideline_adherence_system", GUIDELINE_ADHERENCE_SYSTEM_INSTRUCTIONS)
+SEED_EXTRACTOR_SYSTEM = _reg("seed_extractor_system", SEED_EXTRACTOR_SYSTEM_INSTRUCTIONS)
+SEED_EXTRACTOR_USER = _reg("seed_extractor_user", SEED_EXTRACTOR_USER_INSTRUCTIONS)
+PREFERENCE_EXTRACTOR_SYSTEM = _reg("preference_extractor_system", PREFERENCE_EXTRACTOR_SYSTEM_INSTRUCTIONS)
+PREFERENCE_EXTRACTOR_USER = _reg("preference_extractor_user", PREFERENCE_EXTRACTOR_USER_INSTRUCTIONS)
+EDIT_COMMAND_EXTRACTOR_SYSTEM = _reg("edit_command_extractor_system", EDIT_COMMAND_EXTRACTOR_SYSTEM_INSTRUCTIONS)
+EDIT_COMMAND_EXTRACTOR_USER = _reg("edit_command_extractor_user", EDIT_COMMAND_EXTRACTOR_USER_INSTRUCTIONS)
+RESPONSE_WRITER_SYSTEM = _reg("response_writer_system", RESPONSE_WRITER_SYSTEM_INSTRUCTIONS)
+RESPONSE_WRITER_USER = _reg("response_writer_user", RESPONSE_WRITER_USER_INSTRUCTIONS)
+CHATBOT_SYSTEM = _reg("chatbot_system", CHATBOT_SYSTEM_INSTRUCTIONS)
+
+
+def sync_prompts(*, client=None, registry=None) -> dict:
+    """Seed registry prompts into Langfuse, creating ONLY those missing.
+
+    Idempotent and safe on every pod start: an existing prompt is left
+    untouched because live text may be a deliberate UI edit — the UI is the
+    source of truth and overwriting it would silently revert prompt-engineering
+    work. Returns ``{"created", "skipped", "failed"}`` counts.
+    """
+    counts = {"created": 0, "skipped": 0, "failed": 0}
+    if client is None:
+        client = get_langfuse_client()
+    if client is None:
+        return counts  # tracing disabled — nothing to seed
+
+    registry = registry if registry is not None else ALL_PROMPTS
+    for prompt in registry:
+        # Existence check WITHOUT a fallback (so a missing prompt raises) and
+        # WITHOUT the cache (ttl 0), so it isn't answered from stale state.
+        try:
+            existing = client.get_prompt(prompt.name, label=prompt.label, cache_ttl_seconds=0)
+        except Exception:
+            existing = None  # not found / transient error → treat as missing
+        if existing is not None:
+            counts["skipped"] += 1
+            continue
+        try:
+            client.create_prompt(
+                name=prompt.name,
+                type="text",
+                prompt=prompt.fallback,
+                labels=[prompt.label],
+            )
+            counts["created"] += 1
+        except Exception as exc:
+            _prompt_logger.warning("create_prompt(%s) failed: %s", prompt.name, exc)
+            counts["failed"] += 1
+    return counts

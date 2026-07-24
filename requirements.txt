@@ -23,5 +23,8 @@ python-dotenv>=1.0.0
 psycopg2-binary>=2.9
 
 # LLM observability (optional at runtime — tracing activates only when
-# LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY are set)
-langfuse>=2.0
+# LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY are set). Pin the v3 line: the trace
+# metadata convention (langfuse_session_id/langfuse_user_id/langfuse_tags) and
+# the prompt-management API used in backend/observability.py + prompts.py are
+# v3-specific.
+langfuse>=3.0

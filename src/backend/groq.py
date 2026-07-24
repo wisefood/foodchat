@@ -65,7 +65,10 @@ class GroqConnectionPool:
 
         # Add other kwargs
         for k, v in sorted(kwargs.items()):
-            if k not in ('api_key', 'format'):  # Exclude sensitive/handled params
+            # Exclude sensitive/handled params AND callbacks: the Langfuse
+            # handler is an identity-bearing object attached below, so keying
+            # on it would fragment the pool (a new client per handler identity).
+            if k not in ('api_key', 'format', 'callbacks'):
                 key_parts.append(f"{k}={v}")
 
         return "_".join(key_parts)
@@ -152,11 +155,16 @@ class GroqConnectionPool:
                 # Merge kwargs with json config
                 final_kwargs = {**kwargs, **json_config}
 
-                # Langfuse tracing (M5) — no-op unless keys are configured.
-                from backend.observability import langchain_callbacks
-                callbacks = langchain_callbacks()
-                if callbacks:
-                    final_kwargs.setdefault("callbacks", callbacks)
+                # Langfuse tracing — attach the shared handler once, here at the
+                # pool, so every call is traced automatically without callbacks
+                # at each call site. No-op (None) unless keys are configured.
+                # Excluded from the pool cache key above.
+                from backend.observability import get_callback_handler
+                handler = get_callback_handler()
+                if handler is not None:
+                    callbacks = list(final_kwargs.get("callbacks") or [])
+                    callbacks.append(handler)
+                    final_kwargs["callbacks"] = callbacks
 
                 self._pool[pool_key] = ChatGroq(
                     model=model,

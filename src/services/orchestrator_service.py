@@ -40,6 +40,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from agents import OrchestratorAgent, PlanAnalyst
+from backend.observability import trace_context
 from models.attribution import Attribution
 from models.session import MealPlan, WeeklyMealPlan
 from . import plan_parameters
@@ -160,21 +161,27 @@ class OrchestratorService:
         return turn
 
     def process(self, session_id: str, member_id: str, message: str) -> ChatTurn:
-        """Validate ownership, check the message cap, classify, and route."""
-        session = self._owned_session(session_id, member_id)
-        limit_turn = self._limit_turn(session)
-        if limit_turn is not None:
-            return limit_turn
+        """Validate ownership, check the message cap, classify, and route.
 
-        # Mid-clarification turns usually bypass classification — the user is
-        # answering our question. Handlers may still bounce the turn back to
-        # normal routing when the reply clearly isn't an answer.
-        if session.state == "clarifying":
-            turn = self._handle_clarification_turn(session_id, message)
-        else:
-            turn = self._classify_and_route(session, session_id, message)
+        The whole turn runs inside ``trace_context`` so every downstream LLM
+        call (classify, clarify, plan grading, response writing, …) groups
+        under one Langfuse Session (session_id) and User (member_id).
+        """
+        with trace_context(session_id=session_id, user_id=member_id):
+            session = self._owned_session(session_id, member_id)
+            limit_turn = self._limit_turn(session)
+            if limit_turn is not None:
+                return limit_turn
 
-        return self._attach_memory_suggestions(session, turn, message)
+            # Mid-clarification turns usually bypass classification — the user
+            # is answering our question. Handlers may still bounce the turn
+            # back to normal routing when the reply clearly isn't an answer.
+            if session.state == "clarifying":
+                turn = self._handle_clarification_turn(session_id, message)
+            else:
+                turn = self._classify_and_route(session, session_id, message)
+
+            return self._attach_memory_suggestions(session, turn, message)
 
     # Explicit FoodScholar consults bypass classification entirely: "can you
     # check with food scholar?" is a request to ask the expert, and the
@@ -826,42 +833,43 @@ class OrchestratorService:
         regenerate a weekly plan created since. Omitted (older clients) →
         the active canvas, as before.
         """
-        session = self._owned_session(session_id, member_id)
-        limit_turn = self._limit_turn(session)
-        if limit_turn is not None:
-            return limit_turn
+        with trace_context(session_id=session_id, user_id=member_id):
+            session = self._owned_session(session_id, member_id)
+            limit_turn = self._limit_turn(session)
+            if limit_turn is not None:
+                return limit_turn
 
-        applied = dict(session.user_profile.get("plan_parameters") or {})
-        applied.update(values)
-        session.user_profile["plan_parameters"] = applied
-        history = session.user_profile.get("history", "") or ""
-        line = plan_parameters.history_line(values)
-        session.user_profile["history"] = f"{history}\n{line}" if history else line
-        self.session_service.persist_profile(session_id)
+            applied = dict(session.user_profile.get("plan_parameters") or {})
+            applied.update(values)
+            session.user_profile["plan_parameters"] = applied
+            history = session.user_profile.get("history", "") or ""
+            line = plan_parameters.history_line(values)
+            session.user_profile["history"] = f"{history}\n{line}" if history else line
+            self.session_service.persist_profile(session_id)
 
-        target = plan_type if plan_type in ("daily", "weekly") else None
-        if target is None:
-            canvas = session.active_canvas
-            target = canvas.plan_type if canvas is not None else "daily"
+            target = plan_type if plan_type in ("daily", "weekly") else None
+            if target is None:
+                canvas = session.active_canvas
+                target = canvas.plan_type if canvas is not None else "daily"
 
-        message = plan_parameters.describe(values)
-        if target == "weekly" and session.get_current_weekly_plan() is not None:
-            logger.info("[%s] Applying plan parameters %s (weekly refine).", session_id, values)
-            turn = self._handle_weekly(
-                session_id, message, "refine_plan", is_refinement=True,
-            )
-        else:
-            is_refinement = session.get_current_daily_plan() is not None
-            intent = "refine_plan" if is_refinement else "daily_plan"
-            logger.info("[%s] Applying plan parameters %s (%s).", session_id, values, intent)
-            turn = self._handle_plan(
-                session_id, message, intent,
-                is_refinement=is_refinement, skip_clarification=True,
-            )
-        # Always return the card with its new current values so the UI stays
-        # in sync, even on the refine paths where the handlers skip it.
-        turn.plan_parameters = plan_parameters.build_card(session.user_profile, target)
-        return turn
+            message = plan_parameters.describe(values)
+            if target == "weekly" and session.get_current_weekly_plan() is not None:
+                logger.info("[%s] Applying plan parameters %s (weekly refine).", session_id, values)
+                turn = self._handle_weekly(
+                    session_id, message, "refine_plan", is_refinement=True,
+                )
+            else:
+                is_refinement = session.get_current_daily_plan() is not None
+                intent = "refine_plan" if is_refinement else "daily_plan"
+                logger.info("[%s] Applying plan parameters %s (%s).", session_id, values, intent)
+                turn = self._handle_plan(
+                    session_id, message, intent,
+                    is_refinement=is_refinement, skip_clarification=True,
+                )
+            # Always return the card with its new current values so the UI stays
+            # in sync, even on the refine paths where the handlers skip it.
+            turn.plan_parameters = plan_parameters.build_card(session.user_profile, target)
+            return turn
 
     def compose_plan(
         self, session_id: str, member_id: str, picks: list[dict],
@@ -877,57 +885,58 @@ class OrchestratorService:
         generation composes the rest deterministically: no intent
         classification, no clarification round.
         """
-        session = self._owned_session(session_id, member_id)
-        limit_turn = self._limit_turn(session)
-        if limit_turn is not None:
-            return limit_turn
+        with trace_context(session_id=session_id, user_id=member_id):
+            session = self._owned_session(session_id, member_id)
+            limit_turn = self._limit_turn(session)
+            if limit_turn is not None:
+                return limit_turn
 
-        # Composing is a deliberate action that supersedes any pending
-        # question — leaving the trap armed would make the member's next
-        # message answer a question they've moved on from.
-        if session.state == "clarifying":
-            logger.info("[%s] Compose supersedes a pending clarification.", session_id)
-            self.session_service.clear_clarification_state(session_id)
+            # Composing is a deliberate action that supersedes any pending
+            # question — leaving the trap armed would make the member's next
+            # message answer a question they've moved on from.
+            if session.state == "clarifying":
+                logger.info("[%s] Compose supersedes a pending clarification.", session_id)
+                self.session_service.clear_clarification_state(session_id)
 
-        seeds = []
-        for pick in picks:
-            seed = {
-                "recipe_id": pick["recipe_id"],
-                "meal_type": pick["meal_type"],
-                "name": pick.get("title") or "",
-            }
-            if pick.get("day") is not None:
-                seed["day"] = pick["day"]
-            seeds.append(seed)
+            seeds = []
+            for pick in picks:
+                seed = {
+                    "recipe_id": pick["recipe_id"],
+                    "meal_type": pick["meal_type"],
+                    "name": pick.get("title") or "",
+                }
+                if pick.get("day") is not None:
+                    seed["day"] = pick["day"]
+                seeds.append(seed)
 
-        logger.info(
-            "[%s] Manual compose (%s): %d pick(s) → %s",
-            session_id, plan_type, len(seeds),
-            [(s.get("day"), s["meal_type"], s["recipe_id"]) for s in seeds],
-        )
-
-        # Picks that reach the plan are stored by _settle_manual_picks
-        # (persist_seeds=True); ones the pipeline refused are dropped there.
-        if plan_type == "weekly":
-            text = (message or "").strip() or (
-                "Complete my meal plan for this week around the dishes I picked."
-            )
-            turn = self._handle_weekly(
-                session_id, text, "weekly_plan", is_refinement=False,
-                seeds=seeds, persist_seeds=True,
-            )
-        else:
-            text = (message or "").strip() or (
-                "Complete my meal plan for today around the dishes I picked."
-            )
-            turn = self._handle_plan(
-                session_id, text, "daily_plan", is_refinement=False,
-                seeds=seeds, skip_clarification=True, persist_seeds=True,
+            logger.info(
+                "[%s] Manual compose (%s): %d pick(s) → %s",
+                session_id, plan_type, len(seeds),
+                [(s.get("day"), s["meal_type"], s["recipe_id"]) for s in seeds],
             )
 
-        # The member's own words reach compose when they type instead of
-        # pressing the button — a preference stated there must still nudge.
-        return self._attach_memory_suggestions(session, turn, message or "")
+            # Picks that reach the plan are stored by _settle_manual_picks
+            # (persist_seeds=True); ones the pipeline refused are dropped there.
+            if plan_type == "weekly":
+                text = (message or "").strip() or (
+                    "Complete my meal plan for this week around the dishes I picked."
+                )
+                turn = self._handle_weekly(
+                    session_id, text, "weekly_plan", is_refinement=False,
+                    seeds=seeds, persist_seeds=True,
+                )
+            else:
+                text = (message or "").strip() or (
+                    "Complete my meal plan for today around the dishes I picked."
+                )
+                turn = self._handle_plan(
+                    session_id, text, "daily_plan", is_refinement=False,
+                    seeds=seeds, skip_clarification=True, persist_seeds=True,
+                )
+
+            # The member's own words reach compose when they type instead of
+            # pressing the button — a preference stated there must still nudge.
+            return self._attach_memory_suggestions(session, turn, message or "")
 
     def _handle_weekly(
         self, session_id: str, message: str, intent: str, is_refinement: bool,

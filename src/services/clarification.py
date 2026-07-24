@@ -36,16 +36,17 @@ from typing import Optional
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from backend.groq import GROQ_CHAT
+from backend.observability import build_trace_config
 from agents import QueryReconciler
 from prompts import (
-    QUERY_CHECKER_SYSTEM_INSTRUCTIONS,
-    QUERY_CHECKER_USER_INSTRUCTIONS,
-    USER_PROFILE_CHECKER_SYSTEM_INSTRUCTIONS,
-    USER_PROFILE_CHECKER_USER_INSTRUCTIONS,
-    USER_INFO_COLLECTOR_SYSTEM_INSTRUCTIONS,
-    USER_INFO_COLLECTOR_USER_INSTRUCTIONS,
-    QUERY_REFORMULATOR_SYSTEM_INSTRUCTIONS,
-    QUERY_REFORMULATOR_USER_INSTRUCTIONS,
+    QUERY_CHECKER_SYSTEM,
+    QUERY_CHECKER_USER,
+    USER_PROFILE_CHECKER_SYSTEM,
+    USER_PROFILE_CHECKER_USER,
+    USER_INFO_COLLECTOR_SYSTEM,
+    USER_INFO_COLLECTOR_USER,
+    QUERY_REFORMULATOR_SYSTEM,
+    QUERY_REFORMULATOR_USER,
 )
 from schemas import (
     QueryCheckerSchema,
@@ -226,9 +227,9 @@ class ClarificationManager:
     def _specificity_path(self, query: str, profile: dict, origin_intent: str) -> ClarificationOutcome:
         """Vague-query fallback: check specificity, then profile signal."""
         response = self.query_checker.invoke([
-            SystemMessage(content=QUERY_CHECKER_SYSTEM_INSTRUCTIONS),
-            HumanMessage(content=QUERY_CHECKER_USER_INSTRUCTIONS.format(user_query=query)),
-        ])
+            SystemMessage(content=QUERY_CHECKER_SYSTEM.compile()),
+            HumanMessage(content=QUERY_CHECKER_USER.compile(user_query=query)),
+        ], config=build_trace_config(run_name="query_specificity", tags=["clarify"]))
         check = json.loads(response.content).get("response", "YES")
         if check != "NO":
             return ClarificationOutcome(profile=profile, final_query=query)
@@ -259,11 +260,11 @@ class ClarificationManager:
         suggestions: list[str] = []
         if preferences:
             pc = self.profile_checker.invoke([
-                SystemMessage(content=USER_PROFILE_CHECKER_SYSTEM_INSTRUCTIONS),
-                HumanMessage(content=USER_PROFILE_CHECKER_USER_INSTRUCTIONS.format(
+                SystemMessage(content=USER_PROFILE_CHECKER_SYSTEM.compile()),
+                HumanMessage(content=USER_PROFILE_CHECKER_USER.compile(
                     preferences=preferences, feedback_history=[],
                 )),
-            ])
+            ], config=build_trace_config(run_name="profile_signal", tags=["clarify"]))
             pc_json = json.loads(pc.content)
             if pc_json.get("response") != "NO":
                 # Profile carries enough signal — reformulate without asking.
@@ -293,15 +294,16 @@ class ClarificationManager:
 
         response = self.question_generator.invoke(
             [
-                SystemMessage(content=USER_INFO_COLLECTOR_SYSTEM_INSTRUCTIONS),
-                HumanMessage(content=USER_INFO_COLLECTOR_USER_INSTRUCTIONS.format(
+                SystemMessage(content=USER_INFO_COLLECTOR_SYSTEM.compile()),
+                HumanMessage(content=USER_INFO_COLLECTOR_USER.compile(
                     user_query=state.original_query,
                     preferences=state.profile.get("preferences", []),
                     feedback_history=[],
                     suggestions=topic,
                 )),
             ]
-            + history
+            + history,
+            config=build_trace_config(run_name="clarify_question", tags=["clarify"]),
         )
         state.current_question = response.content
         return response.content
@@ -321,14 +323,14 @@ class ClarificationManager:
         collected = self._collected(state)
 
         response = self.reformulator.invoke([
-            SystemMessage(content=QUERY_REFORMULATOR_SYSTEM_INSTRUCTIONS),
-            HumanMessage(content=QUERY_REFORMULATOR_USER_INSTRUCTIONS.format(
+            SystemMessage(content=QUERY_REFORMULATOR_SYSTEM.compile()),
+            HumanMessage(content=QUERY_REFORMULATOR_USER.compile(
                 original_query=state.original_query,
                 preferences=state.profile.get("preferences", []),
                 feedback_history=[],
                 collected_info=collected or None,
             )),
-        ])
+        ], config=build_trace_config(run_name="query_reformulate", tags=["clarify"]))
         final_query = json.loads(response.content)["reformulated_query"]
         logger.info("Reformulated query: %s", final_query)
         return final_query

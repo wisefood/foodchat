@@ -20,7 +20,7 @@ class FakeLLM:
     def __init__(self, *payloads):
         self._payloads = list(payloads)
 
-    def invoke(self, _messages):
+    def invoke(self, _messages, config=None):
         class R:
             pass
 

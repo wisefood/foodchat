@@ -80,7 +80,7 @@ class TestDocumentGraderParsing:
             def __init__(self):
                 self.n = 0
 
-            def invoke(self, messages):
+            def invoke(self, messages, config=None):
                 class R: pass
                 r = R()
                 self.n += 1

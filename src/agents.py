@@ -31,27 +31,29 @@ from typing import Optional
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from backend.groq import GROQ_CHAT
+from backend.observability import build_trace_config
 from models.recipe import CandidatesBySlot, ScoredPlan
 from prompts import (
-    GRADER_SYSTEM_INSTRUCTIONS,
-    PLAN_ANALYST_SYSTEM_INSTRUCTIONS,
-    GRADER_USER_INSTRUCTIONS,
-    MEAL_DIVERSITY_SYSTEM_INSTRUCTIONS,
-    GUIDELINE_ADHERENCE_SYSTEM_INSTRUCTIONS,
-    QUERY_RECONCILER_SYSTEM_INSTRUCTIONS,
-    QUERY_RECONCILER_USER_INSTRUCTIONS,
-    ORCHESTRATOR_SYSTEM_INSTRUCTIONS,
-    ORCHESTRATOR_USER_INSTRUCTIONS,
-    DIETARY_INTENT_EXTRACTOR_SYSTEM_INSTRUCTIONS,
-    DIETARY_INTENT_EXTRACTOR_USER_INSTRUCTIONS,
-    SEED_EXTRACTOR_SYSTEM_INSTRUCTIONS,
-    SEED_EXTRACTOR_USER_INSTRUCTIONS,
-    PREFERENCE_EXTRACTOR_SYSTEM_INSTRUCTIONS,
-    PREFERENCE_EXTRACTOR_USER_INSTRUCTIONS,
-    EDIT_COMMAND_EXTRACTOR_SYSTEM_INSTRUCTIONS,
-    EDIT_COMMAND_EXTRACTOR_USER_INSTRUCTIONS,
-    RESPONSE_WRITER_SYSTEM_INSTRUCTIONS,
-    RESPONSE_WRITER_USER_INSTRUCTIONS,
+    GRADER_SYSTEM,
+    GRADER_USER,
+    PLAN_ANALYST_SYSTEM,
+    MEAL_DIVERSITY_SYSTEM,
+    GUIDELINE_ADHERENCE_SYSTEM,
+    QUERY_RECONCILER_SYSTEM,
+    QUERY_RECONCILER_USER,
+    ORCHESTRATOR_SYSTEM,
+    ORCHESTRATOR_USER,
+    DIETARY_INTENT_EXTRACTOR_SYSTEM,
+    DIETARY_INTENT_EXTRACTOR_USER,
+    SEED_EXTRACTOR_SYSTEM,
+    SEED_EXTRACTOR_USER,
+    PREFERENCE_EXTRACTOR_SYSTEM,
+    PREFERENCE_EXTRACTOR_USER,
+    EDIT_COMMAND_EXTRACTOR_SYSTEM,
+    EDIT_COMMAND_EXTRACTOR_USER,
+    RESPONSE_WRITER_SYSTEM,
+    RESPONSE_WRITER_USER,
+    CHATBOT_SYSTEM,
 )
 from schemas import (
     ScoringSchema,
@@ -113,14 +115,14 @@ class DocumentGrader:
                 for slot, course in (("breakfast", breakfast), ("lunch", lunch), ("dinner", dinner))
             )
             result = self.grader.invoke([
-                SystemMessage(content=GRADER_SYSTEM_INSTRUCTIONS),
-                HumanMessage(content=GRADER_USER_INSTRUCTIONS.format(
+                SystemMessage(content=GRADER_SYSTEM.compile()),
+                HumanMessage(content=GRADER_USER.compile(
                     query=query,
                     daily_plan=plan_text,
                     preferences=",".join(user_profile.get("preferences", [])),
                     feedback_history=feedback_history or "No prior feedback.",
                 )),
-            ])
+            ], config=build_trace_config(run_name="plan_grade", tags=["planning"]))
             grade = json.loads(result.content)
             scored.append(ScoredPlan(
                 breakfast=breakfast, lunch=lunch, dinner=dinner,
@@ -146,9 +148,9 @@ class MealDiversityGrader:
 
     def score(self, plan_text: str) -> dict:
         result = self.client.invoke([
-            SystemMessage(content=MEAL_DIVERSITY_SYSTEM_INSTRUCTIONS),
+            SystemMessage(content=MEAL_DIVERSITY_SYSTEM.compile()),
             HumanMessage(content=plan_text),
-        ])
+        ], config=build_trace_config(run_name="meal_diversity", tags=["metrics"]))
         try:
             return json.loads(result.content)
         except Exception:
@@ -167,9 +169,9 @@ class GuidelineAdherenceGrader:
 
     def score(self, plan_text: str, guidelines_text: str) -> dict:
         result = self.client.invoke([
-            SystemMessage(content=GUIDELINE_ADHERENCE_SYSTEM_INSTRUCTIONS),
+            SystemMessage(content=GUIDELINE_ADHERENCE_SYSTEM.compile()),
             HumanMessage(content=f"GUIDELINES:\n{guidelines_text}\n\nMEAL PLAN:\n{plan_text}"),
-        ])
+        ], config=build_trace_config(run_name="guideline_adherence", tags=["metrics"]))
         try:
             return json.loads(result.content)
         except Exception:
@@ -188,18 +190,9 @@ class SimpleChatBot:
     # Nutrition-science questions never reach this prompt — the orchestrator
     # routes them to FoodScholar (nutrition_question intent). This bot only
     # sees greetings, small talk, and the leftovers; it must never claim it
-    # "can't answer" something — it redirects warmly instead.
-    SYSTEM_PROMPT = (
-        "You are FoodChat, the friendly meal-planning assistant of the WiseFood platform. "
-        "You help people plan what to eat: daily meal plans, weekly meal plans, and "
-        "refinements to plans you've already made ('swap the dinner', 'make it lighter'). "
-        "Nutrition-science questions are answered for you by FoodScholar, WiseFood's "
-        "evidence-based Q&A service, so never tell the user a question can't be answered here. "
-        "For this conversation: respond warmly and briefly, stay food-related where natural, "
-        "and when the user seems unsure what to do next, suggest something concrete like "
-        "'want a plan for today?' or 'shall we plan your week around something you love?'. "
-        "Never invent recipes or plans in this mode — offer to create one instead."
-    )
+    # "can't answer" something — it redirects warmly instead. The persona text
+    # lives in the prompt registry (prompts.CHATBOT_SYSTEM) so it is Langfuse-
+    # managed like every other prompt.
 
     def __init__(self, model: str = None, temperature: float = None):
         self.chatbot = GROQ_CHAT.get_client(
@@ -209,14 +202,17 @@ class SimpleChatBot:
 
     def chat(self, query: str, history: list[tuple[str, str]] = None) -> str:
         """Respond to ``query`` given recent (role, content) history pairs."""
-        messages = [SystemMessage(content=self.SYSTEM_PROMPT)]
+        messages = [SystemMessage(content=CHATBOT_SYSTEM.compile())]
         for role, content in (history or [])[-CHATBOT_HISTORY_TURNS:]:
             if role == "assistant":
                 messages.append(AIMessage(content=content))
             else:
                 messages.append(HumanMessage(content=content))
         messages.append(HumanMessage(content=query))
-        return self.chatbot.invoke(messages).content
+        return self.chatbot.invoke(
+            messages,
+            config=build_trace_config(run_name="smalltalk", tags=["chat"]),
+        ).content
 
 
 class QueryReconciler:
@@ -239,14 +235,14 @@ class QueryReconciler:
         ])) or "(nothing on file)"
 
         result = self.query_reconciler.invoke([
-            SystemMessage(content=QUERY_RECONCILER_SYSTEM_INSTRUCTIONS),
-            HumanMessage(content=QUERY_RECONCILER_USER_INSTRUCTIONS.format(
+            SystemMessage(content=QUERY_RECONCILER_SYSTEM.compile()),
+            HumanMessage(content=QUERY_RECONCILER_USER.compile(
                 query=query,
                 diet=user_profile.get("diet", []),
                 allergies=user_profile.get("allergies", []),
                 known_facts=known_facts,
             )),
-        ])
+        ], config=build_trace_config(run_name="query_reconcile", tags=["clarify"]))
         return json.loads(result.content)
 
 
@@ -263,9 +259,9 @@ class DietaryIntentExtractor:
     def extract(self, query: str) -> list[str]:
         try:
             result = self.llm.invoke([
-                SystemMessage(content=DIETARY_INTENT_EXTRACTOR_SYSTEM_INSTRUCTIONS),
-                HumanMessage(content=DIETARY_INTENT_EXTRACTOR_USER_INSTRUCTIONS.format(query=query)),
-            ])
+                SystemMessage(content=DIETARY_INTENT_EXTRACTOR_SYSTEM.compile()),
+                HumanMessage(content=DIETARY_INTENT_EXTRACTOR_USER.compile(query=query)),
+            ], config=build_trace_config(run_name="dietary_intent", tags=["extract"]))
             return json.loads(result.content).get("dietary_tags", [])
         except Exception as e:
             logger.warning("DietaryIntentExtractor failed: %s", e)
@@ -289,9 +285,9 @@ class PreferenceExtractor:
     def extract(self, message: str) -> list[dict]:
         try:
             result = self.llm.invoke([
-                SystemMessage(content=PREFERENCE_EXTRACTOR_SYSTEM_INSTRUCTIONS),
-                HumanMessage(content=PREFERENCE_EXTRACTOR_USER_INSTRUCTIONS.format(message=message)),
-            ])
+                SystemMessage(content=PREFERENCE_EXTRACTOR_SYSTEM.compile()),
+                HumanMessage(content=PREFERENCE_EXTRACTOR_USER.compile(message=message)),
+            ], config=build_trace_config(run_name="preference_extract", tags=["memory"]))
             memories = json.loads(result.content).get("memories", [])
             return [m for m in memories if isinstance(m, dict) and m.get("value") and m.get("kind")]
         except Exception as e:
@@ -317,9 +313,9 @@ class SeedExtractor:
     def extract(self, query: str) -> list[dict]:
         try:
             result = self.llm.invoke([
-                SystemMessage(content=SEED_EXTRACTOR_SYSTEM_INSTRUCTIONS),
-                HumanMessage(content=SEED_EXTRACTOR_USER_INSTRUCTIONS.format(query=query)),
-            ])
+                SystemMessage(content=SEED_EXTRACTOR_SYSTEM.compile()),
+                HumanMessage(content=SEED_EXTRACTOR_USER.compile(query=query)),
+            ], config=build_trace_config(run_name="seed_extract", tags=["planning"]))
             seeds = json.loads(result.content).get("seeds", [])
             return [s for s in seeds if isinstance(s, dict) and s.get("name")]
         except Exception as e:
@@ -342,11 +338,11 @@ class EditCommandExtractor:
         degrades to a whole-plan refinement)."""
         try:
             result = self.llm.invoke([
-                SystemMessage(content=EDIT_COMMAND_EXTRACTOR_SYSTEM_INSTRUCTIONS),
-                HumanMessage(content=EDIT_COMMAND_EXTRACTOR_USER_INSTRUCTIONS.format(
+                SystemMessage(content=EDIT_COMMAND_EXTRACTOR_SYSTEM.compile()),
+                HumanMessage(content=EDIT_COMMAND_EXTRACTOR_USER.compile(
                     plan_type=plan_type, message=message,
                 )),
-            ])
+            ], config=build_trace_config(run_name="edit_command", tags=["edit"]))
             command = json.loads(result.content)
             if not command.get("directive"):
                 command["directive"] = "different"
@@ -373,12 +369,12 @@ class ResponseWriter:
     def write(self, facts: dict, user_message: str, fallback: str) -> str:
         try:
             result = self.llm.invoke([
-                SystemMessage(content=RESPONSE_WRITER_SYSTEM_INSTRUCTIONS),
-                HumanMessage(content=RESPONSE_WRITER_USER_INSTRUCTIONS.format(
+                SystemMessage(content=RESPONSE_WRITER_SYSTEM.compile()),
+                HumanMessage(content=RESPONSE_WRITER_USER.compile(
                     facts=json.dumps(facts, ensure_ascii=False),
                     user_message=user_message[:400],
                 )),
-            ])
+            ], config=build_trace_config(run_name="response_write", tags=["chat"]))
             text = (result.content or "").strip()
             # Guard against runaway or empty generations.
             if not text or len(text) > 900:
@@ -405,7 +401,7 @@ class PlanAnalyst:
 
     def answer(self, question: str, plan_summary: str,
                history: list[tuple[str, str]] = None) -> str:
-        messages = [SystemMessage(content=PLAN_ANALYST_SYSTEM_INSTRUCTIONS)]
+        messages = [SystemMessage(content=PLAN_ANALYST_SYSTEM.compile())]
         for role, content in (history or [])[-CHATBOT_HISTORY_TURNS:]:
             if role == "assistant":
                 messages.append(AIMessage(content=content))
@@ -414,7 +410,10 @@ class PlanAnalyst:
         messages.append(HumanMessage(
             content=f"CURRENT PLAN:\n{plan_summary}\n\nQUESTION: {question}"
         ))
-        return self.llm.invoke(messages).content
+        return self.llm.invoke(
+            messages,
+            config=build_trace_config(run_name="plan_analyst", tags=["plan_qa"]),
+        ).content
 
 
 class OrchestratorAgent:
@@ -452,15 +451,16 @@ class OrchestratorAgent:
         ) or "(no prior conversation)"
 
         messages = [
-            SystemMessage(content=ORCHESTRATOR_SYSTEM_INSTRUCTIONS),
-            HumanMessage(content=ORCHESTRATOR_USER_INSTRUCTIONS.format(
+            SystemMessage(content=ORCHESTRATOR_SYSTEM.compile()),
+            HumanMessage(content=ORCHESTRATOR_USER.compile(
                 history=history_text, message=message,
             )),
         ]
 
+        config = build_trace_config(run_name="orchestrate", tags=["router"])
         for attempt in range(MAX_RETRIES):
             try:
-                result = self.llm.invoke(messages)
+                result = self.llm.invoke(messages, config=config)
                 parsed = json.loads(result.content)
                 intent = parsed.get("intent", "chat")
                 if intent in self.VALID_INTENTS:

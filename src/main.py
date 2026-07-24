@@ -14,6 +14,8 @@ No data files, vector stores, or embedding models are required to boot.
 """
 
 import logging
+import threading
+from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
 
@@ -37,10 +39,40 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup/shutdown for Langfuse (entirely optional — no-op without keys).
+
+    Startup seeds the prompt registry into Langfuse in a DAEMON thread so a
+    slow or down Langfuse never delays or fails pod boot. Seeding is idempotent
+    (creates only missing prompts; never overwrites UI edits). Shutdown flushes
+    buffered traces so the last requests aren't lost on pod termination.
+    """
+    def _seed_prompts() -> None:
+        try:
+            from prompts import sync_prompts
+            result = sync_prompts()
+            if any(result.values()):
+                logger.info("Langfuse prompt sync: %s", result)
+        except Exception as exc:  # observability must never break the app
+            logger.warning("Langfuse prompt sync failed: %s", exc)
+
+    threading.Thread(
+        target=_seed_prompts, name="langfuse-prompt-sync", daemon=True
+    ).start()
+
+    yield
+
+    from backend.observability import flush_langfuse
+    flush_langfuse()
+
+
 app = FastAPI(
     title="FoodChat API",
     description="Session-based meal planning chat API",
     version="2.0.0",
+    lifespan=lifespan,
 )
 
 logger.info("Initializing database...")
