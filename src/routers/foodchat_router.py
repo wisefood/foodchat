@@ -387,7 +387,7 @@ def _require_session(session_id: str, member_id: str):
 @router.post(
     "/sessions", response_model=SessionResponse, status_code=status.HTTP_201_CREATED
 )
-async def create_session(request: CreateSessionRequest):
+def create_session(request: CreateSessionRequest):
     """Create a new chat session; fetches the member's profile from WiseFood."""
     try:
         user_profile = services.profile_service.get_member_profile(request.member_id)
@@ -431,7 +431,7 @@ async def create_session(request: CreateSessionRequest):
 
 
 @router.get("/sessions/{session_id}", response_model=SessionResponse)
-async def get_session(
+def get_session(
     session_id: str,
     member_id: str = Query(..., description="Must match session owner"),
 ):
@@ -447,7 +447,7 @@ async def get_session(
 
 
 @router.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_session(
+def delete_session(
     session_id: str,
     member_id: str = Query(..., description="Must match session owner"),
 ):
@@ -459,7 +459,7 @@ async def delete_session(
 
 
 @router.get("/members/{member_id}/sessions", response_model=List[SessionResponse])
-async def get_member_sessions(member_id: str):
+def get_member_sessions(member_id: str):
     """Get all sessions for a specific member."""
     sessions = services.session_service.get_member_sessions(member_id)
     return [
@@ -494,7 +494,7 @@ class MemberCurrentPlansResponse(BaseModel):
     "/members/{member_id}/current-plans",
     response_model=MemberCurrentPlansResponse,
 )
-async def get_member_current_plans(member_id: str):
+def get_member_current_plans(member_id: str):
     """Most recent daily/weekly plans for a member (dashboard widget)."""
     session = services.session_service.get_member_current_plans(member_id)
     if session is None:
@@ -520,7 +520,7 @@ async def get_member_current_plans(member_id: str):
 
 
 @router.post("/sessions/{session_id}/chat", response_model=ChatTurnResponse)
-async def unified_chat(session_id: str, request: ChatRequest):
+def unified_chat(session_id: str, request: ChatRequest):
     """
     Unified conversational endpoint.
 
@@ -596,7 +596,7 @@ def _chat_turn_response(turn) -> ChatTurnResponse:
 
 
 @router.post("/sessions/{session_id}/compose", response_model=ChatTurnResponse)
-async def compose_plan(session_id: str, request: ComposeRequest):
+def compose_plan(session_id: str, request: ComposeRequest):
     """
     Manual mode: complete a hand-started plan (daily or weekly). The user
     picked recipes for some slots on a blank canvas; FoodChat pins them
@@ -655,7 +655,7 @@ async def compose_plan(session_id: str, request: ComposeRequest):
 
 
 @router.post("/sessions/{session_id}/plan-parameters", response_model=ChatTurnResponse)
-async def apply_plan_parameters(session_id: str, request: PlanParametersRequest):
+def apply_plan_parameters(session_id: str, request: PlanParametersRequest):
     """
     Apply values from the interactive plan-parameter card (time budget,
     difficulty, goal). Deterministic alternative to typing a refinement:
@@ -691,7 +691,7 @@ async def apply_plan_parameters(session_id: str, request: PlanParametersRequest)
 
 
 @router.get("/sessions/{session_id}/conversation", response_model=ConversationPage)
-async def get_conversation(
+def get_conversation(
     session_id: str,
     member_id: str = Query(..., description="WiseFood member ID — must match session owner"),
     before_id: Optional[int] = Query(None, description="Cursor: return messages with DB id < this value"),
@@ -737,7 +737,7 @@ async def get_conversation(
 
 
 @router.get("/sessions/{session_id}/meal-plans", response_model=List[MealPlanResponse])
-async def get_meal_plans(
+def get_meal_plans(
     session_id: str,
     member_id: str = Query(..., description="Must match session owner"),
 ):
@@ -747,7 +747,7 @@ async def get_meal_plans(
 
 
 @router.get("/sessions/{session_id}/meal-plans/current", response_model=Optional[MealPlanResponse])
-async def get_current_meal_plan(
+def get_current_meal_plan(
     session_id: str,
     member_id: str = Query(..., description="Must match session owner"),
 ):
@@ -758,7 +758,7 @@ async def get_current_meal_plan(
 
 
 @router.get("/sessions/{session_id}/meal-plans/history", response_model=List[MealPlanResponse])
-async def get_daily_plan_history(
+def get_daily_plan_history(
     session_id: str,
     member_id: str = Query(..., description="Must match session owner"),
 ):
@@ -772,7 +772,7 @@ async def get_daily_plan_history(
 
 
 @router.get("/sessions/{session_id}/weekly-meal-plans", response_model=List[WeeklyMealPlanResponse])
-async def get_weekly_meal_plans(
+def get_weekly_meal_plans(
     session_id: str,
     member_id: str = Query(..., description="Must match session owner"),
 ):
@@ -782,7 +782,7 @@ async def get_weekly_meal_plans(
 
 
 @router.get("/sessions/{session_id}/weekly-meal-plans/current", response_model=Optional[WeeklyMealPlanResponse])
-async def get_current_weekly_meal_plan(
+def get_current_weekly_meal_plan(
     session_id: str,
     member_id: str = Query(..., description="Must match session owner"),
 ):
@@ -793,7 +793,7 @@ async def get_current_weekly_meal_plan(
 
 
 @router.get("/sessions/{session_id}/weekly-meal-plans/history", response_model=List[WeeklyMealPlanResponse])
-async def get_weekly_plan_history(
+def get_weekly_plan_history(
     session_id: str,
     member_id: str = Query(..., description="Must match session owner"),
 ):
@@ -812,7 +812,7 @@ async def get_weekly_plan_history(
     "/sessions/{session_id}/messages/{message_id}/feedback",
     response_model=FeedbackResponse,
 )
-async def submit_feedback(session_id: str, message_id: int, request: FeedbackRequest):
+def submit_feedback(session_id: str, message_id: int, request: FeedbackRequest):
     """
     Submit thumbs up/down feedback on an assistant message.
 
@@ -855,7 +855,7 @@ async def submit_feedback(session_id: str, message_id: int, request: FeedbackReq
 
 
 @router.post("/sessions/{session_id}/memory", response_model=MemoryDecisionResponse)
-async def decide_memory(session_id: str, request: MemoryDecisionRequest):
+def decide_memory(session_id: str, request: MemoryDecisionRequest):
     """
     Answer a memory nudge ("It seems you don't like blueberries — remember?").
 
@@ -889,7 +889,7 @@ async def decide_memory(session_id: str, request: MemoryDecisionRequest):
 
 
 @router.put("/sessions/{session_id}/diners", response_model=DinersResponse)
-async def set_diners(session_id: str, request: SetDinersRequest):
+def set_diners(session_id: str, request: SetDinersRequest):
     """
     Update who this session cooks for. Rebuilds the merged session profile
     (hard constraints = union of allergies/diets; soft preferences keep the
@@ -922,6 +922,6 @@ async def set_diners(session_id: str, request: SetDinersRequest):
 
 
 @router.get("/health")
-async def health_check():
+def health_check():
     """Health check endpoint."""
     return {"status": "ok", "service": "foodchat"}
