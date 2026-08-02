@@ -250,9 +250,14 @@ class OrchestratorService:
             # dish request means the user already has a starting point).
             seeds = self.seed_service.extract_seeds(message)
 
-            offer = self._maybe_offer_favorites(session, message, intent, seeds)
-            if offer is not None:
-                return offer
+            # No favourites toll-booth. The offer intercepted the first plan
+            # of EVERY session with a yes/no question before doing anything —
+            # a member who plans daily answered the same question daily, and
+            # called it what it was: repetitive. Favourites need no question:
+            # they are a soft ranking boost that every hard filter still
+            # gates, the response writer names one when it lands, and a
+            # member who says "no favourites" has that decline held by
+            # PlanningState for the rest of the session.
 
             if intent == "weekly_plan":
                 # A *shaped* week — salads beside dinner, a two-plate lunch —

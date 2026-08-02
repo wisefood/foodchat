@@ -273,20 +273,22 @@ class TestFavoritesOffer:
         profile = {**sample_profile, "favorite_recipe_ids": ["r-past"]}
         return session_service.create_session(f"member-{uuid.uuid4()}", profile)
 
-    def test_offer_fires_once_then_generates_on_yes(self, session_service, sample_profile):
+    def test_no_tollbooth_before_the_first_plan(self, session_service, sample_profile):
+        """A plan request generates a plan, favourites or not.
+
+        The offer used to intercept the first plan of EVERY session with a
+        yes/no question — a member who plans daily answered it daily and
+        called it repetitive. Favourites need no question: they are a soft
+        ranking boost that every hard filter still gates, and a member who
+        does not want them says so once, held by PlanningState.
+        """
         calls = []
         orch = self._orchestrator(session_service, calls)
         session = self._session_with_favorites(session_service, sample_profile)
 
         turn = orch.process(session.session_id, session.member_id, "plan my day")
-        assert turn.intent == "favorites_offer"
-        assert "Pastitsio" in turn.content
-        assert turn.needs_clarification
-        assert calls == []  # no plan generated yet
-
-        turn2 = orch.process(session.session_id, session.member_id, "yes please")
-        assert calls[0]["message"] == "plan my day"          # original request preserved
-        assert calls[0]["seeds"] == [{"name": "Pastitsio", "recipe_id": "r-past"}]  # favorite pinned BY ID
+        assert turn.intent == "daily_plan"
+        assert len(calls) == 1, "the plan generates immediately, no interception"
 
     def test_decline_generates_without_seeds(self, session_service, sample_profile):
         calls = []
@@ -306,17 +308,15 @@ class TestFavoritesOffer:
         assert turn.intent == "daily_plan"
         assert len(calls) == 1
 
-    def test_offer_not_repeated_in_session(self, session_service, sample_profile):
+    def test_repeat_plan_requests_never_ask_anything(self, session_service, sample_profile):
         calls = []
         orch = self._orchestrator(session_service, calls)
         session = self._session_with_favorites(session_service, sample_profile)
 
         orch.process(session.session_id, session.member_id, "plan my day")
-        orch.process(session.session_id, session.member_id, "no")
-        # Next plan request must NOT re-offer (dedupe via message intent tag)
         turn = orch.process(session.session_id, session.member_id, "another plan")
         assert turn.intent == "daily_plan"
-        assert len(calls) == 2
+        assert len(calls) == 2, "every plan request plans; none interrogates"
 
     def test_explicit_seeds_suppress_offer(self, session_service, sample_profile):
         calls = []
