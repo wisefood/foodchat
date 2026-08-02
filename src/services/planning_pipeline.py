@@ -191,15 +191,10 @@ class PlanningPipeline:
             envelope = PLANNER.plan_meals(
                 spec=spec,
                 allergens=profile.get("allergies") or [],
-                # Normalised, never raw.
-            #
-            # RecipeWrangler ANDs diet tags and never relaxes them, so a single
-            # value it does not know — "balanced", "mediterranean", "omnivore",
-            # a goal slug that leaked into the diet list — returns zero
-            # candidates for every slot and the member gets an apology. The old
-            # client did this and its docstring said why; dropping it when the
-            # candidate source moved is what emptied the plan.
-            diet=normalize_diet_tags(profile.get("diet")),
+                # Normalised, never raw: RecipeWrangler ANDs diet tags and
+                # never relaxes them, so one unknown value ("balanced",
+                # "omnivore") empties every slot. See candidates_client.
+                diet=normalize_diet_tags(profile.get("diet")),
                 cuisines=cuisines,
                 exclude_ingredients=profile.get("food_dislikes") or [],
                 exclude_recipe_ids=list(exclude_recipe_ids or []),

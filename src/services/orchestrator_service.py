@@ -269,6 +269,18 @@ class OrchestratorService:
             return self._handle_plan(session_id, message, intent, is_refinement=True)
 
         if intent == "edit_plan_slot":
+            if session.active_canvas is None:
+                # "get me a side salad as well" with nothing on the canvas is
+                # not an error to bounce — it is a plan request wearing edit
+                # words. refine_plan already degrades this way; an edit with
+                # no plan deserves the same grace, not "ask me for a plan
+                # first" (a real member hit exactly that and read it as the
+                # assistant refusing to do its one job).
+                logger.info("[%s] edit_plan_slot with no active canvas — fresh daily plan", session_id)
+                seeds = self.seed_service.extract_seeds(message)
+                return self._handle_plan(
+                    session_id, message, "daily_plan", is_refinement=False, seeds=seeds
+                )
             return self._handle_edit(session_id, message)
 
         if intent == "nutrition_question":

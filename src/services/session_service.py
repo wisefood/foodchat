@@ -384,6 +384,38 @@ class SessionService:
 
         return meal_plan
 
+    def add_prepared_meal_plan(self, session_id: str, meal_plan: MealPlan) -> MealPlan:
+        """Store a plan that arrives already assembled.
+
+        The structured (multi-plate / multi-day) path builds a complete
+        `MealPlan` with `days` populated — `from_courses` would flatten it
+        back into three single-plate slots, which is the exact shape it exists
+        to escape. Same persistence and canvas lifecycle as `add_meal_plan`.
+        """
+        session = self.get_session(session_id)
+        if not session:
+            raise ValueError(f"Session {session_id} not found")
+
+        session.meal_plans.append(meal_plan)
+
+        db = SessionLocal()
+        try:
+            db_save_meal_plan(
+                db, meal_plan.id, session_id, "daily",
+                _serialize_meal_plan(meal_plan),
+                version=meal_plan.version, parent_id=meal_plan.parent_id,
+            )
+        finally:
+            db.close()
+
+        session.daily_canvas = PlanCanvas(
+            plan_type="daily",
+            current_id=meal_plan.id,
+            root_id=meal_plan.id,
+        )
+        self._persist_canvases(session_id, session)
+        return meal_plan
+
     def refine_meal_plan(
         self,
         session_id: str,

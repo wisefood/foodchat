@@ -377,6 +377,20 @@ class ChatService:
         session = self._get_session(session_id)
         signals = self.feedback_service.get_signals(session.member_id)
 
+        # The standing plan shape. A non-default spec — extra meals, several
+        # days, a multi-plate lunch — goes through the structured path, which
+        # can express it; the classic three-slot grader cannot. This is the
+        # dispatch DYNAMIC_MEALS_PLAN.md Phase 2 was built for: the engine and
+        # the state both existed, and nothing connected them, so "add salads
+        # as side dishes" extracted a spec, stored it, and then generated
+        # exactly the plan it would have generated anyway.
+        spec = profile.pop("_plan_spec", None)
+        if spec is not None and not spec.is_default:
+            return self._generate_structured(
+                session_id, final_query, profile, spec, pinned, seed_note,
+                signals, is_refinement,
+            )
+
         plans = self.pipeline.generate(
             final_query, profile, pinned=pinned,
             exclude_recipe_ids=signals.downvoted_recipe_ids,
@@ -449,6 +463,67 @@ class ChatService:
             facts, final_query, fallback=f"{fallback} {seed_note}".strip() if seed_note else fallback,
         )
 
+        self.session_service.add_message(session_id, "assistant", formatted)
+        return formatted, False, meal_plan
+
+    def _generate_structured(
+        self,
+        session_id: str,
+        final_query: str,
+        profile: dict,
+        spec,
+        pinned: dict,
+        seed_note: Optional[str],
+        signals,
+        is_refinement: bool,
+    ) -> Tuple[str, bool, Optional[MealPlan]]:
+        """Generate and store a plan whose shape the classic path cannot say.
+
+        Everything the member reads comes from what actually happened: the
+        shape that was built, the concerns the spec raised (three desserts in
+        a day gets a sentence, not silent compliance), and the anchors that
+        were honoured. The writer phrases; it does not invent.
+        """
+        excluded = list(signals.downvoted_recipe_ids or []) + list(
+            profile.get("_excluded_recipe_ids") or []
+        )
+        meal_plan = self.pipeline.plan_structured(
+            profile, spec, exclude_recipe_ids=excluded, pinned=pinned,
+        )
+        if meal_plan is None:
+            logger.warning("[%s] Structured plan came back empty — apology.", session_id)
+            apology = no_plan_message(profile)
+            self.session_service.add_message(session_id, "assistant", apology)
+            return apology, False, None
+
+        meal_plan = self.session_service.add_prepared_meal_plan(session_id, meal_plan)
+        logger.info(
+            "[%s] Structured plan %s stored (%s).",
+            session_id, meal_plan.id, spec.describe(),
+        )
+
+        concerns = spec.concerns()
+        facts = {
+            "action": "structured_plan",
+            "shape": spec.describe(),
+            "day_one": {
+                meal.meal_type: [plate.title for plate in meal.plates]
+                for meal in (meal_plan.days[0].meals if meal_plan.days else [])
+            },
+            "seed_note": seed_note,
+            # The spec's own reservations — the assistant must say them, not
+            # build three desserts silently. The member asked for guidance as
+            # well as obedience.
+            "concerns": concerns,
+            "notes": meal_plan.reasoning[:300],
+        }
+        fallback_parts = [f"Here's your plan — {spec.describe()}."]
+        if seed_note:
+            fallback_parts.append(seed_note)
+        fallback_parts.extend(concerns)
+        formatted = self.response_writer.write(
+            facts, final_query, fallback=" ".join(fallback_parts),
+        )
         self.session_service.add_message(session_id, "assistant", formatted)
         return formatted, False, meal_plan
 
