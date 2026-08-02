@@ -60,6 +60,30 @@ class SessionResponse(BaseModel):
     state: str
     message_count: int
     created_at: datetime
+    # None = never titled; the client falls back to the first user message.
+    title: Optional[str] = None
+
+
+class RenameSessionRequest(BaseModel):
+    member_id: str
+    title: str = Field(..., min_length=1, max_length=120)
+
+
+class SavePlanRequest(BaseModel):
+    member_id: str
+    saved: bool = True
+    # Optional custom name; defaults to the session title or plan type.
+    title: Optional[str] = Field(None, max_length=120)
+
+
+class SavedPlanResponse(BaseModel):
+    plan_id: str
+    session_id: str
+    plan_type: str
+    saved_title: Optional[str] = None
+    saved_at: Optional[datetime] = None
+    created_at: Optional[datetime] = None
+    plan: dict
 
 
 class MatchReasonResponse(BaseModel):
@@ -452,6 +476,7 @@ def create_session(request: CreateSessionRequest):
         return SessionResponse(
             session_id=session.session_id,
             member_id=session.member_id,
+            title=session.title,
             state=session.state,
             message_count=len(session.conversation),
             created_at=session.created_at,
@@ -473,6 +498,7 @@ def get_session(
     return SessionResponse(
         session_id=session.session_id,
         member_id=session.member_id,
+        title=session.title,
         state=session.state,
         message_count=len(session.conversation),
         created_at=session.created_at,
@@ -491,6 +517,47 @@ def delete_session(
         )
 
 
+@router.patch("/sessions/{session_id}", response_model=SessionResponse)
+def rename_session(session_id: str, request: RenameSessionRequest):
+    """Rename a session. Only the owning member may."""
+    if not services.session_service.rename_session(
+        session_id, request.member_id, request.title
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or access denied"
+        )
+    session = _require_session(session_id, request.member_id)
+    return SessionResponse(
+        session_id=session.session_id,
+        member_id=session.member_id,
+        title=session.title,
+        state=session.state,
+        message_count=len(session.conversation),
+        created_at=session.created_at,
+    )
+
+
+@router.post("/sessions/{session_id}/meal-plans/{plan_id}/save", status_code=status.HTTP_204_NO_CONTENT)
+def save_meal_plan(session_id: str, plan_id: str, request: SavePlanRequest):
+    """Save (or unsave) a plan so it outlives its conversation."""
+    _require_session(session_id, request.member_id)
+    if not services.session_service.set_plan_saved(
+        session_id, request.member_id, plan_id, request.saved, request.title
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Plan not found in this session"
+        )
+
+
+@router.get("/members/{member_id}/saved-plans", response_model=List[SavedPlanResponse])
+def get_member_saved_plans(member_id: str):
+    """Every plan the member saved, across all their sessions, newest first."""
+    return [
+        SavedPlanResponse(**row)
+        for row in services.session_service.get_member_saved_plans(member_id)
+    ]
+
+
 @router.get("/members/{member_id}/sessions", response_model=List[SessionResponse])
 def get_member_sessions(member_id: str):
     """Get all sessions for a specific member."""
@@ -498,6 +565,7 @@ def get_member_sessions(member_id: str):
     return [
         SessionResponse(
             session_id=s.session_id,
+            title=s.title,
             member_id=s.member_id,
             state=s.state,
             message_count=len(s.conversation),

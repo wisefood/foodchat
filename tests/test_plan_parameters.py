@@ -84,7 +84,7 @@ class TestCardAndText:
     def test_card_reflects_applied_profile_values(self):
         card = plan_parameters.build_card({"plan_parameters": {"cooking_time": 20}})
         by_key = {p["key"]: p for p in card["parameters"]}
-        assert set(by_key) == {"cooking_time", "difficulty", "goal"}
+        assert set(by_key) == {"cooking_time", "difficulty", "goal", "food_waste"}
         assert by_key["cooking_time"]["value"] == 20
         assert by_key["difficulty"]["value"] is None
 
@@ -116,7 +116,7 @@ class TestCardAttachment:
                                  is_refinement=False)
         assert turn.plan_parameters is not None
         keys = [p["key"] for p in turn.plan_parameters["parameters"]]
-        assert keys == ["cooking_time", "difficulty", "goal"]
+        assert keys == ["cooking_time", "difficulty", "goal", "food_waste"]
 
     def test_text_refinement_does_not_re_attach_the_card(self, session_service, sample_profile):
         session = make_session(session_service, sample_profile)

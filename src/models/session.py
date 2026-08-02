@@ -256,6 +256,10 @@ class Session:
     member_id: str
     user_profile: dict
 
+    # Member-facing name. None means never titled; the UI falls back to the
+    # first user message so naming is a choice, not a chore.
+    title: Optional[str] = None
+
     # Unified conversation thread (user + assistant turns, all intents)
     conversation: list[Message] = field(default_factory=list)
 

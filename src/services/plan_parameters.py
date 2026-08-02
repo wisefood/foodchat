@@ -51,6 +51,31 @@ PARAMETER_DEFS: list[dict] = [
         ],
         "default": "balanced",
     },
+    {
+        # Food waste is a *dimension of the plan*, not of any one recipe: a
+        # week where Monday's leftover half-cabbage reappears in Wednesday's
+        # dinner wastes less than one where every meal opens a new set of
+        # ingredients. Nothing in a single prompt reliably says whether the
+        # member wants that trade — reuse pulls against variety — so it is a
+        # control, not an inference.
+        #
+        # One control, not a toggle plus a scope: "off" is the scope's own
+        # zero, and two knobs that can contradict each other ("waste: on,
+        # scope: off") is a settings bug shipped as a feature.
+        "key": "food_waste",
+        "label": "Food waste",
+        "kind": "choice",
+        "options": [
+            {"value": "off", "label": "Off"},
+            # Reuse fresh ingredients across the plan; pantry staples (oil,
+            # flour, spices) don't count as waste and don't constrain.
+            {"value": "reuse", "label": "Reuse ingredients"},
+            # Also shrink the total shopping list: fewer distinct
+            # ingredients overall, at some cost to variety.
+            {"value": "strict", "label": "Minimal shopping"},
+        ],
+        "default": "off",
+    },
 ]
 
 # How each applied value reads in the canonical refinement query.
@@ -67,7 +92,23 @@ _PHRASES = {
         "high_protein": "aim for high-protein meals",
         "energy": "aim for energizing, sustaining meals",
     },
+    "food_waste": {
+        "off": "no ingredient-reuse constraint",
+        "reuse": "favour meals that reuse each other's fresh ingredients to reduce food waste",
+        "strict": "keep the overall shopping list small — strongly favour meals sharing ingredients, even at some cost to variety",
+    },
 }
+
+
+def waste_mode(values: dict) -> str:
+    """The applied food-waste setting: 'off', 'reuse' or 'strict'.
+
+    Read by the weekly planner's scorer, which selects without an LLM — a
+    preference that never becomes a number there is a preference that does
+    not exist. The daily path hears the same setting as prose via `describe`.
+    """
+    value = values.get("food_waste")
+    return value if value in ("reuse", "strict") else "off"
 
 
 def build_card(profile: dict, plan_type: str = "daily") -> dict:

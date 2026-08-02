@@ -28,6 +28,9 @@ def _aware(value):
     return value
 
 from db import (
+    db_update_session_title,
+    db_set_plan_saved,
+    db_get_member_saved_plans,
     SessionLocal,
     db_create_session,
     db_get_session,
@@ -116,6 +119,7 @@ class SessionService:
             session = Session(
                 session_id=row.session_id,
                 member_id=row.member_id,
+                title=getattr(row, "title", None),
                 user_profile=user_profile,
                 state=row.state,
                 clarification=clarification,
@@ -177,6 +181,59 @@ class SessionService:
         if deleted:
             self._sessions.pop(session_id, None)
         return deleted
+
+    def rename_session(self, session_id: str, member_id: str, title: str) -> bool:
+        """Set the member-facing session name. Owner-scoped like delete."""
+        db = SessionLocal()
+        try:
+            ok = db_update_session_title(db, session_id, member_id, title)
+        finally:
+            db.close()
+        if ok:
+            cached = self._sessions.get(session_id)
+            if cached:
+                cached.title = title.strip()[:120] or None
+        return ok
+
+    def set_plan_saved(
+        self, session_id: str, member_id: str, plan_id: str,
+        saved: bool, title: Optional[str] = None,
+    ) -> bool:
+        """Mark a plan as saved. The session check runs first so a plan id
+        can never be toggled through someone else's session."""
+        if not self.get_session(session_id, member_id=member_id):
+            return False
+        db = SessionLocal()
+        try:
+            return db_set_plan_saved(db, session_id, plan_id, saved, title)
+        finally:
+            db.close()
+
+    def get_member_saved_plans(self, member_id: str) -> list[dict]:
+        """Saved plans across the member's sessions, newest saved first.
+        Returned as plain dicts (payload already parsed): the router shapes
+        them, and no Session object needs hydrating for a listing."""
+        db = SessionLocal()
+        try:
+            rows = db_get_member_saved_plans(db, member_id)
+            out = []
+            for row in rows:
+                try:
+                    payload = json.loads(row.payload)
+                except (TypeError, ValueError):
+                    continue  # an unreadable saved plan is not worth a 500
+                out.append({
+                    "plan_id": row.id,
+                    "session_id": row.session_id,
+                    "plan_type": row.plan_type,
+                    "saved_title": row.saved_title,
+                    "saved_at": row.saved_at,
+                    "created_at": row.created_at,
+                    "plan": payload,
+                })
+            return out
+        finally:
+            db.close()
 
     def get_member_sessions(self, member_id: str) -> list[Session]:
         db = SessionLocal()

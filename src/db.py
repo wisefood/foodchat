@@ -74,6 +74,9 @@ class SessionRow(Base):
 
     session_id = Column(String, primary_key=True)
     member_id = Column(String, nullable=False, index=True)
+    # Member-facing name. NULL means never titled: the UI then falls back to
+    # the first user message, so a rename is a choice, not a chore.
+    title = Column(Text, nullable=True)
     user_profile = Column(Text, nullable=False)           # JSON blob
     # Two independent canvas contexts (JSON blobs or NULL)
     daily_canvas = Column(Text, nullable=True)
@@ -105,6 +108,11 @@ class MealPlanRow(Base):
     id = Column(String, primary_key=True)
     session_id = Column(String, ForeignKey("sessions.session_id", ondelete="CASCADE"), nullable=False, index=True)
     plan_type = Column(String, nullable=False)       # "daily" | "weekly"
+    # Saved by the member. Plans are session-scoped and die with their
+    # conversation; saving is the member saying "this one outlives the chat".
+    saved = Column(Integer, nullable=False, default=0)
+    saved_title = Column(Text, nullable=True)
+    saved_at = Column(DateTime(timezone=True), nullable=True)
     version = Column(Integer, nullable=False, default=1)
     parent_id = Column(String, nullable=True)        # id of previous version, NULL for v1
     payload = Column(Text, nullable=False)           # full plan as JSON
@@ -144,6 +152,7 @@ def _migrate_existing_db() -> None:
             ("daily_canvas", "TEXT"),
             ("weekly_canvas", "TEXT"),
             ("clarification_state", "TEXT"),
+            ("title", "TEXT"),
         ]
         for col_name, col_type in session_migrations:
             if col_name not in existing_session_cols:
@@ -164,6 +173,13 @@ def _migrate_existing_db() -> None:
             ("parent_id", "TEXT"),
         ]
         for col_name, col_type in plan_migrations:
+            if col_name not in existing_plan_cols:
+                conn.execute(sa.text(f"ALTER TABLE meal_plans ADD COLUMN {col_name} {col_type}"))
+        for col_name, col_type in [
+            ("saved", "INTEGER NOT NULL DEFAULT 0"),
+            ("saved_title", "TEXT"),
+            ("saved_at", "TIMESTAMP"),
+        ]:
             if col_name not in existing_plan_cols:
                 conn.execute(sa.text(f"ALTER TABLE meal_plans ADD COLUMN {col_name} {col_type}"))
 
@@ -251,6 +267,55 @@ def db_update_state(
         row.state = state
         row.clarification_state = clarification_state
         db.commit()
+
+
+def db_update_session_title(db: DBSession, session_id: str, member_id: str, title: str) -> bool:
+    """Rename a session. Member-scoped: a session id is guessable enough that
+    renaming must prove ownership the same way delete does."""
+    row = (
+        db.query(SessionRow)
+        .filter(SessionRow.session_id == session_id, SessionRow.member_id == member_id)
+        .first()
+    )
+    if not row:
+        return False
+    row.title = title.strip()[:120] or None
+    db.commit()
+    return True
+
+
+def db_set_plan_saved(
+    db: DBSession, session_id: str, plan_id: str, saved: bool, title: str | None = None
+) -> bool:
+    """Mark a plan as saved (or unsave it). Session-scoped by the caller."""
+    row = (
+        db.query(MealPlanRow)
+        .filter(MealPlanRow.id == plan_id, MealPlanRow.session_id == session_id)
+        .first()
+    )
+    if not row:
+        return False
+    row.saved = 1 if saved else 0
+    row.saved_title = (title or "").strip()[:120] or None if saved else None
+    row.saved_at = utcnow() if saved else None
+    db.commit()
+    return True
+
+
+def db_get_member_saved_plans(db: DBSession, member_id: str) -> list[MealPlanRow]:
+    """Every saved plan across the member's sessions, newest saved first.
+
+    Joined through sessions because plans carry no member_id of their own —
+    ownership is the session's, and filtering there is what keeps one
+    member's saved list from ever showing another's plans.
+    """
+    return (
+        db.query(MealPlanRow)
+        .join(SessionRow, SessionRow.session_id == MealPlanRow.session_id)
+        .filter(SessionRow.member_id == member_id, MealPlanRow.saved == 1)
+        .order_by(MealPlanRow.saved_at.desc())
+        .all()
+    )
 
 
 def db_update_user_profile(db: DBSession, session_id: str, user_profile: str) -> None:
