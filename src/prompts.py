@@ -463,6 +463,12 @@ which meals, and whether any meal should be served as more than one plate.
 
 You are not choosing recipes. You only decide what to ask the planner for.
 
+Return a JSON object with the fields "mentioned", "num_days", "meals" and
+"plates". (Groq requires the word "json" to appear in the prompt whenever a
+JSON response format is requested — every other extractor here says it too,
+and this one did not, so it failed on every single turn with a 400 and the
+plan shape was silently never extracted.)
+
 Meals: breakfast, brunch, lunch, dinner, snack, dessert, side, drink.
 
 A meal can be served as several plates. Each plate has a ROLE:

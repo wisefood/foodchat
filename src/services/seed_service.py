@@ -26,7 +26,7 @@ from typing import Optional
 from agents import SeedExtractor
 from models.recipe import CandidateRecipe, ResolvedRecipe
 from services.adapted_recipes import overlay_resolved
-from services.candidates_client import CANDIDATES, RecipeCandidatesClient, allergen_conflict
+from services.candidates_client import normalize_diet_tags, CANDIDATES, RecipeCandidatesClient, allergen_conflict
 
 logger = logging.getLogger(__name__)
 
@@ -157,7 +157,10 @@ class SeedService:
             name,
             limit=5,
             allergens=profile.get("allergies") or [],
-            diet=profile.get("diet") or [],
+            # Normalised for the same reason as everywhere else: an
+            # unrecognised tag ANDs a name search down to nothing, so a
+            # member's named dish would silently fail to resolve.
+            diet=normalize_diet_tags(profile.get("diet")),
             exclude_ingredients=profile.get("food_dislikes") or [],
         )
 

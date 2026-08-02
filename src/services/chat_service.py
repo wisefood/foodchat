@@ -25,7 +25,9 @@ from typing import Optional, Tuple
 from agents import GuidelineAdherenceGrader, MealDiversityGrader, ResponseWriter, SimpleChatBot
 from models.recipe import CandidateRecipe, ScoredPlan
 from models.session import MealPlan
+from models.planning_state import PlanningStateDelta
 from services.adapted_recipes import overlay_plan
+from services.planning_delta import extract_state_delta
 from services.candidates_client import CANDIDATES
 from services.clarification import ClarificationManager, ClarificationState
 from services.feedback_service import FeedbackService
@@ -108,6 +110,8 @@ class ChatService:
         self.chatbot = SimpleChatBot()
         self.seed_service = SeedService()
         self.feedback_service = FeedbackService()
+        # Used to re-resolve anchors carried from earlier turns.
+        self.client = CANDIDATES
         self.response_writer = ResponseWriter()
         self.diversity_grader = MealDiversityGrader()
         self.guideline_grader = GuidelineAdherenceGrader()
@@ -174,6 +178,18 @@ class ChatService:
         # snapshot — the profile is what the clarification state persists, so
         # pins survive restarts mid-clarification.
         profile = dict(session.user_profile)
+
+        # Standing constraints: what the member has already told us.
+        #
+        # Read before anything this turn says, merged with this turn's delta,
+        # and written back. Previously each turn started from the profile alone
+        # and rebuilt the request from a rewritten query, so "no favourites",
+        # an anchored dish and "salads on the side" all evaporated the moment
+        # the next message arrived.
+        state = self.session_service.get_planning_state(session_id)
+        delta = extract_state_delta(effective_message)
+        state = state.merge(delta)
+
         if seeds:
             resolutions = self.seed_service.resolve_seeds(seeds, profile)
             pinned, dropped = self.seed_service.place_daily(resolutions)
@@ -185,9 +201,36 @@ class ChatService:
                     }
                     for slot, r in pinned.items()
                 }
+                # An anchor the member named is a standing choice, not a
+                # property of this one message. Saying "add a salad" next turn
+                # must not silently drop the apple pie they asked for.
+                state = state.merge(
+                    PlanningStateDelta(
+                        anchors={slot: r.recipe_id for slot, r in pinned.items()}
+                    )
+                )
             note = self.seed_service.describe(resolutions, dropped)
             if note:
                 profile["_seed_note"] = note
+
+        # Anchors set in earlier turns, re-pinned for this one.
+        if state.anchors:
+            carried = self._pin_from_anchors(state, profile)
+            if carried:
+                profile.setdefault("_pinned_slots", {}).update(carried)
+
+        if state.use_favorites is False:
+            # The member said no. It has to keep meaning no — a favourite that
+            # reappears one turn after being declined reads as not listening.
+            profile["favorite_recipe_ids"] = []
+            profile["_favorites_declined"] = True
+
+        if state.excluded_recipe_ids:
+            profile["_excluded_recipe_ids"] = list(state.excluded_recipe_ids)
+
+        profile["_plan_spec"] = state.spec
+        self.session_service.set_planning_state(session_id, state)
+        logger.info("[%s] Standing plan state: %s", session_id, state.describe())
 
         if skip_clarification:
             return self._generate_and_store(
@@ -258,6 +301,29 @@ class ChatService:
     # ------------------------------------------------------------------ #
     # Generation                                                           #
     # ------------------------------------------------------------------ #
+
+    def _pin_from_anchors(self, state, profile: dict) -> dict:
+        """Re-resolve anchors held from earlier turns into pinned slots.
+
+        Stored as ids rather than snapshots, so the title and ingredients are
+        whatever they are now — including the member's own adapted version,
+        which a snapshot taken three turns ago would not have.
+        """
+        pinned: dict = {}
+        already = set((profile.get("_pinned_slots") or {}).keys())
+        for slot, recipe_id in state.anchors.items():
+            if slot in already:
+                continue  # this turn named one explicitly; it wins
+            resolved = self.client.fetch_recipe(recipe_id) if self.client else None
+            if resolved is None:
+                logger.info("Anchor %s for %s no longer resolvable", recipe_id, slot)
+                continue
+            recipe = resolved.recipe
+            pinned[slot] = {
+                "recipe_id": recipe.recipe_id, "title": recipe.title,
+                "ingredients": recipe.ingredients, "directions": recipe.directions,
+            }
+        return pinned
 
     def _generate_and_store(
         self,

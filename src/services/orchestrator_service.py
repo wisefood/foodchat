@@ -374,6 +374,24 @@ class OrchestratorService:
         accepted = bool(_AFFIRMATIVE.match(message or ""))
         logger.info("[%s] Favorites offer %s.", session_id, "accepted" if accepted else "declined")
 
+        # Record the answer so it outlives this turn.
+        #
+        # It was computed and thrown away: the decline suppressed the boost for
+        # exactly one request, and the next regeneration read `favorite_recipe_ids`
+        # off the profile again and put the favourite straight back. A member who
+        # says no and sees their favourite in the plan anyway has been told their
+        # answer does not matter.
+        from models.planning_state import PlanningStateDelta
+
+        try:
+            state = self.session_service.get_planning_state(session_id)
+            self.session_service.set_planning_state(
+                session_id, state.merge(PlanningStateDelta(use_favorites=accepted))
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Losing the preference is bad; losing the plan is worse.
+            logger.warning("[%s] Could not persist favorites answer: %s", session_id, exc)
+
         seeds: list[dict] = []
         if accepted:
             # Anchor exactly the favorites that were OFFERED (resolved pairs

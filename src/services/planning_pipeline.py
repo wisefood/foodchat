@@ -24,7 +24,7 @@ from models.plan_spec import PlanSpec
 from models.recipe import CandidateRecipe, ScoredPlan
 from models.session import MealPlan
 from services import plan_parameters
-from services.candidates_client import CANDIDATES
+from services.candidates_client import CANDIDATES, normalize_diet_tags
 
 logger = logging.getLogger(__name__)
 
@@ -191,7 +191,15 @@ class PlanningPipeline:
             envelope = PLANNER.plan_meals(
                 spec=spec,
                 allergens=profile.get("allergies") or [],
-                diet=profile.get("diet") or [],
+                # Normalised, never raw.
+            #
+            # RecipeWrangler ANDs diet tags and never relaxes them, so a single
+            # value it does not know — "balanced", "mediterranean", "omnivore",
+            # a goal slug that leaked into the diet list — returns zero
+            # candidates for every slot and the member gets an apology. The old
+            # client did this and its docstring said why; dropping it when the
+            # candidate source moved is what emptied the plan.
+            diet=normalize_diet_tags(profile.get("diet")),
                 cuisines=cuisines,
                 exclude_ingredients=profile.get("food_dislikes") or [],
                 exclude_recipe_ids=list(exclude_recipe_ids or []),
@@ -371,7 +379,7 @@ def _fetch_candidate_pool(
             slots=slots,
             count_per_slot=limit_per_slot,
             allergens=profile.get("allergies") or [],
-            diet=profile.get("diet") or [],
+            diet=normalize_diet_tags(profile.get("diet")),
             cuisines=cuisines,
             exclude_ingredients=profile.get("food_dislikes") or [],
             exclude_recipe_ids=exclude_recipe_ids,

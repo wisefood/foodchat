@@ -220,7 +220,8 @@ class RecipeCandidatesClient:
                 slots=(meal_type,),
                 count_per_slot=limit,
                 allergens=profile.get("allergies") or [],
-                diet=profile.get("diet") or [],
+                # Normalised: an unknown tag ANDs to zero candidates.
+                diet=normalize_diet_tags(profile.get("diet")),
                 cuisines=cuisines,
                 exclude_ingredients=profile.get("food_dislikes") or [],
                 exclude_recipe_ids=list(exclude_ids),

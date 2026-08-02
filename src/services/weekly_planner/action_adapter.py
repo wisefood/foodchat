@@ -17,7 +17,7 @@ neutral, never blocking the plan.
 from typing import Any, Dict, List, Union
 
 from services import plan_parameters
-from services.candidates_client import CANDIDATES
+from services.candidates_client import CANDIDATES, normalize_diet_tags
 
 # Candidates fetched per slot per day. One fetch serves all three slots of a
 # day, so this stays small to keep the RecipeWrangler payloads light.
@@ -70,7 +70,9 @@ class RecipeActionSpace:
             pool = _fetch_candidate_pool(
                 profile=self.user_profile,
                 allergens=self.allergens,
-                diet=self.diet,
+                # Normalised: an unknown tag ANDs to zero candidates,
+                # and diet is never relaxed.
+                diet=normalize_diet_tags(self.diet),
                 cuisines=cuisines,
                 exclude_recipe_ids=list(self._selected_ids),
                 limit_per_slot=DAILY_POOL_LIMIT,
@@ -140,7 +142,7 @@ def _fetch_candidate_pool(
             days=1,
             count_per_slot=limit_per_slot,
             allergens=allergens,
-            diet=diet,
+            diet=normalize_diet_tags(diet),
             cuisines=cuisines,
             exclude_ingredients=profile.get("food_dislikes") or [],
             exclude_recipe_ids=exclude_recipe_ids,

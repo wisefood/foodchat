@@ -253,6 +253,20 @@ def db_update_state(
         db.commit()
 
 
+def db_update_user_profile(db: DBSession, session_id: str, user_profile: str) -> None:
+    """Replace the session's stored profile JSON.
+
+    The profile row carries the durable planning state (`PlanningState`), which
+    has to survive the turn that set it — that is the whole point of it. Written
+    as a whole document rather than a patch because it is one JSON column and a
+    read-modify-write inside one request is the only writer.
+    """
+    row = db.query(SessionRow).filter(SessionRow.session_id == session_id).first()
+    if row:
+        row.user_profile = user_profile
+        db.commit()
+
+
 # ------------------------------------------------------------------ #
 # Message helpers                                                      #
 # ------------------------------------------------------------------ #

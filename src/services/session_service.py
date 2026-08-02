@@ -37,6 +37,7 @@ from db import (
     db_get_messages,
     db_update_canvases,
     db_update_state,
+    db_update_user_profile,
     db_update_profile,
     db_save_meal_plan,
     db_get_session_meal_plans,
@@ -545,6 +546,44 @@ class SessionService:
         db = SessionLocal()
         try:
             db_update_state(db, session_id, "clarifying", clarification_state=json.dumps(state_dict))
+        finally:
+            db.close()
+
+    # Reserved key inside `user_profile` holding the durable planning state.
+    # Namespaced with an underscore so it cannot collide with a profile field
+    # coming from the member service.
+    PLANNING_STATE_KEY = "_planning_state"
+
+    def get_planning_state(self, session_id: str):
+        """The member's standing plan constraints for this session."""
+        from models.planning_state import PlanningState
+
+        session = self.get_session(session_id)
+        if not session:
+            return PlanningState()
+        return PlanningState.from_dict(
+            (session.user_profile or {}).get(self.PLANNING_STATE_KEY)
+        )
+
+    def set_planning_state(self, session_id: str, state) -> None:
+        """Persist the standing constraints so the next turn still has them.
+
+        Written on the session's profile rather than a new column: it is
+        session-scoped state, `user_profile` is already a JSON document on the
+        session row, and a migration to store four small fields would be a
+        migration to maintain forever.
+        """
+        session = self.get_session(session_id)
+        if not session:
+            raise ValueError(f"Session {session_id} not found")
+
+        profile = dict(session.user_profile or {})
+        profile[self.PLANNING_STATE_KEY] = state.to_dict()
+        session.user_profile = profile
+
+        db = SessionLocal()
+        try:
+            db_update_user_profile(db, session_id, json.dumps(profile))
         finally:
             db.close()
 
