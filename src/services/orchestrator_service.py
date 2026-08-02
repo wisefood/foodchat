@@ -504,6 +504,20 @@ class OrchestratorService:
     def _handle_edit(self, session_id: str, message: str) -> ChatTurn:
         """Targeted single-slot edit with verified directive (M4b)."""
         outcome = self.edit_service.process(session_id, message)
+        if outcome.unresolved:
+            # The classifier heard "change the plan" but no single slot could
+            # be parsed. The member is still asking for a change — run it as a
+            # refinement of the active plan, which reads free text, instead of
+            # bouncing back "could you rephrase?".
+            session = self.session_service.get_session(session_id)
+            canvas = session.active_canvas if session else None
+            if canvas is not None and canvas.plan_type == "weekly":
+                return self._handle_weekly(
+                    session_id, message, "refine_plan", is_refinement=True
+                )
+            return self._handle_plan(
+                session_id, message, "refine_plan", is_refinement=True
+            )
         return self._turn_from_edit(session_id, outcome)
 
     def _turn_from_edit(self, session_id: str, outcome) -> ChatTurn:

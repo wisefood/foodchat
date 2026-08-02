@@ -142,20 +142,25 @@ class EditService:
 
     def process(self, session_id: str, message: str) -> EditOutcome:
         session = self._get_session(session_id)
-        self.session_service.add_message(session_id, "user", message)
 
         canvas = session.active_canvas
         if canvas is None:
             text = ("There's no plan on the canvas yet — ask me for a daily or "
                     "weekly plan first, then I can swap meals in it.")
+            self.session_service.add_message(session_id, "user", message)
             self.session_service.add_message(session_id, "assistant", text)
             return EditOutcome(text=text)
 
         command = self.extractor.extract(message, plan_type=canvas.plan_type)
         if command is None:
-            text = "I couldn't quite parse which meal to change — could you rephrase?"
-            self.session_service.add_message(session_id, "assistant", text)
-            return EditOutcome(text=text, needs_clarification=True)
+            # Not parseable as a slot edit — but the classifier heard a
+            # request to change the plan, and "could you rephrase?" answers
+            # that request with homework. Nothing is logged here; the
+            # orchestrator reroutes the message through the refinement path,
+            # which understands free text and stores the turn itself.
+            return EditOutcome(text="", unresolved=True)
+
+        self.session_service.add_message(session_id, "user", message)
 
         # Weekly edits need a day; daily edits need a meal type. Ask once.
         missing_slot = (
