@@ -255,6 +255,24 @@ class OrchestratorService:
                 return offer
 
             if intent == "weekly_plan":
+                # A *shaped* week — salads beside dinner, a two-plate lunch —
+                # cannot be expressed by the weekly planner, whose loop is
+                # fixed at seven days of three single-plate meals. The
+                # structured path can, and RecipeWrangler plans N days
+                # natively without reusing a recipe. Route the request there;
+                # the spec extractor reads "week" as num_days=7, and the plan
+                # lands on the plan canvas with every day rendered.
+                from services.planning_delta import extract_state_delta
+                delta = extract_state_delta(message)
+                if delta.spec is not None and delta.spec.plates:
+                    logger.info(
+                        "[%s] Weekly request carries a multi-plate shape (%s) — "
+                        "routing through the structured path",
+                        session_id, delta.spec.describe(),
+                    )
+                    return self._handle_plan(
+                        session_id, message, "daily_plan", is_refinement=False, seeds=seeds
+                    )
                 return self._handle_weekly(session_id, message, intent, is_refinement=False, seeds=seeds)
             return self._handle_plan(session_id, message, intent, is_refinement=False, seeds=seeds)
 
