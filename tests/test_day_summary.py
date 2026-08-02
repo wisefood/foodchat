@@ -150,7 +150,16 @@ class FakeCandidates:
     def __init__(self):
         self.calls = 0
 
-    def fetch_candidates(self, **kwargs):
+    def split_cuisines(self, likes):
+        """No vocabulary in tests, so nothing is a cuisine.
+
+        Mirrors the real client's behaviour when the vocabulary fetch fails —
+        everything stays an ingredient — which is the safe degradation these
+        tests should be asserting against anyway.
+        """
+        return [], list(likes or [])
+
+    def pool(self, **kwargs):
         self.calls += 1
         return {
             slot: [CandidateRecipe(f"{slot}-{self.calls}", spec["title"],
@@ -186,6 +195,7 @@ class TestWeeklyServiceDaySummaries:
         fake = FakeCandidates()
         monkeypatch.setattr(wps, "CANDIDATES", fake)
         monkeypatch.setattr(aa, "CANDIDATES", fake)
+        monkeypatch.setattr(aa, "_fetch_candidate_pool", lambda **kw: fake.pool(**kw))
 
         svc = wps.WeeklyPlanService.__new__(wps.WeeklyPlanService)
         svc.session_service = session_service

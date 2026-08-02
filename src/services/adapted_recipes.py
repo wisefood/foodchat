@@ -58,26 +58,67 @@ def _overlay_nutrition(existing: dict | None, payload: dict) -> dict | None:
     return existing
 
 
+def _overlay_course(course, adapted: dict) -> bool:
+    """Replace one plate with the member's saved version. True if it changed."""
+    record = adapted.get(course.recipe_id)
+    if not record:
+        return False
+    payload = record.get("payload") or {}
+    title = _display_title(record)
+    if title:
+        course.title = title
+    text = _ingredients_text(payload)
+    if text:
+        course.ingredients = text
+    course.nutrition = _overlay_nutrition(course.nutrition, payload)
+    course.match_reasons = list(course.match_reasons or []) + [dict(ADAPTED_REASON)]
+    return True
+
+
 def overlay_plan(meal_plan, profile: dict) -> int:
-    """Overlay all courses of a daily MealPlan in place; returns adapted count."""
+    """Overlay every plate of a daily MealPlan in place; returns adapted count.
+
+    Walks `day_plans`, not the three scalar courses.
+
+    Those cover one plate of one day. A plan with a two-course dinner, or more
+    than one day, kept the member's adapted version for the main and served the
+    original for every other plate — someone who had swapped an ingredient out
+    for an allergy or a dislike got their swap on one dish and the thing they
+    had rejected on the next.
+
+    `day_plans` presents a legacy plan as one day of single-plate meals, so the
+    classic case walks exactly the same three courses it always did.
+
+    The scalar fields are mirrors of day 1's mains, so they are refreshed after
+    the walk — the objects are shared for a legacy plan but rebuilt for a
+    flexible one, and a reader addressing `plan.dinner` by name must not see the
+    unadapted version.
+    """
     adapted = adapted_map(profile)
     if not adapted:
         return 0
+
     count = 0
-    for course in (meal_plan.breakfast, meal_plan.lunch, meal_plan.dinner):
-        record = adapted.get(course.recipe_id)
-        if not record:
-            continue
-        payload = record.get("payload") or {}
-        title = _display_title(record)
-        if title:
-            course.title = title
-        text = _ingredients_text(payload)
-        if text:
-            course.ingredients = text
-        course.nutrition = _overlay_nutrition(course.nutrition, payload)
-        course.match_reasons = list(course.match_reasons or []) + [dict(ADAPTED_REASON)]
-        count += 1
+    seen: set[int] = set()
+    for day in meal_plan.day_plans:
+        for meal in day.meals:
+            for plate in meal.plates:
+                # A plan's scalar fields can be the *same objects* as day 1's
+                # plates. Overlaying twice would append a second "adapted"
+                # reason chip and count one swap as two.
+                if id(plate) in seen:
+                    continue
+                seen.add(id(plate))
+                if _overlay_course(plate, adapted):
+                    count += 1
+
+    if getattr(meal_plan, "days", None):
+        by_slot = {m.meal_type: m.main for m in meal_plan.days[0].meals}
+        for slot in ("breakfast", "lunch", "dinner"):
+            plate = by_slot.get(slot)
+            if plate is not None:
+                setattr(meal_plan, slot, plate)
+
     return count
 
 

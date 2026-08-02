@@ -84,23 +84,33 @@ class SeedService:
                     continue
                 # Known id unexpectedly gone — fall through to name search.
 
-            suggestions = self._autocomplete_tolerant(name)
-            if not suggestions:
-                resolutions.append(SeedResolution(
-                    requested_name=name, status="not_found",
-                    note=f"I couldn't find a recipe matching “{name}”.",
-                ))
-                continue
-
-            # Walk the suggestions in rank order: the legacy autocomplete
-            # index has carried corrupt docs whose stored id is a title or a
-            # dead legacy id — dying on suggestion[0] silently dropped the
-            # anchor the user just asked for.
+            # Search first, autocomplete second.
+            #
+            # `/api/v2/tools/find_recipes` is an analysed full-text search with
+            # relevance ranking, so "bolognesse" finds bolognese without the
+            # truncation retries below — and, more usefully, it applies the
+            # member's allergens and diet, so a dish they cannot eat is never
+            # offered as an anchor in the first place. Autocomplete is a
+            # prefix matcher for a type-ahead box; it was doing this job only
+            # because it was the only search FoodChat knew about.
+            candidates = self._search_by_name(name, profile)
             resolved = None
-            for recipe_id, _title in suggestions[:3]:
-                resolved = self.client.fetch_recipe(recipe_id)
+            for candidate in candidates[:3]:
+                resolved = self.client.fetch_recipe(candidate.recipe_id)
                 if resolved is not None:
                     break
+
+            if resolved is None:
+                # Autocomplete fallback. Kept because it walks a different
+                # index: a recipe absent from search for any reason is still
+                # reachable by exact prefix, and losing a user's named dish is
+                # worse than a second round trip.
+                suggestions = self._autocomplete_tolerant(name)
+                for recipe_id, _title in suggestions[:3]:
+                    resolved = self.client.fetch_recipe(recipe_id)
+                    if resolved is not None:
+                        break
+
             if resolved is None:
                 resolutions.append(SeedResolution(
                     requested_name=name, status="not_found",
@@ -131,6 +141,24 @@ class SeedService:
             requested_name=name, status="resolved", recipe=resolved,
             meal_type=seed.get("meal_type"), day=seed.get("day"),
             kept=bool(seed.get("kept")),
+        )
+
+    def _search_by_name(self, name: str, profile: dict) -> list:
+        """Recipes matching a dish name, filtered to what the member can eat.
+
+        The allergy gate in `_finalize_resolution` still runs — this narrows
+        the field rather than replacing the check. Filtering here means the
+        gate rejects a genuinely borderline dish instead of the first three
+        results all being things the member is allergic to.
+        """
+        from services.plan_client import PLANNER
+
+        return PLANNER.find_recipes(
+            name,
+            limit=5,
+            allergens=profile.get("allergies") or [],
+            diet=profile.get("diet") or [],
+            exclude_ingredients=profile.get("food_dislikes") or [],
         )
 
     def _autocomplete_tolerant(self, name: str) -> list[tuple[str, str]]:

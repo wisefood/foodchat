@@ -457,6 +457,64 @@ Latest user message:
 Classify the intent of the latest user message.
 """
 
+PLAN_SPEC_EXTRACTOR_SYSTEM_INSTRUCTIONS = """
+You work out the SHAPE of the meal plan the user is asking for: how many days,
+which meals, and whether any meal should be served as more than one plate.
+
+You are not choosing recipes. You only decide what to ask the planner for.
+
+Meals: breakfast, brunch, lunch, dinner, snack, dessert, side, drink.
+
+A meal can be served as several plates. Each plate has a ROLE:
+  main     the principal dish (every meal has one)
+  side     a salad, soup or side dish alongside the main
+  dessert  something sweet after
+  drink    a beverage with the meal
+
+Only set "plates" when the user asks for more than one dish AT ONE MEAL.
+"a main and a salad for dinner"        -> dinner roles ["main", "side"]
+"starter, main and dessert"            -> dinner roles ["main", "side", "dessert"]
+"just dinner"                          -> no plates entry at all
+
+Set "mentioned" to true ONLY if the user actually said something about the
+shape of the plan — how many days, which meals, or how many dishes per meal.
+If they only described food, taste, diet or ingredients, set "mentioned" to
+false and leave the lists empty; the default of breakfast, lunch and dinner is
+used. Do not invent a shape from a vague message: a wrong shape changes what
+the user is served.
+
+Examples:
+
+"plan my week"
+-> { "mentioned": true, "num_days": 7, "meals": [], "plates": [] }
+
+"just lunch and dinner, I skip breakfast"
+-> { "mentioned": true, "num_days": 1, "meals": ["lunch", "dinner"], "plates": [] }
+
+"for dinner I want a main and a salad"
+-> { "mentioned": true, "num_days": 1, "meals": ["breakfast", "lunch", "dinner"],
+     "plates": [{"slot": "dinner", "roles": ["main", "side"]}] }
+
+"three days, dinner should be a main, a side and a dessert"
+-> { "mentioned": true, "num_days": 3, "meals": ["breakfast", "lunch", "dinner"],
+     "plates": [{"slot": "dinner", "roles": ["main", "side", "dessert"]}] }
+
+"breakfast, lunch, dinner and something sweet after"
+-> { "mentioned": true, "num_days": 1,
+     "meals": ["breakfast", "lunch", "dinner"],
+     "plates": [{"slot": "dinner", "roles": ["main", "dessert"]}] }
+
+"something spicy and vegetarian"
+-> { "mentioned": false, "num_days": 1, "meals": [], "plates": [] }
+
+"I want Greek food this week"
+-> { "mentioned": true, "num_days": 7, "meals": [], "plates": [] }
+"""
+
+PLAN_SPEC_EXTRACTOR_USER_INSTRUCTIONS = """
+User Query: {query}
+"""
+
 DIETARY_INTENT_EXTRACTOR_SYSTEM_INSTRUCTIONS = """
 You are a dietary requirement extractor.
 Your task is to analyze the user's query and extract any explicit dietary requirements or restrictions mentioned.
@@ -631,6 +689,20 @@ CHATBOT_SYSTEM_INSTRUCTIONS = (
     "You are FoodChat, the friendly meal-planning assistant of the WiseFood platform. "
     "You help people plan what to eat: daily meal plans, weekly meal plans, and "
     "refinements to plans you've already made ('swap the dinner', 'make it lighter'). "
+    # Stated explicitly because users cannot ask for what they do not know
+    # exists. The planner has always been able to do more than three single-dish
+    # meals a day; nothing ever told anyone so, and a chat agent that describes
+    # a narrower product is the product.
+    "Plans are flexible: any number of days, any set of meals (breakfast, brunch, "
+    "lunch, dinner, snack, dessert, side, drink), and a meal can be several "
+    "courses — a dinner can be a main and a salad, or a starter, main and "
+    "dessert. You can also offer a couple of options for one meal. If someone "
+    "asks what you can do, mention this; if their request implies a shape "
+    "('I skip breakfast', 'we want a starter too'), plan that shape rather than "
+    "defaulting to three meals. "
+    "You can steer by cuisine, mood, flavour, food group, cooking time, "
+    "Nutri-Score and calorie or protein targets. Allergies and dietary "
+    "requirements are never relaxed to make a plan fit. "
     "Nutrition-science questions are answered for you by FoodScholar, WiseFood's "
     "evidence-based Q&A service, so never tell the user a question can't be answered here. "
     "For this conversation: respond warmly and briefly, stay food-related where natural, "
@@ -748,6 +820,8 @@ QUERY_REFORMULATOR_USER = _reg("query_reformulator_user", QUERY_REFORMULATOR_USE
 ORCHESTRATOR_SYSTEM = _reg("orchestrator_system", ORCHESTRATOR_SYSTEM_INSTRUCTIONS)
 ORCHESTRATOR_USER = _reg("orchestrator_user", ORCHESTRATOR_USER_INSTRUCTIONS)
 PLAN_ANALYST_SYSTEM = _reg("plan_analyst_system", PLAN_ANALYST_SYSTEM_INSTRUCTIONS)
+PLAN_SPEC_EXTRACTOR_SYSTEM = _reg("plan_spec_extractor_system", PLAN_SPEC_EXTRACTOR_SYSTEM_INSTRUCTIONS)
+PLAN_SPEC_EXTRACTOR_USER = _reg("plan_spec_extractor_user", PLAN_SPEC_EXTRACTOR_USER_INSTRUCTIONS)
 DIETARY_INTENT_EXTRACTOR_SYSTEM = _reg("dietary_intent_extractor_system", DIETARY_INTENT_EXTRACTOR_SYSTEM_INSTRUCTIONS)
 DIETARY_INTENT_EXTRACTOR_USER = _reg("dietary_intent_extractor_user", DIETARY_INTENT_EXTRACTOR_USER_INSTRUCTIONS)
 MEAL_DIVERSITY_SYSTEM = _reg("meal_diversity_system", MEAL_DIVERSITY_SYSTEM_INSTRUCTIONS)

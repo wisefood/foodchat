@@ -30,6 +30,10 @@ logger = logging.getLogger(__name__)
 RECIPEWRANGLER_API_URL = os.getenv("RECIPEWRANGLER_API_URL", "http://recipewrangler:8001")
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("RECIPEWRANGLER_TIMEOUT", "60"))
 
+# Retained for `fetch_details` batching and the response readers below. The
+# candidate fetch that used to live here is gone: every slot pool now comes
+# from `/api/v2/tools/plan_meals` via `services.plan_client`, which is the only
+# surface that knows the corpus's annotations and its planning tier.
 MEAL_SLOTS = ("breakfast", "lunch", "dinner")
 
 # Dietary tags as stored on RecipeWrangler recipe nodes (confirmed against the API).
@@ -139,87 +143,97 @@ class RecipeCandidatesClient:
     def __init__(self, base_url: Optional[str] = None):
         self.base_url = (base_url or RECIPEWRANGLER_API_URL).rstrip("/")
 
-    def fetch_candidates(
-        self,
-        allergens: Optional[list[str]] = None,
-        diet=None,
-        include_ingredients: Optional[list[str]] = None,
-        exclude_ingredients: Optional[list[str]] = None,
-        exclude_recipe_ids: Optional[list[str]] = None,
-        favorite_recipe_ids: Optional[list[str]] = None,
-        nutrition_profile: Optional[dict] = None,
-        limit_per_slot: int = 5,
-        randomize: bool = True,
-    ) -> CandidatesBySlot:
-        """Fetch candidate recipes grouped by meal slot.
+    # Vocabulary cache. RecipeWrangler owns these lists and they change when the
+    # corpus is re-annotated, so hardcoding them here would drift silently — a
+    # cuisine added upstream would keep being sent as an ingredient forever.
+    _vocab_cache: Optional[dict] = None
 
-        ``favorite_recipe_ids`` is a soft ranking boost applied server-side —
-        favorites float to the top of their slot but hard filters (allergens,
-        diet, exclusions) always win.
+    def vocabularies(self) -> dict:
+        """Closed vocabularies from RecipeWrangler's tool manifest.
 
-        Raises ``httpx.HTTPError`` on transport/HTTP failures — callers decide
-        how to degrade (the chat layer apologizes; it must never 500 silently).
+        Cached for the process lifetime. Failure returns an empty dict rather
+        than raising: every caller degrades to "treat nothing as a cuisine",
+        which is exactly the behaviour that existed before this was added.
         """
-        payload = {
-            "user_profile": {
-                "allergies": allergens or [],
-                "diet": normalize_diet_tags(diet),
-            },
-            "constraints": {
-                "include_ingredients": include_ingredients or [],
-                "exclude_ingredients": exclude_ingredients or [],
-                "exclude_recipe_ids": exclude_recipe_ids or [],
-                "favorite_recipe_ids": favorite_recipe_ids or [],
-                "nutrition_profile": nutrition_profile,
-            },
-            "quotas": {slot: limit_per_slot for slot in MEAL_SLOTS},
-            "randomize": randomize,
-        }
+        if RecipeCandidatesClient._vocab_cache is not None:
+            return RecipeCandidatesClient._vocab_cache
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                response = client.get(f"{self.base_url}/api/v2/tools")
+                response.raise_for_status()
+                vocab = response.json().get("vocabularies") or {}
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not load RecipeWrangler vocabularies: %s", exc)
+            vocab = {}
+        RecipeCandidatesClient._vocab_cache = vocab
+        return vocab
 
-        logger.info(
-            "Fetching RecipeWrangler candidates (limit=%d/slot, %d allergens, diet=%s)",
-            limit_per_slot, len(payload["user_profile"]["allergies"]),
-            payload["user_profile"]["diet"],
-        )
-        with httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS) as client:
-            response = client.post(
-                f"{self.base_url}/api/v1/recipes/foodchat_candidates", json=payload
+    def split_cuisines(self, likes: list[str]) -> tuple[list[str], list[str]]:
+        """Separate cuisines from ingredients in a member's `food_likes`.
+
+        The profile stores both in one list — `apply_memory` folds a `cuisine`
+        memory into `food_likes` alongside a `like` — so "greek" arrived at
+        RecipeWrangler as an ingredient to search for, matching nothing, while
+        the cuisine filter it should have driven went unused.
+
+        Splitting here rather than at write time means existing profiles are
+        fixed too, without a migration, and a member whose stored "thai" only
+        becomes a recognised cuisine next month starts benefiting then.
+
+        Returns ``(cuisines, remaining_ingredients)``.
+        """
+        known = {c.lower() for c in (self.vocabularies().get("cuisines") or [])}
+        if not known:
+            return [], list(likes or [])
+
+        cuisines, ingredients = [], []
+        for raw in likes or []:
+            value = str(raw or "").strip().lower()
+            if not value:
+                continue
+            slug = value.replace("-", "_").replace(" ", "_")
+            if slug in known:
+                cuisines.append(slug)
+            else:
+                ingredients.append(raw)
+        return cuisines, ingredients
+
+    def slot_candidates(
+        self, profile: dict, meal_type: str, exclude_ids: list[str], limit: int = 8
+    ) -> list[CandidateRecipe]:
+        """Candidates for one slot, from `/api/v2/tools/plan_meals`.
+
+        Lives on this client so the services that need recipes keep a single
+        dependency, even though the pool now comes from the v2 planning surface
+        rather than the v1 candidate endpoint this class was built around.
+
+        Only the requested slot is asked for: a single-slot swap does not touch
+        the other meals, and asking for them would spend the exclusion budget on
+        recipes nobody will look at.
+        """
+        from services.plan_client import PLANNER
+
+        cuisines, _ = self.split_cuisines(profile.get("food_likes") or [])
+        try:
+            envelope = PLANNER.plan_meals(
+                days=1,
+                slots=(meal_type,),
+                count_per_slot=limit,
+                allergens=profile.get("allergies") or [],
+                diet=profile.get("diet") or [],
+                cuisines=cuisines,
+                exclude_ingredients=profile.get("food_dislikes") or [],
+                exclude_recipe_ids=list(exclude_ids),
+                favorite_recipe_ids=profile.get("favorite_recipe_ids") or [],
+                min_nutri_score=profile.get("min_nutri_score"),
             )
-            response.raise_for_status()
-            data = response.json()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("slot candidate fetch failed for %s: %s", meal_type, exc)
+            return []
 
-        slot_results = data.get("results", {}) if isinstance(data, dict) else {}
-        candidates: CandidatesBySlot = {slot: [] for slot in MEAL_SLOTS}
-        dropped = 0
-        for slot in MEAL_SLOTS:
-            for r in slot_results.get(slot, []):
-                candidate = CandidateRecipe(
-                    recipe_id=str(r.get("recipe_id", "")),
-                    title=r.get("title", ""),
-                    ingredients=r.get("ingredients", ""),
-                    directions=r.get("directions", ""),
-                )
-                # Backstop: never trust upstream tags with safety data.
-                conflict = allergen_conflict(
-                    f"{candidate.title} {candidate.ingredients}", allergens or []
-                )
-                if conflict:
-                    dropped += 1
-                    logger.warning(
-                        "Allergen backstop dropped %r (%s) — contains %r despite "
-                        "passing upstream filters", candidate.title, slot, conflict,
-                    )
-                    continue
-                candidates[slot].append(candidate)
-            logger.info("Got %d candidates for %s", len(candidates[slot]), slot)
-        if dropped:
-            logger.warning("Allergen backstop dropped %d candidate(s) in total — "
-                           "upstream tagging needs attention", dropped)
-        return candidates
-
-    # ------------------------------------------------------------------ #
-    # Recipe resolution (seeded planning, M2)                              #
-    # ------------------------------------------------------------------ #
+        return PLANNER.to_candidates(
+            envelope, allergens=profile.get("allergies") or []
+        ).get(meal_type, [])
 
     def autocomplete(self, name: str, limit: int = 5) -> list[tuple[str, str]]:
         """Resolve a dish name to (recipe_id, title) suggestions.

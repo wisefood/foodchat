@@ -34,7 +34,16 @@ class FakeCandidatesClient:
         self.result = result
         self.called_with = None
 
-    def fetch_candidates(self, **kwargs):
+    def split_cuisines(self, likes):
+        """No vocabulary in tests, so nothing is a cuisine.
+
+        Mirrors the real client's behaviour when the vocabulary fetch fails —
+        everything stays an ingredient — which is the safe degradation these
+        tests should be asserting against anyway.
+        """
+        return [], list(likes or [])
+
+    def pool(self, **kwargs):
         self.called_with = kwargs
         return self.result
 
@@ -52,19 +61,27 @@ class TestGenerate:
             "breakfast": _slot("b", 2), "lunch": _slot("l", 1), "dinner": _slot("d", 1),
         })
         monkeypatch.setattr(pp, "CANDIDATES", fake)
+        monkeypatch.setattr(pp, "_fetch_candidate_pool", lambda **kw: fake.pool(**kw))
 
         plans = pipeline.generate("vegan day", sample_profile)
         assert [p.score for p in plans] == [5, 4]
-        # profile constraints forwarded as hard filters
-        assert fake.called_with["allergens"] == ["peanuts"]
-        assert fake.called_with["exclude_ingredients"] == ["olives"]
-        assert "chickpeas" in fake.called_with["include_ingredients"]
+        # Profile constraints reach the pool. They travel inside `profile` now
+        # rather than as flat kwargs: the pool builder forwards allergens, diet
+        # and dislikes to `plan_meals`, which applies them as hard filters.
+        sent = fake.called_with
+        assert sent["profile"]["allergies"] == ["peanuts"]
+        assert sent["profile"]["food_dislikes"] == ["olives"]
+        # Liked ingredients stay a *boost*: `plan_meals` treats
+        # `include_ingredients` as a requirement, so forwarding them would
+        # demand chickpeas in every breakfast and empty the slot.
+        assert "chickpeas" in sent["liked_ingredients"]
 
     def test_empty_slot_yields_no_plans(self, pipeline, monkeypatch, sample_profile):
         fake = FakeCandidatesClient({
             "breakfast": [], "lunch": _slot("l", 1), "dinner": _slot("d", 1),
         })
         monkeypatch.setattr(pp, "CANDIDATES", fake)
+        monkeypatch.setattr(pp, "_fetch_candidate_pool", lambda **kw: fake.pool(**kw))
         assert pipeline.generate("anything", sample_profile) == []
 
 

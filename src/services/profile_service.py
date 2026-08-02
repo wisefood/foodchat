@@ -25,6 +25,45 @@ GOAL_TO_NUTRITION_PROFILE: dict[str, dict[str, float]] = {
 }
 
 
+# Goals that imply a Nutri-Score floor as well as a macro target.
+#
+# A Nutri-Score is a whole-recipe judgement — composition, not one nutrient —
+# so it expresses "generally healthier" in a way a macro bound cannot. Someone
+# losing weight is served better by a B-or-better 600 kcal meal than by any
+# 600 kcal meal, and the score is already on every recipe.
+#
+# Deliberately lenient: "B" admits A and B, which is roughly half the corpus.
+# A floor of "A" would be a stricter filter than any of these goals implies,
+# and RecipeWrangler relaxes nothing here — an over-tight floor returns an
+# empty slot rather than a slightly worse meal.
+GOAL_TO_MIN_NUTRI_SCORE: dict[str, str] = {
+    "reduce_fat": "C",
+    "reduce_carbs": "C",
+    "reduce_calories": "B",
+    "lose_weight": "B",
+    "eat_healthier": "B",
+}
+
+# Worst to best, for picking the strictest floor across several goals.
+_NUTRI_RANK = {"A": 1, "B": 2, "C": 3, "D": 4, "E": 5}
+
+
+def goals_min_nutri_score(goal_slugs: list[str]) -> str | None:
+    """The strictest Nutri-Score floor implied by a member's goals.
+
+    None when no goal implies one, which leaves the filter off entirely rather
+    than defaulting to a floor nobody asked for.
+    """
+    floors = [
+        GOAL_TO_MIN_NUTRI_SCORE[slug]
+        for slug in goal_slugs
+        if slug in GOAL_TO_MIN_NUTRI_SCORE
+    ]
+    if not floors:
+        return None
+    return min(floors, key=lambda label: _NUTRI_RANK[label])
+
+
 def goals_nutrition_profile(goal_slugs: list[str]) -> dict[str, float]:
     """Merge the numeric targets of all mapped goals (strictest bound wins)."""
     merged: dict[str, float] = {}
@@ -390,6 +429,10 @@ class ProfileService:
         return {
             "diet": list(dict.fromkeys(dietary_groups)),
             "nutrition_profile": goal_nutrition or None,
+            # Whole-recipe quality floor, alongside the per-nutrient targets.
+            # Only reaches the v2 planning surface; the v1 candidate endpoint
+            # has no equivalent, so it is simply unused there.
+            "min_nutri_score": goals_min_nutri_score(dietary_goals),
             "allergies": list(allergies),
             "preferences": self._build_preferences(nutritional_preferences, properties)
             + goal_preference_strings(dietary_goals),

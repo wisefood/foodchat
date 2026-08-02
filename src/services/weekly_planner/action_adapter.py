@@ -16,6 +16,7 @@ neutral, never blocking the plan.
 
 from typing import Any, Dict, List, Union
 
+from services import plan_parameters
 from services.candidates_client import CANDIDATES
 
 # Candidates fetched per slot per day. One fetch serves all three slots of a
@@ -51,13 +52,28 @@ class RecipeActionSpace:
         current_day = current_state.get("day", 1)
 
         if current_day not in self._day_cache:
-            pool = CANDIDATES.fetch_candidates(
+            # Same preference split as the daily pipeline. The weekly planner
+            # selects without an LLM, so a cuisine preference it cannot express
+            # as a filter is a preference it cannot honour at all — there is no
+            # grader downstream to compensate.
+            cuisines, liked_ingredients = CANDIDATES.split_cuisines(
+                self.user_profile.get("food_likes") or []
+            )
+            # Sourced from `/api/v2/tools/plan_meals`, like the daily pipeline.
+            #
+            # This planner matters most for the switch: it selects without an
+            # LLM, so a preference it cannot express as a filter is one it
+            # cannot honour at all. The v1 endpoint queried a store holding no
+            # cuisine, mood or flavour, and no `planning_tier` — so a week of
+            # meals could include recipes explicitly withdrawn from automated
+            # planning, and no amount of downstream scoring would notice.
+            pool = _fetch_candidate_pool(
+                profile=self.user_profile,
                 allergens=self.allergens,
                 diet=self.diet,
+                cuisines=cuisines,
                 exclude_recipe_ids=list(self._selected_ids),
-                favorite_recipe_ids=self.user_profile.get("favorite_recipe_ids") or [],
                 limit_per_slot=DAILY_POOL_LIMIT,
-                randomize=True,
             )
             self._day_cache[current_day] = pool
             # One batch details call enriches the whole day's pool (M6) —
@@ -92,3 +108,50 @@ class RecipeActionSpace:
         """Called by the environment after a recipe is committed to the plan."""
         if recipe_id and recipe_id not in self._selected_ids:
             self._selected_ids.append(recipe_id)
+
+
+def _fetch_candidate_pool(
+    *,
+    profile: dict,
+    allergens: list,
+    diet: list,
+    cuisines: list,
+    exclude_recipe_ids: list,
+    limit_per_slot: int,
+) -> dict:
+    """A per-slot candidate pool from the planning endpoint.
+
+    Shares the daily pipeline's reasoning: `plan_meals` asked for N recipes per
+    slot is a candidate source whose pool already respects the member's
+    preferences and already excludes anything withdrawn from planning.
+
+    Liked ingredients are deliberately not forwarded — `plan_meals` treats
+    `include_ingredients` as a requirement, so a member who likes chickpeas
+    would demand chickpeas in every breakfast and empty the slot.
+
+    Returns `{}` on failure; the MDP treats an empty pool as a day it cannot
+    fill, which is what it already did when the old endpoint failed.
+    """
+    from services import plan_parameters
+    from services.plan_client import PLANNER
+
+    try:
+        envelope = PLANNER.plan_meals(
+            days=1,
+            count_per_slot=limit_per_slot,
+            allergens=allergens,
+            diet=diet,
+            cuisines=cuisines,
+            exclude_ingredients=profile.get("food_dislikes") or [],
+            exclude_recipe_ids=exclude_recipe_ids,
+            favorite_recipe_ids=profile.get("favorite_recipe_ids") or [],
+            max_minutes=plan_parameters.max_duration_minutes(
+                profile.get("plan_parameters") or {}
+            ),
+            min_nutri_score=profile.get("min_nutri_score"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error("weekly candidate pool fetch failed: %s", exc)
+        return {}
+
+    return PLANNER.to_candidates(envelope, allergens=allergens)

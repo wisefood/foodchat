@@ -98,3 +98,33 @@ class SeedDishSchema(BaseModel):
 class SeedExtractionSchema(BaseModel):
     """Named dishes to anchor into the plan (empty when none requested)."""
     seeds: list[SeedDishSchema]
+
+
+class MealPlateSchema(BaseModel):
+    """The plates one meal is served as.
+
+    Roles, not course types: FoodChat reasons in `main`/`side`/`dessert`/`drink`
+    because that is what a plate's nutrition weight is keyed by and what
+    `MealCourse.role` stores. The translation to RecipeWrangler's course-type
+    taxonomy happens at the client boundary, so the model never has to learn
+    two vocabularies for the same idea.
+    """
+    slot: Literal["breakfast", "brunch", "lunch", "dinner",
+                  "snack", "dessert", "side", "drink"]
+    roles: list[Literal["main", "side", "dessert", "drink"]] = ["main"]
+
+
+class PlanSpecSchema(BaseModel):
+    """The shape of plan the user asked for, if they said anything about it.
+
+    `mentioned` is the field that matters. Most messages say nothing about
+    shape, and "three meals, unstated" and "three meals, explicitly asked for"
+    produce the same lists — only the flag tells them apart. Without it the
+    extractor cannot abstain, and every vague message silently re-shapes the
+    plan the user is served.
+    """
+    mentioned: bool = False
+    num_days: conint(ge=1, le=7) = 1
+    meals: list[Literal["breakfast", "brunch", "lunch", "dinner",
+                        "snack", "dessert", "side", "drink"]] = []
+    plates: list[MealPlateSchema] = []

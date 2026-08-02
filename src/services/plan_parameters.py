@@ -112,6 +112,28 @@ def sanitize(values: dict) -> dict:
     return clean
 
 
+def max_duration_minutes(values: dict) -> int | None:
+    """The cooking-time slider as a real constraint, not prose.
+
+    `describe` renders this value as "keep cooking time under N minutes per
+    meal" and hands it to the LLM grader, which reads it as a hint and ranks
+    accordingly. RecipeWrangler can filter on duration directly, so the slider
+    can now narrow the candidate set instead of merely nudging how it is scored
+    — a member who set 20 minutes stops being shown 90-minute braises at all.
+
+    Returned as-is rather than clamped: the slider's own bounds (10-90) are
+    enforced by `sanitize`, and inventing a second, different limit here is how
+    two components end up disagreeing about what the user asked for.
+    """
+    value = values.get("cooking_time")
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def describe(values: dict) -> str:
     """Canonical refinement message for sanitized values (deterministic)."""
     phrases = []

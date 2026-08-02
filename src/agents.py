@@ -44,6 +44,8 @@ from prompts import (
     ORCHESTRATOR_SYSTEM,
     ORCHESTRATOR_USER,
     DIETARY_INTENT_EXTRACTOR_SYSTEM,
+    PLAN_SPEC_EXTRACTOR_SYSTEM,
+    PLAN_SPEC_EXTRACTOR_USER,
     DIETARY_INTENT_EXTRACTOR_USER,
     SEED_EXTRACTOR_SYSTEM,
     SEED_EXTRACTOR_USER,
@@ -60,6 +62,7 @@ from schemas import (
     QueryReconcilerSchema,
     OrchestratorSchema,
     DietaryTagsSchema,
+    PlanSpecSchema,
     SeedExtractionSchema,
     PreferenceExtractionSchema,
     EditCommandSchema,
@@ -266,6 +269,64 @@ class DietaryIntentExtractor:
         except Exception as e:
             logger.warning("DietaryIntentExtractor failed: %s", e)
             return []
+
+
+class PlanSpecExtractor:
+    """Works out the SHAPE of plan a user asked for — days, meals, plates.
+
+    Separate from the dietary and seed extractors because it answers a
+    different kind of question: not *what* to cook but *how many things, when,
+    and served as how many plates*. The seed extractor is already told
+    explicitly to ignore everything this one looks for.
+
+    Abstention is the important behaviour. Most messages say nothing about
+    shape, and a shape invented from a vague message changes what the user is
+    actually served — so `mentioned: false` falls straight through to the
+    default three meals.
+    """
+
+    def __init__(self, model: str = None, temperature: float = 0.0):
+        self.llm = GROQ_CHAT.get_client(
+            model=model or DEFAULT_MODEL,
+            temperature=temperature,
+            format=PlanSpecSchema.model_json_schema(),
+        )
+
+    def extract(self, query: str) -> "PlanSpec":
+        """Return a `PlanSpec`; the default shape when nothing was asked.
+
+        Never raises. A model outage must not stop a plan being made — it just
+        means the plan has the shape it has always had.
+        """
+        from models.plan_spec import PlanSpec
+
+        try:
+            result = self.llm.invoke([
+                SystemMessage(content=PLAN_SPEC_EXTRACTOR_SYSTEM.compile()),
+                HumanMessage(content=PLAN_SPEC_EXTRACTOR_USER.compile(query=query)),
+            ], config=build_trace_config(run_name="plan_spec", tags=["extract"]))
+            payload = json.loads(result.content)
+        except Exception as e:
+            logger.warning("PlanSpecExtractor failed: %s", e)
+            return PlanSpec.default()
+
+        if not payload.get("mentioned"):
+            return PlanSpec.default()
+
+        # The schema carries plates as a list of {slot, roles}; PlanSpec keys
+        # them by slot. Converted here rather than in the model so the model
+        # stays independent of whatever shape a given extractor emits.
+        spec = PlanSpec.from_spec({
+            "num_days": payload.get("num_days"),
+            "meals": payload.get("meals"),
+            "plates": {
+                entry.get("slot"): entry.get("roles")
+                for entry in (payload.get("plates") or [])
+                if entry.get("slot")
+            },
+        })
+        logger.info("Plan shape requested: %s", spec.describe())
+        return spec
 
 
 class PreferenceExtractor:

@@ -158,7 +158,16 @@ class TestPipelinePinning:
             def __init__(self):
                 self.called_with = None
 
-            def fetch_candidates(self, **kwargs):
+            def split_cuisines(self, likes):
+                """No vocabulary in tests, so nothing is a cuisine.
+
+                Mirrors the real client's behaviour when the vocabulary fetch fails —
+                everything stays an ingredient — which is the safe degradation these
+                tests should be asserting against anyway.
+                """
+                return [], list(likes or [])
+
+            def pool(self, **kwargs):
                 self.called_with = kwargs
                 slot = lambda p: [CandidateRecipe(f"{p}1", p, "i", "d")]
                 return {"breakfast": slot("b"), "lunch": slot("l"), "dinner": slot("d")}
@@ -173,6 +182,7 @@ class TestPipelinePinning:
 
         fake = FakeCandidates()
         monkeypatch.setattr(pp, "CANDIDATES", fake)
+        monkeypatch.setattr(pp, "_fetch_candidate_pool", lambda **kw: fake.pool(**kw))
         pipeline = PlanningPipeline.__new__(PlanningPipeline)
         pipeline.grader = PassGrader()
 
@@ -180,7 +190,10 @@ class TestPipelinePinning:
                                   pinned={"dinner": PASTITSIO.recipe})
         assert plans[0].dinner is PASTITSIO.recipe
         assert fake.called_with["exclude_recipe_ids"] == ["r-past"]
-        assert fake.called_with["favorite_recipe_ids"] == []
+        # Favourites are forwarded from the profile now, not as a flat kwarg —
+        # `plan_meals` takes them as a ranking boost, so a pinned plan still
+        # floats a member's favourites in the slots it did not pin.
+        assert fake.called_with["profile"].get("favorite_recipe_ids", []) == []
 
 
 class TestWeeklyPlannerPinning:

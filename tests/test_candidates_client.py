@@ -57,40 +57,6 @@ def capture(monkeypatch):
     return _CapturingClient
 
 
-class TestFetchCandidates:
-    def test_builds_contractual_payload(self, capture):
-        client = RecipeCandidatesClient(base_url="http://rw.test")
-        client.fetch_candidates(
-            allergens=["peanuts"],
-            diet=["vegetarian", "omnivore"],
-            include_ingredients=["chickpeas"],
-            exclude_ingredients=["olives"],
-            exclude_recipe_ids=["r-1"],
-            limit_per_slot=4,
-            randomize=True,
-        )
-        sent = capture.captured
-        assert sent["url"] == "http://rw.test/api/v1/recipes/foodchat_candidates"
-        assert sent["json"]["user_profile"] == {"allergies": ["peanuts"], "diet": ["vegetarian"]}
-        assert sent["json"]["constraints"]["exclude_recipe_ids"] == ["r-1"]
-        assert sent["json"]["quotas"] == {"breakfast": 4, "lunch": 4, "dinner": 4}
-        assert sent["json"]["randomize"] is True
-
-    def test_parses_slots_into_typed_candidates(self, capture):
-        capture.response_payload = {
-            "results": {
-                "breakfast": [{"recipe_id": 7, "title": "Oats", "ingredients": "oats", "directions": "cook"}],
-                "lunch": [],
-                # dinner key missing entirely — must still yield an (empty) slot
-            }
-        }
-        result = RecipeCandidatesClient(base_url="http://rw.test").fetch_candidates()
-        assert set(result.keys()) == {"breakfast", "lunch", "dinner"}
-        assert result["breakfast"][0].recipe_id == "7"  # coerced to str
-        assert result["breakfast"][0].title == "Oats"
-        assert result["lunch"] == [] and result["dinner"] == []
-
-
 class TestAllergenConflict:
     """Synonym-expanded, word-boundary allergen matching."""
 
@@ -115,34 +81,20 @@ class TestAllergenConflict:
         assert allergen_conflict("almond walnut shrimp", []) is None
 
 
-class TestAllergenBackstop:
-    """fetch_candidates drops candidates whose text contradicts upstream filters."""
+class TestAllergenBackstopMoved:
+    """The backstop now runs in `plan_client.to_candidates`.
 
-    def test_poisoned_tag_candidate_is_dropped(self, capture):
-        capture.response_payload = {
-            "results": {
-                "breakfast": [
-                    # RW believed this was nut_free (broken graph tags)
-                    {"recipe_id": 1, "title": "Almond crumbed chicken",
-                     "ingredients": "chicken, almond meal", "directions": "fry"},
-                    {"recipe_id": 2, "title": "Oat porridge",
-                     "ingredients": "oats, banana", "directions": "simmer"},
-                ],
-                "lunch": [], "dinner": [],
-            }
-        }
-        result = RecipeCandidatesClient(base_url="http://rw.test").fetch_candidates(
-            allergens=["tree nuts"]
-        )
-        assert [c.title for c in result["breakfast"]] == ["Oat porridge"]
+    It used to live inside `fetch_candidates`, which is gone: every slot pool
+    comes from `/api/v2/tools/plan_meals` now. The check itself was not dropped
+    — the reason for it stands, since the corpus has tagged almond dishes
+    `nut_free` in production — it just moved to where the candidates arrive.
+    See `test_plan_client.py::TestAllergenBackstop`.
+    """
 
-    def test_no_allergens_passes_everything(self, capture):
-        capture.response_payload = {
-            "results": {
-                "breakfast": [{"recipe_id": 1, "title": "Almond granola",
-                               "ingredients": "almonds", "directions": "bake"}],
-                "lunch": [], "dinner": [],
-            }
-        }
-        result = RecipeCandidatesClient(base_url="http://rw.test").fetch_candidates()
-        assert len(result["breakfast"]) == 1
+    def test_the_matcher_still_lives_here(self):
+        """`allergen_conflict` stays in this module; only its caller moved."""
+        from services.candidates_client import allergen_conflict
+
+        assert allergen_conflict("almond cake", ["tree nuts"])
+        assert allergen_conflict("green salad", ["tree nuts"]) is None
+

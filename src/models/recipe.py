@@ -11,16 +11,31 @@ from typing import Optional
 
 @dataclass(frozen=True)
 class CandidateRecipe:
-    """One recipe candidate as returned by RecipeWrangler (text fields only).
+    """One recipe candidate as returned by RecipeWrangler.
 
-    Nutrition/image enrichment is fetched separately (planned M4 batch
-    endpoint) — candidates stay lightweight for LLM grading.
+    The text fields are what the LLM grader reads; the rest are optional
+    metadata the candidate endpoints already return.
+
+    `nutrition` and `nutri_score` were previously discarded on arrival —
+    RecipeWrangler sends per-serving macros with every candidate, and FoodChat
+    dropped them and then made a second `/recipes/details` round trip to fetch
+    the same numbers back. Keeping them costs nothing, since they are already
+    in the response, and lets a plan be checked against a calorie target
+    without a second call.
+
+    All default to None so every existing construction site keeps working and
+    the grader's view of a candidate is unchanged.
     """
 
     recipe_id: str
     title: str
     ingredients: str
     directions: str
+    # Per serving: calories, protein_g, carbs_g, fat_g. None when the recipe
+    # has no stored profile — which is a real state, not an error.
+    nutrition: Optional[dict] = None
+    # Letter grade, from the v2 planning surface only.
+    nutri_score: Optional[str] = None
 
 
 # Slot name ("breakfast"/"lunch"/"dinner") → candidates for that slot.

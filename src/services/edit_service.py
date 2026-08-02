@@ -223,15 +223,12 @@ class EditService:
         Returns (choice, old_enrichment, new_enrichment, facts).
         """
         profile = session.user_profile
-        candidates = self.client.fetch_candidates(
-            allergens=profile.get("allergies", []),
-            diet=profile.get("diet", []),
-            exclude_ingredients=profile.get("food_dislikes") or [],
-            exclude_recipe_ids=exclude_ids,
-            favorite_recipe_ids=profile.get("favorite_recipe_ids") or [],
-            limit_per_slot=CANDIDATE_POOL,
-            randomize=False,
-        ).get(meal_type, [])
+        # Replacements come from the planning endpoint, like every other
+        # candidate in the service. A swap that pulled from a source with no
+        # annotations and no `planning_tier` could hand the user a recipe the
+        # original plan was not allowed to contain — "make it lighter" is not
+        # licence to reach outside the constraints.
+        candidates = self.client.slot_candidates(profile, meal_type, exclude_ids)
 
         if not candidates:
             return None, None, None, {"failure": "no candidates for this slot"}

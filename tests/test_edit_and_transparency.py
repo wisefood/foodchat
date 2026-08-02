@@ -58,13 +58,20 @@ class FakeEditClient:
     """Candidates + batch details stand-in for edit flows."""
 
     def __init__(self, slot_candidates, enrichment):
-        self.slot_candidates = slot_candidates      # meal_type -> [CandidateRecipe]
+        self.slot_candidates_map = slot_candidates  # meal_type -> [CandidateRecipe]
         self.enrichment = enrichment                # recipe_id -> RecipeEnrichment
         self.fetch_args = None
 
-    def fetch_candidates(self, **kwargs):
-        self.fetch_args = kwargs
-        return {"breakfast": [], "lunch": [], "dinner": [], **self.slot_candidates}
+    # `_slot_candidates` replaced `fetch_candidates` when the edit service moved
+    # onto `/api/v2/tools/plan_meals`. Patched at the method rather than the
+    # transport so these tests keep exercising the edit logic.
+    def slot_candidates(self, profile, meal_type, exclude_ids, limit=8):
+        self.fetch_args = {"profile": profile, "meal_type": meal_type,
+                           "exclude_ids": exclude_ids}
+        return self.slot_candidates_map.get(meal_type, [])
+
+    def split_cuisines(self, likes):
+        return [], list(likes or [])
 
     def fetch_details(self, recipe_ids):
         return {rid: self.enrichment[rid] for rid in recipe_ids if rid in self.enrichment}
@@ -123,7 +130,11 @@ class TestDailySlotEdit:
         assert changed["verified"] is True
         assert "700" in outcome.text and "420" in outcome.text
         # Current plan recipes were excluded from the candidate fetch
-        assert set(svc.client.fetch_args["exclude_recipe_ids"]) == {"cur-b", "cur-l", "cur-d"}
+        # The current plan's recipes are excluded so a swap cannot return what
+        # is already on the plate. The kwarg is named `exclude_ids` now — the
+        # fetch moved from `fetch_candidates` to `slot_candidates`, which takes
+        # one slot rather than all three.
+        assert set(svc.client.fetch_args["exclude_ids"]) == {"cur-b", "cur-l", "cur-d"}
 
     def test_honest_failure_offers_nearest_miss(self, session_service, sample_profile):
         session = _session_with_daily_plan(session_service, sample_profile)
