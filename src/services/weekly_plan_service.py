@@ -9,7 +9,11 @@ from .weekly_planner.reward_logic import RewardCalculator
 from .weekly_planner.environment import WeeklyMealPlanEnv
 from .weekly_planner.day_summary import build_day_summaries
 from .weekly_planner.explainability import build_weekly_explainability
-from .weekly_planner.planner import WeeklyPlanner, build_preference_scorer
+from .weekly_planner.planner import (
+    PlanGenerationError,
+    WeeklyPlanner,
+    build_preference_scorer,
+)
 from .adapted_recipes import overlay_weekly_entries
 from .candidates_client import CANDIDATES
 from agents import DietaryIntentExtractor, ResponseWriter
@@ -56,7 +60,7 @@ class WeeklyPlanService:
         content: str,
         is_refinement: bool = False,
         seeds: Optional[list[dict]] = None,
-    ) -> Tuple[str, WeeklyMealPlan]:
+    ) -> Tuple[str, Optional[WeeklyMealPlan]]:
         session = self.session_service.get_session(session_id)
         if not session:
             raise ValueError(f"Session {session_id} not found")
@@ -130,10 +134,36 @@ class WeeklyPlanService:
         logger.info(
             "[%s] Generating 7-day plan (21 meals, %d pinned).", session_id, len(pinned)
         )
-        plan_entries = planner.generate_full_plan(
-            user_query=effective_query, pinned=pinned,
-            scorer=build_preference_scorer(session.user_profile),
-        )
+        try:
+            plan_entries = planner.generate_full_plan(
+                user_query=effective_query, pinned=pinned,
+                scorer=build_preference_scorer(session.user_profile),
+            )
+        except PlanGenerationError as exc:
+            # An unfillable slot is an answer, not a server fault. Name the
+            # slot and the standing constraints, because the member cannot fix
+            # what they cannot see — "adjust your requirements" with no noun
+            # was the old daily-path message, and it taught nobody anything.
+            logger.warning("[%s] Weekly plan unfillable: %s", session_id, exc)
+            constraints = []
+            if action_space.diet:
+                constraints.append("diet: " + ", ".join(sorted(map(str, action_space.diet))))
+            if action_space.allergens:
+                constraints.append(
+                    "allergens excluded: " + ", ".join(sorted(map(str, action_space.allergens)))
+                )
+            because = (
+                " with your current constraints (" + "; ".join(constraints) + ")"
+                if constraints else ""
+            )
+            message = (
+                f"I couldn't build the full week — I found no recipes for "
+                f"{exc.meal_type} on day {exc.day}{because}. "
+                "I can try a shorter plan, relax one of the constraints, or "
+                "you can name a dish you'd like there and I'll plan around it."
+            )
+            self.session_service.add_message(session_id, "assistant", message)
+            return message, None
         logger.info("[%s] Plan generation complete — %d entries.", session_id, len(plan_entries))
 
         # M4 enrichment: one batch details call covers all 21 recipes —

@@ -10,6 +10,22 @@ logger = logging.getLogger(__name__)
 TOTAL_SLOTS = 21  # 7 days x 3 meals
 
 
+class PlanGenerationError(RuntimeError):
+    """A slot could not be filled and the plan cannot be completed.
+
+    Carries which slot failed so the caller can *say* it. This surfaced to
+    members as an HTTP 500 with a stack trace — a member asking for a week of
+    meals got an internal error page because day 1's breakfast came back
+    empty. An unfillable slot is a conversational answer ("here is what I
+    couldn't do, and why"), not a server fault.
+    """
+
+    def __init__(self, meal_type: str, day: int):
+        self.meal_type = str(meal_type)
+        self.day = int(day)
+        super().__init__(f"No candidate recipes found for {meal_type} on day {day}")
+
+
 def build_preference_scorer(user_profile: Dict[str, Any]) -> Callable:
     """Heuristic candidate scorer (M4): preference-aware selection at zero
     LLM cost. Favorites dominate, liked ingredients boost, similarity to
@@ -91,11 +107,10 @@ class WeeklyPlanner:
                 )
                 if not candidates:
                     # No recipes for this course — fail loudly rather than
-                    # produce a plan with holes. (Constraint relaxation is a
-                    # planned improvement.)
-                    raise ValueError(
-                        f"No candidate recipes found for {state['meal_type']} on day {state['day']}"
-                    )
+                    # produce a plan with holes. Typed so the service can turn
+                    # it into a sentence instead of a 500. (Constraint
+                    # relaxation is a planned improvement.)
+                    raise PlanGenerationError(state["meal_type"], state["day"])
                 # Hard constraints prune the pool BEFORE the pick (M6):
                 # e.g. meat candidates leave once the weekly limit is spent.
                 # Prunes/relaxations are recorded on env.selection_events at

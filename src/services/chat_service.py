@@ -42,11 +42,39 @@ logger = logging.getLogger(__name__)
 # file is absent the grader scores against an empty context (logged once per call).
 GUIDELINES_PATH = Path(__file__).resolve().parents[2] / "belgium_dietary_guidelines_augmentation.cypher"
 
-NO_PLAN_APOLOGY = (
-    "I'm sorry, I couldn't find enough recipes to build a "
-    "complete meal plan matching your preferences. "
-    "Could you try adjusting your requirements?"
-)
+def no_plan_message(profile: dict) -> str:
+    """The empty-plan answer, naming what stood in the way.
+
+    The old text — "Could you try adjusting your requirements?" — named no
+    requirement, so a member whose profile combination was the cause had
+    nothing to adjust and nowhere to start. If we know the standing
+    constraints, say them; an apology that teaches nothing is just a shrug
+    with manners.
+    """
+    constraints = []
+    diet = profile.get("diet") or []
+    if diet:
+        diet = [diet] if isinstance(diet, str) else list(diet)
+        constraints.append("diet: " + ", ".join(sorted(map(str, diet))))
+    allergies = profile.get("allergies") or []
+    if allergies:
+        constraints.append("allergens excluded: " + ", ".join(sorted(map(str, allergies))))
+    dislikes = profile.get("food_dislikes") or []
+    if dislikes:
+        constraints.append("avoiding: " + ", ".join(sorted(map(str, dislikes))))
+
+    if constraints:
+        return (
+            "I couldn't find enough recipes for a complete plan with your "
+            "current constraints (" + "; ".join(constraints) + "). "
+            "Tell me which one to relax, or name a dish you'd like and "
+            "I'll plan around it."
+        )
+    return (
+        "I couldn't find enough recipes to build a complete meal plan for "
+        "that request. Try being a little broader, or name a dish you'd "
+        "like and I'll plan around it."
+    )
 
 
 def _format_plan_as_context(plan: MealPlan) -> str:
@@ -356,8 +384,9 @@ class ChatService:
         )
         if not plans:
             logger.warning("[%s] No candidate plans — returning apology.", session_id)
-            self.session_service.add_message(session_id, "assistant", NO_PLAN_APOLOGY)
-            return NO_PLAN_APOLOGY, False, None
+            apology = no_plan_message(profile)
+            self.session_service.add_message(session_id, "assistant", apology)
+            return apology, False, None
 
         best = plans[0]
         metrics = self._compute_metrics(session_id, best)
