@@ -301,9 +301,21 @@ class PlanSpecExtractor:
         from models.plan_spec import PlanSpec
 
         try:
+            system_text = PLAN_SPEC_EXTRACTOR_SYSTEM.compile()
+            user_text = PLAN_SPEC_EXTRACTOR_USER.compile(query=query)
+            # Groq rejects any json_object request whose messages don't
+            # contain the word "json" — a 400 on every call, which this
+            # except swallows into "no shape extracted", silently. The
+            # in-code prompt says it, but prompts are served from Langfuse
+            # at runtime and existing managed copies are never overwritten
+            # by a deploy — so a stale managed prompt disabled multi-plate
+            # planning in production while every local test passed. This
+            # guard makes the requirement structural instead of editorial.
+            if "json" not in f"{system_text} {user_text}".lower():
+                system_text += "\nReturn the result as a JSON object."
             result = self.llm.invoke([
-                SystemMessage(content=PLAN_SPEC_EXTRACTOR_SYSTEM.compile()),
-                HumanMessage(content=PLAN_SPEC_EXTRACTOR_USER.compile(query=query)),
+                SystemMessage(content=system_text),
+                HumanMessage(content=user_text),
             ], config=build_trace_config(run_name="plan_spec", tags=["extract"]))
             payload = json.loads(result.content)
         except Exception as e:

@@ -128,6 +128,25 @@ class DirectivePredicate:
         return None
 
 
+# Unverified directives that mean "change it" rather than naming a dish.
+_GENERIC_DIRECTIVES = frozenset({
+    "different", "something else", "something different", "anything",
+    "another", "another one", "surprise me", "change it", "swap it",
+    "new", "something new", "other", "else",
+})
+
+
+def _names_a_dish(directive: str) -> bool:
+    """Whether an unverified directive reads as a dish name.
+
+    Errs toward yes: a false positive costs one name search that returns
+    nothing and falls back to the old behaviour; a false negative silently
+    hands the member the slot's default instead of what they asked for.
+    """
+    d = (directive or "").strip().lower()
+    return bool(d) and d not in _GENERIC_DIRECTIVES and len(d) > 2
+
+
 class EditService:
     """Targeted single-slot plan edits with verified directives."""
 
@@ -228,6 +247,27 @@ class EditService:
         Returns (choice, old_enrichment, new_enrichment, facts).
         """
         profile = session.user_profile
+
+        # A directive that names a dish resolves BY NAME, before any slot
+        # candidates. "i want apple pie for breakfast" used to classify as an
+        # unverified predicate that every breakfast candidate trivially
+        # passes — so the member got the slot's top-ranked muffins while the
+        # reply claimed a "best match for apple pie". An explicit name beats
+        # the slot's course taxonomy: someone asking for pie at breakfast has
+        # already decided pie is breakfast food. Hard constraints still hold —
+        # the name search runs with the member's allergens, diet and dislikes.
+        if predicate.kind == "unverified" and _names_a_dish(predicate.directive):
+            named = self._resolve_named_dish(predicate.directive, profile, exclude_ids)
+            if named is not None:
+                enrichment = self.client.fetch_details([old_recipe_id, named.recipe_id])
+                facts = {
+                    "directive": predicate.directive, "verified": False,
+                    "named_dish": named.title,
+                }
+                return named, enrichment.get(old_recipe_id), enrichment.get(named.recipe_id), facts
+            # Fall through to slot candidates, but say the truth about it.
+            # (facts merged below via named_miss.)
+
         # Replacements come from the planning endpoint, like every other
         # candidate in the service. A swap that pulled from a source with no
         # annotations and no `planning_tier` could hand the user a recipe the
@@ -250,6 +290,10 @@ class EditService:
         ]
 
         facts: dict = {"directive": predicate.directive, "verified": predicate.verifiable}
+        if predicate.kind == "unverified" and _names_a_dish(predicate.directive):
+            # The name found nothing above; the reply must not pretend the
+            # slot's top candidate matched it.
+            facts["named_miss"] = predicate.directive
         if passing:
             favorites = set(session.user_profile.get("favorite_recipe_ids") or [])
             choice = next((c for c in passing if c.recipe_id in favorites), passing[0])
@@ -268,6 +312,34 @@ class EditService:
                 "protein_g": enrichment[nearest_id].protein_g,
             }
         return None, old_rich, None, facts
+
+    def _resolve_named_dish(
+        self, name: str, profile: dict, exclude_ids: list[str]
+    ) -> Optional[CandidateRecipe]:
+        """The member's named dish, via full-text search under hard constraints.
+
+        No course-type filter on purpose — the name is the member overriding
+        the taxonomy. Allergens, diet and dislikes still apply; a named dish
+        that violates them returns nothing rather than something unsafe.
+        """
+        from services.candidates_client import normalize_diet_tags
+        from services.plan_client import PLANNER
+
+        try:
+            hits = PLANNER.find_recipes(
+                name,
+                allergens=profile.get("allergies") or [],
+                diet=normalize_diet_tags(profile.get("diet")),
+                exclude_ingredients=profile.get("food_dislikes") or [],
+                limit=3,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("named-dish search failed for %r: %s", name, exc)
+            return None
+        for hit in hits:
+            if hit.recipe_id not in exclude_ids:
+                return hit
+        return None
 
     def _edit_daily(self, session, meal_type: str, predicate, original_message: str) -> EditOutcome:
         plan = session.get_current_daily_plan()
@@ -322,8 +394,23 @@ class EditService:
 
         changed = [self._changed_slot(meal_type, None, old_course.title, old_rich,
                                       choice.title, new_rich, predicate)]
+        for key in ("named_dish", "named_miss"):
+            if key in facts:
+                changed[0][key] = facts[key]
         facts.update({"changed": changed[0]})
         text = self._success_text(changed[0], predicate)
+
+        # A dish the member named and got is a standing choice, not a
+        # property of this turn: pin it so the next refinement re-anchors it
+        # instead of regenerating it away — which is exactly how the apple
+        # pie vanished one turn after being served.
+        if facts.get("named_dish"):
+            from models.planning_state import PlanningStateDelta
+            state = self.session_service.get_planning_state(session.session_id)
+            self.session_service.set_planning_state(
+                session.session_id,
+                state.merge(PlanningStateDelta(anchors={meal_type: choice.recipe_id})),
+            )
         self.session_service.add_message(session.session_id, "assistant", text)
         return EditOutcome(
             text=text, meal_plan=new_plan, changed_slots=changed, facts=facts,
@@ -432,6 +519,15 @@ class EditService:
             text += f" That takes it from {old_kcal:.0f} to {new_kcal:.0f} kcal per serving."
         elif predicate.verifiable and changed["verified"]:
             text += f" Verified: the new pick satisfies “{changed['directive']}”."
+        elif changed.get("named_dish"):
+            # The member named this dish and we found exactly it — no hedging.
+            pass
+        elif changed.get("named_miss"):
+            text += (
+                f" I couldn't find “{changed['named_miss']}” in our recipes, "
+                "so I picked a fitting alternative — name another dish if "
+                "you had one in mind."
+            )
         elif not predicate.verifiable:
             text += f" I picked the best match for “{changed['directive']}” — tell me if it's not quite right."
         return text
