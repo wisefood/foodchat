@@ -146,6 +146,34 @@ Daily Plan to Score
 
 """
 
+BATCH_GRADER_USER_INSTRUCTIONS = """
+Below are {plan_count} candidate daily plans, each marked "PLAN <index>".
+Score EVERY one of them against your instructions. Because you can see them
+side by side, grade comparatively: the strongest plan of the batch should
+outscore the others, and two plans should only tie when they are genuinely
+interchangeable.
+
+Where a course shows kcal and protein, use the numbers: a day whose meals sum
+far outside a sensible daily intake, or whose lunch is a fraction of its
+breakfast, is a worse day than one that adds up. Missing numbers are not a
+fault — score what is shown.
+
+User's Immediate Query
+{query}
+
+User Preferences
+{preferences}
+
+User Feedback Summary
+{feedback_history}
+
+Candidate Plans
+{plans}
+
+Return a JSON object: {{"grades": [{{"plan_index": <int>, "reasoning": <str>, "score": <1-5>}}, ...]}}
+with exactly one entry per plan, in any order.
+"""
+
 QUERY_RECONCILER_SYSTEM_INSTRUCTIONS = """
 You are a query reconciler for a meal planning system.
 Your task is to analyze the user's query and their dietary profile to identify:
@@ -831,6 +859,7 @@ def _reg(name: str, fallback: str) -> _Prompt:
 # --- managed prompt objects (one per constant above) --------------------- #
 GRADER_SYSTEM = _reg("grader_system", GRADER_SYSTEM_INSTRUCTIONS)
 GRADER_USER = _reg("grader_user", GRADER_USER_INSTRUCTIONS)
+BATCH_GRADER_USER = _reg("batch_grader_user", BATCH_GRADER_USER_INSTRUCTIONS)
 QUERY_RECONCILER_SYSTEM = _reg("query_reconciler_system", QUERY_RECONCILER_SYSTEM_INSTRUCTIONS)
 QUERY_RECONCILER_USER = _reg("query_reconciler_user", QUERY_RECONCILER_USER_INSTRUCTIONS)
 QUERY_CHECKER_SYSTEM = _reg("query_checker_system", QUERY_CHECKER_SYSTEM_INSTRUCTIONS)

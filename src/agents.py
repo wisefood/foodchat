@@ -34,6 +34,7 @@ from backend.groq import GROQ_CHAT
 from backend.observability import build_trace_config
 from models.recipe import CandidatesBySlot, ScoredPlan
 from prompts import (
+    BATCH_GRADER_USER,
     GRADER_SYSTEM,
     GRADER_USER,
     PLAN_ANALYST_SYSTEM,
@@ -58,6 +59,7 @@ from prompts import (
     CHATBOT_SYSTEM,
 )
 from schemas import (
+    BatchScoringSchema,
     ScoringSchema,
     QueryReconcilerSchema,
     OrchestratorSchema,
@@ -85,7 +87,7 @@ class DocumentGrader:
         self.grader = GROQ_CHAT.get_client(
             model=model or DEFAULT_MODEL,
             temperature=temperature if temperature is not None else DEFAULT_TEMPERATURE,
-            format=ScoringSchema.model_json_schema(),
+            format=BatchScoringSchema.model_json_schema(),
         )
         self.max_plans_to_score = max_plans_to_score or MAX_PLANS_TO_SCORE
 
@@ -95,9 +97,18 @@ class DocumentGrader:
     ) -> list[ScoredPlan]:
         """Return the top-scored combinations, best first (at most 3).
 
-        The combination space (limit³) is sampled down to
-        ``max_plans_to_score`` before grading — each grade is one LLM call, so
-        this bounds latency/cost per plan request.
+        One LLM call for the whole batch. One call *per combination* made
+        grading the latency floor of every plan request — ten sequential
+        Groq round-trips before the member saw anything — and scored each
+        day in isolation, when the actual task is comparative: pick the best
+        day of the batch.
+
+        Sampling is rank-aware, not uniform. RecipeWrangler returns each
+        slot's candidates best-first (planning tier, Nutri-Score, curated
+        source); `random.sample` over the full product ignored that order,
+        so the strongest combination could simply never be graded. The
+        top-of-ranking combo is always in the batch; the rest of the space
+        still gets sampled so the judge sees variety.
         """
         combos = list(itertools.product(
             candidates.get("breakfast", []),
@@ -109,24 +120,56 @@ class DocumentGrader:
             logger.warning("No possible daily plans — at least one slot has no candidates")
             return []
 
-        sampled = random.sample(combos, min(len(combos), self.max_plans_to_score))
-        scored: list[ScoredPlan] = []
-        for breakfast, lunch, dinner in sampled:
-            plan_text = "".join(
-                f"{slot}: {course.title}\nIngredients: {course.ingredients}\n"
-                f"Directions: {course.directions}\n\n"
-                for slot, course in (("breakfast", breakfast), ("lunch", lunch), ("dinner", dinner))
+        # combos[0] is top-of-ranking in every slot by construction of
+        # itertools.product over best-first lists.
+        rest = random.sample(combos[1:], min(len(combos) - 1, self.max_plans_to_score - 1))
+        sampled = [combos[0]] + rest
+
+        def course_text(slot: str, course) -> str:
+            lines = [f"{slot}: {course.title}"]
+            nutrition = getattr(course, "nutrition", None) or {}
+            kcal = nutrition.get("kcal") or nutrition.get("calories")
+            protein = nutrition.get("protein_g")
+            if kcal is not None:
+                macro = f"  ~{round(float(kcal))} kcal"
+                if protein is not None:
+                    macro += f", {round(float(protein))}g protein"
+                lines.append(macro)
+            lines.append(f"  Ingredients: {str(course.ingredients)[:400]}")
+            return "\n".join(lines)
+
+        plans_text = "\n\n".join(
+            f"PLAN {i}\n" + "\n".join(
+                course_text(slot, course)
+                for slot, course in (("breakfast", b), ("lunch", l), ("dinner", d))
             )
+            for i, (b, l, d) in enumerate(sampled)
+        )
+
+        try:
             result = self.grader.invoke([
                 SystemMessage(content=GRADER_SYSTEM.compile()),
-                HumanMessage(content=GRADER_USER.compile(
+                HumanMessage(content=BATCH_GRADER_USER.compile(
+                    plan_count=len(sampled),
                     query=query,
-                    daily_plan=plan_text,
+                    plans=plans_text,
                     preferences=",".join(user_profile.get("preferences", [])),
                     feedback_history=feedback_history or "No prior feedback.",
                 )),
-            ], config=build_trace_config(run_name="plan_grade", tags=["planning"]))
-            grade = json.loads(result.content)
+            ], config=build_trace_config(run_name="plan_grade_batch", tags=["planning"]))
+            grades = json.loads(result.content).get("grades", [])
+        except Exception as exc:  # noqa: BLE001
+            # The caller already degrades to the unranked pool on [].
+            logger.warning("Batch grading failed: %s", exc)
+            return []
+
+        scored: list[ScoredPlan] = []
+        for grade in grades:
+            try:
+                index = int(grade.get("plan_index"))
+                breakfast, lunch, dinner = sampled[index]
+            except (TypeError, ValueError, IndexError):
+                continue
             scored.append(ScoredPlan(
                 breakfast=breakfast, lunch=lunch, dinner=dinner,
                 score=int(grade.get("score", 0)),

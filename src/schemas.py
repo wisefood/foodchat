@@ -20,6 +20,24 @@ class ScoringSchema(BaseModel):
     score: conint(ge=1, le=5)
 
 
+class PlanGradeSchema(BaseModel):
+    """One graded plan inside a batch."""
+    plan_index: int
+    reasoning: str
+    score: conint(ge=1, le=5)
+
+
+class BatchScoringSchema(BaseModel):
+    """All candidate day-plans graded in ONE call.
+
+    One combination per LLM call made grading the latency floor of every plan
+    request — ten sequential Groq round-trips before a member saw anything.
+    Grading the batch together also lets the judge rank comparatively, which
+    is the actual task: pick the best day, not absolute-score ten days.
+    """
+    grades: list[PlanGradeSchema]
+
+
 class QueryReconcilerSchema(BaseModel):
     """Conflicts / gaps between a plan request and the user profile."""
     missing_info: list[str]          # e.g. cooking time, difficulty, goal

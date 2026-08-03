@@ -94,21 +94,29 @@ class TestDocumentGraderParsing:
         grader.max_plans_to_score = 10
 
         class FakeLLM:
+            """One batch call in, one grades array out — the new contract."""
+
             def __init__(self):
-                self.n = 0
+                self.calls = 0
 
             def invoke(self, messages, config=None):
                 class R: pass
                 r = R()
-                self.n += 1
-                r.content = json.dumps({"score": self.n, "reasoning": f"r{self.n}"})
+                self.calls += 1
+                r.content = json.dumps({"grades": [
+                    {"plan_index": 0, "score": 3, "reasoning": "r0"},
+                    {"plan_index": 1, "score": 5, "reasoning": "r1"},
+                    {"plan_index": 99, "score": 4, "reasoning": "junk index dropped"},
+                ]})
                 return r
 
-        grader.grader = FakeLLM()
+        fake = FakeLLM()
+        grader.grader = fake
         candidates = {"breakfast": _slot("b", 2), "lunch": _slot("l", 1), "dinner": _slot("d", 1)}
         plans = grader.grade_daily_plans("q", candidates, {"preferences": []})
-        assert len(plans) == 2
-        assert plans[0].score >= plans[1].score
+        assert fake.calls == 1, "the whole batch grades in ONE call"
+        assert len(plans) == 2, "junk indices are dropped, real ones kept"
+        assert plans[0].score == 5 and plans[1].score == 3, "sorted best-first"
         assert all(isinstance(p, ScoredPlan) for p in plans)
 
     def test_grader_empty_candidates(self):
