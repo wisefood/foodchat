@@ -118,6 +118,20 @@ class SeedExtractionSchema(BaseModel):
     seeds: list[SeedDishSchema]
 
 
+class PantryExtractionSchema(BaseModel):
+    """On-hand ingredients stated in a user turn (food-waste planning).
+
+    `mentioned` is the abstention flag, same contract as PlanSpecSchema:
+    most messages say nothing about a pantry, and only the flag separates
+    "no ingredients stated" from "stated an empty list".
+    """
+    mentioned: bool = False
+    # Ingredients the user HAS and wants used ("I've got zucchini").
+    have: list[str] = []
+    # Ingredients the user declared spent ("I used up the zucchini").
+    used_up: list[str] = []
+
+
 class MealPlateSchema(BaseModel):
     """The plates one meal is served as.
 

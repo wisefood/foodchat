@@ -240,6 +240,36 @@ class PlanSpec:
         """
         return [(slot, role) for slot in self.meals for role in self.roles_for(slot)]
 
+    def to_dict(self) -> dict[str, Any]:
+        """The JSON-safe form `from_spec` reads back.
+
+        A `PlanSpec` travels inside the session profile snapshot (so a plan
+        shape survives a clarification round-trip), and that snapshot is
+        `json.dumps`-ed onto the session row. Carrying the dataclass itself
+        raised "Object of type PlanSpec is not JSON serializable" from
+        whichever turn happened to ask a clarifying question — so the
+        serializable form lives here, next to the parser, rather than being
+        open-coded by each caller that needs to persist one.
+        """
+        return {
+            "num_days": self.num_days,
+            "meals": list(self.meals),
+            "plates": {slot: list(roles) for slot, roles in self.plates.items()},
+        }
+
+    @classmethod
+    def coerce(cls, raw: Any) -> "PlanSpec":
+        """A `PlanSpec` from either a stored dict or a live instance.
+
+        Readers accept both: a spec that rode through persistence arrives as
+        a dict, while one taken straight from in-memory state is already an
+        object (and, after a failed write, an in-process session can still
+        hold one).
+        """
+        if isinstance(raw, cls):
+            return raw
+        return cls.from_spec(raw)
+
     @classmethod
     def default(cls) -> "PlanSpec":
         return cls()

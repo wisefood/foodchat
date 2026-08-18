@@ -2,6 +2,77 @@
 
 ---
 
+# Fix: intermittent 500 "Object of type PlanSpec is not JSON serializable"
+
+> **Date:** 2026-08-18
+> **Branch:** main
+> No API change. Fixes a live intermittent 500 on plan turns.
+
+`process_plan_request` stashed the standing plan shape in the session profile
+snapshot as a live `PlanSpec` dataclass (`profile["_plan_spec"] = state.spec`).
+That snapshot rides inside `ClarificationState` and is `json.dumps`-ed onto
+the session row — so **any turn that asked a clarifying question died** while
+trying to store the question it had just asked, and the member got a 500.
+
+It looked random because *whether a turn clarifies* is an LLM decision
+(`QueryReconciler` + the specificity check): the same sentence clarifies on
+one turn and not the next, and only the clarifying path serializes. Turns that
+planned straight through popped `_plan_spec` in `_generate_and_store` before
+anything touched JSON, so retrying "worked".
+
+| What | Detail |
+|---|---|
+| `src/models/plan_spec.py` | `PlanSpec.to_dict()` (the JSON-safe form `from_spec` already read back) and `PlanSpec.coerce()`, which accepts a stored dict or a live instance — an in-process session can still hold the object. |
+| `src/services/chat_service.py` | Stores `state.spec.to_dict()`; `_generate_and_store` coerces it back, so the shape still survives a clarification round-trip and still routes to the structured path. |
+| `src/models/planning_state.py` | `to_dict()` reuses `PlanSpec.to_dict()` instead of open-coding the same three fields — the two can no longer drift. |
+| `tests/test_clarification.py` | `TestClarificationStateIsPersistable` — a clarifying plan turn with a non-default spec must persist, and the stored state must round-trip to an equal, still-non-default spec. Verified to fail with the original `TypeError` before the fix. |
+
+Introduced by `0c7b96a` (multi-plate/N-day dispatch). Audited the other
+transient snapshot keys (`_pinned_slots`, `_seed_note`, `_excluded_recipe_ids`,
+`_pantry`, `_favorites_declined`) — all plain JSON types.
+
+---
+
+# Pantry planning — "cook from what I have" (food waste)
+
+> **Date:** 2026-08-18
+> **Branch:** main
+> FoodChat-only (PANTRY_PLANNING_PLAN.md Tier A — no RecipeWrangler change
+> assumed). Wire-compatible: no schema change; badges ride the existing
+> `match_reasons`/ledger contracts (new chip kind `"pantry"`).
+
+A member states ingredients they have at home ("I've got zucchini, spinach
+and some ground beef"); both horizons boost recipes that use them and report
+measured coverage — used AND unused items — honestly. The core constraint:
+`plan_meals` ANDs `include_ingredients`, so the whole pantry at once would
+empty every slot; sourcing is a capped per-item fan-out (single-item hard
+include = "must use this one thing"), merged coverage-first, pool size
+unchanged. Every user-facing claim comes from a deterministic word-boundary
+matcher, never the LLM.
+
+| What | Detail |
+|---|---|
+| `src/services/pantry_service.py` (new) | Matcher, regex-gated extraction → `PlanningStateDelta`, threaded per-item candidate fetch (best-effort), coverage-first pool merge, coverage facts, badge/ledger annotation for both plan shapes, honest coverage prose. Knobs: `FOODCHAT_PANTRY_ITEM_LIMIT` (6), `FOODCHAT_PANTRY_PER_ITEM_CANDIDATES` (3) — in `.env.example`. |
+| `src/models/planning_state.py` | `PlanningState.pantry` (durable, additive; "used up the X" removes; reset clears) + delta `pantry_add`/`pantry_remove`. Silence is not a retraction. |
+| `src/agents.py`, `src/prompts.py`, `src/schemas.py` | `PantryExtractor` with its OWN prompt name (`pantry_extractor_*`) — extending the seed extractor's managed prompt would stay silently disabled in production (Langfuse copies are never overwritten; the PlanSpecExtractor "json" incident). Regex-gated so most turns pay no LLM call. Abstains via `mentioned: false`. |
+| `src/services/chat_service.py` | Merges the pantry delta from the RAW message (refinement context text is never mistaken for the fridge), stashes `profile["_pantry"]` (survives clarification), and after generation attaches badges + `facts["pantry"] {used, unused, note}` on both the graded and structured paths. |
+| `src/services/planning_pipeline.py` | `generate()`: pantry fan-out merged coverage-first + grader "prefer using …" hint. `plan_structured()`: pantry-matching ids ride the `favorite_recipe_ids` float (the structured path's only soft rank signal); structured plates now carry ingredients/directions text from the envelope (was `""` — which also blinded the matcher). |
+| `src/services/weekly_plan_service.py` + `weekly_planner/` | Weekly reads the SAME PlanningState (whichever horizon hears about the zucchini, both honour it). `RecipeActionSpace(pantry=…)` folds per-item matches into every day's pool (diet normalised at the call site, incl. query-level tags); `build_preference_scorer(pantry=…)` adds +3 per matched item capped at 2 — above a favourite (+5 < 6), below variety-flattening. Entries annotated after explainability (chips appended, not overwritten). |
+| `src/services/edit_service.py` | New verifiable directive `uses_ingredient` ("something with zucchini"): candidates via single-item include, verified against candidate ingredient text — fixes the old behaviour where the phrase was full-text-searched as a dish name. Also: swap candidate fetches now exclude `PlanningState.excluded_recipe_ids` (a rejected recipe could come back through a swap). |
+| `src/services/orchestrator_service.py` | `preference_update` turns capture pure inventory statements ("I have leftover rice") into planning state and answer deterministically with an offer to plan; falls back to smalltalk on any failure. |
+| UI badges | Per-course/entry `match_reasons` kind `"pantry"`: "uses your zucchini — reducing food waste" + "cooked from your leftovers"; plan-level ledger row "using N of M on-hand ingredient(s)" (status `relaxed` when items went unused). Unused items get a sentence in the reply, never silence. |
+| Docs/tests | `CHAT_ENDPOINT_PIPELINE.md` updated (daily §2/§4, weekly §5). `tests/test_pantry.py` (29 tests, LLM-free). 397 passing. |
+
+Known and deliberate: presence-matching only — no quantity awareness, and
+"uses your zucchini" never claims "uses it all up". Weekly named-dish swap
+anchors still aren't persisted to PlanningState (daily's are) — the
+entry-level pin protects the current canvas only; keyed weekly anchors are
+future work. The local demo harness (`wisefood_demo_client.py`, untracked)
+gained an ingredient-verified slot filler so `include_ingredients` works
+against the demo gateway too.
+
+---
+
 # Review fixes — pick lifecycle, card addressing, turn concerns
 
 > **Date:** 2026-07-23

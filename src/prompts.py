@@ -646,6 +646,43 @@ SEED_EXTRACTOR_USER_INSTRUCTIONS = """
 User message: {query}
 """
 
+# Pantry extraction — on-hand ingredients for food-waste planning.
+# A NEW prompt name on purpose: extending the seed extractor's managed prompt
+# would be invisible in production, where existing Langfuse copies are never
+# overwritten by a deploy (see sync_prompts and the PlanSpecExtractor "json"
+# incident). A new name does not exist upstream, so it syncs cleanly.
+PANTRY_EXTRACTOR_SYSTEM_INSTRUCTIONS = """
+You extract ON-HAND INGREDIENTS from a user message for a meal-planning assistant that reduces food waste.
+The user may state ingredients they already have at home and want used in their meal plan, or declare ingredients as used up / gone.
+
+Extract into two lists:
+- "have": ingredients the user HAS and wants cooked with ("I've got zucchini and half a bag of spinach", "there's leftover chicken in the fridge", "use up my carrots")
+- "used_up": ingredients the user says are now GONE ("I used up the zucchini", "the spinach went bad, toss it from the list")
+
+Rules:
+- Ingredients only — raw foods, produce, proteins, leftovers-as-ingredients. NOT named dishes ("lasagna"), cuisines ("Greek"), or preferences ("I love garlic").
+- Strip quantities and conditions: "half a bag of spinach" -> "spinach"; "some leftover rice" -> "rice".
+- Do NOT list ingredients mentioned as dislikes, allergies, or exclusions ("no mushrooms please").
+- Set "mentioned" to true ONLY when the user actually states having or having-used-up ingredients. Otherwise return {"mentioned": false, "have": [], "used_up": []}.
+
+OUTPUT FORMAT (MANDATORY) — a single JSON object:
+{"mentioned": true/false, "have": [...], "used_up": [...]}
+
+Examples:
+"I have zucchini, spinach and some ground beef — plan dinner around them"
+-> {"mentioned": true, "have": ["zucchini", "spinach", "ground beef"], "used_up": []}
+
+"I used up the zucchini yesterday, but there's still feta left"
+-> {"mentioned": true, "have": ["feta"], "used_up": ["zucchini"]}
+
+"Plan me a healthy vegetarian week"
+-> {"mentioned": false, "have": [], "used_up": []}
+"""
+
+PANTRY_EXTRACTOR_USER_INSTRUCTIONS = """
+User message: {message}
+"""
+
 # Preference extraction (M3) — durable memory candidates from a user turn.
 PREFERENCE_EXTRACTOR_SYSTEM_INSTRUCTIONS = """
 You detect DURABLE, cross-session food preferences in a single user message for a meal-planning assistant.
@@ -881,6 +918,8 @@ MEAL_DIVERSITY_SYSTEM = _reg("meal_diversity_system", MEAL_DIVERSITY_SYSTEM_INST
 GUIDELINE_ADHERENCE_SYSTEM = _reg("guideline_adherence_system", GUIDELINE_ADHERENCE_SYSTEM_INSTRUCTIONS)
 SEED_EXTRACTOR_SYSTEM = _reg("seed_extractor_system", SEED_EXTRACTOR_SYSTEM_INSTRUCTIONS)
 SEED_EXTRACTOR_USER = _reg("seed_extractor_user", SEED_EXTRACTOR_USER_INSTRUCTIONS)
+PANTRY_EXTRACTOR_SYSTEM = _reg("pantry_extractor_system", PANTRY_EXTRACTOR_SYSTEM_INSTRUCTIONS)
+PANTRY_EXTRACTOR_USER = _reg("pantry_extractor_user", PANTRY_EXTRACTOR_USER_INSTRUCTIONS)
 PREFERENCE_EXTRACTOR_SYSTEM = _reg("preference_extractor_system", PREFERENCE_EXTRACTOR_SYSTEM_INSTRUCTIONS)
 PREFERENCE_EXTRACTOR_USER = _reg("preference_extractor_user", PREFERENCE_EXTRACTOR_USER_INSTRUCTIONS)
 EDIT_COMMAND_EXTRACTOR_SYSTEM = _reg("edit_command_extractor_system", EDIT_COMMAND_EXTRACTOR_SYSTEM_INSTRUCTIONS)
