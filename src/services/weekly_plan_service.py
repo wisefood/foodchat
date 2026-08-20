@@ -9,6 +9,7 @@ from .weekly_planner.reward_logic import RewardCalculator
 from .weekly_planner.environment import WeeklyMealPlanEnv
 from .weekly_planner.day_summary import build_day_summaries
 from .weekly_planner.explainability import build_weekly_explainability
+from .transparency import split_ledger
 from .weekly_planner.planner import (
     PlanGenerationError,
     WeeklyPlanner,
@@ -231,6 +232,9 @@ class WeeklyPlanService:
             )
 
         pinned_titles = [p.get("recipe_title", "") for p in pinned.values()]
+        weekly_honored, weekly_not_honored = split_ledger(
+            explainability["constraints_applied"]
+        )
         facts = {
             "action": "refined_weekly_plan" if is_refinement else "new_weekly_plan",
             "days": 7, "meals": 21,
@@ -241,12 +245,14 @@ class WeeklyPlanService:
                 f"{DAY_NAMES[d - 1] if 1 <= d <= 7 else f'Day {d}'}: {s}"
                 for d, s in sorted(day_summaries.items()) if s
             ],
-            # M7: same fact key the daily flow uses, plus the measured
-            # week summary ("kept within your 3-meat-meal limit, 96% of
-            # your calorie budget") so the reply can mention it.
-            "constraints_honored": [
-                c["constraint"] for c in explainability["constraints_applied"][:4]
-            ],
+            # M7: same fact keys the daily flow uses, plus the measured week
+            # summary ("kept within your 3-meat-meal limit, 96% of your
+            # calorie budget") so the reply can mention it. Split by status,
+            # never sliced — the weekly ledger also carries "violated", and
+            # announcing a violated meat limit as honoured is the one thing
+            # this ledger exists to prevent.
+            "constraints_honored": weekly_honored,
+            "constraints_not_honored": weekly_not_honored,
             "week_summary": explainability["reasoning"],
         }
         response_text = self.response_writer.write(

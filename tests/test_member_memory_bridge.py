@@ -24,9 +24,11 @@ class FakeProfileService:
     def __init__(self):
         self.applied = []
         self.optouts = []
+        self.evidence = []
 
-    def apply_memory(self, member_id, kind, value, session_id):
+    def apply_memory(self, member_id, kind, value, session_id, evidence=""):
         self.applied.append((member_id, kind, value))
+        self.evidence.append(evidence)
         return True
 
     def record_memory_optout(self, member_id, value):

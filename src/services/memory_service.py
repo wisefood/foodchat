@@ -123,6 +123,9 @@ class MemoryService:
                 "kind": kind,
                 "value": value,
                 "statement": statement,
+                # The extractor's own justification, carried to the client and
+                # back so an accepted memory can say what it was inferred from.
+                "evidence": str(cand.get("evidence") or "")[:240],
             })
             if len(suggestions) >= MAX_SUGGESTIONS_PER_TURN:
                 break
@@ -153,7 +156,9 @@ class MemoryService:
 
         if decision == "accept":
             applied = self.profile_service.apply_memory(
-                session.member_id, kind, value, session_id=session.session_id
+                session.member_id, kind, value,
+                session_id=session.session_id,
+                evidence=str(suggestion.get("evidence") or "")[:240],
             )
             if applied:
                 # Keep the live session consistent so the very next plan
@@ -170,6 +175,34 @@ class MemoryService:
             session.user_profile["memory_optouts"] = optouts
             self.session_service.persist_profile(session.session_id)
         return False
+
+    @staticmethod
+    def _attribute_to_session_member(profile: dict, key: str, value: str) -> None:
+        """Record the accepting member as the origin of a just-added constraint.
+
+        ``merge_profiles`` builds ``constraint_origins`` when the diner set is
+        chosen; a memory accepted mid-session never passes through it, so its
+        row rendered with ``members: []`` beside properly attributed siblings —
+        which reads as "nobody at this table asked for this".
+
+        Solo sessions are skipped on purpose: ``transparency`` attributes only
+        when several people are eating, so there is nothing to say and writing
+        the record would be inventing a household.
+        """
+        diners = profile.get("cooking_for_names") or []
+        if len(diners) < 2:
+            return
+        primary = str(diners[0] or "")
+        if not primary:
+            return
+        origins = dict(profile.get("constraint_origins") or {})
+        by_value = dict(origins.get(key) or {})
+        who = list(by_value.get(value) or [])
+        if primary not in who:
+            who.append(primary)
+        by_value[value] = who
+        origins[key] = by_value
+        profile["constraint_origins"] = origins
 
     def _apply_to_session_profile(self, session, kind: str, value: str) -> None:
         profile = session.user_profile
@@ -191,11 +224,13 @@ class MemoryService:
                 v for v in (profile.get("food_likes") or [])
                 if str(v).lower() != value
             ]
+            self._attribute_to_session_member(profile, "food_dislikes", value)
         elif kind == "allergy_hint":
             items = list(profile.get("allergies") or [])
             if value not in [str(v).lower() for v in items]:
                 items.append(value)
             profile["allergies"] = items
+            self._attribute_to_session_member(profile, "allergies", value)
         elif kind == "standing_seed":
             seeds = list(profile.get("standing_seeds") or [])
             if value not in [s.get("name", "").lower() for s in seeds]:
@@ -226,4 +261,23 @@ class MemoryService:
                     else:
                         existing[key] = max(existing[key], bound) if key in existing else bound
                 profile["nutrition_profile"] = existing
+            # The ledger reads goals from `goal_reconciliation`, which
+            # `merge_profiles` wrote when the diners were chosen — so a goal
+            # accepted afterwards had no row at all, not even a demoted one.
+            # Only extended when a record already exists: with none,
+            # `_goal_rows` derives rows from `dietary_goals` directly, and
+            # creating one here would render a solo session as a household.
+            reconciliation = list(profile.get("goal_reconciliation") or [])
+            if reconciliation and not any(
+                str(r.get("slug") or "").lower() == value for r in reconciliation
+            ):
+                diners = profile.get("cooking_for_names") or []
+                reconciliation.append({
+                    "slug": value,
+                    "member": str(diners[0]) if diners else "",
+                    # The session member is the primary, and merge_profiles
+                    # treats every primary goal as a target.
+                    "applied": "target",
+                })
+                profile["goal_reconciliation"] = reconciliation
         self.session_service.persist_profile(session.session_id)

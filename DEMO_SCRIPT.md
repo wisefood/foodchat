@@ -67,6 +67,70 @@ curl -s $BASE/api/v1/recipewrangler/status
 - **Demo account broken** → guest mode: one click, ephemeral household,
   the whole journey works (budgets apply).
 
+## The reconciliation beat (C3 / R1-D10)
+
+Run this inside row 12, once the household plan is on the canvas. It is the
+answer to "does one member's inferred goal quietly win?"
+
+1. Point at the ledger: **"no peanuts — Tom"**, **"vegetarian — Anna"**. Each row
+   names the diner it protects, not the whole table. Safety is a union: nobody
+   is out-voted.
+2. Point at the goal rows. Dimitris's **less saturated fat** (the goal
+   FoodScholar captured in row 11) shows as applied — it sets the plan's numeric
+   targets. Anna's goal shows amber, as **relaxed**, and the tooltip says why:
+   applied as a preference, not a target, because another diner's goal sets the
+   targets.
+3. The line to say: *"We could have stacked every diner's targets and produced
+   nothing edible, or picked one and hidden it. We pick one and say so, and the
+   others still steer the ranking."*
+4. If asked what happens when two diners want the same thing: it is recorded as
+   agreement, both names on one applied row — not a conflict.
+
+## Free exploration (R2-W1)
+
+Attendees are **not restricted to this script**, and it is worth saying so
+unprompted. In a guest session a visitor can: create their own household and add
+members, set arbitrary allergens, diets and goals, ask free-text questions in
+either app, edit or delete anything in the memory panel, and watch a change in
+one app land in the other. The script is a guided path through the same surface,
+not a rail.
+
+## Booth data handling (attendee input) — R1-D8, D11
+
+Attendees will type real preferences, real allergies, sometimes a real health
+worry, into a shared laptop. The procedure, not the intention, is what protects
+them.
+
+**Rule: attendees never touch the demo account.** Hand them a **guest session**
+(one click on the login screen). A guest is a real but short-lived Keycloak user
+with its own household and member, so nothing they enter can reach the demo
+household or another attendee's data. Guest sessions live in `sessionStorage`,
+so closing the tab already isolates the next visitor.
+
+**Between attendees, every time:**
+
+1. Have them click **"Erase my data now"** in the amber guest banner — or click
+   it for them before handing the laptop on. It calls
+   `DELETE /api/v1/system/guest`, which deletes the guest's household, its
+   members, its FoodChat sessions and the Keycloak user itself, then drops the
+   local session and returns to the login screen. A toast confirms the erase; if
+   it says the erase could not be confirmed, fall back to step 3.
+2. Open a **new** guest session for the next attendee. Never continue in one
+   that has someone else's history.
+3. Manual fallback if the button ever fails (offline, gateway hiccup): close the
+   tab to drop the session, and the expiry reaper deletes the account and all
+   its data within `GUEST_TTL_SECONDS` regardless. Nothing survives the day.
+
+**Say it out loud when someone asks.** "You're in a sandbox that gets deleted —
+either when you click erase, or automatically when it expires. Nothing you type
+here is used to train anything." That sentence is also the ethics-block clause
+in the paper.
+
+**What we log while they use it:** the same LLM traces every turn produces
+(Langfuse) and application logs, both tied to the ephemeral guest id, which is
+destroyed with the account. If an attendee asks to see the observability tab,
+show it on the demo account rather than theirs.
+
 ## Talking points (research framing)
 
 - Consent-gated, **scrutable user modeling**: nothing durable is learned

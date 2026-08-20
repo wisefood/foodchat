@@ -2,6 +2,57 @@
 
 ---
 
+# Memory provenance + per-diner constraint attribution
+
+> **Date:** 2026-08-19
+> **Branch:** fix/model-migration-config-chain
+> Ships with wisefood-ui (the memory panel renders `evidence`). Wire-compatible:
+> `evidence`, `members` and `constraint_origins` are all additive and absent on
+> anything stored earlier.
+
+Two questions the plan could not answer before: *why am I seeing this memory*,
+and *which of us is this constraint for*.
+
+| Area | Change |
+|---|---|
+| Provenance | The extractor's own justification for a suggested memory was computed and then dropped. It now rides accept/decline and is stored with the memory, so the panel can say what it was inferred from. |
+| Attribution | Ledger rows carry `members`, sourced from a new `constraint_origins` map built during `merge_profiles`. Listing every diner on every row read as if the whole table were allergic and hid the one person the row exists for. Attribution is suppressed for solo plans, where it says nothing. |
+| Goals | `goal_reconciliation` records which diner asked for each goal and whether it became a numeric target or was demoted to a soft preference. A goal that steered the plan invisibly, and a goal dropped without a trace, were the two failure modes. |
+
+Fixes found while reviewing the above:
+
+- **A relaxed constraint was announced as honoured.** `constraints_applied[:4]`
+  fed the response writer under `constraints_honored`, but the ledger mixes
+  `satisfied`, `relaxed` and (weekly) `violated`. The writer is told to mention
+  "an honored request" and believed the key, so a reply could claim a goal was
+  met while the ledger beside it said otherwise — reproduced with `increase
+  protein` landing fourth. `transparency.split_ledger` now splits by status for
+  both the daily and weekly paths, and passes `constraints_not_honored` too, so
+  the prompt's standing instruction to "say plainly" what could not be honoured
+  finally has a fact behind it. A row with an unrecognised status is claimed
+  neither way — plans stored before the field existed must not be asserted
+  either direction.
+- **A memory accepted mid-session was invisible to the ledger.**
+  `_apply_to_session_profile` bypasses `merge_profiles`, so a newly accepted
+  allergy rendered with `members: []` beside attributed siblings, and an
+  accepted goal got no row at all. Both records are now updated on accept, and
+  deliberately not for solo sessions, where writing them would invent a
+  household of one.
+
+`tests/test_ledger_honesty.py` is new (11 tests): three fail without the
+attribution fix, and the slicing test asserts the old `[:4]` behaviour produced
+the bug it replaces. 405 passing.
+
+Known, not fixed here: the goal `detail` strings describe a numeric-target
+mechanism that does not exist yet (`nutrition_profile` is written but never
+read — `plan_meals` has no macro parameter); a demoted slug missing from
+`GOAL_PREFERENCE_STRINGS` is still recorded `applied: "soft"`; sessions created
+before this deploy show no attribution until diners are re-set; and `evidence`
+is client-echoed text stored verbatim into durable provenance while
+`kind`/`value` are re-validated — a trust-model decision, not a bug fix.
+
+---
+
 # Model migration + one honest config chain
 
 > **Date:** 2026-08-19

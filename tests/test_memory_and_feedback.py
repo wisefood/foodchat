@@ -8,6 +8,7 @@ import pytest
 from services.feedback_service import FeedbackService
 from services.memory_service import MemoryService
 from services.profile_service import ProfileService
+from services.transparency import constraints_ledger
 
 
 class FakeExtractor:
@@ -24,9 +25,11 @@ class FakeProfileService:
     def __init__(self):
         self.applied = []
         self.optouts = []
+        self.evidence = []
 
-    def apply_memory(self, member_id, kind, value, session_id):
+    def apply_memory(self, member_id, kind, value, session_id, evidence=""):
         self.applied.append((member_id, kind, value))
+        self.evidence.append(evidence)
         return True
 
     def record_memory_optout(self, member_id, value):
@@ -114,6 +117,19 @@ class TestMemoryDecisions:
 
         restored = SessionService().get_session(session.session_id)
         assert {"name": "pastitsio"} in restored.user_profile["standing_seeds"]
+
+    def test_accept_carries_evidence_through_to_the_write(self, session_service, sample_profile):
+        """R1-D3: the panel has to say what a memory was inferred from."""
+        fake_profiles = FakeProfileService()
+        svc = _mk_memory_service(session_service, [CAND], fake_profiles)
+        session = _session(session_service, sample_profile)
+
+        # The client echoes back exactly what suggest() produced
+        suggestion = svc.suggest(session, "I hate blueberries")[0]
+        assert suggestion["evidence"] == "user said 'I hate blueberries'"
+
+        svc.decide(session, suggestion, "accept")
+        assert fake_profiles.evidence == ["user said 'I hate blueberries'"]
 
     def test_decline_records_optout(self, session_service, sample_profile):
         fake_profiles = FakeProfileService()
@@ -214,3 +230,96 @@ class TestDinerMerge:
         assert merged["preferences"] == ["2000 calories target"]
         assert merged["favorite_recipe_ids"] == ["r-1"]
         assert merged["cooking_for_names"] == ["Me", "Anna", "Tom"]
+        # Every constraint knows which diner it protects
+        assert merged["constraint_origins"]["allergies"]["peanuts"] == ["Me"]
+        assert merged["constraint_origins"]["allergies"]["shellfish"] == ["Tom"]
+        assert merged["constraint_origins"]["diet"]["vegetarian"] == ["Anna"]
+
+    def test_other_diners_goals_demoted_not_dropped(self):
+        """R1-D10: one member's inferred goal must not silently dominate."""
+        primary = {
+            "diet": [], "allergies": [], "food_likes": [], "food_dislikes": [],
+            "preferences": ["prefers lower-fat meals"],
+            "dietary_goals": ["reduce_fat"],
+            "nutrition_profile": {"max_fat": 20.0},
+        }
+        anna = {
+            "diet": [], "allergies": [], "food_likes": [], "food_dislikes": [],
+            "preferences": [], "dietary_goals": ["increase_protein"],
+            "nutrition_profile": {"min_protein": 30.0},
+        }
+        merged = ProfileService.merge_profiles(primary, [anna], ["Me", "Anna"])
+
+        # The primary's goal still sets the numeric targets
+        assert merged["nutrition_profile"] == {"max_fat": 20.0}
+        assert merged["dietary_goals"] == ["reduce_fat"]
+        # Anna's goal survives as a soft signal rather than disappearing
+        assert "prefers higher-protein meals" in merged["preferences"]
+        # And the reconciliation is on the record, per member
+        assert merged["goal_reconciliation"] == [
+            {"slug": "reduce_fat", "member": "Me", "applied": "target"},
+            {"slug": "increase_protein", "member": "Anna", "applied": "soft"},
+        ]
+
+    def test_shared_goal_is_agreement_not_conflict(self):
+        primary = {"preferences": [], "dietary_goals": ["reduce_fat"]}
+        anna = {"preferences": [], "dietary_goals": ["reduce_fat"]}
+        merged = ProfileService.merge_profiles(primary, [anna], ["Me", "Anna"])
+
+        assert all(r["applied"] == "target" for r in merged["goal_reconciliation"])
+        # No demotion, so nothing was appended to the soft channel
+        assert merged["preferences"] == []
+
+
+class TestLedgerAttribution:
+    """The plan has to say whose constraint each row is (R1-D10 / A2)."""
+
+    def _household(self):
+        primary = {
+            "diet": [], "allergies": [], "food_likes": [], "food_dislikes": [],
+            "preferences": [], "dietary_goals": ["reduce_fat"],
+        }
+        anna = {
+            "diet": ["vegetarian"], "allergies": [], "food_likes": [],
+            "food_dislikes": ["fish"], "preferences": [],
+            "dietary_goals": ["increase_protein"],
+        }
+        tom = {
+            "diet": [], "allergies": ["peanuts"], "food_likes": [],
+            "food_dislikes": [], "preferences": [], "dietary_goals": [],
+        }
+        return ProfileService.merge_profiles(primary, [anna, tom], ["Me", "Anna", "Tom"])
+
+    def test_constraint_names_only_the_diner_it_protects(self):
+        ledger = constraints_ledger(self._household())
+
+        peanuts = next(r for r in ledger if "peanuts" in r["constraint"])
+        assert peanuts["members"] == ["Tom"]
+        assert peanuts["type"] == "hard"
+
+        veg = next(r for r in ledger if r["constraint"] == "vegetarian")
+        assert veg["members"] == ["Anna"]
+
+        fish = next(r for r in ledger if "fish" in r["constraint"])
+        assert fish["members"] == ["Anna"]
+
+    def test_demoted_goal_appears_as_relaxed_with_a_reason(self):
+        ledger = constraints_ledger(self._household())
+
+        applied = next(r for r in ledger if r["constraint"] == "reduce fat")
+        assert applied["status"] == "satisfied"
+        assert applied["members"] == ["Me"]
+
+        demoted = next(r for r in ledger if r["constraint"] == "increase protein")
+        assert demoted["status"] == "relaxed"
+        assert demoted["members"] == ["Anna"]
+        assert "not a target" in demoted["detail"]
+
+    def test_solo_plan_has_no_attribution_noise(self):
+        solo = {"allergies": ["peanuts"], "dietary_goals": ["reduce_fat"],
+                "cooking_for_names": ["Me"]}
+        ledger = constraints_ledger(solo)
+
+        assert next(r for r in ledger if "peanuts" in r["constraint"])["members"] == []
+        goal = next(r for r in ledger if r["constraint"] == "reduce fat")
+        assert goal["status"] == "satisfied"

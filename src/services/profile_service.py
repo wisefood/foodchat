@@ -173,7 +173,14 @@ class ProfileService:
     # immediately. Every durable write carries provenance in
     # properties.memory_log — personalization must stay auditable.
 
-    def apply_memory(self, member_id: str, kind: str, value: str, session_id: str) -> bool:
+    def apply_memory(
+        self,
+        member_id: str,
+        kind: str,
+        value: str,
+        session_id: str,
+        evidence: str = "",
+    ) -> bool:
         """Persist a user-CONSENTED memory to the durable member profile.
 
         kind → destination:
@@ -272,11 +279,17 @@ class ProfileService:
                 # Provenance: who learned what, where, when. Reached only when a
                 # durable change was actually made above.
                 log = list(props.get("memory_log") or [])
-                log.append({
+                entry = {
                     "kind": kind, "value": value_norm,
                     "source": "foodchat", "session_id": session_id,
                     "recorded_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-                })
+                }
+                # What the member said that led here — the memory panel shows
+                # it under "Why am I seeing this?". Omitted rather than stored
+                # empty, so old entries and new ones read the same way.
+                if evidence:
+                    entry["evidence"] = evidence
+                log.append(entry)
                 props["memory_log"] = log
                 profile.properties = props
 
@@ -352,21 +365,52 @@ class ProfileService:
         Hard constraints (safety/identity) are the UNION across all diners:
         allergies, dietary groups, dislikes-as-exclusions. Soft preferences
         keep the primary member's weighting (their likes lead, other diners'
-        likes follow). Macro targets stay the primary member's. The primary
-        member's favorites keep their boost.
+        likes follow). The primary member's favorites keep their boost.
+
+        Goals are the delicate part. The primary member's goals keep their
+        numeric targets (``nutrition_profile``, ``min_nutri_score``), because
+        stacking several members' targets can empty the candidate set. Every
+        other diner's goal is demoted to the soft ``preferences`` channel
+        instead of being dropped, and the whole picture — whose goal, applied
+        as a target or only as a signal — is recorded in
+        ``goal_reconciliation`` so the plan can say so out loud. A goal that
+        vanished silently is what made a household plan look like one member's
+        plan.
+
+        ``constraint_origins`` keeps the member each constraint came from, so
+        the ledger can attribute "no peanuts" to the diner who is allergic
+        rather than to everyone at the table.
         """
         merged = dict(primary)
+        names = [str(n) for n in (diner_names or [])]
+        primary_name = names[0] if names else ""
+        # names is [primary, *others]; a short list just yields empty names
+        other_names = names[1:]
+        attributed = [(primary_name, primary)] + [
+            (other_names[i] if i < len(other_names) else "", profile)
+            for i, profile in enumerate(others)
+        ]
+
+        origins: dict[str, dict[str, list[str]]] = {}
 
         def union(key: str) -> list:
             seen: dict[str, str] = {}
-            for profile in [primary, *others]:
+            key_origins: dict[str, list[str]] = {}
+            for name, profile in attributed:
                 for item in profile.get(key) or []:
-                    seen.setdefault(str(item).lower(), item)
+                    low = str(item).lower()
+                    seen.setdefault(low, item)
+                    who = key_origins.setdefault(low, [])
+                    if name and name not in who:
+                        who.append(name)
+            # Re-key origins by the value as it will be displayed
+            origins[key] = {seen[low]: who for low, who in key_origins.items()}
             return list(seen.values())
 
         merged["allergies"] = union("allergies")
         merged["diet"] = union("diet")
         merged["food_dislikes"] = union("food_dislikes")
+        merged["constraint_origins"] = origins
 
         likes = list(primary.get("food_likes") or [])
         for other in others:
@@ -375,6 +419,33 @@ class ProfileService:
                     likes.append(like)
         merged["food_likes"] = likes
 
+        # ── Goal reconciliation ──
+        primary_goals = [str(s).lower() for s in (primary.get("dietary_goals") or [])]
+        reconciliation: list[dict] = [
+            {"slug": slug, "member": primary_name, "applied": "target"}
+            for slug in primary_goals
+        ]
+
+        demoted: list[str] = []
+        for name, profile in attributed[1:]:
+            for slug in profile.get("dietary_goals") or []:
+                slug = str(slug).lower()
+                if slug in primary_goals:
+                    # Two diners wanting the same thing is agreement, not conflict
+                    reconciliation.append({"slug": slug, "member": name, "applied": "target"})
+                    continue
+                if slug not in demoted:
+                    demoted.append(slug)
+                reconciliation.append({"slug": slug, "member": name, "applied": "soft"})
+
+        if demoted:
+            preferences = list(merged.get("preferences") or [])
+            for text in goal_preference_strings(demoted):
+                if text not in preferences:
+                    preferences.append(text)
+            merged["preferences"] = preferences
+
+        merged["goal_reconciliation"] = reconciliation
         merged["cooking_for_names"] = diner_names
         return merged
 

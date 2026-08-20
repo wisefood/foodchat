@@ -33,7 +33,7 @@ from services.clarification import ClarificationManager, ClarificationState
 from services.feedback_service import FeedbackService
 from services.planning_pipeline import PlanningPipeline
 from services.seed_service import SeedService
-from services.transparency import apply_transparency
+from services.transparency import apply_transparency, split_ledger
 from .session_service import SessionService
 
 logger = logging.getLogger(__name__)
@@ -448,6 +448,11 @@ class ChatService:
         self.session_service.resave_meal_plan(meal_plan)
 
         # Grounded response writer (M4c): prose from facts, canned fallback.
+        # The ledger is split by status, never sliced: a "relaxed" row handed
+        # over as honoured let the reply claim a goal was met while the ledger
+        # beside it said it wasn't. Both halves are passed, so "couldn't honour
+        # X" is a fact the writer has rather than a silence.
+        honored, not_honored = split_ledger(meal_plan.constraints_applied)
         facts = {
             "action": "refined_daily_plan" if is_refinement else "new_daily_plan",
             "meals": {
@@ -457,7 +462,8 @@ class ChatService:
             },
             "seed_note": seed_note,
             "cooking_for": profile.get("cooking_for_names") or [],
-            "constraints_honored": [c["constraint"] for c in meal_plan.constraints_applied[:4]],
+            "constraints_honored": honored,
+            "constraints_not_honored": not_honored,
         }
         formatted = self.response_writer.write(
             facts, final_query, fallback=f"{fallback} {seed_note}".strip() if seed_note else fallback,

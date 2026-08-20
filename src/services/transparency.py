@@ -50,38 +50,143 @@ def match_reasons(
 def constraints_ledger(profile: dict, downvoted_count: int = 0) -> list[dict]:
     """Hard/soft constraint rows for the plan header.
 
-    Sources: the merged session profile (which already unions diner
-    constraints — cooking_for_names attributes them) and feedback exclusions.
+    Sources: the merged session profile (whose ``constraint_origins`` records
+    which diner each constraint came from) and feedback exclusions.
+
+    Rows carry ``members`` so a household plan can attribute a constraint to
+    the diner it protects. Listing every diner on every row — which is what
+    this did before — reads as if the whole table were allergic, and hides the
+    one member the row is actually there for.
+
+    Goals get rows too, including the ones reconciliation demoted to a soft
+    signal. A goal that steered the plan without appearing anywhere is the
+    "silently dominates" failure; a goal that was dropped without a trace is
+    its mirror image.
     """
     ledger: list[dict] = []
     diners = profile.get("cooking_for_names") or []
-    source_suffix = f" ({', '.join(diners)})" if len(diners) > 1 else ""
+    household = len(diners) > 1
+    origins = profile.get("constraint_origins") or {}
+
+    def members_for(key: str, value: str) -> list[str]:
+        # Attribution only means something when several people are eating
+        if not household:
+            return []
+        return list((origins.get(key) or {}).get(value) or [])
 
     for allergen in profile.get("allergies") or []:
         ledger.append({
             "constraint": f"no {allergen}",
             "type": "hard", "status": "satisfied",
-            "source": f"allergy{source_suffix}",
+            "source": "allergy",
+            "members": members_for("allergies", allergen),
         })
     for diet in profile.get("diet") or []:
         ledger.append({
             "constraint": str(diet),
             "type": "hard", "status": "satisfied",
-            "source": f"dietary group{source_suffix}",
+            "source": "dietary group",
+            "members": members_for("diet", diet),
         })
     for dislike in (profile.get("food_dislikes") or [])[:5]:
         ledger.append({
             "constraint": f"avoiding {dislike}",
             "type": "soft", "status": "satisfied",
             "source": "preferences",
+            "members": members_for("food_dislikes", dislike),
         })
+
+    ledger.extend(_goal_rows(profile, household))
+
     if downvoted_count:
         ledger.append({
             "constraint": f"excluding {downvoted_count} recipe(s) you disliked",
             "type": "soft", "status": "satisfied",
             "source": "your feedback",
+            "members": [],
         })
     return ledger
+
+
+def _goal_rows(profile: dict, household: bool) -> list[dict]:
+    """One row per goal, saying whether it became a target or only a signal."""
+    reconciliation = profile.get("goal_reconciliation") or []
+    if not reconciliation:
+        # Solo plans have no reconciliation record; the member's own goals are
+        # all targets, so report them as such rather than not at all.
+        return [
+            {
+                "constraint": _goal_label(slug),
+                "type": "soft", "status": "satisfied",
+                "source": "your goal", "members": [],
+            }
+            for slug in (profile.get("dietary_goals") or [])
+        ]
+
+    # Collapse to one row per goal, collecting who asked for it
+    rows: dict[str, dict] = {}
+    for record in reconciliation:
+        slug = str(record.get("slug") or "")
+        if not slug:
+            continue
+        applied = record.get("applied") == "target"
+        member = str(record.get("member") or "")
+        row = rows.setdefault(slug, {
+            "constraint": _goal_label(slug),
+            "type": "soft",
+            "status": "satisfied" if applied else "relaxed",
+            "source": "goal",
+            "members": [],
+        })
+        if member and member not in row["members"]:
+            row["members"].append(member)
+        # Any member holding it as a target makes the goal a target
+        if applied:
+            row["status"] = "satisfied"
+
+    for row in rows.values():
+        if row["status"] == "relaxed":
+            row["detail"] = (
+                "Applied as a preference, not a target — another diner's goal "
+                "sets this plan's numeric targets."
+            )
+        elif household:
+            row["detail"] = "Sets this plan's numeric targets."
+
+    return list(rows.values())
+
+
+def _goal_label(slug: str) -> str:
+    return str(slug).replace("_", " ").strip() or "goal"
+
+
+def split_ledger(ledger: list, limit: int = 4) -> tuple[list[str], list[str]]:
+    """Split a ledger into what was actually honoured and what was not.
+
+    ``constraints_applied`` mixes statuses — "satisfied", "relaxed" and, on
+    weekly plans, "violated". Handing the first N rows to the response writer
+    under ``constraints_honored`` let it announce a relaxed goal as honoured
+    while the ledger rendered beside it said otherwise; the writer is told to
+    mention "an honored request", and it believed the key.
+
+    Returns ``(honored, not_honored)`` constraint strings. A row with no
+    recognised status lands in NEITHER list: plans stored before the status
+    field existed would otherwise be claimed as honoured (a false positive) or
+    apologised for (a false negative), and silence is the only honest option
+    when the ledger does not say.
+    """
+    honored: list[str] = []
+    not_honored: list[str] = []
+    for row in ledger or []:
+        text = row.get("constraint")
+        if not text:
+            continue
+        status = row.get("status")
+        if status == "satisfied":
+            honored.append(text)
+        elif status in ("relaxed", "violated"):
+            not_honored.append(text)
+    return honored[:limit], not_honored[:limit]
 
 
 def personalization_summary(profile: dict, feedback_lines: int = 0) -> dict:

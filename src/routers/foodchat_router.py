@@ -253,6 +253,10 @@ class MemorySuggestionModel(BaseModel):
     kind: str            # like | dislike | cuisine | constraint | allergy_hint | standing_seed
     value: str
     statement: str
+    # What in the turn supports this, echoed back on accept and stored with the
+    # memory. It is the answer to "why am I seeing this?" in the memory panel,
+    # and it was being extracted and then discarded.
+    evidence: Optional[str] = None
 
 
 class CitationResponse(BaseModel):
