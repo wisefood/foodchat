@@ -72,8 +72,39 @@ from schemas import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = os.getenv("FOODCHAT_LLM_MODEL", "llama-3.3-70b-versatile")
-DEFAULT_TEMPERATURE = float(os.getenv("FOODCHAT_LLM_TEMPERATURE", "0.0"))
+
+def _opt_float(name: str) -> Optional[float]:
+    """An env float, or None when unset/unparseable so the pool default wins.
+
+    None is meaningful here, not merely absent: every call site below reads
+    ``x if x is not None else DEFAULT``, and the pool in turn reads
+    ``temperature if temperature is not None else GROQ_DEFAULT_TEMPERATURE``.
+    Carrying a literal at this layer would break that chain (see groq.py).
+    """
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("%s=%r is not a number; using the pool default.", name, raw)
+        return None
+
+
+# Deliberately WITHOUT a literal fallback: None means "inherit
+# GROQ_DEFAULT_MODEL", which is the only place the default model name lives.
+# With a literal here, GROQ_DEFAULT_MODEL was dead config — it could never be
+# reached, so operators who set it saw no change at all.
+DEFAULT_MODEL = os.getenv("FOODCHAT_LLM_MODEL")
+# The cheap structured-output extractors (dietary tags, plan spec, seeds,
+# preferences, edit commands) do span-picking, not judgment, and every planning
+# turn hits several of them. A small fast model is the right tool and keeps
+# per-turn latency off the reasoning model's price.
+FAST_MODEL = os.getenv("FOODCHAT_FAST_MODEL", "openai/gpt-oss-20b")
+DEFAULT_TEMPERATURE = _opt_float("FOODCHAT_LLM_TEMPERATURE")
+# Prose, not extraction — a distinct setting rather than a shadowed default, so
+# it keeps its own literal. Governs every agent that writes to the member:
+# SimpleChatBot, ResponseWriter and PlanAnalyst.
 CHATBOT_TEMPERATURE = float(os.getenv("FOODCHAT_CHATBOT_TEMPERATURE", "0.7"))
 MAX_RETRIES = int(os.getenv("FOODCHAT_MAX_RETRIES", "3"))
 MAX_PLANS_TO_SCORE = int(os.getenv("FOODCHAT_MAX_PLANS_TO_SCORE", "10"))
@@ -295,10 +326,12 @@ class QueryReconciler:
 class DietaryIntentExtractor:
     """Extracts dietary requirement tags (vegan, low-carb, …) from a user query."""
 
-    def __init__(self, model: str = None, temperature: float = 0.0):
+    def __init__(self, model: str = None, temperature: float = None):
         self.llm = GROQ_CHAT.get_client(
-            model=model or DEFAULT_MODEL,
-            temperature=temperature,
+            model=model or FAST_MODEL,
+            temperature=(
+                temperature if temperature is not None else DEFAULT_TEMPERATURE
+            ),
             format=DietaryTagsSchema.model_json_schema(),
         )
 
@@ -328,10 +361,12 @@ class PlanSpecExtractor:
     default three meals.
     """
 
-    def __init__(self, model: str = None, temperature: float = 0.0):
+    def __init__(self, model: str = None, temperature: float = None):
         self.llm = GROQ_CHAT.get_client(
-            model=model or DEFAULT_MODEL,
-            temperature=temperature,
+            model=model or FAST_MODEL,
+            temperature=(
+                temperature if temperature is not None else DEFAULT_TEMPERATURE
+            ),
             format=PlanSpecSchema.model_json_schema(),
         )
 
@@ -391,10 +426,12 @@ class PreferenceExtractor:
     policy — this agent only detects; it NEVER writes memory itself.
     """
 
-    def __init__(self, model: str = None, temperature: float = 0.0):
+    def __init__(self, model: str = None, temperature: float = None):
         self.llm = GROQ_CHAT.get_client(
-            model=model or DEFAULT_MODEL,
-            temperature=temperature,
+            model=model or FAST_MODEL,
+            temperature=(
+                temperature if temperature is not None else DEFAULT_TEMPERATURE
+            ),
             format=PreferenceExtractionSchema.model_json_schema(),
         )
 
@@ -419,10 +456,12 @@ class SeedExtractor:
     and the favorites-offer gate (an explicit dish request suppresses the offer).
     """
 
-    def __init__(self, model: str = None, temperature: float = 0.0):
+    def __init__(self, model: str = None, temperature: float = None):
         self.llm = GROQ_CHAT.get_client(
-            model=model or DEFAULT_MODEL,
-            temperature=temperature,
+            model=model or FAST_MODEL,
+            temperature=(
+                temperature if temperature is not None else DEFAULT_TEMPERATURE
+            ),
             format=SeedExtractionSchema.model_json_schema(),
         )
 
@@ -442,10 +481,12 @@ class SeedExtractor:
 class EditCommandExtractor:
     """Parses a targeted slot-edit request into a structured command (M4b)."""
 
-    def __init__(self, model: str = None, temperature: float = 0.0):
+    def __init__(self, model: str = None, temperature: float = None):
         self.llm = GROQ_CHAT.get_client(
-            model=model or DEFAULT_MODEL,
-            temperature=temperature,
+            model=model or FAST_MODEL,
+            temperature=(
+                temperature if temperature is not None else DEFAULT_TEMPERATURE
+            ),
             format=EditCommandSchema.model_json_schema(),
         )
 

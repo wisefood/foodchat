@@ -7,3 +7,8 @@ __pycache__
 RECSYS26_PLAN.md
 
 .coverage
+
+# Local SQLite session store — DATABASE_URL defaults to ./foodchat.db, so a
+# dev run or a test that forgets its tmpdir drops one next to the code.
+*.db
+foodchat.db

@@ -14,6 +14,7 @@ No data files, vector stores, or embedding models are required to boot.
 """
 
 import logging
+import os
 import threading
 from contextlib import asynccontextmanager
 
@@ -33,8 +34,14 @@ from services import (
     init_orchestrator_service,
 )
 
+# Both Dockerfile stages set LOG_LEVEL (DEBUG in dev, INFO in prod) and nothing
+# read it, so the dev image logged at INFO exactly like production. Validated
+# against a fixed set rather than getattr(logging, ...): an unknown value falls
+# back to INFO, because a typo'd log level must not stop the pod from booting.
+_LOG_LEVELS = {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"}
+_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper()
 logging.basicConfig(
-    level=logging.INFO,
+    level=_LOG_LEVEL if _LOG_LEVEL in _LOG_LEVELS else "INFO",
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
@@ -100,7 +107,6 @@ def root():
 
 
 if __name__ == "__main__":
-    import os
     import uvicorn
 
     host = os.getenv("SERVER_HOST", "0.0.0.0")

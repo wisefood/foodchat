@@ -29,7 +29,6 @@ The conversational behaviour is unchanged from the generator version:
 
 import json
 import logging
-import os
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -37,7 +36,11 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from backend.groq import GROQ_CHAT
 from backend.observability import build_trace_config
-from agents import QueryReconciler
+# DEFAULT_MODEL/DEFAULT_TEMPERATURE come from agents rather than a second
+# os.getenv here: a duplicate read with its own literal fallback is exactly
+# how these two became unsettable (see backend/groq.py). None means
+# "inherit GROQ_DEFAULT_*".
+from agents import DEFAULT_MODEL, DEFAULT_TEMPERATURE, QueryReconciler
 from prompts import (
     QUERY_CHECKER_SYSTEM,
     QUERY_CHECKER_USER,
@@ -55,9 +58,6 @@ from schemas import (
 )
 
 logger = logging.getLogger(__name__)
-
-DEFAULT_MODEL = os.getenv("FOODCHAT_LLM_MODEL", "llama-3.3-70b-versatile")
-DEFAULT_TEMPERATURE = float(os.getenv("FOODCHAT_LLM_TEMPERATURE", "0.0"))
 
 
 @dataclass

@@ -2,6 +2,42 @@
 
 ---
 
+# Model migration + one honest config chain
+
+> **Date:** 2026-08-19
+> **Branch:** fix/model-migration-config-chain
+> Ships with platform-deployment (`lib/foodchat.libsonnet` gains the model
+> block). No wisefood-api or wisefood-ui change. Deploy the two together: the
+> image default alone is correct, the manifest just makes it explicit.
+
+Groq shut down `llama-3.3-70b-versatile` and `llama-3.1-8b-instant` on
+2026-08-16. Both were FoodChat's defaults, so every LLM call had been failing
+since — silently, because each agent catches the error and falls back: plans
+lost their grader ranking, extractors returned empty, prose writers emitted
+canned text. Nothing 500'd, so nothing alerted.
+
+| Area | Change |
+|---|---|
+| Models | Reasoning tier → `openai/gpt-oss-120b`, matching foodscholar so the platform runs one reasoning family. The five structured-output extractors (dietary tags, plan spec, seeds, preferences, edit commands) → `openai/gpt-oss-20b` via the new `FOODCHAT_FAST_MODEL`: they pick spans rather than reason, and several run per planning turn. `qwen/qwen3.6-27b` is the documented cheaper fallback. |
+| Reasoning families | New `backend/model_profiles.py`. `gpt-oss`/`qwen3`/`deepseek-r1` return their deliberation inside `content` at the provider default, which breaks every `json.loads` in agents.py into a silent fallback — the exact failure mode above, with a live model. The pool now injects `reasoning_format="hidden"` and floors `max_tokens` per family, and drops the reasoning params for families that 400 on them (`ChatGroq` is `extra="ignore"`, so a wrong knob fails one layer away at the provider). A `RETIRED` table warns on a shut-down id with its date and replacement — this is what would have caught 08-16. |
+| Config chain | `GROQ_DEFAULT_MODEL` and `GROQ_DEFAULT_TEMPERATURE` were unreachable dead config: documented, read, and shadowed at every call site, because a second `os.getenv` with its own literal fallback is never `None` so `model or GROQ_DEFAULT_MODEL` could never fire. Callers now read `os.getenv(NAME)` with no default; `backend/groq.py` holds the only literal. Resolution is narrowest-wins: ctor arg → `FOODCHAT_FAST_MODEL` → `FOODCHAT_LLM_MODEL` → `GROQ_DEFAULT_*`. |
+| Temperature | `FOODCHAT_LLM_TEMPERATURE` reached only 6 of 13 agents — five extractors hardcoded `temperature: float = 0.0` in their signature, so "not None" always won. All signatures are now `= None`; an unparseable value warns and inherits instead of raising. `FOODCHAT_CHATBOT_TEMPERATURE` keeps its own literal: prose is a separate setting, not a shadowed default (it governs `SimpleChatBot`, `ResponseWriter`, `PlanAnalyst`). |
+| `LOG_LEVEL` | Set by both Dockerfile stages and read by nothing, so the dev image logged at INFO like production. Now honoured, validated against a fixed set so a typo falls back to INFO rather than failing the boot. |
+| Docs | `.env.example` states the resolution order and forbids adding a literal at any other level — the sprawl was never the count (33 vars, all documented, all read), it was that three of them silently did nothing. |
+
+`tests/test_model_profiles.py` is new (20 tests, LLM-free): reasoning stays
+hidden for every reasoning family, the token floor raises but never lowers, a
+caller's explicit knob beats the family default, non-reasoning families get the
+params dropped, and profiled configs never collide on one cached pool client.
+394 passing.
+
+Not in scope: the `saved-plans` / session-rename routes the UI calls and the
+gateway does not proxy (three dead UI features — separate change, needs a
+`patch` verb on the gateway's foodchat client), and the pantry-planning
+follow-ups tracked on PR #1.
+
+---
+
 # Review fixes — pick lifecycle, card addressing, turn concerns
 
 > **Date:** 2026-07-23
