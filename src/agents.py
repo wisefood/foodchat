@@ -50,6 +50,8 @@ from prompts import (
     DIETARY_INTENT_EXTRACTOR_USER,
     SEED_EXTRACTOR_SYSTEM,
     SEED_EXTRACTOR_USER,
+    PANTRY_EXTRACTOR_SYSTEM,
+    PANTRY_EXTRACTOR_USER,
     PREFERENCE_EXTRACTOR_SYSTEM,
     PREFERENCE_EXTRACTOR_USER,
     EDIT_COMMAND_EXTRACTOR_SYSTEM,
@@ -66,6 +68,7 @@ from schemas import (
     DietaryTagsSchema,
     PlanSpecSchema,
     SeedExtractionSchema,
+    PantryExtractionSchema,
     PreferenceExtractionSchema,
     EditCommandSchema,
 )
@@ -437,6 +440,52 @@ class SeedExtractor:
         except Exception as e:
             logger.warning("SeedExtractor failed: %s", e)
             return []
+
+
+class PantryExtractor:
+    """Extracts on-hand ingredients ("I have zucchini and spinach") for
+    pantry-driven, food-waste-reducing planning.
+
+    Deliberately NOT folded into SeedExtractor: that agent's managed prompt
+    explicitly refuses ingredients, and existing Langfuse prompt copies are
+    never overwritten by a deploy — extending it would work locally and stay
+    silently disabled in production (the PlanSpecExtractor "json" incident).
+    A new agent with a new prompt name syncs cleanly. Callers gate this behind
+    a cheap regex (services.pantry_service) so most turns never pay the call.
+    """
+
+    def __init__(self, model: str = None, temperature: float = 0.0):
+        self.llm = GROQ_CHAT.get_client(
+            model=model or DEFAULT_MODEL,
+            temperature=temperature,
+            format=PantryExtractionSchema.model_json_schema(),
+        )
+
+    def extract(self, message: str) -> dict:
+        """{"have": [...], "used_up": [...]} — both empty when nothing stated."""
+        empty = {"have": [], "used_up": []}
+        try:
+            system_text = PANTRY_EXTRACTOR_SYSTEM.compile()
+            user_text = PANTRY_EXTRACTOR_USER.compile(message=message)
+            # Same structural guard as PlanSpecExtractor: Groq 400s any
+            # json_object request whose messages omit the word "json", and a
+            # managed prompt edit can strip it silently.
+            if "json" not in f"{system_text} {user_text}".lower():
+                system_text += "\nReturn the result as a JSON object."
+            result = self.llm.invoke([
+                SystemMessage(content=system_text),
+                HumanMessage(content=user_text),
+            ], config=build_trace_config(run_name="pantry_extract", tags=["planning"]))
+            payload = json.loads(result.content)
+        except Exception as e:
+            logger.warning("PantryExtractor failed: %s", e)
+            return empty
+        if not payload.get("mentioned"):
+            return empty
+        return {
+            "have": [str(i) for i in (payload.get("have") or []) if i],
+            "used_up": [str(i) for i in (payload.get("used_up") or []) if i],
+        }
 
 
 class EditCommandExtractor:

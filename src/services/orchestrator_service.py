@@ -667,7 +667,37 @@ class OrchestratorService:
         The durable write stays consent-gated: process() attaches the memory
         nudge and the profile only changes via POST /sessions/{id}/memory —
         this handler just answers in the persona voice.
+
+        One exception answers deterministically: a pantry statement ("I have
+        leftover rice in the fridge") is session planning state, not a durable
+        profile fact — it is stored NOW so the next plan uses it, and the
+        reply names what was noted and offers to plan. Best-effort: a failed
+        capture falls back to the ordinary acknowledgment.
         """
+        try:
+            from services import pantry_service
+
+            delta = pantry_service.extract_pantry_delta(message)
+            if not delta.is_empty:
+                state = self.session_service.get_planning_state(session_id)
+                state = state.merge(delta)
+                self.session_service.set_planning_state(session_id, state)
+                if state.pantry:
+                    text = (
+                        "Noted — I'll plan around your "
+                        + ", ".join(state.pantry)
+                        + " to keep food waste down. Ask me for a daily or "
+                        "weekly plan and I'll work them in."
+                    )
+                else:
+                    text = "Noted — I've cleared those from your use-up list."
+                self.session_service.add_message(session_id, "user", message)
+                self.session_service.add_message(session_id, "assistant", text)
+                self._tag_last_message(session_id, "preference_update", None)
+                return ChatTurn(role="assistant", content=text, intent="preference_update")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[%s] Pantry capture failed: %s", session_id, exc)
+
         response_text, _, _ = self.chat_service.process_smalltalk(session_id, message)
         self._tag_last_message(session_id, "preference_update", None)
         return ChatTurn(role="assistant", content=response_text, intent="preference_update")

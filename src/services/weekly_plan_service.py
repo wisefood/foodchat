@@ -91,6 +91,22 @@ class WeeklyPlanService:
         if query_diet_tags:
             logger.info("[%s] Extracted diet tags from query: %s", session_id, query_diet_tags)
 
+        # Pantry (food waste): merge this turn's "I have …" statements into the
+        # standing planning state, then plan with the accumulated list. Read
+        # from the RAW message so recipe text in the refinement context is
+        # never mistaken for the member's fridge. The daily flow does the same
+        # merge; whichever horizon hears about the zucchini, both honour it.
+        from services import pantry_service
+
+        state = self.session_service.get_planning_state(session_id)
+        pantry_delta = pantry_service.extract_pantry_delta(content)
+        if not pantry_delta.is_empty:
+            state = state.merge(pantry_delta)
+            self.session_service.set_planning_state(session_id, state)
+        pantry = state.pantry
+        if pantry:
+            logger.info("[%s] Pantry to use up: %s", session_id, ", ".join(pantry))
+
         # Standing seeds (M3): dishes the user consented to "always include"
         # auto-anchor into fresh weekly plans when no explicit seeds compete.
         if not seeds and not is_refinement:
@@ -115,7 +131,9 @@ class WeeklyPlanService:
             seed_note = self.seed_service.describe(resolutions, dropped)
 
         logger.info("[%s] Initializing action space and environment.", session_id)
-        action_space = RecipeActionSpace(session.user_profile, additional_diet=query_diet_tags)
+        action_space = RecipeActionSpace(
+            session.user_profile, additional_diet=query_diet_tags, pantry=pantry,
+        )
         # Anchored recipes must never repeat elsewhere in the week.
         for entry in pinned.values():
             action_space.mark_selected(entry["recipe_id"])
@@ -137,7 +155,7 @@ class WeeklyPlanService:
         try:
             plan_entries = planner.generate_full_plan(
                 user_query=effective_query, pinned=pinned,
-                scorer=build_preference_scorer(session.user_profile),
+                scorer=build_preference_scorer(session.user_profile, pantry=pantry),
             )
         except PlanGenerationError as exc:
             # An unfillable slot is an answer, not a server fault. Name the
@@ -205,6 +223,14 @@ class WeeklyPlanService:
             feedback_lines=len(history_text.splitlines()) if history_text else 0,
         )
 
+        # Pantry coverage: per-entry UI badges + a ledger row, appended AFTER
+        # explainability so its chips are extended, not overwritten. Measured
+        # by the deterministic matcher — the reply may not claim more.
+        pantry_facts = pantry_service.annotate_weekly_entries(
+            plan_entries, pantry, explainability=explainability,
+        )
+        pantry_note = pantry_service.describe_coverage(pantry_facts)
+
         if is_refinement:
             weekly_plan = self.session_service.refine_weekly_meal_plan(
                 session_id, plan_entries, day_summaries=day_summaries,
@@ -249,9 +275,16 @@ class WeeklyPlanService:
             ],
             "week_summary": explainability["reasoning"],
         }
+        if pantry_facts:
+            facts["pantry"] = {
+                "used": pantry_facts["used"],
+                "unused": pantry_facts["unused"],
+                "note": pantry_note,
+            }
+        fallback_extras = " ".join(p for p in (seed_note, pantry_note) if p)
         response_text = self.response_writer.write(
             facts, content,
-            fallback=f"{fallback} {seed_note}".strip() if seed_note else fallback,
+            fallback=f"{fallback} {fallback_extras}".strip() if fallback_extras else fallback,
         )
 
         self.session_service.add_message(session_id, "assistant", response_text)

@@ -222,3 +222,82 @@ class TestCollectedFactsRemembered:
         # Survives restart — the reconciler's known facts see it next time
         restored = SessionService().get_session(session.session_id)
         assert "30 minutes tops" in restored.user_profile["history"]
+
+
+class TestClarificationStateIsPersistable:
+    """A turn that asks a question must be able to STORE what it asked.
+
+    The profile snapshot rides inside `ClarificationState` and is json.dumps-ed
+    onto the session row. It once carried a live `PlanSpec` dataclass, so any
+    turn that happened to clarify died with "Object of type PlanSpec is not
+    JSON serializable" — intermittently, because whether a turn clarifies is
+    an LLM decision. Anything the plan flow stashes in that snapshot has to
+    survive the dump.
+    """
+
+    def _clarifying_service(self, session_service):
+        from services.chat_service import ChatService
+
+        svc = ChatService.__new__(ChatService)
+        svc.session_service = session_service
+        svc.clarifier = make_manager(
+            reconcile_result={
+                "needs_clarification": True,
+                "has_dietary_conflict": False,
+                "missing_info": ["cooking time"],
+            },
+            question_payloads=["How long can you cook?"],
+        )
+        svc.seed_service = None  # no seeds on this path
+        return svc
+
+    def test_plan_turn_that_clarifies_persists_cleanly(
+        self, session_service, sample_profile, monkeypatch
+    ):
+        import importlib
+        import uuid
+
+        from models.plan_spec import PlanSpec
+        from models.planning_state import PlanningStateDelta
+        from services.session_service import SessionService
+
+        # import_module, not `from services import chat_service`: the package's
+        # singleton placeholders shadow submodule names on attribute lookup.
+        chat_service_module = importlib.import_module("services.chat_service")
+
+        # Shape extraction is an LLM call; pin it so the turn is offline and
+        # the standing spec is definitely non-default — the exact combination
+        # that used to raise.
+        monkeypatch.setattr(
+            chat_service_module, "extract_state_delta",
+            lambda *a, **k: PlanningStateDelta(
+                spec=PlanSpec(num_days=3, meals=("lunch",),
+                              plates={"lunch": ("main", "salad")}),
+            ),
+        )
+
+        session = session_service.create_session(
+            f"member-{uuid.uuid4()}", sample_profile
+        )
+        svc = self._clarifying_service(session_service)
+
+        text, needs, plan = svc.process_plan_request(
+            session.session_id, "plan 3 days with a salad on the side",
+        )
+
+        assert needs is True and plan is None and text
+        # The write actually reached the DB, and what it wrote is JSON.
+        restored = SessionService().get_session(session.session_id)
+        assert restored.state == "clarifying"
+        json.dumps(restored.clarification)
+
+    def test_stored_spec_still_drives_the_structured_path(self):
+        """The round-trip must preserve the shape, not just serialize."""
+        from models.plan_spec import PlanSpec
+
+        spec = PlanSpec(num_days=3, meals=("lunch",), plates={"lunch": ("main", "salad")})
+        revived = PlanSpec.coerce(json.loads(json.dumps(spec.to_dict())))
+
+        assert revived == spec
+        assert not revived.is_default          # still routes to plan_structured
+        assert PlanSpec.coerce(spec) is spec    # a live instance passes through

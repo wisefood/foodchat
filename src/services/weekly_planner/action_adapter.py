@@ -14,10 +14,14 @@ details call leaves the candidates bare and constraints degrade to
 neutral, never blocking the plan.
 """
 
+import logging
 from typing import Any, Dict, List, Union
 
-from services import plan_parameters
 from services.candidates_client import CANDIDATES, normalize_diet_tags
+
+# The failure path below logs; without this the except clause itself raised
+# NameError, turning a degradable fetch failure into a crashed plan.
+logger = logging.getLogger(__name__)
 
 # Candidates fetched per slot per day. One fetch serves all three slots of a
 # day, so this stays small to keep the RecipeWrangler payloads light.
@@ -27,7 +31,12 @@ DAILY_POOL_LIMIT = 10
 class RecipeActionSpace:
     """Per-day candidate pools for the weekly planner."""
 
-    def __init__(self, user_profile: Dict[str, Any], additional_diet: List[str] = None):
+    def __init__(
+        self,
+        user_profile: Dict[str, Any],
+        additional_diet: List[str] = None,
+        pantry: tuple = (),
+    ):
         self.user_profile = user_profile
         self.allergens = user_profile.get("allergies", [])
 
@@ -37,6 +46,10 @@ class RecipeActionSpace:
         # Query-level diet tags (extracted from the user message) tighten the
         # profile diet for this plan only.
         self.diet = list(set(profile_diet + (additional_diet or [])))
+        # On-hand ingredients to use up (food waste). Pantry-matching recipes
+        # are folded into every day's pool so the scorer's boost has something
+        # to boost — a preference the pool never contains cannot be honoured.
+        self.pantry = tuple(pantry or ())
 
         # Per-day candidate pool cache, keyed by day index.
         self._day_cache: Dict[int, Dict[str, list]] = {}
@@ -77,6 +90,23 @@ class RecipeActionSpace:
                 exclude_recipe_ids=list(self._selected_ids),
                 limit_per_slot=DAILY_POOL_LIMIT,
             )
+            if self.pantry and pool:
+                # Same Tier-A fan-out as the daily pipeline: single-item hard
+                # includes, merged coverage-first, pool size unchanged. The
+                # allergen/diet constraints ride inside the fetch.
+                from services import pantry_service
+
+                pantry_pools = pantry_service.fetch_pantry_candidates(
+                    self.user_profile, self.pantry,
+                    exclude_recipe_ids=list(self._selected_ids),
+                    per_item=2,
+                    # Profile + query-level tags, tightened. Normalised like
+                    # every other call site (idempotent inside the fetch).
+                    diet=normalize_diet_tags(self.diet),
+                )
+                pool = pantry_service.merge_pantry_pool(
+                    pool, pantry_pools, self.pantry, DAILY_POOL_LIMIT,
+                )
             self._day_cache[current_day] = pool
             # One batch details call enriches the whole day's pool (M6) —
             # nutrition/tags feed the tracker and constraint filter during

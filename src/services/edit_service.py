@@ -24,6 +24,7 @@ Directive predicates (quantitative when nutrition data exists):
 """
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -72,6 +73,13 @@ class DirectivePredicate:
         self.directive = (directive or "different").lower().strip()
         self.kind, self.tag = self._classify(self.directive)
 
+    # "something with zucchini", "one using the leftover chicken", "use up my
+    # spinach" — an ingredient requirement, verifiable by text match.
+    _USES_RE = re.compile(
+        r"(?:\busing\b|\bwith\b|\bthat\s+uses\b|\buses?\s+up\b)\s+"
+        r"(?:the\s+|my\s+|our\s+|some\s+|leftover\s+)*([a-z][a-z\s-]{1,40})"
+    )
+
     @staticmethod
     def _classify(d: str) -> tuple[str, Optional[str]]:
         if any(w in d for w in ("lighter", "lower calorie", "less calorie", "fewer calorie", "light ")) or d == "light":
@@ -83,6 +91,13 @@ class DirectivePredicate:
         for phrase, tag in DIET_TAG_DIRECTIVES.items():
             if phrase in d:
                 return "diet_tag", tag
+        # After the diet tags so "with something vegetarian" stays a diet
+        # directive rather than a hunt for an ingredient named "something".
+        uses = DirectivePredicate._USES_RE.search(d)
+        if uses:
+            term = uses.group(1).strip().rstrip(".!?,")
+            if term and term not in ("something", "anything", "it"):
+                return "uses_ingredient", term
         return "unverified", None
 
     @property
@@ -113,6 +128,11 @@ class DirectivePredicate:
             return new.duration < old.duration
         if self.kind == "diet_tag":
             return self.tag in (new.tags or [])
+        if self.kind == "uses_ingredient":
+            # Enrichment carries no ingredient text; the check runs against
+            # the candidate's own text in `_find_replacement`. From here
+            # alone this fails closed, per the rule above.
+            return False
         return False
 
     def nearest(self, old: Optional[RecipeEnrichment], candidates: dict) -> Optional[str]:
@@ -273,7 +293,21 @@ class EditService:
         # annotations and no `planning_tier` could hand the user a recipe the
         # original plan was not allowed to contain — "make it lighter" is not
         # licence to reach outside the constraints.
-        candidates = self.client.slot_candidates(profile, meal_type, exclude_ids)
+        if predicate.kind == "uses_ingredient":
+            # "Something with zucchini": fetch this slot with a single-item
+            # hard include (see pantry_service — one item is exactly "must
+            # use this"), then verify by text match. slot_candidates cannot
+            # express the include, so it is only the fallback pool here.
+            from services.pantry_service import fetch_pantry_candidates
+
+            candidates = fetch_pantry_candidates(
+                profile, [predicate.tag], slots=(meal_type,),
+                exclude_recipe_ids=exclude_ids, per_item=CANDIDATE_POOL,
+            ).get(meal_type, [])
+            if not candidates:
+                candidates = self.client.slot_candidates(profile, meal_type, exclude_ids)
+        else:
+            candidates = self.client.slot_candidates(profile, meal_type, exclude_ids)
 
         if not candidates:
             return None, None, None, {"failure": "no candidates for this slot"}
@@ -284,10 +318,20 @@ class EditService:
         )
         old_rich = enrichment.get(old_recipe_id)
 
-        passing = [
-            c for c in candidates
-            if predicate.passes(old_rich, enrichment.get(c.recipe_id))
-        ]
+        if predicate.kind == "uses_ingredient":
+            # Verified against the candidate's own ingredient text — the one
+            # source that can prove "uses zucchini". Deterministic, no model.
+            from services.pantry_service import matched_items
+
+            passing = [
+                c for c in candidates
+                if matched_items(f"{c.title} {c.ingredients}", [predicate.tag])
+            ]
+        else:
+            passing = [
+                c for c in candidates
+                if predicate.passes(old_rich, enrichment.get(c.recipe_id))
+            ]
 
         facts: dict = {"directive": predicate.directive, "verified": predicate.verifiable}
         if predicate.kind == "unverified" and _names_a_dish(predicate.directive):
@@ -351,7 +395,8 @@ class EditService:
         old_course = getattr(plan, meal_type)
         current_ids = [plan.breakfast.recipe_id, plan.lunch.recipe_id, plan.dinner.recipe_id]
         choice, old_rich, new_rich, facts = self._find_replacement(
-            session, meal_type, predicate, old_course.recipe_id, current_ids,
+            session, meal_type, predicate, old_course.recipe_id,
+            current_ids + self._standing_exclusions(session),
         )
 
         if choice is None:
@@ -436,7 +481,8 @@ class EditService:
         old = target.get("recipe", {})
         all_ids = [str(e.get("recipe", {}).get("recipe_id", "")) for e in plan.entries]
         choice, old_rich, new_rich, facts = self._find_replacement(
-            session, meal_type, predicate, str(old.get("recipe_id", "")), all_ids,
+            session, meal_type, predicate, str(old.get("recipe_id", "")),
+            all_ids + self._standing_exclusions(session),
         )
 
         if choice is None:
@@ -517,6 +563,8 @@ class EditService:
         old_kcal, new_kcal = changed["old"]["kcal"], changed["new"]["kcal"]
         if predicate.kind == "lighter" and old_kcal and new_kcal:
             text += f" That takes it from {old_kcal:.0f} to {new_kcal:.0f} kcal per serving."
+        elif predicate.kind == "uses_ingredient":
+            text += f" Verified: it uses your {predicate.tag} — less food waste."
         elif predicate.verifiable and changed["verified"]:
             text += f" Verified: the new pick satisfies “{changed['directive']}”."
         elif changed.get("named_dish"):
@@ -544,6 +592,19 @@ class EditService:
         else:
             text += ". Want me to relax the requirement or another constraint?"
         return text
+
+    def _standing_exclusions(self, session) -> list[str]:
+        """Recipes the member already rejected (downvote, "not that one").
+
+        A swap that could resurrect one of them reads as not listening —
+        the same rule regeneration already follows. Best-effort: an
+        unreadable state costs the exclusion, never the swap.
+        """
+        try:
+            state = self.session_service.get_planning_state(session.session_id)
+            return [r for r in state.excluded_recipe_ids if r]
+        except Exception:  # noqa: BLE001
+            return []
 
     def _get_session(self, session_id: str):
         session = self.session_service.get_session(session_id)
