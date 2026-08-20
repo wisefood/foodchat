@@ -4,7 +4,7 @@
 
 # Memory provenance + per-diner constraint attribution
 
-> **Date:** 2026-08-19
+> **Date:** 2026-08-20
 > **Branch:** fix/model-migration-config-chain
 > Ships with wisefood-ui (the memory panel renders `evidence`). Wire-compatible:
 > `evidence`, `members` and `constraint_origins` are all additive and absent on
@@ -55,7 +55,7 @@ is client-echoed text stored verbatim into durable provenance while
 
 # Model migration + one honest config chain
 
-> **Date:** 2026-08-19
+> **Date:** 2026-08-20
 > **Branch:** fix/model-migration-config-chain
 > Ships with platform-deployment (`lib/foodchat.libsonnet` gains the model
 > block). No wisefood-api or wisefood-ui change. Deploy the two together: the
