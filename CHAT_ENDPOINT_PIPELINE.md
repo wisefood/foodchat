@@ -63,6 +63,12 @@ Client (wisefood-api gateway)
   +--> is_refinement and daily canvas exists ?
   |      +--> yes -> prepend current plan text to the effective message
   |
+  +--> standing PlanningState merge (spec / anchors / favorites / exclusions)
+  |      + pantry_service.extract_pantry_delta(RAW message)
+  |        (regex-gated PantryExtractor: "I have zucchini and spinach" ->
+  |         state.pantry; "used up the zucchini" removes it; persisted on
+  |         the session, rides the profile snapshot as profile["_pantry"])
+  |
   +--> ClarificationManager.start(effective_message, session.user_profile, origin_intent)
          |
          |  (reconciles query vs profile; merged profile rides on the outcome)
@@ -104,9 +110,16 @@ correctly after a process restart or on a different replica.
   |
   +--> PlanningPipeline.generate(final_query, profile)
   |      |
-  |      +--> RecipeCandidatesClient.fetch_candidates(...)
+  |      +--> candidate pool from /api/v2/tools/plan_meals
   |      |      hard filters server-side at RecipeWrangler:
   |      |      allergens (FoodOn taxonomy), diet tags, exclude ingredients/ids
+  |      |
+  |      +--> profile["_pantry"] set ? (food waste)
+  |      |      +--> per-item plan_meals fan-out (include_ingredients=[ONE
+  |      |           item] each — the endpoint ANDs the list, so the whole
+  |      |           pantry at once would empty every slot), merged into the
+  |      |           pool coverage-first, pool size unchanged; grader query
+  |      |           gains a "prefer using: ..." hint
   |      |
   |      +--> any slot empty ? -> [] -> apology response, no plan
   |      |
@@ -123,6 +136,13 @@ correctly after a process restart or on a different replica.
   +--> store:
   |      is_refinement -> session_service.refine_meal_plan  (version+1, parent_id)
   |      else          -> session_service.add_meal_plan     (version 1, fresh canvas)
+  |
+  +--> pantry coverage (deterministic word-boundary matcher, never the LLM):
+  |      per-course match_reasons chips (kind "pantry": "uses your zucchini —
+  |      reducing food waste" / "cooked from your leftovers"), a ledger row
+  |      ("using N of M on-hand ingredient(s)", status relaxed when items
+  |      went unused), and facts["pantry"] {used, unused, note} for the
+  |      ResponseWriter — unused items get a sentence, never silence
   |
   +--> add assistant message, return (text, needs_clarification=False, meal_plan)
 ```
@@ -163,10 +183,15 @@ correctly after a process restart or on a different replica.
   |
   +--> add user message; inject current weekly canvas text when refining
   +--> DietaryIntentExtractor.extract(content)      -> query-level diet tags
-  +--> RecipeActionSpace(profile, extra diet tags)  -> per-day candidate pools
+  +--> pantry_service.extract_pantry_delta(RAW message) merged into the
+  |      standing PlanningState (same state the daily flow reads — whichever
+  |      horizon hears about the zucchini, both honour it)
+  +--> RecipeActionSpace(profile, extra diet tags, pantry) -> per-day pools
   |      (RecipeWrangler fetch once per day, selected ids excluded -> no
   |       repeats; each day's pool enriched with one batch details call ->
-  |       candidates carry nutrition + diet tags during selection)
+  |       candidates carry nutrition + diet tags during selection; a stated
+  |       pantry folds per-item matches into every day's pool coverage-first,
+  |       and build_preference_scorer adds +3 per matched item, capped at 2)
   +--> WeeklyMealPlanEnv + WeeklyPlanner.generate_full_plan
   |      21 steps (7 days x 3 meals), fully LLM-free:
   |      apply_hard_constraints prunes the pool (weekly meat limit —
@@ -184,6 +209,9 @@ correctly after a process restart or on a different replica.
   |      weekly metrics (variety + category distribution, deterministic
   |      guideline frequency checklist, nutrition trackers with coverage,
   |      per-day breakdown) and the whole-week justification prose
+  +--> pantry_service.annotate_weekly_entries (after explainability, so its
+  |      chips are appended to, not overwritten): per-entry pantry badges,
+  |      a coverage ledger row, facts["pantry"] {used, unused, note}
   +--> store (refine -> version+1 | fresh -> version 1) + assistant message
   |      (ResponseWriter facts include constraints_honored + week_summary)
 ```
@@ -225,6 +253,7 @@ Exception    -> HTTP 500
 - [src/services/chat_service.py](src/services/chat_service.py)
 - [src/services/clarification.py](src/services/clarification.py)
 - [src/services/planning_pipeline.py](src/services/planning_pipeline.py)
+- [src/services/pantry_service.py](src/services/pantry_service.py)
 - [src/services/candidates_client.py](src/services/candidates_client.py)
 - [src/services/weekly_plan_service.py](src/services/weekly_plan_service.py)
 - [src/services/session_service.py](src/services/session_service.py)

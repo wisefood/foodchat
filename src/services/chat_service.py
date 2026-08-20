@@ -23,10 +23,12 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 from agents import GuidelineAdherenceGrader, MealDiversityGrader, ResponseWriter, SimpleChatBot
+from models.plan_spec import PlanSpec
 from models.recipe import CandidateRecipe, ScoredPlan
 from models.session import MealPlan
 from models.planning_state import PlanningStateDelta
 from services.adapted_recipes import overlay_plan
+from services import pantry_service
 from services.planning_delta import extract_state_delta
 from services.candidates_client import CANDIDATES
 from services.clarification import ClarificationManager, ClarificationState
@@ -217,6 +219,10 @@ class ChatService:
         state = self.session_service.get_planning_state(session_id)
         delta = extract_state_delta(effective_message)
         state = state.merge(delta)
+        # Pantry statements ("I have zucchini and spinach") — read from the
+        # RAW message, not the refinement context, so ingredients quoted from
+        # the current plan are never mistaken for the member's fridge.
+        state = state.merge(pantry_service.extract_pantry_delta(message))
 
         if seeds:
             resolutions = self.seed_service.resolve_seeds(seeds, profile)
@@ -256,7 +262,16 @@ class ChatService:
         if state.excluded_recipe_ids:
             profile["_excluded_recipe_ids"] = list(state.excluded_recipe_ids)
 
-        profile["_plan_spec"] = state.spec
+        # Serialized, not the dataclass: this snapshot is json.dumps-ed onto
+        # the session row whenever the turn asks a clarifying question, and a
+        # live PlanSpec made that write raise ("not JSON serializable") on
+        # exactly those turns — intermittently, since clarification is an LLM
+        # decision. `_generate_and_store` coerces it back.
+        profile["_plan_spec"] = state.spec.to_dict()
+        if state.pantry:
+            # Rides the profile snapshot like the other underscore keys, so
+            # the pantry survives an intervening clarification round-trip.
+            profile["_pantry"] = list(state.pantry)
         self.session_service.set_planning_state(session_id, state)
         logger.info("[%s] Standing plan state: %s", session_id, state.describe())
 
@@ -371,6 +386,9 @@ class ChatService:
         pinned = {
             slot: CandidateRecipe(**fields) for slot, fields in pinned_raw.items()
         }
+        # Read before the pipeline pops "_pantry" from this same dict — the
+        # coverage badges below need to know what was asked for.
+        pantry = pantry_service.normalize_items(profile.get("_pantry") or [])
 
         # Feedback finally drives recommendations (M3): downvoted recipes are
         # excluded and the rating history reaches the grader prompts.
@@ -384,7 +402,8 @@ class ChatService:
         # the state both existed, and nothing connected them, so "add salads
         # as side dishes" extracted a spec, stored it, and then generated
         # exactly the plan it would have generated anyway.
-        spec = profile.pop("_plan_spec", None)
+        spec_raw = profile.pop("_plan_spec", None)
+        spec = PlanSpec.coerce(spec_raw) if spec_raw is not None else None
         if spec is not None and not spec.is_default:
             return self._generate_structured(
                 session_id, final_query, profile, spec, pinned, seed_note,
@@ -445,6 +464,12 @@ class ChatService:
                 "[%s] %d course(s) use the member's adapted version.",
                 session_id, adapted_count,
             )
+        # Pantry coverage: UI badges per course + a ledger row, computed by
+        # the deterministic matcher AFTER transparency/overlay so the chips
+        # land on what the member will actually see. Before the resave, so
+        # they persist.
+        pantry_facts = pantry_service.annotate_daily_plan(meal_plan, pantry)
+        pantry_note = pantry_service.describe_coverage(pantry_facts)
         self.session_service.resave_meal_plan(meal_plan)
 
         # Grounded response writer (M4c): prose from facts, canned fallback.
@@ -465,8 +490,18 @@ class ChatService:
             "constraints_honored": honored,
             "constraints_not_honored": not_honored,
         }
+        if pantry_facts:
+            # The writer may only phrase what the matcher measured — used
+            # AND unused items both reach the member.
+            facts["pantry"] = {
+                "used": pantry_facts["used"],
+                "unused": pantry_facts["unused"],
+                "note": pantry_note,
+            }
+        fallback_extras = " ".join(p for p in (seed_note, pantry_note) if p)
         formatted = self.response_writer.write(
-            facts, final_query, fallback=f"{fallback} {seed_note}".strip() if seed_note else fallback,
+            facts, final_query,
+            fallback=f"{fallback} {fallback_extras}".strip() if fallback_extras else fallback,
         )
 
         self.session_service.add_message(session_id, "assistant", formatted)
@@ -493,6 +528,8 @@ class ChatService:
         excluded = list(signals.downvoted_recipe_ids or []) + list(
             profile.get("_excluded_recipe_ids") or []
         )
+        # Before plan_structured pops "_pantry" — coverage badges need it.
+        pantry = pantry_service.normalize_items(profile.get("_pantry") or [])
         meal_plan = self.pipeline.plan_structured(
             profile, spec, exclude_recipe_ids=excluded, pinned=pinned,
         )
@@ -501,6 +538,10 @@ class ChatService:
             apology = no_plan_message(profile)
             self.session_service.add_message(session_id, "assistant", apology)
             return apology, False, None
+
+        # Pantry coverage badges + ledger row, before the plan is stored.
+        pantry_facts = pantry_service.annotate_daily_plan(meal_plan, pantry)
+        pantry_note = pantry_service.describe_coverage(pantry_facts)
 
         meal_plan = self.session_service.add_prepared_meal_plan(session_id, meal_plan)
         logger.info(
@@ -523,9 +564,17 @@ class ChatService:
             "concerns": concerns,
             "notes": meal_plan.reasoning[:300],
         }
+        if pantry_facts:
+            facts["pantry"] = {
+                "used": pantry_facts["used"],
+                "unused": pantry_facts["unused"],
+                "note": pantry_note,
+            }
         fallback_parts = [f"Here's your plan — {spec.describe()}."]
         if seed_note:
             fallback_parts.append(seed_note)
+        if pantry_note:
+            fallback_parts.append(pantry_note)
         fallback_parts.extend(concerns)
         formatted = self.response_writer.write(
             facts, final_query, fallback=" ".join(fallback_parts),

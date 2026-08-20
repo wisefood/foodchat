@@ -23,7 +23,7 @@ from agents import DocumentGrader
 from models.plan_spec import PlanSpec
 from models.recipe import CandidateRecipe, ScoredPlan
 from models.session import MealPlan
-from services import plan_parameters
+from services import pantry_service, plan_parameters
 from services.candidates_client import CANDIDATES, normalize_diet_tags
 
 logger = logging.getLogger(__name__)
@@ -59,8 +59,15 @@ class PlanningPipeline:
         recipes the user explicitly requested (seeded planning, M2): a pinned
         slot has exactly one candidate — its anchor — so every graded
         combination contains it, and the other slots are ranked around it.
+
+        ``profile["_pantry"]`` (transient, stashed by chat_service like the
+        other underscore keys) lists on-hand ingredients to use up: matching
+        recipes are folded into the pool coverage-first and the grader is told
+        to prefer combinations that use them. A boost, never a filter — the
+        pool stays constraint-correct and full-sized either way.
         """
         pinned = pinned or {}
+        pantry = pantry_service.normalize_items(profile.pop("_pantry", None) or [])
 
         # `food_likes` mixes cuisines and ingredients, because a "cuisine"
         # memory is folded into the same list as a "like". Sent whole they all
@@ -105,6 +112,24 @@ class PlanningPipeline:
             ),
             limit_per_slot=CANDIDATE_LIMIT,
         )
+
+        # Pantry (food waste): fold in recipes that use the member's on-hand
+        # ingredients, coverage-first. The per-item fan-out exists because
+        # `plan_meals` ANDs `include_ingredients` — the whole pantry at once
+        # would demand every item in every recipe and empty the slots.
+        if pantry and candidates:
+            pantry_pools = pantry_service.fetch_pantry_candidates(
+                profile, pantry,
+                exclude_recipe_ids=(
+                    [r.recipe_id for r in pinned.values()]
+                    + list(exclude_recipe_ids or [])
+                ),
+            )
+            candidates = pantry_service.merge_pantry_pool(
+                candidates, pantry_pools, pantry, CANDIDATE_LIMIT,
+            )
+            logger.info("Pantry boost applied for: %s", ", ".join(pantry))
+
         for slot, anchor in pinned.items():
             candidates[slot] = [anchor]
             logger.info("Slot %s pinned to %r", slot, anchor.title)
@@ -120,9 +145,20 @@ class PlanningPipeline:
             )
             return []
 
+        # The grader hears about the pantry as a preference in the query text;
+        # every user-facing coverage CLAIM still comes from the deterministic
+        # matcher (pantry_service), never from the model.
+        grader_query = query
+        if pantry:
+            grader_query = (
+                f"{query}\n\nThe user has these ingredients at home to use up "
+                f"(reduce food waste): {', '.join(pantry)}. Prefer combinations "
+                "that together use as many of them as possible."
+            )
+
         try:
             scored = self.grader.grade_daily_plans(
-                query, candidates, profile, feedback_history
+                grader_query, candidates, profile, feedback_history
             )
         except Exception as exc:  # noqa: BLE001
             # The grader is a model call. Losing it should cost the *ranking*,
@@ -187,6 +223,15 @@ class PlanningPipeline:
             profile.get("plan_parameters") or {}
         )
 
+        # Pantry boost for the structured path. Assembly is delegated wholly
+        # to `plan_meals`, whose only soft rank signal is the favourites
+        # float — so pantry-matching recipe ids ride that signal. Hard
+        # filters still decide eligibility; this reorders, never widens.
+        pantry = pantry_service.normalize_items(profile.pop("_pantry", None) or [])
+        boost_ids = (
+            pantry_service.pantry_boost_ids(profile, pantry) if pantry else []
+        )
+
         try:
             envelope = PLANNER.plan_meals(
                 spec=spec,
@@ -198,6 +243,7 @@ class PlanningPipeline:
                 cuisines=cuisines,
                 exclude_ingredients=profile.get("food_dislikes") or [],
                 exclude_recipe_ids=list(exclude_recipe_ids or []),
+                favorite_recipe_ids=boost_ids,
                 max_minutes=max_minutes,
                 min_nutri_score=profile.get("min_nutri_score"),
             )
@@ -231,8 +277,15 @@ class PlanningPipeline:
                     MealCourse(
                         recipe_id=recipe_id,
                         title=str(recipe.get("title") or ""),
-                        ingredients="",
-                        directions="",
+                        # The envelope carries the text (same keys
+                        # to_candidates reads); the pantry coverage matcher
+                        # and the UI read it downstream.
+                        ingredients=str(recipe.get("ingredients") or ""),
+                        directions=str(
+                            recipe.get("directions")
+                            or recipe.get("instructions")
+                            or ""
+                        ),
                         nutrition=_meal_nutrition(recipe),
                         image_url=recipe.get("image_url"),
                         role=role,

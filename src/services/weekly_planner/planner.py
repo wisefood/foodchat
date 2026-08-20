@@ -61,7 +61,9 @@ def perishable_tokens(ingredients_text: Any) -> set:
     }
 
 
-def build_preference_scorer(user_profile: Dict[str, Any]) -> Callable:
+def build_preference_scorer(
+    user_profile: Dict[str, Any], pantry: tuple = (),
+) -> Callable:
     """Heuristic candidate scorer (M4): preference-aware selection at zero
     LLM cost. Favorites dominate, liked ingredients boost, similarity to
     meals already in the plan penalizes (variety), and — when the member has
@@ -78,13 +80,22 @@ def build_preference_scorer(user_profile: Dict[str, Any]) -> Callable:
     place the weekly planner can honour the setting at all: it selects
     without an LLM, so a preference that never becomes a number here is a
     preference that does not exist.
+
+    ``pantry`` — on-hand ingredients the member asked to use up. +3 per
+    matched item, capped at two: an explicit this-turn request outranks a
+    standing favourite (+5 < 6) but cannot ride a long ingredient list into
+    flattening variety. Always on when the member stated a pantry —
+    unlike the perishable-reuse axis it needs no slider, because the member
+    asked for it in words.
     """
     favorites = {str(f) for f in (user_profile.get("favorite_recipe_ids") or [])}
     likes = [str(l).lower() for l in (user_profile.get("food_likes") or [])]
 
     from services import plan_parameters  # local import; avoids a cycle at module load
+    from services.pantry_service import matched_items, normalize_items
     waste = plan_parameters.waste_mode(user_profile.get("plan_parameters") or {})
     waste_weight = {"off": 0.0, "reuse": 0.8, "strict": 1.6}[waste]
+    pantry_items = list(normalize_items(pantry))
 
     def scorer(
         candidate: Dict[str, Any],
@@ -96,6 +107,13 @@ def build_preference_scorer(user_profile: Dict[str, Any]) -> Callable:
             score += 5.0
         ingredients = str(candidate.get("recipe_ingredients", "")).lower()
         score += sum(1.0 for like in likes if like and like in ingredients)
+
+        # Pantry (food waste): boost recipes that use what the member has.
+        if pantry_items:
+            hits = matched_items(
+                f"{candidate.get('recipe_title', '')} {ingredients}", pantry_items
+            )
+            score += 3.0 * min(len(hits), 2)
 
         # Variety: penalize title-token overlap with meals already planned.
         title_tokens = {

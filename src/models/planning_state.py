@@ -64,6 +64,12 @@ class PlanningState:
     # ("nothing too heavy in the evening"). Carried into the grader's prompt.
     notes: tuple[str, ...] = ()
 
+    # On-hand ingredients the member wants used up ("I have zucchini and
+    # spinach") — the food-waste pantry. Normalized lowercase names, insertion
+    # order kept. Session-scoped planning state like everything here, NOT a
+    # durable profile field; see services.pantry_service.
+    pantry: tuple[str, ...] = ()
+
     def merge(self, delta: "PlanningStateDelta") -> "PlanningState":
         """Apply one turn's changes. Absent fields leave state untouched."""
         if delta.reset:
@@ -90,6 +96,17 @@ class PlanningState:
             if note and note not in notes:
                 notes.append(note)
 
+        # Pantry: additive, with explicit removal ("I used up the zucchini").
+        # Silence leaves it alone, like everything else here.
+        pantry = list(self.pantry)
+        removed = {str(r).strip().lower() for r in (delta.pantry_remove or ()) if r}
+        if removed:
+            pantry = [item for item in pantry if item not in removed]
+        for item in delta.pantry_add or ():
+            value = str(item).strip().lower()
+            if value and value not in pantry:
+                pantry.append(value)
+
         return replace(
             self,
             spec=spec,
@@ -99,6 +116,7 @@ class PlanningState:
                 self.use_favorites if delta.use_favorites is None else delta.use_favorites
             ),
             notes=tuple(notes),
+            pantry=tuple(pantry),
         )
 
     def describe(self) -> str:
@@ -118,6 +136,8 @@ class PlanningState:
             parts.append("favourites declined")
         if self.excluded_recipe_ids:
             parts.append(f"{len(self.excluded_recipe_ids)} recipe(s) ruled out")
+        if self.pantry:
+            parts.append("pantry to use up: " + ", ".join(self.pantry))
         if self.notes:
             parts.append("; ".join(self.notes))
         return " · ".join(parts)
@@ -126,15 +146,12 @@ class PlanningState:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "spec": {
-                "num_days": self.spec.num_days,
-                "meals": list(self.spec.meals),
-                "plates": {k: list(v) for k, v in self.spec.plates.items()},
-            },
+            "spec": self.spec.to_dict(),
             "anchors": dict(self.anchors),
             "excluded_recipe_ids": list(self.excluded_recipe_ids),
             "use_favorites": self.use_favorites,
             "notes": list(self.notes),
+            "pantry": list(self.pantry),
         }
 
     @classmethod
@@ -163,6 +180,9 @@ class PlanningState:
             ),
             use_favorites=favourites if isinstance(favourites, bool) else None,
             notes=tuple(str(n) for n in (raw.get("notes") or []) if n),
+            pantry=tuple(
+                str(p).strip().lower() for p in (raw.get("pantry") or []) if p
+            ),
         )
 
 
@@ -180,6 +200,10 @@ class PlanningStateDelta:
     excluded_recipe_ids: tuple[str, ...] = ()
     use_favorites: Optional[bool] = None
     notes: tuple[str, ...] = ()
+    # Pantry items this turn added ("I have …") / declared spent ("used up
+    # the …"). Separate tuples so adding and removing in one turn both land.
+    pantry_add: tuple[str, ...] = ()
+    pantry_remove: tuple[str, ...] = ()
     reset: bool = False
 
     @property
@@ -190,5 +214,7 @@ class PlanningStateDelta:
             or self.excluded_recipe_ids
             or self.use_favorites is not None
             or self.notes
+            or self.pantry_add
+            or self.pantry_remove
             or self.reset
         )
