@@ -94,7 +94,7 @@ class RecipeActionSpace:
                 # Same Tier-A fan-out as the daily pipeline: single-item hard
                 # includes, merged coverage-first, pool size unchanged. The
                 # allergen/diet constraints ride inside the fetch.
-                from services import pantry_service
+                from services import pantry_service, plan_parameters
 
                 pantry_pools = pantry_service.fetch_pantry_candidates(
                     self.user_profile, self.pantry,
@@ -103,6 +103,14 @@ class RecipeActionSpace:
                     # Profile + query-level tags, tightened. Normalised like
                     # every other call site (idempotent inside the fetch).
                     diet=normalize_diet_tags(self.diet),
+                    # Parity with the base pool above, which applies both.
+                    # The merge ranks coverage-first, so a constraint missing
+                    # here surfaces at the top of the day's pool rather than
+                    # merely appearing in it.
+                    cuisines=cuisines,
+                    max_minutes=plan_parameters.max_duration_minutes(
+                        self.user_profile.get("plan_parameters") or {}
+                    ),
                 )
                 pool = pantry_service.merge_pantry_pool(
                     pool, pantry_pools, self.pantry, DAILY_POOL_LIMIT,

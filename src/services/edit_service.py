@@ -75,10 +75,51 @@ class DirectivePredicate:
 
     # "something with zucchini", "one using the leftover chicken", "use up my
     # spinach" — an ingredient requirement, verifiable by text match.
+    #
+    # The capture is at most TWO words ("ground beef") and never crosses into
+    # the rest of the sentence. A greedy [a-z\s-]{1,40} run swallowed whatever
+    # followed — "zucchini please", "chicken instead", "zucchini and spinach" —
+    # and a term like that hard-fails: the include fetch finds nothing, the
+    # text match finds nothing, and the member is told no candidate satisfies a
+    # request that used to produce an ordinary swap.
     _USES_RE = re.compile(
         r"(?:\busing\b|\bwith\b|\bthat\s+uses\b|\buses?\s+up\b)\s+"
-        r"(?:the\s+|my\s+|our\s+|some\s+|leftover\s+)*([a-z][a-z\s-]{1,40})"
+        r"(?:(?:the|my|our|some|a|an|leftover|left-over|remaining)\s+)*"
+        r"([a-z][a-z-]*(?:\s+[a-z][a-z-]*)?)"
     )
+    # Words that can follow an ingredient without belonging to it.
+    _TRAILING_FILLER = frozenset({
+        "please", "instead", "too", "also", "again", "thanks", "tonight",
+        "today", "tomorrow", "now", "and", "or", "but", "for", "in", "on",
+        "with", "this", "that", "time", "one", "ones",
+    })
+    # An opener that means the phrase never named an ingredient. Comparatives
+    # matter most: "with less salt" is a directive about a quantity, and
+    # searching for an ingredient called "less salt" finds nothing at all.
+    _NOT_AN_INGREDIENT = frozenset({
+        "something", "anything", "nothing", "it", "them", "one",
+        "more", "less", "fewer", "lower", "higher", "extra", "much", "many",
+        "other", "another", "different", "new", "same", "better",
+    })
+
+    @staticmethod
+    def _ingredient_term(directive: str) -> Optional[str]:
+        """The ingredient a directive requires, or None when it names none.
+
+        Returning None is the safe direction: the directive falls through to
+        "unverified", which still produces a swap. Claiming a term that is not
+        an ingredient produces a dead end instead.
+        """
+        match = DirectivePredicate._USES_RE.search(directive)
+        if not match:
+            return None
+        words = [w.strip(".!?,;:") for w in match.group(1).split()]
+        words = [w for w in words if w]
+        while words and words[-1] in DirectivePredicate._TRAILING_FILLER:
+            words.pop()
+        if not words or words[0] in DirectivePredicate._NOT_AN_INGREDIENT:
+            return None
+        return " ".join(words[:2])
 
     @staticmethod
     def _classify(d: str) -> tuple[str, Optional[str]]:
@@ -93,11 +134,9 @@ class DirectivePredicate:
                 return "diet_tag", tag
         # After the diet tags so "with something vegetarian" stays a diet
         # directive rather than a hunt for an ingredient named "something".
-        uses = DirectivePredicate._USES_RE.search(d)
-        if uses:
-            term = uses.group(1).strip().rstrip(".!?,")
-            if term and term not in ("something", "anything", "it"):
-                return "uses_ingredient", term
+        term = DirectivePredicate._ingredient_term(d)
+        if term:
+            return "uses_ingredient", term
         return "unverified", None
 
     @property
@@ -298,11 +337,20 @@ class EditService:
             # hard include (see pantry_service — one item is exactly "must
             # use this"), then verify by text match. slot_candidates cannot
             # express the include, so it is only the fallback pool here.
+            from services.candidates_client import CANDIDATES as _CANDS
             from services.pantry_service import fetch_pantry_candidates
 
+            # Same cuisine filter `slot_candidates` applies, so the two
+            # branches of this if/else cannot offer differently-constrained
+            # pools — "make it lighter is not licence to reach outside the
+            # constraints" has to hold for "something with zucchini" too.
+            # (Neither branch applies the cooking-time slider; that gap is
+            # older than the pantry work and belongs to slot_candidates.)
+            _cuisines, _ = _CANDS.split_cuisines(profile.get("food_likes") or [])
             candidates = fetch_pantry_candidates(
                 profile, [predicate.tag], slots=(meal_type,),
                 exclude_recipe_ids=exclude_ids, per_item=CANDIDATE_POOL,
+                cuisines=_cuisines,
             ).get(meal_type, [])
             if not candidates:
                 candidates = self.client.slot_candidates(profile, meal_type, exclude_ids)

@@ -124,6 +124,12 @@ class PlanningPipeline:
                     [r.recipe_id for r in pinned.values()]
                     + list(exclude_recipe_ids or [])
                 ),
+                # The same cuisine and cooking-time constraints the base pool
+                # was fetched with. Omitting them let pantry candidates that
+                # break the time slider rank ABOVE the compliant ones, since
+                # the merge sorts coverage-first.
+                cuisines=cuisines,
+                max_minutes=max_minutes,
             )
             candidates = pantry_service.merge_pantry_pool(
                 candidates, pantry_pools, pantry, CANDIDATE_LIMIT,

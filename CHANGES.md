@@ -2,6 +2,43 @@
 
 ---
 
+# Pantry review follow-ups
+
+> **Date:** 2026-08-20
+> **Branch:** main
+> No API change. One UI-visible contract change: the `match_reasons` chip
+> `"cooked from your leftovers"` is gone (see below) — clients render chips
+> generically, so nothing breaks.
+
+Fixes from the review of PR #1, applied after the merge.
+
+| Fix | Why it mattered |
+|---|---|
+| The `uses_ingredient` directive no longer captures greedily. | `([a-z\s-]{1,40})` swallowed whatever followed the ingredient — "zucchini please", "chicken instead", "zucchini and spinach". A junk term hard-fails: the single-item include finds nothing, the text match finds nothing, and the member is told no candidate satisfies a request that previously produced an ordinary swap. Now at most two words, with trailing filler stripped and comparative openers ("less salt") rejected back to `unverified`. A two-item request verifies the first item rather than searching for an ingredient literally named "zucchini and spinach". |
+| The matcher is number-symmetric. | The pattern appended an optional `s`, which only worked one way: a member who said "tomatoes" — the natural way to name fridge contents — never matched a recipe listing "tomato". The plan used the item while the reply said *"I couldn't work in your tomatoes"* and the ledger recorded the coverage `relaxed`. Under-reporting is supposed to be the safe direction; here it produced an affirmative false claim. Each word is now stemmed and re-inflected. "rice" still does not match "price". |
+| The fan-out carries the caller's `cuisines` and `max_minutes`. | The pantry pool is merged into the ordinary one and sorted coverage-first, so a constraint the fan-out dropped did not merely appear — it appeared at the **top**. A member with the cooking-time slider at 20 minutes who mentioned a courgette got a 90-minute bake ranked first. All three call sites now pass what their own base pool passes; the edit path matches `slot_candidates` exactly rather than letting its two branches offer differently-constrained pools. |
+| The `"cooked from your leftovers"` chip is removed. | It was emitted on every match, unconditionally. "I picked up courgettes today" is a pantry statement too, and nothing in the state records whether an item is a leftover — so the claim had no measurement behind it, in a module whose stated rule is that every user-facing claim comes from the matcher. The food-waste chip already carries the intent without asserting the item's history. |
+
+Also folded in from the merge: `PantryExtractor` moved to `FOODCHAT_FAST_MODEL`
+with an inheritable temperature. Its hunks did not overlap the ones that moved
+the other five extractors, so git merged it cleanly onto the 120b reasoning
+model with `FOODCHAT_LLM_TEMPERATURE` shadowed — the exact bug the model
+migration had just removed.
+
+`tests/test_pantry_followups.py` is new (21 tests). Verified as regressions,
+not decoration: reverting the stemmer fails 2, reverting the capture fails 1.
+457 passing.
+
+Still open from that review, deliberately: the pantry branch in
+`_handle_preference_update` returns early on any pantry delta, so *"I love
+spicy food and I've got leftover rice"* replies about the rice and drops the
+preference acknowledgment plus its memory nudge; and `plan_structured` spends
+`favorite_recipe_ids` — the structured path's only soft rank signal — entirely
+on pantry ids instead of merging both lists. Neither is a false claim to the
+member, which is why they waited.
+
+---
+
 # Memory provenance + per-diner constraint attribution
 
 > **Date:** 2026-08-20

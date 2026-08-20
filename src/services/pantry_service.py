@@ -50,9 +50,8 @@ PANTRY_ITEM_LIMIT = int(os.getenv("FOODCHAT_PANTRY_ITEM_LIMIT", "6"))
 # is one extra `plan_meals` round-trip).
 PANTRY_PER_ITEM_CANDIDATES = int(os.getenv("FOODCHAT_PANTRY_PER_ITEM_CANDIDATES", "3"))
 
-# The UI badge texts (shared contract with the UI, kind="pantry").
+# The UI badge text (shared contract with the UI, kind="pantry").
 BADGE_FOODWASTE = "reducing food waste"
-BADGE_LEFTOVERS = "cooked from your leftovers"
 
 # Cheap gate for the LLM extraction: most turns say nothing about a pantry,
 # and an extractor call per turn would price the feature into every message.
@@ -76,12 +75,42 @@ def normalize_items(raw: Iterable) -> tuple[str, ...]:
     return tuple(seen)
 
 
+def _singular(word: str) -> str:
+    """A crude singular stem, enough for ingredient names.
+
+    "tomatoes" → "tomato", "berries" → "berri" (which still matches "berries"
+    once the suffix is optional again), "peas" → "pea". Deliberately not a
+    real stemmer: it only has to make the match symmetric.
+    """
+    for suffix, stem in (("ies", "i"), ("oes", "o"), ("es", ""), ("s", "")):
+        if len(word) > len(suffix) + 1 and word.endswith(suffix):
+            return word[: -len(suffix)] + stem
+    return word
+
+
+def _item_pattern(term: str) -> str:
+    """A word-boundary pattern matching ``term`` in either number.
+
+    The original pattern appended an optional "s", which only worked in one
+    direction: a member who said "tomatoes" — the natural way to name what is
+    in a fridge — never matched a recipe listing "tomato". The plan then used
+    the item while the reply said "I couldn't work in your tomatoes" and the
+    ledger recorded the coverage as relaxed. Under-reporting is supposed to be
+    the safe direction, but here it produced an affirmative false claim, so
+    each word is stemmed and re-inflected instead.
+    """
+    words = [w for w in term.split() if w]
+    return r"\b" + r"\s+".join(
+        re.escape(_singular(w)) + r"(?:e?s)?" for w in words
+    ) + r"\b"
+
+
 def matched_items(text: str, pantry: Iterable[str]) -> list[str]:
-    """Pantry items present in the text (word-boundary, plural-tolerant).
+    """Pantry items present in the text (word-boundary, number-insensitive).
 
     The same matching posture as the allergen backstop: word boundaries so
-    "rice" does not match "price", an optional trailing "s" so "carrot"
-    matches "carrots". Multi-word items match as a phrase.
+    "rice" does not match "price". Singular and plural match each other in
+    both directions. Multi-word items match as a phrase.
     """
     haystack = (text or "").lower()
     hits: list[str] = []
@@ -89,7 +118,7 @@ def matched_items(text: str, pantry: Iterable[str]) -> list[str]:
         term = str(item).strip().lower()
         if not term:
             continue
-        if re.search(r"\b" + re.escape(term) + r"s?\b", haystack):
+        if re.search(_item_pattern(term), haystack):
             hits.append(term)
     return hits
 
@@ -138,13 +167,22 @@ def fetch_pantry_candidates(
     exclude_recipe_ids: Optional[list[str]] = None,
     per_item: Optional[int] = None,
     diet: Optional[list[str]] = None,
+    cuisines: Optional[list[str]] = None,
+    max_minutes: Optional[int] = None,
 ) -> dict[str, list[CandidateRecipe]]:
-    """Recipes that use each pantry item, under the member's hard constraints.
+    """Recipes that use each pantry item, under the member's constraints.
 
     One `plan_meals` call per item (capped), each with a SINGLE-item hard
     include — "must use this one thing" is exactly the AND semantics the
     endpoint has. Calls run in parallel and each failure means only "that
     item found nothing"; the plan never blocks on the pantry.
+
+    ``cuisines`` and ``max_minutes`` MUST be threaded from the caller, because
+    this pool is merged into the ordinary one and sorted coverage-first — so
+    anything omitted here does not merely appear, it appears at the TOP. Left
+    out, a member with the cooking-time slider at 20 minutes who mentioned a
+    courgette got a 90-minute bake ranked first. The pantry is an input to
+    search, never a way around what the member asked for.
     """
     from services.candidates_client import normalize_diet_tags
     from services.plan_client import PLANNER
@@ -167,9 +205,11 @@ def fetch_pantry_candidates(
                 count_per_slot=count,
                 allergens=profile.get("allergies") or [],
                 diet=diet_tags,
+                cuisines=list(cuisines or []),
                 include_ingredients=[item],
                 exclude_ingredients=profile.get("food_dislikes") or [],
                 exclude_recipe_ids=list(exclude_recipe_ids or []),
+                max_minutes=max_minutes,
                 min_nutri_score=profile.get("min_nutri_score"),
             )
         except Exception as exc:  # noqa: BLE001
@@ -291,12 +331,18 @@ def coverage_facts(
 
 
 def _badge_reasons(matches: list[str]) -> list[dict]:
-    """The per-course UI chips for a recipe that uses pantry items."""
+    """The per-course UI chip for a recipe that uses pantry items.
+
+    One chip, and it names what the matcher actually found. There was a second,
+    constant chip reading "cooked from your leftovers" — emitted on every match
+    regardless of what the member said. "I picked up courgettes today" is a
+    pantry statement too, and nothing in the state records whether an item was
+    a leftover, so the claim had no measurement behind it. This module's rule
+    is that every user-facing claim comes from the matcher; the food-waste chip
+    already carries the intent without asserting the item's history.
+    """
     label = "uses your " + ", ".join(matches) + f" — {BADGE_FOODWASTE}"
-    return [
-        {"kind": "pantry", "label": label},
-        {"kind": "pantry", "label": BADGE_LEFTOVERS},
-    ]
+    return [{"kind": "pantry", "label": label}]
 
 
 def _ledger_row(facts: dict) -> dict:

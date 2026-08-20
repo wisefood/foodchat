@@ -183,7 +183,10 @@ class TestAnnotation:
         labels = " ".join(r["label"] for r in plan.lunch.match_reasons)
         assert "pantry" in kinds
         assert "zucchini" in labels and pantry_service.BADGE_FOODWASTE in labels
-        assert pantry_service.BADGE_LEFTOVERS in labels
+        # One chip per matching course, and no claim about the item's history:
+        # nothing records whether a pantry item is a leftover or fresh.
+        assert len(plan.lunch.match_reasons) == 1
+        assert "leftover" not in labels.lower()
         assert not plan.breakfast.match_reasons  # no false badge
         row = plan.constraints_applied[-1]
         assert row["source"] == "your pantry" and row["status"] == "relaxed"
