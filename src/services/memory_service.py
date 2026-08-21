@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 
 VALID_KINDS = {
     "like", "dislike", "cuisine", "constraint", "allergy_hint",
-    "standing_seed", "dietary_goal",
+    "standing_seed", "dietary_goal", "diet",
 }
 # At most this many nudges per turn — more reads as surveillance, not help.
 MAX_SUGGESTIONS_PER_TURN = 2
@@ -84,6 +84,13 @@ class MemoryService:
             "dislike": dislikes,
             "allergy_hint": allergies,
             "standing_seed": seeds,
+            "diet": {
+                str(d).strip().lower()
+                for d in (
+                    [profile.get("diet")] if isinstance(profile.get("diet"), str)
+                    else (profile.get("diet") or [])
+                )
+            },
             "dietary_goal": goals,
             "constraint": set(),
         }
@@ -236,6 +243,16 @@ class MemoryService:
             if value not in [s.get("name", "").lower() for s in seeds]:
                 seeds.append({"name": value})
             profile["standing_seeds"] = seeds
+        elif kind == "diet":
+            # Mirror the durable write so the very next plan filters on it
+            # without waiting for a profile refetch, and drop "omnivore" here
+            # too — the session copy has to agree with what was stored.
+            groups = profile.get("diet") or []
+            groups = [groups] if isinstance(groups, str) else list(groups)
+            groups = [g for g in groups if str(g).strip().lower() != "omnivore"]
+            if value not in [str(g).strip().lower() for g in groups]:
+                groups.append(value)
+            profile["diet"] = groups
         elif kind == "constraint":
             history = profile.get("history", "") or ""
             profile["history"] = (history + "\n" if history else "") + value

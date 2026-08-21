@@ -19,7 +19,6 @@ survives restarts and works across replicas (see ``services.clarification``).
 
 import logging
 import re
-from pathlib import Path
 from typing import Optional, Tuple
 
 from agents import GuidelineAdherenceGrader, MealDiversityGrader, ResponseWriter, SimpleChatBot
@@ -29,6 +28,7 @@ from models.session import MealPlan
 from models.planning_state import PlanningStateDelta
 from services.adapted_recipes import overlay_plan
 from services import pantry_service
+from services import diet_intent
 from services.planning_delta import extract_state_delta
 from services.candidates_client import CANDIDATES
 from services.clarification import ClarificationManager, ClarificationState
@@ -40,10 +40,6 @@ from .session_service import SessionService
 
 logger = logging.getLogger(__name__)
 
-# National dietary guidelines used by the adherence grader. Optional: when the
-# file is absent the grader scores against an empty context (logged once per call).
-GUIDELINES_PATH = Path(__file__).resolve().parents[2] / "belgium_dietary_guidelines_augmentation.cypher"
-
 def no_plan_message(profile: dict) -> str:
     """The empty-plan answer, naming what stood in the way.
 
@@ -52,12 +48,20 @@ def no_plan_message(profile: dict) -> str:
     nothing to adjust and nowhere to start. If we know the standing
     constraints, say them; an apology that teaches nothing is just a shrug
     with manners.
+
+    But it has to name the constraints that were APPLIED. It listed the raw
+    profile, so a member who asked for something vegetarian was told the
+    blocker was "diet: omnivore" — a value dropped before the request as
+    non-restrictive, and no mention of the vegetarian filter that actually
+    narrowed the search. Naming a constraint that was never sent points the
+    member at the wrong thing to relax.
     """
     constraints = []
-    diet = profile.get("diet") or []
-    if diet:
-        diet = [diet] if isinstance(diet, str) else list(diet)
-        constraints.append("diet: " + ", ".join(sorted(map(str, diet))))
+    diet_line = diet_intent.describe_applied(
+        profile.get("_diet_tags") or (), profile.get("diet")
+    )
+    if diet_line:
+        constraints.append("diet — " + diet_line)
     allergies = profile.get("allergies") or []
     if allergies:
         constraints.append("allergens excluded: " + ", ".join(sorted(map(str, allergies))))
@@ -223,6 +227,12 @@ class ChatService:
         # RAW message, not the refinement context, so ingredients quoted from
         # the current plan are never mistaken for the member's fridge.
         state = state.merge(pantry_service.extract_pantry_delta(message))
+        # Diet stated in chat ("I need something vegetarian"). RAW message for
+        # the same reason as the pantry: a refinement context quotes the
+        # current plan's ingredients, and "chicken" in there is not a request.
+        # Filterable diets become standing state that every fetch site unions
+        # with the profile; nutrition claims ride `notes` to the grader.
+        state = state.merge(diet_intent.extract_diet_delta(message))
 
         if seeds:
             resolutions = self.seed_service.resolve_seeds(seeds, profile)
@@ -272,6 +282,11 @@ class ChatService:
             # Rides the profile snapshot like the other underscore keys, so
             # the pantry survives an intervening clarification round-trip.
             profile["_pantry"] = list(state.pantry)
+        if state.diet_tags:
+            # Read by candidates_client.effective_diet at EVERY fetch site, so
+            # unlike "_pantry" it is never popped — the base pool, the pantry
+            # fan-out and a seed lookup all have to agree on the diet.
+            profile["_diet_tags"] = list(state.diet_tags)
         self.session_service.set_planning_state(session_id, state)
         logger.info("[%s] Standing plan state: %s", session_id, state.describe())
 
@@ -313,7 +328,24 @@ class ChatService:
 
         state = ClarificationState.from_dict(session.clarification)
         origin_intent = state.origin_intent
+        # Read before step() — it advances the phase, and only the conflict
+        # phase's answer can retract a stated diet.
+        was_conflict = state.phase == "conflict"
         outcome = self.clarifier.step(state, message)
+
+        if was_conflict and diet_intent.is_conflict_refusal(message):
+            # "No, follow my profile." Until now the answer to this question
+            # was recorded as prose and nothing acted on it, so the only
+            # reachable outcome was the one the member had just declined.
+            planning = self.session_service.get_planning_state(session_id)
+            if planning.diet_tags:
+                self.session_service.set_planning_state(
+                    session_id, planning.merge(PlanningStateDelta(diet_clear=True))
+                )
+                logger.info(
+                    "[%s] Dietary conflict declined — stated diet retracted.",
+                    session_id,
+                )
 
         if outcome.needs_clarification:
             self.session_service.set_clarification_state(session_id, outcome.state.to_dict())
@@ -591,12 +623,13 @@ class ChatService:
 
         diversity = self.diversity_grader.score(plan_text)
 
-        guidelines_text = ""
-        try:
-            guidelines_text = GUIDELINES_PATH.read_text(encoding="utf-8")
-        except OSError as e:
-            logger.warning("[%s] Guidelines file unavailable (%s) — scoring without it.", session_id, e)
-        adherence = self.guideline_grader.score(plan_text, guidelines_text)
+        # No guideline corpus is wired up yet, so this grades on the prompt's
+        # own rubric. It used to read a `.cypher` file that is not in the repo
+        # at all — so every score came from an empty context, and had the file
+        # existed it would have pasted raw Cypher statements into the prompt.
+        # Rules come from the data catalog as faceted texts (rule_text with
+        # region/audience/nutrient facets); that is the seam to fill.
+        adherence = self.guideline_grader.score(plan_text, "")
 
         return {
             "llm_score": plan.score,

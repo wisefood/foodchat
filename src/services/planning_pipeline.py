@@ -24,7 +24,7 @@ from models.plan_spec import PlanSpec
 from models.recipe import CandidateRecipe, ScoredPlan
 from models.session import MealPlan
 from services import pantry_service, plan_parameters
-from services.candidates_client import CANDIDATES, normalize_diet_tags
+from services.candidates_client import CANDIDATES, effective_diet
 
 logger = logging.getLogger(__name__)
 
@@ -245,7 +245,7 @@ class PlanningPipeline:
                 # Normalised, never raw: RecipeWrangler ANDs diet tags and
                 # never relaxes them, so one unknown value ("balanced",
                 # "omnivore") empties every slot. See candidates_client.
-                diet=normalize_diet_tags(profile.get("diet")),
+                diet=effective_diet(profile),
                 cuisines=cuisines,
                 exclude_ingredients=profile.get("food_dislikes") or [],
                 exclude_recipe_ids=list(exclude_recipe_ids or []),
@@ -433,7 +433,7 @@ def _fetch_candidate_pool(
             slots=slots,
             count_per_slot=limit_per_slot,
             allergens=profile.get("allergies") or [],
-            diet=normalize_diet_tags(profile.get("diet")),
+            diet=effective_diet(profile),
             cuisines=cuisines,
             exclude_ingredients=profile.get("food_dislikes") or [],
             exclude_recipe_ids=exclude_recipe_ids,

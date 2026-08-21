@@ -29,7 +29,7 @@ class WeeklyNutritionalTracker:
     Relies on existing user profile schemas and MealCourse models.
     """
 
-    def __init__(self, user_profile: Dict[str, Any]):
+    def __init__(self, user_profile: Dict[str, Any], stated_diet: Optional[List[str]] = None):
         """
         Initialize the tracker with user preferences and constraints.
 
@@ -44,10 +44,16 @@ class WeeklyNutritionalTracker:
         self.weekly_fat = 0.0
         self.meat_meals_count = 0
 
+        # A diet the member stated in chat counts as much as a stored one. It
+        # used to be invisible here, so someone who said "vegetarian" this
+        # session still got a meat budget of 3 and had every fish meal counted
+        # against it — the tracker was reading a profile that disagreed with
+        # the plan being built from it.
         diet = user_profile.get("diet") or []
         if isinstance(diet, str):
             diet = [diet]
         diet_set = {str(d).lower() for d in diet}
+        diet_set |= {str(d).lower() for d in (stated_diet or [])}
         # Pescatarians would have every fish meal counted as "meat" otherwise.
         self.counts_fish_as_meat = not (diet_set & {"pescatarian", "pescatarian_safe"})
 

@@ -184,7 +184,7 @@ def fetch_pantry_candidates(
     courgette got a 90-minute bake ranked first. The pantry is an input to
     search, never a way around what the member asked for.
     """
-    from services.candidates_client import normalize_diet_tags
+    from services.candidates_client import normalize_diet_tags, effective_diet
     from services.plan_client import PLANNER
 
     items = list(normalize_items(pantry))[:PANTRY_ITEM_LIMIT]
@@ -193,8 +193,11 @@ def fetch_pantry_candidates(
     count = per_item if per_item is not None else PANTRY_PER_ITEM_CANDIDATES
     # A caller with a tightened diet (weekly action space: profile diet +
     # query-level tags) passes it explicitly; otherwise the profile's own.
-    diet_tags = normalize_diet_tags(
-        diet if diet is not None else profile.get("diet")
+    # Named for the guard in tests/test_diet_normalization_wiring.py: this
+    # value is normalised, and a bare `diet_tags` reads like raw input.
+    normalized_diet = (
+        normalize_diet_tags(diet) if diet is not None
+        else effective_diet(profile)
     )
 
     def fetch_one(item: str) -> dict[str, list[CandidateRecipe]]:
@@ -204,7 +207,7 @@ def fetch_pantry_candidates(
                 slots=slots,
                 count_per_slot=count,
                 allergens=profile.get("allergies") or [],
-                diet=diet_tags,
+                diet=normalized_diet,
                 cuisines=list(cuisines or []),
                 include_ingredients=[item],
                 exclude_ingredients=profile.get("food_dislikes") or [],
@@ -278,7 +281,7 @@ def pantry_boost_ids(
     `favorite_recipe_ids` float within their slot while hard filters still
     decide eligibility. These ids ride that signal.
     """
-    from services.candidates_client import normalize_diet_tags
+    from services.candidates_client import effective_diet
     from services.plan_client import PLANNER
 
     ids: list[str] = []
@@ -288,7 +291,7 @@ def pantry_boost_ids(
                 item,
                 limit=limit_per_item,
                 allergens=profile.get("allergies") or [],
-                diet=normalize_diet_tags(profile.get("diet")),
+                diet=effective_diet(profile),
                 exclude_ingredients=profile.get("food_dislikes") or [],
             )
         except Exception as exc:  # noqa: BLE001

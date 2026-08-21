@@ -2,6 +2,77 @@
 
 ---
 
+# A diet you state in chat is a diet we plan with (Phase A)
+
+> **Date:** 2026-08-21
+> **Branch:** fix/stated-diet-and-honest-constraints
+> Ships with wisefood-api (`feat/foodchat-plan-library-proxy` branch gains the
+> gateway fixes below). No UI change. Wire-compatible: `diet_tags` is additive
+> on the planning-state blob and absent on anything stored earlier.
+
+The transcript that started this:
+
+    member    "i need something vegetarian"
+    assistant "The current plan includes chicken, pork, and meatballs, which
+               conflict with your request … adjust the plan to be fully
+               vegetarian?"
+    member    "yes please"
+    assistant "I couldn't find enough recipes … (diet: omnivore; allergens
+               excluded: nuts, peanuts; avoiding: mushrooms)."
+
+Three independent causes, all seams:
+
+| Cause | Fix |
+|---|---|
+| `DietaryIntentExtractor` was wired **only** into the weekly service, so a daily plan never read diet from the message. | New `services/diet_intent.py` runs it on the RAW message every planning turn; `PlanningState.diet_tags` makes it **standing** for the session (silence is not a retraction), and `candidates_client.effective_diet` unions it with the profile at **every** fetch site — base pool, pantry fan-out, seed lookup, edit swap. |
+| Nothing carried the resolved diet out of the conflict question: `merged = {**profile, **reconciliation}` merges four keys and none is `diet`, so "yes please" was discarded. | The tags were already captured from the original message, so "yes" needs no plumbing. Only a refusal has to act: `is_conflict_refusal` retracts them on "no" / "follow my profile". Deliberately narrow — an unrecognised answer KEEPS what the member said out loud. No reconciler prompt change (it is Langfuse-managed; an edit ships dead). |
+| No memory kind could set a diet — `constraint` lands in free-text history. | New `diet` kind writes `dietary_groups` through the one lossless gateway path, replacing a non-restrictive `omnivore` rather than sitting beside it. The nudge is built **deterministically** from planning state — no LLM call and no `preference_extractor` prompt edit — and carries the member's own sentence as `evidence`. |
+
+**A live outage found on the way.** `low-carb`, `low-fat` and `high-protein`
+were in `VALID_RW_DIET_TAGS` and mapped straight through as hard diet filters.
+Censused against the corpus dump (n=4500) they appear on **zero** recipes —
+they live on RecipeWrangler's separate claim field. RW ANDs diet tags and never
+relaxes them, so "I want a low-carb week" was not a narrow search, it was a
+guaranteed-empty one, and the member was told no recipes exist. Already live on
+the weekly path; threading diet into daily would have spread it. They are now
+routed to the grader as soft signals via `split_diet_intent`, and become real
+numeric targets when the planning surface grows nutrition targets.
+
+Also fixed:
+
+- **The apology named a constraint it never applied.** It listed the raw
+  profile, so the blocker read `diet: omnivore` — dropped before the request —
+  with no mention of the vegetarian filter. It now reports what was *sent*, and
+  says plainly when a stored value is not a restriction. With nothing to
+  contrast against, the note is omitted rather than accusing a setting that did
+  nothing.
+- **The weekly tracker budgeted a stated vegetarian three meat meals** and
+  counted every fish meal against it, because it read only the stored profile.
+- **Guest memory acceptance was a silent no-op**: a guest household has no
+  profile ROW, the gateway 404s, and the SDK swallows it — so the member said
+  yes, we agreed, and stored nothing. The row is now created first.
+- Deleted the fictions: the `.cypher` guideline read (the file is not in the
+  repo — every adherence score has come from an empty context, and had it
+  existed it would have pasted raw Cypher into a prompt; rules come from the
+  data catalog as faceted `rule_text`); `supports_macro_targets: True` and "hit
+  calorie or protein targets", which told the agent it could promise something
+  `plan_meals` has no parameter for; and `eat_healthier`, which sat in a
+  Nutri-Score map but is rejected at the write gate so could never arrive.
+- **wisefood-api**: `diabetic_friendly` added to the drifted `sql.py` enum (a
+  PATCH carrying it passed Pydantic then 500'd); `properties` — dietary goals,
+  standing seeds, memory log — no longer silently dropped when a profile row is
+  created; the member-PATCH path now invalidates the profile cache it mutates.
+
+`tests/test_stated_diet.py` is new (22 tests, LLM-free) and verified regressive:
+reverting `effective_diet` to profile-only fails 2. 488 passing.
+
+Deferred to the reasoning phase, on purpose: quality metrics still run only on
+the classic daily path. The structured path builds a `MealPlan` with no
+`ScoredPlan`, so a metrics adapter written now would be replaced by the
+verifier that unifies metrics across all three paths.
+
+---
+
 # Sessions name themselves
 
 > **Date:** 2026-08-21

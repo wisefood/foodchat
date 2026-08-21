@@ -35,6 +35,7 @@ Returns a unified ChatTurn so the router needs one response model.
 """
 
 import logging
+import uuid as _uuid
 import re
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -154,11 +155,58 @@ class OrchestratorService:
             return turn
         try:
             suggestions = self.memory_service.suggest(session, message)
+            diet_nudge = self._diet_memory_nudge(session, message)
+            if diet_nudge:
+                # Ahead of the extractor's own candidates: a stated diet is the
+                # highest-value thing to remember, and the per-turn cap would
+                # otherwise let two likes crowd it out.
+                suggestions = [diet_nudge] + [
+                    s for s in suggestions if s.get("kind") != "diet"
+                ]
             if suggestions:
                 turn.memory_suggestions = suggestions
         except Exception as e:
             logger.warning("[%s] Memory suggestion failed: %s", session.session_id, e)
         return turn
+
+    def _diet_memory_nudge(self, session, message: str):
+        """A consent nudge for a diet stated in chat but not on the profile.
+
+        Built deterministically from the standing planning state rather than by
+        the preference extractor. Two reasons, and the second is the binding
+        one: it costs no extra LLM call, and it needs no edit to the
+        `preference_extractor` managed prompt — a deploy never overwrites an
+        existing Langfuse copy, so adding a kind there would work locally and
+        ship dead to production.
+
+        The evidence is the member's own sentence, so the memory panel can
+        answer "why am I seeing this?" with something true.
+        """
+        try:
+            from services import diet_intent
+
+            state = self.session_service.get_planning_state(session.session_id)
+            if not state.diet_tags:
+                return None
+            nudge = diet_intent.suggest_diet_memory(
+                state.diet_tags, message, session.user_profile
+            )
+            if not nudge:
+                return None
+            # Respect the same never-ask-twice ledger as every other nudge.
+            optouts = {
+                str(v).strip().lower()
+                for v in (session.user_profile.get("memory_optouts") or [])
+            }
+            if nudge["value"] in optouts:
+                return None
+            nudge["id"] = str(_uuid.uuid4())
+            return nudge
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[%s] Diet nudge failed: %s", session.session_id, exc
+            )
+            return None
 
     def process(self, session_id: str, member_id: str, message: str) -> ChatTurn:
         """Validate ownership, check the message cap, classify, and route.

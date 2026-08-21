@@ -16,8 +16,9 @@ from .weekly_planner.planner import (
     build_preference_scorer,
 )
 from .adapted_recipes import overlay_weekly_entries
-from .candidates_client import CANDIDATES
+from .candidates_client import CANDIDATES, split_diet_intent
 from agents import DietaryIntentExtractor, ResponseWriter
+from models.planning_state import PlanningStateDelta
 from models.session import WeeklyMealPlan
 
 logger = logging.getLogger(__name__)
@@ -87,10 +88,20 @@ class WeeklyPlanService:
                     session_id, current_plan.version,
                 )
 
-        # Extract dietary requirements from the user query to filter recipes correctly
-        query_diet_tags = self.diet_extractor.extract(content)
-        if query_diet_tags:
-            logger.info("[%s] Extracted diet tags from query: %s", session_id, query_diet_tags)
+        # Extract dietary requirements from the user query to filter recipes
+        # correctly. Split before use: "low-carb"/"low-fat"/"high-protein" are
+        # nutrition CLAIMS carried on a different field upstream, so sending
+        # one as a diet filter matched zero recipes and turned a stated
+        # preference into "I couldn't find enough recipes". Claims become
+        # grader signals until the planning endpoint takes numeric targets.
+        query_diet_tags, diet_claims = split_diet_intent(
+            self.diet_extractor.extract(content)
+        )
+        if query_diet_tags or diet_claims:
+            logger.info(
+                "[%s] Diet intent from query: filters=%s claims=%s",
+                session_id, query_diet_tags, diet_claims,
+            )
 
         # Pantry (food waste): merge this turn's "I have …" statements into the
         # standing planning state, then plan with the accumulated list. Read
@@ -101,12 +112,22 @@ class WeeklyPlanService:
 
         state = self.session_service.get_planning_state(session_id)
         pantry_delta = pantry_service.extract_pantry_delta(content)
-        if not pantry_delta.is_empty:
-            state = state.merge(pantry_delta)
+        # Diet is STANDING state, not a per-turn extraction: a member who said
+        # "vegetarian" three turns ago still means it, and the daily flow reads
+        # the same field — whichever horizon hears it, both honour it.
+        diet_delta = PlanningStateDelta(diet_tags=tuple(query_diet_tags),
+                                        notes=tuple(f"prefers {c} meals" for c in diet_claims))
+        if not pantry_delta.is_empty or not diet_delta.is_empty:
+            state = state.merge(pantry_delta).merge(diet_delta)
             self.session_service.set_planning_state(session_id, state)
         pantry = state.pantry
         if pantry:
             logger.info("[%s] Pantry to use up: %s", session_id, ", ".join(pantry))
+        # Union of every diet stated this session, plus the profile's own inside
+        # RecipeActionSpace.
+        standing_diet = list(state.diet_tags)
+        if standing_diet:
+            logger.info("[%s] Diet in force: %s", session_id, ", ".join(standing_diet))
 
         # Standing seeds (M3): dishes the user consented to "always include"
         # auto-anchor into fresh weekly plans when no explicit seeds compete.
@@ -133,7 +154,7 @@ class WeeklyPlanService:
 
         logger.info("[%s] Initializing action space and environment.", session_id)
         action_space = RecipeActionSpace(
-            session.user_profile, additional_diet=query_diet_tags, pantry=pantry,
+            session.user_profile, additional_diet=standing_diet, pantry=pantry,
         )
         # Anchored recipes must never repeat elsewhere in the week.
         for entry in pinned.values():
@@ -147,6 +168,7 @@ class WeeklyPlanService:
             action_space=action_space,
             reward_calculator=self.reward_calculator,
             user_query=effective_query,
+            stated_diet=standing_diet,
         )
         planner = WeeklyPlanner(env)
 

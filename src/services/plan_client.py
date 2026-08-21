@@ -115,7 +115,11 @@ class PlanClient:
             "max_plates_per_meal": MAX_PLATES_PER_MEAL,
             "supports_multi_course_meals": True,
             "supports_nutri_score_floor": True,
-            "supports_macro_targets": True,
+            # No macro targeting: `plan_meals` has no calorie or protein
+            # parameter, and advertising one told the agent it could promise
+            # something the endpoint cannot do. Flips to True when the
+            # planning surface grows nutrition targets.
+            "supports_macro_targets": False,
         }
 
     def describe_options(self) -> str:
@@ -129,8 +133,9 @@ class PlanClient:
             "and a salad, or a main and a dessert. I can steer by cuisine "
             "({n_cuisines} available, "
             "e.g. {cuisine_examples}), by mood, flavour or food group, cap the "
-            "cooking time, set a minimum Nutri-Score, and hit calorie or protein "
-            "targets. Allergens and dietary requirements are never relaxed."
+            "cooking time and set a minimum Nutri-Score. I cannot hit calorie "
+            "or protein targets yet. Allergens and dietary requirements are "
+            "never relaxed."
         ).format(
             days=options["max_days"],
             meals=options["max_meals_per_day"],

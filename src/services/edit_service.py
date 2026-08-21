@@ -30,7 +30,7 @@ from typing import Optional
 
 from agents import EditCommandExtractor
 from models.recipe import CandidateRecipe, RecipeEnrichment
-from services.candidates_client import CANDIDATES
+from services.candidates_client import CANDIDATES, effective_diet
 from .session_service import SessionService
 from .weekly_planner.day_summary import build_day_summaries
 from .weekly_planner.explainability import build_weekly_explainability
@@ -414,14 +414,13 @@ class EditService:
         the taxonomy. Allergens, diet and dislikes still apply; a named dish
         that violates them returns nothing rather than something unsafe.
         """
-        from services.candidates_client import normalize_diet_tags
         from services.plan_client import PLANNER
 
         try:
             hits = PLANNER.find_recipes(
                 name,
                 allergens=profile.get("allergies") or [],
-                diet=normalize_diet_tags(profile.get("diet")),
+                diet=effective_diet(profile),
                 exclude_ingredients=profile.get("food_dislikes") or [],
                 limit=3,
             )

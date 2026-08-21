@@ -36,12 +36,19 @@ GOAL_TO_NUTRITION_PROFILE: dict[str, dict[str, float]] = {
 # A floor of "A" would be a stricter filter than any of these goals implies,
 # and RecipeWrangler relaxes nothing here — an over-tight floor returns an
 # empty slot rather than a slightly worse meal.
+# The dietary_groups the gateway will actually accept from us. The column is a
+# Postgres enum array with 37 values, but the UI's picker writes one of these
+# five, and a value outside the enum is rejected at the API boundary — so this
+# is the safe write vocabulary, not the full enum.
+GATEWAY_DIET_GROUPS = {
+    "omnivore", "vegetarian", "vegan", "pescatarian", "flexitarian",
+}
+
 GOAL_TO_MIN_NUTRI_SCORE: dict[str, str] = {
     "reduce_fat": "C",
     "reduce_carbs": "C",
     "reduce_calories": "B",
     "lose_weight": "B",
-    "eat_healthier": "B",
 }
 
 # Worst to best, for picking the strictest floor across several goals.
@@ -173,6 +180,33 @@ class ProfileService:
     # immediately. Every durable write carries provenance in
     # properties.memory_log — personalization must stay auditable.
 
+    @staticmethod
+    def _ensure_profile_row(client, member_id: str, profile):
+        """Create the member's profile row, then hand back a writable handle.
+
+        Only PATCH /members/{id}/profile is lossless on the gateway, so the row
+        has to exist before anything is written into it. Best-effort: a failure
+        here means the caller reports "not applied" rather than claiming a write
+        that did not happen.
+        """
+        try:
+            client.post(
+                f"members/{member_id}/profile",
+                json={
+                    "nutritional_preferences": {},
+                    "dietary_groups": [],
+                    "allergies": [],
+                    "properties": {},
+                },
+            )
+            logger.info("Created missing profile row for member %s", member_id)
+            return client.members.get(member_id).profile
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Could not create a profile row for member %s: %s", member_id, exc
+            )
+            return None
+
     def apply_memory(
         self,
         member_id: str,
@@ -192,11 +226,24 @@ class ProfileService:
           dietary_goal   → properties.dietary_goals [{slug, label}] — the same
                            field FoodScholar's own consent flow writes, so both
                            apps converge on one goal store the planner reads
+          diet           → dietary_groups (the gateway's enum column; replaces
+                           a non-restrictive "omnivore" rather than sitting
+                           beside it)
         """
         try:
             with self.client_pool.client() as client:
                 member = client.members.get(member_id)
                 profile = member.profile
+                # A guest household is created with a member and no profile
+                # ROW, so the gateway 404s and the SDK swallows it into an
+                # empty object. Every field write below then patched nothing
+                # and every guest memory acceptance was a silent no-op — the
+                # member said yes and we agreed and stored nothing. Create the
+                # row first so consent means something.
+                if profile is None or getattr(profile, "id", None) is None:
+                    profile = self._ensure_profile_row(client, member_id, profile)
+                    if profile is None:
+                        return False
                 prefs = dict(profile.nutritional_preferences or {})
                 props = dict(profile.properties or {})
 
@@ -245,6 +292,26 @@ class ProfileService:
                         seeds.append({"name": value_norm})
                         changed = True
                     props["standing_seeds"] = seeds
+                elif kind == "diet":
+                    # The gateway column is a Postgres ENUM ARRAY, so only its
+                    # own vocabulary can be written — an off-list value is
+                    # rejected at the API boundary. The UI writes one of five.
+                    if value_norm not in GATEWAY_DIET_GROUPS:
+                        logger.warning(
+                            "Diet %r is not a gateway dietary_group — not applied",
+                            value_norm,
+                        )
+                        return False
+                    groups = [str(d).strip().lower() for d in (profile.dietary_groups or [])]
+                    if value_norm not in groups:
+                        # "omnivore" is the absence of a restriction, not a
+                        # restriction to keep beside a real one — leaving it in
+                        # place is how a stated vegetarian kept planning as an
+                        # omnivore.
+                        groups = [g for g in groups if g != "omnivore"]
+                        groups.append(value_norm)
+                        profile.dietary_groups = groups
+                        changed = True
                 elif kind == "dietary_goal":
                     if value_norm not in GOAL_PREFERENCE_STRINGS:
                         logger.warning("Unknown dietary goal %r — not applied", value_norm)

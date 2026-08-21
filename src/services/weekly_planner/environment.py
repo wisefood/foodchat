@@ -19,7 +19,8 @@ class WeeklyMealPlanEnv:
         user_profile: Dict[str, Any], 
         action_space: RecipeActionSpace, 
         reward_calculator: RewardCalculator,
-        user_query: Optional[str] = None
+        user_query: Optional[str] = None,
+        stated_diet: Optional[list] = None,
     ):
         """
         Initialize the environment with user preferences and components.
@@ -29,14 +30,19 @@ class WeeklyMealPlanEnv:
             action_space: The RecipeActionSpace instance to fetch candidate recipes.
             reward_calculator: The RewardCalculator instance to evaluate actions.
             user_query: Optional user query to guide LLM evaluation during planning.
+            stated_diet: Diet tags the member stated in chat this session. The
+                tracker needs them for the meat limit and for whether fish
+                counts as meat — reading only the stored profile meant a
+                stated vegetarian was still budgeted three meat meals.
         """
         self.user_profile = user_profile
         self.action_space = action_space
         self.reward_calculator = reward_calculator
         self.preferences = user_profile.get("preferences", [])
         self.user_query = user_query
-        
-        self.tracker = WeeklyNutritionalTracker(user_profile)
+        self.stated_diet = list(stated_diet or [])
+
+        self.tracker = WeeklyNutritionalTracker(user_profile, self.stated_diet)
         self.current_day = 1
         self.current_meal_idx = 0  # 0: Breakfast, 1: Lunch, 2: Dinner
         self.meal_types = ["breakfast", "lunch", "dinner"]
@@ -53,7 +59,7 @@ class WeeklyMealPlanEnv:
         Args:
             user_query: Optional update to the user query for the new cycle.
         """
-        self.tracker = WeeklyNutritionalTracker(self.user_profile)
+        self.tracker = WeeklyNutritionalTracker(self.user_profile, self.stated_diet)
         self.current_day = 1
         self.current_meal_idx = 0
         self.done = False

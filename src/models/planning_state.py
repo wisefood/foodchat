@@ -70,6 +70,17 @@ class PlanningState:
     # durable profile field; see services.pantry_service.
     pantry: tuple[str, ...] = ()
 
+    # Diet the member stated IN CHAT ("I need something vegetarian"), as
+    # RecipeWrangler diet tags. Standing for the session and merged with the
+    # profile's own diet at fetch time — an explicit request outranks a stored
+    # setting, and `omnivore` is not a restriction to be protected.
+    #
+    # This existed nowhere before: the daily path read only `profile["diet"]`,
+    # so a stated diet reached the grader as prose over a pool that had never
+    # been filtered for it. Durable only if the member accepts the memory
+    # nudge (kind "diet"); until then it dies with the session.
+    diet_tags: tuple[str, ...] = ()
+
     def merge(self, delta: "PlanningStateDelta") -> "PlanningState":
         """Apply one turn's changes. Absent fields leave state untouched."""
         if delta.reset:
@@ -107,6 +118,15 @@ class PlanningState:
             if value and value not in pantry:
                 pantry.append(value)
 
+        # Diet: additive, with an explicit clear for "actually, follow my
+        # profile". `diet_clear` is a flag rather than a remove-list because a
+        # member retracting a stated diet retracts all of it, not one tag.
+        diet_tags = [] if delta.diet_clear else list(self.diet_tags)
+        for tag in delta.diet_tags or ():
+            value = str(tag).strip().lower()
+            if value and value not in diet_tags:
+                diet_tags.append(value)
+
         return replace(
             self,
             spec=spec,
@@ -117,6 +137,7 @@ class PlanningState:
             ),
             notes=tuple(notes),
             pantry=tuple(pantry),
+            diet_tags=tuple(diet_tags),
         )
 
     def describe(self) -> str:
@@ -138,6 +159,8 @@ class PlanningState:
             parts.append(f"{len(self.excluded_recipe_ids)} recipe(s) ruled out")
         if self.pantry:
             parts.append("pantry to use up: " + ", ".join(self.pantry))
+        if self.diet_tags:
+            parts.append("diet stated in chat: " + ", ".join(self.diet_tags))
         if self.notes:
             parts.append("; ".join(self.notes))
         return " · ".join(parts)
@@ -152,6 +175,7 @@ class PlanningState:
             "use_favorites": self.use_favorites,
             "notes": list(self.notes),
             "pantry": list(self.pantry),
+            "diet_tags": list(self.diet_tags),
         }
 
     @classmethod
@@ -183,6 +207,9 @@ class PlanningState:
             pantry=tuple(
                 str(p).strip().lower() for p in (raw.get("pantry") or []) if p
             ),
+            diet_tags=tuple(
+                str(d).strip().lower() for d in (raw.get("diet_tags") or []) if d
+            ),
         )
 
 
@@ -204,6 +231,10 @@ class PlanningStateDelta:
     # the …"). Separate tuples so adding and removing in one turn both land.
     pantry_add: tuple[str, ...] = ()
     pantry_remove: tuple[str, ...] = ()
+    # Diet tags stated this turn, and the retraction flag for "never mind, use
+    # my profile" (answered NO to the dietary-conflict question).
+    diet_tags: tuple[str, ...] = ()
+    diet_clear: bool = False
     reset: bool = False
 
     @property
@@ -216,5 +247,7 @@ class PlanningStateDelta:
             or self.notes
             or self.pantry_add
             or self.pantry_remove
+            or self.diet_tags
+            or self.diet_clear
             or self.reset
         )

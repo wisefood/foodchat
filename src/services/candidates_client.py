@@ -36,23 +36,35 @@ REQUEST_TIMEOUT_SECONDS = float(os.getenv("RECIPEWRANGLER_TIMEOUT", "60"))
 # surface that knows the corpus's annotations and its planning tier.
 MEAL_SLOTS = ("breakfast", "lunch", "dinner")
 
-# Dietary tags as stored on RecipeWrangler recipe nodes (confirmed against the API).
+# Dietary tags actually carried by RecipeWrangler recipes, censused against the
+# corpus dump (dumps/*/elastic-recipes.ndjson.gz, n=4500) rather than assumed:
+#
+#   nut_free 3757 · dairy_free 2815 · pescatarian_safe 2717 · gluten_free 2605
+#   vegetarian_or_vegan 2437 · vegetarian 2436 · pescatarian 2141 · vegan 1336
+#   gluten_free_option 1316
+#
+# RW ANDs diet tags and never relaxes them, so a tag no recipe carries is not a
+# narrow filter — it is a guaranteed-empty one.
 VALID_RW_DIET_TAGS = {
-    "gluten_free", "high-protein", "low-carb", "low-fat",
-    "pescatarian", "pescatarian_safe", "vegan", "dairy_free", "nut_free", "vegetarian",
+    "gluten_free", "gluten_free_option", "pescatarian", "pescatarian_safe",
+    "vegan", "vegetarian", "vegetarian_or_vegan", "dairy_free", "nut_free",
 }
+
+# Nutrition CLAIMS, not diets. "low-carb", "low-fat" and "high-protein" were in
+# the valid-tag set and mapped straight through as hard diet filters — but the
+# census above finds them on ZERO recipes (they live in the separate `tags`
+# claim field). So "I want a low-carb week" filtered every slot to nothing and
+# came back as "I couldn't find enough recipes", which is how a stated
+# preference became an outage. They are routed to the grader as soft signals
+# instead, and become real numeric targets when RW grows nutrition_targets.
+NUTRITION_CLAIM_TAGS = {"low-carb", "low-fat", "high-protein"}
 
 # Common user-profile diet values → RecipeWrangler tag. Values mapped to None are
 # non-restrictive labels (they would produce empty result sets if sent as filters).
 DIET_TAG_MAP = {
     "gluten_free": "gluten_free",
     "gluten-free": "gluten_free",
-    "high_protein": "high-protein",
-    "high-protein": "high-protein",
-    "low_carb": "low-carb",
-    "low-carb": "low-carb",
-    "low_fat": "low-fat",
-    "low-fat": "low-fat",
+    "gluten_free_option": "gluten_free_option",
     "pescatarian": "pescatarian",
     "pescatarian_safe": "pescatarian_safe",
     "vegan": "vegan",
@@ -61,11 +73,45 @@ DIET_TAG_MAP = {
     "nut_free": "nut_free",
     "nut-free": "nut_free",
     "vegetarian": "vegetarian",
+    "vegetarian_or_vegan": "vegetarian_or_vegan",
+    # Claims — deliberately not diet filters. See NUTRITION_CLAIM_TAGS.
+    "high_protein": None,
+    "high-protein": None,
+    "low_carb": None,
+    "low-carb": None,
+    "low_fat": None,
+    "low-fat": None,
+    # Non-restrictive labels.
     "omnivore": None,
     "mediterranean": None,
     "balanced": None,
     "healthy": None,
+    "flexitarian": None,
 }
+
+
+def split_diet_intent(tags) -> tuple[list[str], list[str]]:
+    """Split extracted diet words into (hard filters, soft nutrition claims).
+
+    The extractor is allowed to say "low-carb" — it is a real thing a member
+    wants. What it must not do is become a `diet` filter, because no recipe
+    carries that tag. The claims come back separately so the caller can carry
+    them as grader signals rather than dropping them silently.
+    """
+    filterable: list[str] = []
+    claims: list[str] = []
+    for tag in tags or ():
+        key = str(tag).strip().lower()
+        if not key:
+            continue
+        mapped = DIET_TAG_MAP.get(key, key if key in VALID_RW_DIET_TAGS else None)
+        canonical = key.replace("_", "-")
+        if mapped:
+            if mapped not in filterable:
+                filterable.append(mapped)
+        elif canonical in NUTRITION_CLAIM_TAGS and canonical not in claims:
+            claims.append(canonical)
+    return filterable, claims
 
 
 # --------------------------------------------------------------------------- #
@@ -135,6 +181,28 @@ def normalize_diet_tags(diet) -> list[str]:
         else:
             logger.warning("Dropping unrecognized diet tag %r — not in RecipeWrangler schema", d)
     return tags
+
+
+def effective_diet(profile: dict) -> list[str]:
+    """The diet to filter on: what the member SAID plus what their profile says.
+
+    A diet stated in chat outranks a stored setting, and must not be lost to
+    it. `profile["_diet_tags"]` is the transient stash chat_service fills from
+    `PlanningState.diet_tags` (same underscore convention as `_pantry`).
+
+    Before this existed every fetch site read `profile["diet"]` alone, so "I
+    need something vegetarian" reached the grader as prose over a pool that had
+    never been filtered — and the reply then blamed `diet: omnivore`, a value
+    `normalize_diet_tags` had already dropped as non-restrictive.
+
+    Union rather than override: a vegetarian request from a member whose profile
+    says `gluten_free` must satisfy both. `omnivore` drops out on its own — it
+    is not in the tag map, so it was never a constraint to override.
+    """
+    stated = list(profile.get("_diet_tags") or [])
+    stored = profile.get("diet") or []
+    stored = [stored] if isinstance(stored, str) else list(stored)
+    return normalize_diet_tags(stated + stored)
 
 
 class RecipeCandidatesClient:
@@ -221,7 +289,7 @@ class RecipeCandidatesClient:
                 count_per_slot=limit,
                 allergens=profile.get("allergies") or [],
                 # Normalised: an unknown tag ANDs to zero candidates.
-                diet=normalize_diet_tags(profile.get("diet")),
+                diet=effective_diet(profile),
                 cuisines=cuisines,
                 exclude_ingredients=profile.get("food_dislikes") or [],
                 exclude_recipe_ids=list(exclude_ids),
