@@ -25,6 +25,7 @@ load_dotenv()
 
 from fastapi import FastAPI
 
+import auth
 from db import init_db
 from routers import foodchat_router
 from services import (
@@ -92,6 +93,20 @@ init_weekly_plan_service()
 init_memory_service()
 init_orchestrator_service()
 logger.info("Services initialized (chat, weekly, memory, orchestrator).")
+
+# Verify the gateway's signed member assertion on every member-scoped request.
+# Registered before the router so a route cannot be reached without it — see
+# auth.py for why the gateway is the only party that can make this assertion.
+app.middleware("http")(auth.assertion_middleware)
+
+if auth.enforcing():
+    logger.info("Member assertions ENFORCED (FOODCHAT_ASSERTION_SECRET is set).")
+else:
+    logger.warning(
+        "FOODCHAT_ASSERTION_SECRET is not set: FoodChat will accept any "
+        "member_id it is given. Anything that can reach this port can act as "
+        "any member. Set the same secret here and on the gateway to close it."
+    )
 
 app.include_router(foodchat_router.router)
 

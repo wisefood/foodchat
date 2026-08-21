@@ -7,11 +7,23 @@ server-side and routes internally (see services/orchestrator_service.py).
 The remaining endpoints are session lifecycle, plan/canvas reads,
 paginated conversation history, and message feedback.
 
-Authorization model: FoodChat sits behind the wisefood-api gateway, which
-authenticates the Keycloak user and passes the household member's
-``member_id`` as data. Every session-scoped endpoint therefore REQUIRES the
-member_id and verifies it matches the session owner — this is the only
-access control at this layer, so never make it optional.
+Authorization model — two layers, and neither is optional.
+
+The gateway authenticates the Keycloak user and checks that they own the
+household member they name. It then SIGNS that answer into an
+``X-WiseFood-Member`` assertion (see auth.py), because only the gateway can
+answer "does this user own this member" — the household tables live there.
+
+FoodChat verifies the signature on every member-scoped request and requires the
+``member_id`` in the request to match the member the gateway vouched for. That
+is what makes reaching this service's port insufficient to act as someone else.
+Then, as before, every session-scoped endpoint checks that the member owns the
+session, returning 404 on a mismatch — never 403, which would confirm that a
+session id is real.
+
+Both checks live in ``_require_session``. A new session-scoped route that skips
+it fails ``tests/test_route_authorization.py``, which is parameterised over the
+router's own route table.
 
 Removed in M0 (see CHANGES.md): the legacy pre-orchestrator endpoints
 ``POST/GET /sessions/{id}/messages`` and ``POST/GET /sessions/{id}/weekly``.
@@ -25,6 +37,7 @@ from typing import Dict, List, Literal, Optional
 from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
+import auth
 import services
 from db import SessionLocal, db_upsert_feedback, db_get_message_by_id
 from models.session import MealCourse
@@ -433,9 +446,38 @@ def _require_orchestrator_service():
     return services.orchestrator_service
 
 
+def _require_member(member_id: str) -> str:
+    """Refuse a request that claims to be someone the gateway did not vouch for.
+
+    The first of the two checks. It answers "are you who you say you are",
+    which `_require_session` below cannot: that one only knows whether the
+    member it was handed owns the session, and a caller free to name any member
+    can always satisfy it.
+
+    401, not 404: this is not "you may not see that", it is "I do not know who
+    you are" — and unlike session ownership there is nothing to leak, because
+    the answer does not depend on any session existing.
+    """
+    try:
+        auth.check_member(member_id)
+    except auth.AssertionError_ as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)
+        ) from None
+    return member_id
+
+
 def _require_session(session_id: str, member_id: str):
-    """Load a session and enforce owner access (404 on mismatch, never 403 —
-    a mismatched member must not learn that the session exists)."""
+    """Both checks, in the order they have to happen.
+
+    First that the caller IS this member (the gateway's signed assertion), then
+    that this member owns the session. Ownership alone was never enough: a
+    caller who can name any member can name the owner.
+
+    404 on an ownership mismatch, never 403 — a member who does not own a
+    session must not learn that it exists.
+    """
+    _require_member(member_id)
     session = services.session_service.get_session(session_id, member_id=member_id)
     if not session:
         raise HTTPException(
@@ -454,6 +496,10 @@ def _require_session(session_id: str, member_id: str):
 )
 def create_session(request: CreateSessionRequest):
     """Create a new chat session; fetches the member's profile from WiseFood."""
+    # There is no session to own yet, so ownership cannot be the check here —
+    # identity is. Without it, anyone reachable could open a session AS another
+    # member and then legitimately own everything they did in it.
+    _require_member(request.member_id)
     try:
         user_profile = services.profile_service.get_member_profile(request.member_id)
         # Favorites ride in the profile snapshot: RecipeWrangler boosts them
@@ -519,6 +565,7 @@ def delete_session(
     member_id: str = Query(..., description="Must match session owner"),
 ):
     """Delete a session. Only the owning member may delete it."""
+    _require_member(member_id)
     if not services.session_service.delete_session(session_id, member_id):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or access denied"
@@ -560,6 +607,9 @@ def save_meal_plan(session_id: str, plan_id: str, request: SavePlanRequest):
 @router.get("/members/{member_id}/saved-plans", response_model=List[SavedPlanResponse])
 def get_member_saved_plans(member_id: str):
     """Every plan the member saved, across all their sessions, newest first."""
+    # Member-scoped rather than session-scoped: the id in the path IS the thing
+    # being authorized, so the assertion is the only check there is.
+    _require_member(member_id)
     return [
         SavedPlanResponse(**row)
         for row in services.session_service.get_member_saved_plans(member_id)
@@ -568,7 +618,12 @@ def get_member_saved_plans(member_id: str):
 
 @router.get("/members/{member_id}/sessions", response_model=List[SessionResponse])
 def get_member_sessions(member_id: str):
-    """Get all sessions for a specific member."""
+    """Get all sessions for a specific member.
+
+    The route the isolation requirement is really about: it lists someone's
+    whole conversation history from their id alone.
+    """
+    _require_member(member_id)
     sessions = services.session_service.get_member_sessions(member_id)
     return [
         SessionResponse(
@@ -605,6 +660,7 @@ class MemberCurrentPlansResponse(BaseModel):
 )
 def get_member_current_plans(member_id: str):
     """Most recent daily/weekly plans for a member (dashboard widget)."""
+    _require_member(member_id)
     session = services.session_service.get_member_current_plans(member_id)
     if session is None:
         return MemberCurrentPlansResponse()
@@ -648,6 +704,10 @@ def unified_chat(session_id: str, request: ChatRequest):
     Response includes plan_version and plan_parent_id so the UI can track
     which canvas version was just produced.
     """
+    # Identity BEFORE service availability: an unauthenticated caller should
+    # not learn whether the orchestrator is up, and authorization that runs
+    # second is authorization that a 503 can skip.
+    _require_member(request.member_id)
     orch_svc = _require_orchestrator_service()
 
     logger.info("[%s] /chat from member %s: %.120s", session_id, request.member_id, request.content)
@@ -749,6 +809,10 @@ def compose_plan(session_id: str, request: ComposeRequest):
     Pick shape is enforced by ``ComposePick`` (422 on a bad meal type or an
     out-of-range day), so this only resolves slot collisions.
     """
+    # Identity BEFORE service availability: an unauthenticated caller should
+    # not learn whether the orchestrator is up, and authorization that runs
+    # second is authorization that a 503 can skip.
+    _require_member(request.member_id)
     orch_svc = _require_orchestrator_service()
     plan_type = request.plan_type
 
@@ -806,6 +870,10 @@ def apply_plan_parameters(session_id: str, request: PlanParametersRequest):
     plan the card was rendered with (``plan_type``), or the active canvas
     when the client didn't say.
     """
+    # Identity BEFORE service availability: an unauthenticated caller should
+    # not learn whether the orchestrator is up, and authorization that runs
+    # second is authorization that a 503 can skip.
+    _require_member(request.member_id)
     orch_svc = _require_orchestrator_service()
 
     sanitized = plan_parameters.sanitize(request.values)
@@ -1259,6 +1327,10 @@ def replan(session_id: str, request: RegenerateRequest):
     changing things. Spends model calls, so it is a separate request from the
     state writes above rather than a side effect of them.
     """
+    # Identity BEFORE service availability: an unauthenticated caller should
+    # not learn whether the orchestrator is up, and authorization that runs
+    # second is authorization that a 503 can skip.
+    _require_member(request.member_id)
     orch_svc = _require_orchestrator_service()
     logger.info(
         "[%s] /replan (%s) from member %s",
