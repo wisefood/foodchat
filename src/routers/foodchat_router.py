@@ -1031,6 +1031,237 @@ def set_diners(session_id: str, request: SetDinersRequest):
 
 
 # --------------------------------------------------------------------------- #
+# Standing planning state — the pantry panel and the facet chips              #
+# --------------------------------------------------------------------------- #
+# Everything the member has said that outlives a turn lives in `PlanningState`
+# and, until now, was reachable only by saying it again. So the pantry was
+# invisible ("did it hear me?"), a facet inferred from a sentence could not be
+# taken back except by arguing with the assistant, and a page reload showed a
+# plan whose constraints had no explanation on screen.
+#
+# Reading and changing that state is deliberately separate from re-planning:
+# a member ticking off three pantry items should not trigger three
+# regenerations, and a tick-off is not always a request for a new plan.
+
+
+class PlanningStateResponse(BaseModel):
+    """What is currently in force for this session."""
+
+    pantry: List[str]
+    facets: Dict[str, List[str]]
+    diet_tags: List[str]
+    claim_tags: List[str]
+    notes: List[str]
+    anchors: Dict[str, str]
+    excluded_recipe_ids: List[str]
+    # None means never offered, False means offered and declined. The
+    # distinction is the whole reason the field is tri-state.
+    use_favorites: Optional[bool]
+    # The shape of plan standing for this session, and whether it is the
+    # default — the UI shows the ribbon only when the member changed something.
+    plan_shape: Dict
+    plan_shape_is_default: bool
+    # The query a regeneration would run, so the UI can show what it is about
+    # to ask for rather than describing the button.
+    query: str
+
+    @classmethod
+    def from_state(cls, state) -> "PlanningStateResponse":
+        return cls(
+            pantry=list(state.pantry),
+            # Every family, including the empty ones: `state.facets()` omits
+            # empties because a fetch should not send an empty filter, but a
+            # client that has to check whether a key exists is a client that
+            # will forget to.
+            facets={
+                family: list(getattr(state, family))
+                for family in type(state).FACET_FIELDS
+            },
+            diet_tags=list(state.diet_tags),
+            claim_tags=list(state.claim_tags),
+            notes=list(state.notes),
+            anchors=dict(state.anchors),
+            excluded_recipe_ids=list(state.excluded_recipe_ids),
+            use_favorites=state.use_favorites,
+            plan_shape=state.spec.to_dict(),
+            plan_shape_is_default=state.spec.is_default,
+            query=state.as_query(),
+        )
+
+
+class PantryRequest(BaseModel):
+    """Pantry items, as the member typed them. Normalized server-side."""
+    member_id: str
+    items: List[str] = Field(default_factory=list)
+
+
+class RegenerateRequest(BaseModel):
+    member_id: str
+    # The canvas to re-plan, for the same reason /plan-parameters takes one:
+    # without it the target is whichever canvas is newest at click time.
+    plan_type: Optional[Literal["daily", "weekly"]] = None
+
+
+def _state_response(session_id: str, delta) -> PlanningStateResponse:
+    """Apply a delta to the standing state and return the result.
+
+    One funnel for every mutation below, so no endpoint can write the state
+    without returning it — a client that has to re-fetch to find out what its
+    own write did is a client that will render a stale chip.
+    """
+    state = services.session_service.get_planning_state(session_id)
+    if not delta.is_empty:
+        state = state.merge(delta)
+        services.session_service.set_planning_state(session_id, state)
+    return PlanningStateResponse.from_state(state)
+
+
+@router.get("/sessions/{session_id}/planning-state", response_model=PlanningStateResponse)
+def get_planning_state(
+    session_id: str,
+    member_id: str = Query(..., description="WiseFood member ID — must match session owner"),
+):
+    """Everything standing for this session: pantry, facets, stated diet, claims.
+
+    This is what makes the constraints on a plan survive a reload. The plan's
+    own ledger says what was applied to THAT plan; this says what is still in
+    force for the next one.
+    """
+    _require_session(session_id, member_id)
+    return PlanningStateResponse.from_state(
+        services.session_service.get_planning_state(session_id)
+    )
+
+
+@router.put("/sessions/{session_id}/pantry", response_model=PlanningStateResponse)
+def set_pantry(session_id: str, request: PantryRequest):
+    """Replace the pantry with exactly these items.
+
+    The whole list, not a delta: this is the panel's save, and a member who
+    cleared the last item means the pantry is empty — which an additive-only
+    write could never express.
+    """
+    from models.planning_state import PlanningStateDelta
+    from services import pantry_service
+
+    _require_session(session_id, request.member_id)
+    wanted = pantry_service.normalize_items(request.items)
+    current = services.session_service.get_planning_state(session_id).pantry
+    delta = PlanningStateDelta(
+        pantry_add=tuple(i for i in wanted if i not in current),
+        pantry_remove=tuple(i for i in current if i not in wanted),
+    )
+    logger.info("[%s] Pantry set to %s", session_id, list(wanted))
+    return _state_response(session_id, delta)
+
+
+@router.post("/sessions/{session_id}/pantry", response_model=PlanningStateResponse)
+def add_pantry_items(session_id: str, request: PantryRequest):
+    """Add items, leaving the rest of the pantry alone."""
+    from models.planning_state import PlanningStateDelta
+    from services import pantry_service
+
+    _require_session(session_id, request.member_id)
+    items = pantry_service.normalize_items(request.items)
+    if not items:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No usable pantry items provided",
+        )
+    logger.info("[%s] Pantry += %s", session_id, list(items))
+    return _state_response(session_id, PlanningStateDelta(pantry_add=items))
+
+
+@router.delete("/sessions/{session_id}/pantry/{item}", response_model=PlanningStateResponse)
+def remove_pantry_item(
+    session_id: str,
+    item: str,
+    member_id: str = Query(..., description="WiseFood member ID — must match session owner"),
+):
+    """Take one item out — "used up the zucchini", or heard wrong."""
+    from models.planning_state import PlanningStateDelta
+    from services import pantry_service
+
+    _require_session(session_id, member_id)
+    names = pantry_service.normalize_items([item])
+    logger.info("[%s] Pantry -= %s", session_id, list(names))
+    return _state_response(session_id, PlanningStateDelta(pantry_remove=names))
+
+
+@router.delete("/sessions/{session_id}/facets/{value}", response_model=PlanningStateResponse)
+def remove_facet(
+    session_id: str,
+    value: str,
+    member_id: str = Query(..., description="WiseFood member ID — must match session owner"),
+):
+    """Take back one inferred facet — the removable chip on the plan header.
+
+    Matched across all four families rather than addressed by family: a member
+    removing "light" does not know or care whether it was read as a mood or a
+    flavour, and requiring the client to know would make the chip's own
+    rendering the source of truth for what it deletes.
+    """
+    from models.planning_state import PlanningStateDelta
+
+    _require_session(session_id, member_id)
+    slug = str(value or "").strip().lower()
+    if not slug:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="No facet value given"
+        )
+    logger.info("[%s] Facet removed: %s", session_id, slug)
+    return _state_response(session_id, PlanningStateDelta(facets_remove=(slug,)))
+
+
+@router.post("/sessions/{session_id}/replan", response_model=ChatTurnResponse)
+def replan(session_id: str, request: RegenerateRequest):
+    """Re-plan from the standing state — no new message, no classification.
+
+    What a facet chip removal or a pantry edit calls once the member is done
+    changing things. Spends model calls, so it is a separate request from the
+    state writes above rather than a side effect of them.
+    """
+    orch_svc = _require_orchestrator_service()
+    logger.info(
+        "[%s] /replan (%s) from member %s",
+        session_id, request.plan_type or "active", request.member_id,
+    )
+    try:
+        turn = orch_svc.regenerate(
+            session_id, request.member_id, plan_type=request.plan_type,
+        )
+    except SessionAccessError as e:
+        logger.warning("[%s] /replan 404: %s", session_id, e)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        logger.error("[%s] /replan 500: %s", session_id, e, exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+    return _chat_turn_response(turn)
+
+
+@router.get("/vocabularies")
+def get_vocabularies():
+    """The live facet vocabulary RecipeWrangler actually annotates.
+
+    Exposed so the UI can offer real values instead of a hardcoded list that
+    drifts. It matters more than a convenience: RecipeWrangler ANDs facet
+    values and never relaxes an unlisted one to nothing, so an invented mood
+    does not soften a search — it empties it, and the member is told no meals
+    exist. Empty when the vocabulary is unreachable, which is the signal to
+    offer nothing rather than to guess.
+    """
+    from services.candidates_client import CANDIDATES
+
+    try:
+        vocab = CANDIDATES.vocabularies() or {}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Vocabulary fetch failed: %s", exc)
+        vocab = {}
+    return {"vocabularies": {k: list(v) for k, v in vocab.items()}}
+
+
+# --------------------------------------------------------------------------- #
 # Tool surface                                                                 #
 # --------------------------------------------------------------------------- #
 # The same protocol FoodChat already consumes from RecipeWrangler: a manifest

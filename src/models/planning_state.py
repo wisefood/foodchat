@@ -230,6 +230,31 @@ class PlanningState:
             parts.append("; ".join(self.notes))
         return " · ".join(parts)
 
+    def as_query(self) -> str:
+        """A short natural request equivalent to what is standing.
+
+        Used when the plan is regenerated with no new member message — a facet
+        chip removed, a pantry item ticked off. The wording matters: the query
+        drives the semantic search and the grader, so it has to describe what
+        the member still wants. Describing the EDIT instead ("without the
+        spicy flavour") would search for the thing being removed.
+        """
+        bits: list[str] = []
+        bits += [t.replace("_", " ") for t in self.diet_tags]
+        bits += [t.replace("_", " ") for t in self.claim_tags]
+        for values in self.facets().values():
+            bits += [v.replace("_", " ") for v in values]
+
+        seen: list[str] = []
+        for bit in bits:
+            if bit and bit not in seen:
+                seen.append(bit)
+
+        text = f"a {', '.join(seen)} meal plan" if seen else "a meal plan"
+        if self.pantry:
+            text += " using up " + ", ".join(self.pantry)
+        return text
+
     # -- persistence ---------------------------------------------------- #
 
     def to_dict(self) -> dict[str, Any]:

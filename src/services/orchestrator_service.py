@@ -1091,6 +1091,47 @@ class OrchestratorService:
             turn.plan_parameters = plan_parameters.build_card(session.user_profile, target)
             return turn
 
+    def regenerate(self, session_id: str, member_id: str,
+                   plan_type: Optional[str] = None) -> ChatTurn:
+        """Re-plan from the standing state, with no new member statement.
+
+        The deterministic counterpart of `apply_plan_parameters` for state the
+        member changed by hand rather than by talking: a facet chip removed, a
+        pantry item ticked off. Both write `PlanningState` and then need the
+        plan on screen to reflect it — and neither has a sentence to classify,
+        so routing them through /chat would mean inventing one and having the
+        classifier guess at it.
+
+        The query comes from `PlanningState.as_query()`, so it describes what
+        is still wanted rather than what was just taken away.
+        """
+        with trace_context(session_id=session_id, user_id=member_id):
+            session = self._owned_session(session_id, member_id)
+            limit_turn = self._limit_turn(session)
+            if limit_turn is not None:
+                return limit_turn
+
+            state = self.session_service.get_planning_state(session_id)
+            message = state.as_query()
+
+            target = plan_type if plan_type in ("daily", "weekly") else None
+            if target is None:
+                canvas = session.active_canvas
+                target = canvas.plan_type if canvas is not None else "daily"
+
+            if target == "weekly" and session.get_current_weekly_plan() is not None:
+                logger.info("[%s] Regenerating weekly plan: %s", session_id, message)
+                return self._handle_weekly(
+                    session_id, message, "refine_plan", is_refinement=True,
+                )
+            is_refinement = session.get_current_daily_plan() is not None
+            logger.info("[%s] Regenerating daily plan: %s", session_id, message)
+            return self._handle_plan(
+                session_id, message,
+                "refine_plan" if is_refinement else "daily_plan",
+                is_refinement=is_refinement, skip_clarification=True,
+            )
+
     def compose_plan(
         self, session_id: str, member_id: str, picks: list[dict],
         plan_type: str = "daily", message: Optional[str] = None,
