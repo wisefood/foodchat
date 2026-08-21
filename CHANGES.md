@@ -2,6 +2,70 @@
 
 ---
 
+# A local tool surface for the agent
+
+> **Date:** 2026-08-21
+> **Branch:** fix/stated-diet-and-honest-constraints
+> Additive: two new endpoints, no change to any existing one. No UI change
+> required — the UI can call a tool without a chat turn if it wants to.
+
+The agent was a fixed chain: one classification per turn picked one handler,
+and anything that handler could not do was unreachable. "Summarise my week"
+and "redo Thursday" had no path at all — the nearest available action was a
+full refinement, which regenerates all 21 slots and silently discards a slot
+edit the member had already approved.
+
+`src/tools/` is a declarative registry speaking **the same protocol FoodChat
+already consumes from RecipeWrangler** — `GET /foodchat/tools` for a manifest,
+`POST /foodchat/tools/{name}` to invoke. Rather than invent a second shape, the
+service now speaks the one it already understands, MCP-shaped so a model can be
+handed the manifest directly.
+
+| Tool | What it does |
+|---|---|
+| `summarize_week` | Every day with its meals and calories, week totals, the guideline checklist and variety metrics read back from the stored plan, and the ledger split into what held and what was relaxed. Read-only, no model call. |
+| `summarize_day` | One day in detail: ingredients, per-meal and whole-day nutrition, and the reason chips for each dish. |
+| `plan_totals` | Sums a plan's calories and macros — per plate, per day, per week. **This total did not exist before**: the daily path had no summation at all and the prose prompt asked the model to notice when a day "sums far outside a sensible intake". |
+| `replace_day` | Regenerates one day and pins the other eighteen slots, so the rest of the week survives byte for byte. The surgical alternative to refining the week. Excludes everything already in the plan, everything downvoted, and the day being replaced, so the new day is genuinely new. |
+| `swap_meal` | The existing verified slot edit, exposed as a callable tool on either canvas. |
+
+Every reader is LLM-free and every total reports how many meals actually
+carried nutrition data, rather than implying a complete figure.
+
+**The plan analyst now gets the arithmetic done for it.** It was handed 21
+per-meal nutrition strings and no total, so any question about a whole day or
+week made it add up numbers in prose — the one thing a model should not be
+trusted with here. `_summarize_active_plan` now appends the summed totals with
+an explicit "already summed — do not re-add", plus the coverage caveat. No new
+intent, no prompt change, no extra model call.
+
+Design notes worth keeping:
+
+- Ownership is enforced in the **router**, not the tool: a tool trusts that its
+  caller proved the member owns the session, the same contract every service
+  here follows. A session the caller cannot see returns 404, never 403.
+- `ToolError` is the member-facing failure — a bad day number, no plan yet —
+  and becomes a 400 carrying prose. Anything else is a 500 and a log line.
+- Argument validation lives in the registry, so a wrong day fails with a
+  readable sentence instead of surfacing from inside a planner.
+- `mutates` and `uses_model` are declared per tool, so a caller can decide
+  whether it can afford one inside a turn that has already spent grading.
+
+`tests/test_tools.py` is new (27 tests, LLM-free). The load-bearing one asserts
+the planner still bypasses selection for pinned slots — if that ever stops
+being true, `replace_day` silently becomes a full regeneration and starts
+eating approved edits. 515 passing.
+
+**Agent-side selection is deliberately not wired.** The orchestrator's intent
+list lives in a Langfuse-managed prompt, and a deploy never overwrites an
+existing copy — adding an intent there would work locally and ship dead to
+production. Reaching these tools from a chat turn needs either a new prompt
+name (the `PantryExtractor` pattern) or a manual Langfuse version push. Until
+then they are reachable from the API and from code, and the analyst already
+benefits.
+
+---
+
 # A diet you state in chat is a diet we plan with (Phase A)
 
 > **Date:** 2026-08-21

@@ -1030,6 +1030,67 @@ def set_diners(session_id: str, request: SetDinersRequest):
     return DinersResponse(cooking_for=profile["cooking_for"], cooking_for_names=names)
 
 
+# --------------------------------------------------------------------------- #
+# Tool surface                                                                 #
+# --------------------------------------------------------------------------- #
+# The same protocol FoodChat already consumes from RecipeWrangler: a manifest
+# to discover what exists, and one POST to invoke by name. A model can be
+# handed the manifest directly; the UI can call a tool without a chat turn.
+
+
+class ToolInvokeRequest(BaseModel):
+    """Invoke one tool. `member_id` proves ownership of the session it names."""
+    member_id: str
+    arguments: Dict = Field(default_factory=dict)
+
+
+@router.get("/tools")
+def list_tools():
+    """Every tool the agent can call, with its schema.
+
+    Discovery, not documentation: the manifest is generated from the registry,
+    so a tool that exists is listed and a tool that is listed exists.
+    """
+    import tools
+
+    return {"tools": tools.manifest()}
+
+
+@router.post("/tools/{tool_name}")
+def invoke_tool(tool_name: str, request: ToolInvokeRequest):
+    """Run one tool.
+
+    Ownership is enforced HERE rather than inside the tool: a tool trusts that
+    its caller proved the member owns the session, which is the same contract
+    every service in this codebase follows. A tool naming a session it was not
+    given access to gets the same 404 as a missing one — a mismatched member
+    must not learn the session exists.
+    """
+    import tools
+
+    arguments = dict(request.arguments or {})
+    session_id = arguments.get("session_id")
+    if session_id:
+        _require_session(str(session_id), request.member_id)
+
+    try:
+        result = tools.invoke(tool_name, arguments)
+    except tools.ToolError as exc:
+        # Something the caller can fix — a bad day number, no plan yet — so it
+        # is a 400 carrying member-facing prose, never a 500.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from None
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Tool %s failed: %s", tool_name, exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Tool {tool_name} failed",
+        ) from None
+
+    return {"tool": tool_name, "result": result}
+
+
 @router.get("/health")
 def health_check():
     """Health check endpoint."""

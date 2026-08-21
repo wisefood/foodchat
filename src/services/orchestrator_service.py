@@ -726,6 +726,9 @@ class OrchestratorService:
                         f"  {entry.get('meal_type', 'meal')}: {recipe.get('title', '?')} "
                         f"{fmt_nutrition(recipe.get('nutrition'))}"
                     )
+            totals = self._totals_line(session.session_id, "weekly")
+            if totals:
+                lines.append(totals)
             return "\n".join(lines)
 
         plan = session.get_current_daily_plan()
@@ -735,7 +738,46 @@ class OrchestratorService:
         for slot in ("breakfast", "lunch", "dinner"):
             course = getattr(plan, slot)
             lines.append(f"  {slot}: {course.title} {fmt_nutrition(course.nutrition)}")
+        totals = self._totals_line(session.session_id, "daily")
+        if totals:
+            lines.append(totals)
         return "\n".join(lines)
+
+    @staticmethod
+    def _totals_line(session_id: str, plan_type: str) -> str:
+        """Summed totals for the analyst, so it never has to add up 21 numbers.
+
+        The analyst was handed per-meal nutrition and nothing else, so any
+        question about a whole day or week made it do arithmetic in prose —
+        the one thing a language model should not be trusted with here. The
+        `plan_totals` tool sums the stored plan and says how many meals it
+        could actually see; both facts belong in the context.
+        """
+        try:
+            import tools
+
+            result = tools.invoke(
+                "plan_totals", {"session_id": session_id, "plan_type": plan_type}
+            )
+        except Exception:  # noqa: BLE001
+            return ""
+        total = result.get("total") or {}
+        if not total.get("meals_total"):
+            return ""
+        bits = [f"{total.get('calories', 0):.0f} kcal total"]
+        for key, unit in (("protein_g", "g protein"), ("carbs_g", "g carbs"),
+                          ("fat_g", "g fat")):
+            if total.get(key):
+                bits.append(f"{total[key]:.0f}{unit}")
+        line = "COMPUTED TOTALS (already summed — do not re-add): " + ", ".join(bits)
+        if not total.get("complete"):
+            line += (
+                f" — counted {total.get('meals_counted')} of "
+                f"{total.get('meals_total')} meals; the rest carry no nutrition data"
+            )
+        if plan_type == "weekly" and result.get("daily_average_kcal"):
+            line += f". Daily average {result['daily_average_kcal']:.0f} kcal"
+        return line
 
     def _handle_smalltalk(self, session_id: str, message: str) -> ChatTurn:
         response_text, _, _ = self.chat_service.process_smalltalk(session_id, message)
