@@ -30,7 +30,7 @@ from typing import Optional
 
 from agents import EditCommandExtractor
 from models.recipe import CandidateRecipe, RecipeEnrichment
-from services.candidates_client import CANDIDATES, effective_diet
+from services.candidates_client import CANDIDATES, effective_diet, screening_allergens
 from .session_service import SessionService
 from .weekly_planner.day_summary import build_day_summaries
 from .weekly_planner.explainability import build_weekly_explainability
@@ -419,7 +419,7 @@ class EditService:
         try:
             hits = PLANNER.find_recipes(
                 name,
-                allergens=profile.get("allergies") or [],
+                allergens=screening_allergens(profile),
                 diet=effective_diet(profile),
                 exclude_ingredients=profile.get("food_dislikes") or [],
                 limit=3,

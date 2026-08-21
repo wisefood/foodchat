@@ -184,7 +184,11 @@ def fetch_pantry_candidates(
     courgette got a 90-minute bake ranked first. The pantry is an input to
     search, never a way around what the member asked for.
     """
-    from services.candidates_client import normalize_diet_tags, effective_diet
+    from services.candidates_client import (
+        effective_diet,
+        normalize_diet_tags,
+        screening_allergens,
+    )
     from services.plan_client import PLANNER
 
     items = list(normalize_items(pantry))[:PANTRY_ITEM_LIMIT]
@@ -206,7 +210,7 @@ def fetch_pantry_candidates(
                 days=1,
                 slots=slots,
                 count_per_slot=count,
-                allergens=profile.get("allergies") or [],
+                allergens=screening_allergens(profile),
                 diet=normalized_diet,
                 cuisines=list(cuisines or []),
                 include_ingredients=[item],
@@ -219,7 +223,7 @@ def fetch_pantry_candidates(
             logger.info("Pantry fetch for %r found nothing usable: %s", item, exc)
             return {}
         return PLANNER.to_candidates(
-            envelope, allergens=profile.get("allergies") or []
+            envelope, allergens=screening_allergens(profile)
         )
 
     merged: dict[str, list[CandidateRecipe]] = {slot: [] for slot in slots}
@@ -281,7 +285,7 @@ def pantry_boost_ids(
     `favorite_recipe_ids` float within their slot while hard filters still
     decide eligibility. These ids ride that signal.
     """
-    from services.candidates_client import effective_diet
+    from services.candidates_client import effective_diet, screening_allergens
     from services.plan_client import PLANNER
 
     ids: list[str] = []
@@ -290,7 +294,7 @@ def pantry_boost_ids(
             hits = PLANNER.find_recipes(
                 item,
                 limit=limit_per_item,
-                allergens=profile.get("allergies") or [],
+                allergens=screening_allergens(profile),
                 diet=effective_diet(profile),
                 exclude_ingredients=profile.get("food_dislikes") or [],
             )

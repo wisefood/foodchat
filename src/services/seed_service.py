@@ -31,6 +31,7 @@ from services.candidates_client import (
     RecipeCandidatesClient,
     allergen_conflict,
     effective_diet,
+    screening_allergens,
 )
 
 logger = logging.getLogger(__name__)
@@ -161,7 +162,7 @@ class SeedService:
         return PLANNER.find_recipes(
             name,
             limit=5,
-            allergens=profile.get("allergies") or [],
+            allergens=screening_allergens(profile),
             # Normalised for the same reason as everywhere else: an
             # unrecognised tag ANDs a name search down to nothing, so a
             # member's named dish would silently fail to resolve.

@@ -139,6 +139,43 @@ ALLERGEN_SYNONYMS = {
     "sesame": ["sesame", "tahini"],
 }
 
+# The gateway's dietary_groups enum carries free-from values that RecipeWrangler
+# has no diet tag for, so they were dropped and nothing filtered on them — while
+# the ledger still announced them as satisfied hard constraints. They cannot
+# become RW filters, but they CAN reach the client-side allergen backstop, which
+# is the same defence that exists because the corpus has tagged almond dishes
+# `nut_free` in production. Mapped to the allergen names above rather than new
+# term lists, so there is one place to maintain.
+FREE_FROM_TO_ALLERGEN = {
+    "peanut_free": "peanuts",
+    "nut_free": "tree nuts",
+    "tree_nut_free": "tree nuts",
+    "egg_free": "eggs",
+    "dairy_free": "dairy",
+    "lactose_free": "lactose",
+    "gluten_free": "gluten",
+    "soy_free": "soy",
+    "sesame_free": "sesame",
+    "shellfish_free": "shellfish",
+    "fish_free": "fish",
+}
+
+
+def free_from_allergens(diet) -> list[str]:
+    """Allergen names implied by free-from diet slugs on a profile.
+
+    Returned so callers can union them into `allergies` before screening: a
+    member who selected `peanut_free` gets the peanut backstop even though no
+    RW diet tag exists for it.
+    """
+    raw = diet if isinstance(diet, list) else ([diet] if diet else [])
+    out: list[str] = []
+    for value in raw:
+        allergen = FREE_FROM_TO_ALLERGEN.get(str(value).strip().lower())
+        if allergen and allergen not in out:
+            out.append(allergen)
+    return out
+
 
 def _allergen_terms(allergies: list[str]) -> list[str]:
     """Expand profile allergen names into matchable ingredient terms."""
@@ -161,26 +198,75 @@ def allergen_conflict(text: str, allergies: list[str]) -> Optional[str]:
     return None
 
 
-def normalize_diet_tags(diet) -> list[str]:
-    """Convert user-profile diet values to valid RecipeWrangler diet tags.
+# Values that are deliberately not filters: they describe an absence of
+# restriction, so forwarding one would empty every slot for no reason.
+NON_RESTRICTIVE = {"omnivore", "mediterranean", "balanced", "healthy", "flexitarian"}
 
-    Unknown or non-restrictive values (e.g. 'omnivore', 'mediterranean') are
-    dropped rather than forwarded, because RW treats diet tags as hard filters
-    (ALL must match) and an unknown tag would return zero candidates.
+
+def screening_allergens(profile: dict) -> list[str]:
+    """Allergen names to screen a plate against: stated allergies PLUS the ones
+    implied by free-from diet slugs.
+
+    A member who set `peanut_free` in their dietary groups had no filter and no
+    backstop — the slug is not an RW diet tag and not an allergy entry. Unioning
+    here means every call site that already screens gets the cover, in one
+    place, without each one learning about diet slugs.
+    """
+    allergies = profile.get("allergies") or []
+    allergies = [allergies] if isinstance(allergies, str) else list(allergies)
+    implied = free_from_allergens(profile.get("diet"))
+    known = {str(a).strip().lower() for a in allergies}
+    return list(allergies) + [a for a in implied if a not in known]
+
+
+def classify_diet_tags(diet) -> tuple[list[str], list[str]]:
+    """Split profile diet values into (filterable, unsupported).
+
+    The second list is the point. 26 of the gateway's 37 dietary groups have no
+    RecipeWrangler diet tag — `peanut_free`, `halal`, `kosher`, `keto`,
+    `low_sodium` and the rest — and they used to be dropped with a log line
+    while `transparency.constraints_ledger` still rendered every raw profile
+    diet value as a hard constraint with status "satisfied". A member who
+    selected `peanut_free` was shown a plan asserting a peanut-free guarantee
+    that nothing had enforced.
+
+    Nothing here can invent a filter that does not exist upstream. What it can
+    do is refuse to pretend: the caller gets the unsupported values back and
+    says so, and free-from slugs additionally reach the allergen backstop via
+    `free_from_allergens`.
     """
     raw = diet if isinstance(diet, list) else ([diet] if diet else [])
     tags: list[str] = []
+    unsupported: list[str] = []
     for d in raw:
         key = str(d).lower().strip()
+        if not key:
+            continue
         if key in DIET_TAG_MAP:
             mapped = DIET_TAG_MAP[key]
             if mapped is not None:
-                tags.append(mapped)
+                if mapped not in tags:
+                    tags.append(mapped)
+            elif key not in NON_RESTRICTIVE and key not in unsupported:
+                # Mapped to None but still a real restriction the member chose
+                # (the nutrition claims) — not filterable, not nothing.
+                unsupported.append(key)
         elif key in VALID_RW_DIET_TAGS:
-            tags.append(key)
-        else:
-            logger.warning("Dropping unrecognized diet tag %r — not in RecipeWrangler schema", d)
-    return tags
+            if key not in tags:
+                tags.append(key)
+        elif key not in NON_RESTRICTIVE and key not in unsupported:
+            unsupported.append(key)
+    if unsupported:
+        logger.warning(
+            "Diet values with no RecipeWrangler filter: %s — reported to the "
+            "member as unenforced rather than dropped", unsupported,
+        )
+    return tags, unsupported
+
+
+def normalize_diet_tags(diet) -> list[str]:
+    """The filterable diet tags only. See `classify_diet_tags` for the rest."""
+    return classify_diet_tags(diet)[0]
 
 
 def effective_diet(profile: dict) -> list[str]:
@@ -287,7 +373,7 @@ class RecipeCandidatesClient:
                 days=1,
                 slots=(meal_type,),
                 count_per_slot=limit,
-                allergens=profile.get("allergies") or [],
+                allergens=screening_allergens(profile),
                 # Normalised: an unknown tag ANDs to zero candidates.
                 diet=effective_diet(profile),
                 cuisines=cuisines,
@@ -301,7 +387,7 @@ class RecipeCandidatesClient:
             return []
 
         return PLANNER.to_candidates(
-            envelope, allergens=profile.get("allergies") or []
+            envelope, allergens=screening_allergens(profile)
         ).get(meal_type, [])
 
     def autocomplete(self, name: str, limit: int = 5) -> list[tuple[str, str]]:

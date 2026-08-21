@@ -789,9 +789,11 @@ CHATBOT_SYSTEM_INSTRUCTIONS = (
     "asks what you can do, mention this; if their request implies a shape "
     "('I skip breakfast', 'we want a starter too'), plan that shape rather than "
     "defaulting to three meals. "
-    "You can steer by cuisine, mood, flavour, food group, cooking time, "
-    "Nutri-Score and calorie or protein targets. Allergies and dietary "
-    "requirements are never relaxed to make a plan fit. "
+    "You can steer by cuisine and cooking time, and set a minimum Nutri-Score. "
+    "Do NOT promise to steer by mood, flavour or food group, and do NOT promise "
+    "calorie or protein targets — those are not wired up yet, and offering them "
+    "makes the next turn a disappointment. Allergies and dietary requirements "
+    "are never relaxed to make a plan fit. "
     "Nutrition-science questions are answered for you by FoodScholar, WiseFood's "
     "evidence-based Q&A service, so never tell the user a question can't be answered here. "
     "For this conversation: respond warmly and briefly, stay food-related where natural, "
@@ -957,7 +959,11 @@ EDIT_COMMAND_EXTRACTOR_SYSTEM = _reg("edit_command_extractor_system", EDIT_COMMA
 EDIT_COMMAND_EXTRACTOR_USER = _reg("edit_command_extractor_user", EDIT_COMMAND_EXTRACTOR_USER_INSTRUCTIONS)
 RESPONSE_WRITER_SYSTEM = _reg("response_writer_system", RESPONSE_WRITER_SYSTEM_INSTRUCTIONS)
 RESPONSE_WRITER_USER = _reg("response_writer_user", RESPONSE_WRITER_USER_INSTRUCTIONS)
-CHATBOT_SYSTEM = _reg("chatbot_system", CHATBOT_SYSTEM_INSTRUCTIONS)
+# Registered as v2: `chatbot_system` already exists in Langfuse and a deploy
+# never overwrites an existing copy, so correcting the in-code text would have
+# left the false capability promise live in production forever. The old name is
+# deliberately abandoned rather than edited.
+CHATBOT_SYSTEM = _reg("chatbot_system_v2", CHATBOT_SYSTEM_INSTRUCTIONS)
 SESSION_TITLE_SYSTEM = _reg("session_title_system", SESSION_TITLE_SYSTEM_INSTRUCTIONS)
 SESSION_TITLE_USER = _reg("session_title_user", SESSION_TITLE_USER_INSTRUCTIONS)
 

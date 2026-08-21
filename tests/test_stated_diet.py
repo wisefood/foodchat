@@ -208,4 +208,44 @@ class TestDurableWrite:
         from services.profile_service import GATEWAY_DIET_GROUPS
 
         assert "vegetarian" in GATEWAY_DIET_GROUPS
-        assert "gluten_free" not in GATEWAY_DIET_GROUPS
+        # Not in the gateway enum — writing it would 422.
+        assert "keto_carnivore" not in GATEWAY_DIET_GROUPS
+        assert "lactose_free" not in GATEWAY_DIET_GROUPS
+
+    def test_the_diets_we_can_filter_on_are_the_diets_we_can_store(self):
+        """This assertion previously said the opposite, which encoded a real
+        bug: the write vocabulary was limited to the UI picker's five values,
+        so the three diets FoodChat can actually FILTER on were the three it
+        refused to persist. "Remember I'm gluten-free" was offered, accepted,
+        and then rejected at the write with applied=false."""
+        from services.candidates_client import VALID_RW_DIET_TAGS
+        from services.profile_service import GATEWAY_DIET_GROUPS
+
+        for filterable in ("gluten_free", "dairy_free", "nut_free",
+                           "vegetarian", "vegan", "pescatarian"):
+            assert filterable in VALID_RW_DIET_TAGS, filterable
+            assert filterable in GATEWAY_DIET_GROUPS, (
+                f"{filterable} can be filtered but not stored"
+            )
+
+    def test_the_write_vocabulary_matches_the_gateway_enum_exactly(self):
+        """Drift in either direction is a bug: a missing value silently refuses
+        a legitimate memory, an extra one 422s at the boundary."""
+        import pathlib
+        import re
+
+        from services.profile_service import GATEWAY_DIET_GROUPS
+
+        gw = pathlib.Path(
+            "/mnt/workspaces/wisefood/wisefood-api/src/schemas.py"
+        )
+        if not gw.exists():  # gateway not checked out beside us
+            pytest.skip("wisefood-api not available")
+        block = gw.read_text()
+        block = block[block.find("class DietaryGroupEnum"):]
+        block = block[:block.find("\n\n\n")]
+        enum = set(re.findall(r'=\s*"([a-z_0-9]+)"', block))
+        assert GATEWAY_DIET_GROUPS == enum, (
+            f"missing: {sorted(enum - GATEWAY_DIET_GROUPS)} "
+            f"extra: {sorted(GATEWAY_DIET_GROUPS - enum)}"
+        )

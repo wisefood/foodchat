@@ -81,7 +81,48 @@ def constraints_ledger(profile: dict, downvoted_count: int = 0) -> list[dict]:
             "source": "allergy",
             "members": members_for("allergies", allergen),
         })
-    for diet in profile.get("diet") or []:
+    # A diet row may only claim "satisfied" if something actually filtered on
+    # it. 26 of the gateway's 37 dietary groups have no RecipeWrangler tag, and
+    # this loop used to render every one of them as a satisfied HARD
+    # constraint — so a member who selected `peanut_free` was shown a
+    # peanut-free guarantee with nothing behind it. The unsupported ones now say
+    # so, and the free-from ones name the backstop that does cover them.
+    from services.candidates_client import FREE_FROM_TO_ALLERGEN, classify_diet_tags
+
+    diet_values = profile.get("diet") or []
+    diet_values = [diet_values] if isinstance(diet_values, str) else diet_values
+    _filterable, unsupported = classify_diet_tags(diet_values)
+    unsupported_set = {u.lower() for u in unsupported}
+    from services.candidates_client import NON_RESTRICTIVE
+
+    for diet in diet_values:
+        key = str(diet).strip().lower()
+        if key in NON_RESTRICTIVE:
+            # "omnivore" is the absence of a restriction. Listing it as a
+            # satisfied HARD constraint claimed the plan honoured something
+            # that was never asked of it, and cluttered the header with a row
+            # the member cannot act on.
+            continue
+        if key in unsupported_set:
+            backstop = FREE_FROM_TO_ALLERGEN.get(key)
+            row = {
+                "constraint": str(diet),
+                "type": "hard", "status": "unsupported",
+                "source": "dietary group",
+                "members": members_for("diet", diet),
+                "detail": (
+                    "The recipe catalogue has no filter for this, so it did not "
+                    "narrow the search."
+                ),
+            }
+            if backstop:
+                row["detail"] = (
+                    "The recipe catalogue has no filter for this, so it did not "
+                    f"narrow the search — but {backstop} are screened out of "
+                    "every plate by ingredient name."
+                )
+            ledger.append(row)
+            continue
         ledger.append({
             "constraint": str(diet),
             "type": "hard", "status": "satisfied",
@@ -186,6 +227,11 @@ def split_ledger(ledger: list, limit: int = 4) -> tuple[list[str], list[str]]:
             honored.append(text)
         elif status in ("relaxed", "violated"):
             not_honored.append(text)
+        # "unsupported" is deliberately in NEITHER list. Claiming it honoured
+        # would be the lie this status exists to stop; putting it in the reply as
+        # "couldn't honour peanut_free" would over-alarm a member whose peanuts
+        # ARE screened by the ingredient backstop. The ledger row carries the
+        # nuance in its detail; prose should not flatten it.
     return honored[:limit], not_honored[:limit]
 
 

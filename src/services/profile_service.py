@@ -36,12 +36,34 @@ GOAL_TO_NUTRITION_PROFILE: dict[str, dict[str, float]] = {
 # A floor of "A" would be a stricter filter than any of these goals implies,
 # and RecipeWrangler relaxes nothing here — an over-tight floor returns an
 # empty slot rather than a slightly worse meal.
-# The dietary_groups the gateway will actually accept from us. The column is a
-# Postgres enum array with 37 values, but the UI's picker writes one of these
-# five, and a value outside the enum is rejected at the API boundary — so this
-# is the safe write vocabulary, not the full enum.
+# The dietary_groups the gateway will accept from us: the real Postgres enum,
+# not the five values the UI's picker happens to offer.
+#
+# Restricting this to the picker's five was a mistake with a precise cost: the
+# enum also holds `gluten_free`, `dairy_free` and `nut_free`, which are exactly
+# the three diets FoodChat CAN filter on. So "remember I'm gluten-free" was
+# offered, accepted by the member, refused here, and returned applied=false —
+# the three it could act on were the three it would not persist.
+#
+# `diabetic_friendly` is included because the gateway's own enum copies have
+# been reconciled; anything outside this set is still refused rather than
+# risking a 422 on a value the column does not know.
 GATEWAY_DIET_GROUPS = {
-    "omnivore", "vegetarian", "vegan", "pescatarian", "flexitarian",
+    # dietary patterns
+    "omnivore", "vegetarian", "lacto_vegetarian", "ovo_vegetarian",
+    "lacto_ovo_vegetarian", "pescatarian", "vegan", "raw_vegan", "plant_based",
+    "flexitarian",
+    # religious / cultural
+    "halal", "kosher", "jain", "buddhist_vegetarian",
+    # free-from
+    # No `lactose_free` — it is in FREE_FROM_TO_ALLERGEN for backstop purposes
+    # but NOT in the gateway enum, so writing it would 422.
+    "gluten_free", "dairy_free", "nut_free", "peanut_free",
+    "egg_free", "soy_free", "shellfish_free", "fish_free", "sesame_free",
+    # nutrition-flavoured
+    "low_carb", "low_fat", "low_sodium", "sugar_free", "no_added_sugar",
+    "high_protein", "high_fiber", "low_cholesterol", "low_calorie",
+    "keto", "paleo", "whole30", "mediterranean", "diabetic_friendly",
 }
 
 GOAL_TO_MIN_NUTRI_SCORE: dict[str, str] = {

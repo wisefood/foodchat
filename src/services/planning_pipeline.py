@@ -24,7 +24,7 @@ from models.plan_spec import PlanSpec
 from models.recipe import CandidateRecipe, ScoredPlan
 from models.session import MealPlan
 from services import pantry_service, plan_parameters
-from services.candidates_client import CANDIDATES, effective_diet
+from services.candidates_client import CANDIDATES, effective_diet, screening_allergens
 
 logger = logging.getLogger(__name__)
 
@@ -241,7 +241,7 @@ class PlanningPipeline:
         try:
             envelope = PLANNER.plan_meals(
                 spec=spec,
-                allergens=profile.get("allergies") or [],
+                allergens=screening_allergens(profile),
                 # Normalised, never raw: RecipeWrangler ANDs diet tags and
                 # never relaxes them, so one unknown value ("balanced",
                 # "omnivore") empties every slot. See candidates_client.
@@ -432,7 +432,7 @@ def _fetch_candidate_pool(
             days=1,
             slots=slots,
             count_per_slot=limit_per_slot,
-            allergens=profile.get("allergies") or [],
+            allergens=screening_allergens(profile),
             diet=effective_diet(profile),
             cuisines=cuisines,
             exclude_ingredients=profile.get("food_dislikes") or [],
@@ -453,7 +453,7 @@ def _fetch_candidate_pool(
     if notes:
         logger.info("Candidate pool relaxations: %s", notes)
 
-    pool = PLANNER.to_candidates(envelope, allergens=profile.get("allergies") or [])
+    pool = PLANNER.to_candidates(envelope, allergens=screening_allergens(profile))
     # A slot the endpoint could not fill is absent from the envelope; the caller
     # checks for empties, so make the absence explicit.
     return {slot: pool.get(slot, []) for slot in slots}

@@ -2,6 +2,62 @@
 
 ---
 
+# Never claim a constraint we did not enforce (P0)
+
+> **Date:** 2026-08-21
+> **Branch:** fix/stated-diet-and-honest-constraints
+> No API change. One UI-visible addition: `constraints_applied` rows can now
+> carry `status: "unsupported"`, which clients must render — an unknown status
+> falling through to "satisfied" styling would reinstate the bug.
+
+`normalize_diet_tags` drops **26 of the gateway's 37 dietary groups** — RecipeWrangler
+has no diet tag for `peanut_free`, `halal`, `kosher`, `keto`, `low_sodium` and
+the rest. `constraints_ledger` then rendered **every** raw profile diet value as
+`type: hard, status: satisfied`.
+
+So a member who selected `peanut_free` in their profile was shown a plan header
+asserting a peanut-free guarantee, with no filter behind it — and no allergen
+backstop either, because the backstop keys on plain-English allergen names and
+never saw the slug. Of everything found in the full-stack sweep this is the only
+item that is not merely a missing feature.
+
+| Fix | Detail |
+|---|---|
+| `classify_diet_tags` returns `(filterable, unsupported)` | Unsupported values are handed back to the caller instead of dying in a log line. `normalize_diet_tags` is now a thin wrapper, so every existing call site keeps working. |
+| A new `unsupported` ledger status | The row says the catalogue has no filter for this and it did not narrow the search. Never `satisfied`. |
+| Free-from slugs reach the ingredient backstop | `FREE_FROM_TO_ALLERGEN` maps `peanut_free → peanuts`, `egg_free → eggs`, `shellfish_free → shellfish` and six more onto the existing allergen synonyms, and `screening_allergens(profile)` unions them into the screen at all ten sites that already screen. It cannot invent an upstream filter; it can make the defence that exists cover the slug. |
+| Non-restrictive labels get no row at all | `omnivore` was listed as a *satisfied hard constraint* — claiming the plan honoured something never asked of it, on a row the member cannot act on. |
+| `unsupported` is in neither half of `split_ledger` | Calling it honoured is the lie this exists to stop; putting it in the reply as "couldn't honour peanut_free" would over-alarm a member whose peanuts **are** screened. The ledger row carries the nuance; prose does not flatten it. |
+
+**Two corrections to work shipped earlier today.**
+
+`GATEWAY_DIET_GROUPS` was limited to the five values the UI picker offers. The
+gateway enum also holds `gluten_free`, `dairy_free` and `nut_free` — *exactly*
+the three diets FoodChat can filter on. So "remember I'm gluten-free" was
+offered, accepted by the member, refused at the write, and returned
+`applied: false`: the three it could act on were the three it would not persist.
+The set now matches the gateway enum exactly, with a test asserting parity in
+both directions (a missing value silently refuses a legitimate memory; an extra
+one 422s at the boundary).
+
+The chatbot persona told the member *"You can steer by cuisine, mood, flavour,
+food group, cooking time, Nutri-Score and calorie or protein targets."* Four of
+those seven are not implemented — mood, flavour and food group are never sent to
+RecipeWrangler, and the endpoint has no macro parameter. I had earlier reported
+this promise as harmless because `describe_options()` has no callers; that was
+wrong. The same claim sits in the persona, which is the one place a member
+actually reads it. Corrected under a **new prompt name** (`chatbot_system_v2`) —
+a deploy never overwrites an existing Langfuse copy, so editing the in-code text
+would have left the false promise live in production forever.
+
+`tests/test_unenforced_constraints.py` is new (47 tests, LLM-free), verified
+regressive: restoring the always-satisfied behaviour fails 27 of them. Every
+mapped allergen is asserted expandable by the synonym table, because a mapping
+to a name the table does not know would screen nothing and silently reopen the
+hole. 564 passing.
+
+---
+
 # A local tool surface for the agent
 
 > **Date:** 2026-08-21
