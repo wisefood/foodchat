@@ -217,6 +217,10 @@ def _routes(session_id: str):
             "session_id": session_id, "item": "zucchini", "member_id": m}),
         "remove_facet": lambda m: (api.remove_facet, {
             "session_id": session_id, "value": "light", "member_id": m}),
+        "add_facets": lambda m: (api.add_facets, {
+            "session_id": session_id,
+            "request": api.FacetRequest(member_id=m, values=["light"]),
+        }),
         "invoke_tool": lambda m: (api.invoke_tool, {
             "tool_name": "summarize_week",
             "request": api.ToolInvokeRequest(

@@ -86,6 +86,32 @@ class TestRead:
         assert out.plan_shape_is_default is True
         assert isinstance(out.plan_shape, dict)
 
+    def test_the_shape_comes_with_a_sentence_the_ui_can_show(self, owned):
+        """Reconstructing it client-side would be a second implementation of
+        `PlanSpec.describe()` that drifts from the one the planner builds
+        from."""
+        session_id, member = owned
+        out = api.get_planning_state(session_id, member_id=member)
+        assert "day" in out.plan_shape_summary
+        assert "breakfast" in out.plan_shape_summary
+
+    def test_a_non_default_shape_reads_differently(self, owned):
+        from models.plan_spec import PlanSpec
+
+        session_id, member = owned
+        state = services.session_service.get_planning_state(session_id)
+        services.session_service.set_planning_state(
+            session_id,
+            state.merge(PlanningStateDelta(spec=PlanSpec(
+                num_days=3, meals=("breakfast", "lunch", "dinner"),
+                plates={"dinner": ("main", "side")},
+            ))),
+        )
+        out = api.get_planning_state(session_id, member_id=member)
+        assert out.plan_shape_is_default is False
+        assert "3 days" in out.plan_shape_summary
+        assert "side" in out.plan_shape_summary
+
     def test_it_carries_the_query_a_regeneration_would_run(self, owned):
         session_id, member = owned
         out = api.get_planning_state(session_id, member_id=member)
@@ -302,3 +328,90 @@ class TestReplanNeedsTheOrchestrator:
             assert e.value.status_code == 503
         finally:
             services.orchestrator_service = saved
+
+
+# ── asking for a taste the assistant did not infer ────────────────────────
+#
+# The other half of the removable chip. Without it a member could take back
+# what FoodChat heard and never state something it missed — and `/vocabularies`
+# existed with nothing able to act on what it returned.
+
+VOCAB = {
+    "cuisines": ["thai", "greek"],
+    "moods": ["light", "hearty"],
+    "flavor_profiles": ["spicy"],
+    "food_groups": ["legumes"],
+}
+
+
+@pytest.fixture
+def vocabulary(monkeypatch):
+    from services.candidates_client import CANDIDATES
+
+    monkeypatch.setattr(type(CANDIDATES), "vocabularies", lambda self: VOCAB)
+    return VOCAB
+
+
+class TestAddingAFacet:
+    def test_a_real_value_lands_in_its_family(self, owned, vocabulary):
+        session_id, member = owned
+        out = api.add_facets(session_id, api.FacetRequest(member_id=member, values=["greek"]))
+        assert "greek" in out.facets["cuisines"]
+
+    def test_the_client_does_not_say_which_family(self, owned, vocabulary):
+        """Symmetric with removal — the member does not know either."""
+        session_id, member = owned
+        out = api.add_facets(session_id, api.FacetRequest(member_id=member, values=["spicy"]))
+        assert out.facets["flavor_profiles"] == ["spicy"]
+
+    def test_it_adds_to_what_is_already_standing(self, owned, vocabulary):
+        session_id, member = owned
+        out = api.add_facets(session_id, api.FacetRequest(member_id=member, values=["hearty"]))
+        assert set(out.facets["moods"]) == {"light", "hearty"}
+
+    def test_a_value_the_corpus_lacks_is_refused(self, owned, vocabulary):
+        """Accepting it would not narrow the next plan — it would EMPTY it, and
+        the member would be told no meals exist because of a word this endpoint
+        agreed to."""
+        session_id, member = owned
+        with pytest.raises(HTTPException) as e:
+            api.add_facets(session_id, api.FacetRequest(member_id=member, values=["atlantean"]))
+        assert e.value.status_code == 400
+
+    def test_a_mix_keeps_the_real_one(self, owned, vocabulary):
+        session_id, member = owned
+        out = api.add_facets(
+            session_id, api.FacetRequest(member_id=member, values=["thai", "energising"]),
+        )
+        assert "thai" in out.facets["cuisines"]
+        assert "energising" not in str(out.facets)
+
+    @pytest.mark.parametrize("raw", ["Greek", "  greek  ", "GREEK"])
+    def test_it_normalises_what_the_member_typed(self, owned, vocabulary, raw):
+        session_id, member = owned
+        out = api.add_facets(session_id, api.FacetRequest(member_id=member, values=[raw]))
+        assert "greek" in out.facets["cuisines"]
+
+    def test_no_vocabulary_is_a_503_not_a_silent_no_op(self, owned, monkeypatch):
+        """The member asked for something and is entitled to know it did not
+        land."""
+        from services.candidates_client import CANDIDATES
+
+        monkeypatch.setattr(type(CANDIDATES), "vocabularies", lambda self: {})
+        session_id, member = owned
+        with pytest.raises(HTTPException) as e:
+            api.add_facets(session_id, api.FacetRequest(member_id=member, values=["greek"]))
+        assert e.value.status_code == 503
+
+    def test_it_is_ownership_checked_like_every_other_write(self, owned, vocabulary):
+        session_id, _ = owned
+        intruder = f"member-{uuid.uuid4()}"
+        with pytest.raises(HTTPException) as e:
+            api.add_facets(session_id, api.FacetRequest(member_id=intruder, values=["greek"]))
+        assert e.value.status_code == 404
+
+    def test_add_then_remove_round_trips(self, owned, vocabulary):
+        session_id, member = owned
+        api.add_facets(session_id, api.FacetRequest(member_id=member, values=["greek"]))
+        out = api.remove_facet(session_id, "greek", member_id=member)
+        assert "greek" not in out.facets["cuisines"]

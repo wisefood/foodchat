@@ -1167,6 +1167,11 @@ class PlanningStateResponse(BaseModel):
     # default — the UI shows the ribbon only when the member changed something.
     plan_shape: Dict
     plan_shape_is_default: bool
+    # The same shape as a sentence — "3 days — breakfast; lunch; dinner: main +
+    # side". `plan_shape` is the machine form; reconstructing this description
+    # client-side would mean a second implementation of `PlanSpec.describe()`
+    # that drifts from the one the planner actually builds from.
+    plan_shape_summary: str
     # The query a regeneration would run, so the UI can show what it is about
     # to ask for rather than describing the button.
     query: str
@@ -1191,6 +1196,7 @@ class PlanningStateResponse(BaseModel):
             use_favorites=state.use_favorites,
             plan_shape=state.spec.to_dict(),
             plan_shape_is_default=state.spec.is_default,
+            plan_shape_summary=state.spec.describe(),
             query=state.as_query(),
         )
 
@@ -1292,6 +1298,79 @@ def remove_pantry_item(
     names = pantry_service.normalize_items([item])
     logger.info("[%s] Pantry -= %s", session_id, list(names))
     return _state_response(session_id, PlanningStateDelta(pantry_remove=names))
+
+
+class FacetRequest(BaseModel):
+    """Facet values to add, from the live vocabulary."""
+    member_id: str
+    values: List[str] = Field(default_factory=list, max_length=12)
+
+
+@router.post("/sessions/{session_id}/facets", response_model=PlanningStateResponse)
+def add_facets(session_id: str, request: FacetRequest):
+    """Ask for a taste the assistant did not infer.
+
+    The other half of the removable chip. Without it the member could take back
+    what FoodChat heard and never state something it missed — and `/vocabularies`
+    existed with nothing able to act on what it returned.
+
+    Values are matched against the LIVE vocabulary and anything unlisted is
+    dropped, reported in the log, and left out of the state. Not tidiness:
+    RecipeWrangler ANDs facet values and never relaxes an unlisted one, so
+    accepting an invented mood would not narrow the next plan — it would empty
+    it, and the member would be told no meals exist because of a word this
+    endpoint agreed to.
+    """
+    from models.planning_state import PlanningStateDelta
+    from services.candidates_client import CANDIDATES
+
+    _require_session(session_id, request.member_id)
+
+    try:
+        vocab = CANDIDATES.vocabularies() or {}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Vocabulary unavailable, refusing facet add: %s", exc)
+        vocab = {}
+    if not vocab:
+        # With no live list there is no value that is safe to accept. 503
+        # rather than a silent no-op: the member asked for something and is
+        # entitled to know it did not land.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="The recipe vocabulary is unavailable, so this can't be applied yet",
+        )
+
+    families = ("cuisines", "moods", "flavor_profiles", "food_groups")
+    allowed = {
+        family: {str(v).strip().lower() for v in (vocab.get(family) or ())}
+        for family in families
+    }
+    accepted: dict[str, list[str]] = {family: [] for family in families}
+    rejected: list[str] = []
+    for raw in request.values:
+        slug = str(raw).strip().lower().replace("-", "_").replace(" ", "_")
+        if not slug:
+            continue
+        # By value, not by family — symmetric with removal, and the member
+        # does not know which family a word belongs to either.
+        family = next((f for f in families if slug in allowed[f]), None)
+        if family is None:
+            rejected.append(slug)
+        elif slug not in accepted[family]:
+            accepted[family].append(slug)
+
+    if rejected:
+        logger.info("[%s] Dropped facets not in the vocabulary: %s", session_id, rejected)
+    if not any(accepted.values()):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="None of those are things the recipe collection is tagged with",
+        )
+
+    logger.info("[%s] Facets added: %s", session_id, accepted)
+    return _state_response(session_id, PlanningStateDelta(
+        **{family: tuple(values) for family, values in accepted.items()}
+    ))
 
 
 @router.delete("/sessions/{session_id}/facets/{value}", response_model=PlanningStateResponse)
