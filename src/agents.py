@@ -26,19 +26,18 @@ import json
 import logging
 import os
 import random
-from typing import Optional
+from typing import Optional, Sequence
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from backend.groq import GROQ_CHAT
 from backend.observability import build_trace_config
-from models.recipe import CandidatesBySlot, ScoredPlan
+from models.recipe import CandidatesBySlot, ScoredPlan, slot_sort_key
 from prompts import (
+    PLAN_GRADER_SYSTEM,
+    PLAN_GRADER_USER,
     PLAN_STRATEGIST_SYSTEM,
     PLAN_STRATEGIST_USER,
-    BATCH_GRADER_USER,
-    GRADER_SYSTEM,
-    GRADER_USER,
     PLAN_ANALYST_SYSTEM,
     MEAL_DIVERSITY_SYSTEM,
     GUIDELINE_ADHERENCE_SYSTEM,
@@ -119,11 +118,29 @@ DEFAULT_TEMPERATURE = _opt_float("FOODCHAT_LLM_TEMPERATURE")
 CHATBOT_TEMPERATURE = float(os.getenv("FOODCHAT_CHATBOT_TEMPERATURE", "0.7"))
 MAX_RETRIES = int(os.getenv("FOODCHAT_MAX_RETRIES", "3"))
 MAX_PLANS_TO_SCORE = int(os.getenv("FOODCHAT_MAX_PLANS_TO_SCORE", "10"))
+
+# How far into the combination space the grader will walk before it stops
+# enumerating and samples instead.
+#
+# `itertools.product` over three slots of eight candidates is 512 — cheap to
+# materialise, which is why the old three-slot grader could. Over seven slots
+# it is two million, and a day with a main and two sides is worse. The scan is
+# bounded so a generalised grader cannot hang the turn on exactly the plans it
+# exists to support; the batch itself is still `MAX_PLANS_TO_SCORE`.
+_COMBO_SCAN_LIMIT = 512
 CHATBOT_HISTORY_TURNS = int(os.getenv("FOODCHAT_CHATBOT_HISTORY_TURNS", "12"))
 
 
 class DocumentGrader:
-    """Scores breakfast×lunch×dinner combinations against the query + profile."""
+    """Scores candidate days against the query + profile.
+
+    `grade_daily_plans` is the three-slot entry point every existing caller
+    uses, and it now delegates to `grade_plans`, which takes whatever slots it
+    is given. The three-slot version was not a simplification — it was the
+    reason a four-meal day, or a dinner served as a main and a side, could not
+    be ranked at all, which is why the structured planning path shipped with no
+    grading and no quality metrics.
+    """
 
     def __init__(self, model: str = None, temperature: float = None, max_plans_to_score: int = None):
         self.grader = GROQ_CHAT.get_client(
@@ -137,7 +154,17 @@ class DocumentGrader:
         self, query: str, candidates: CandidatesBySlot, user_profile: dict,
         feedback_history: str = "",
     ) -> list[ScoredPlan]:
-        """Return the top-scored combinations, best first (at most 3).
+        """The three-slot entry point. Kept because every caller uses it."""
+        return self.grade_plans(
+            query, candidates, user_profile, feedback_history,
+            slots=("breakfast", "lunch", "dinner"),
+        )
+
+    def grade_plans(
+        self, query: str, candidates: CandidatesBySlot, user_profile: dict,
+        feedback_history: str = "", slots: Optional[Sequence[str]] = None,
+    ) -> list[ScoredPlan]:
+        """Return the top-scored days, best first (at most 3).
 
         One LLM call for the whole batch. One call *per combination* made
         grading the latency floor of every plan request — ten sequential
@@ -152,20 +179,74 @@ class DocumentGrader:
         top-of-ranking combo is always in the batch; the rest of the space
         still gets sampled so the judge sees variety.
         """
-        combos = list(itertools.product(
-            candidates.get("breakfast", []),
-            candidates.get("lunch", []),
-            candidates.get("dinner", []),
-        ))
-        logger.info("Grading daily plans — %d possible combinations", len(combos))
-        if not combos:
-            logger.warning("No possible daily plans — at least one slot has no candidates")
+        # Which slots this day has. Given explicitly by the three-slot entry
+        # point; otherwise whatever the pool actually filled, in eating order.
+        if slots:
+            # An explicitly requested shape fails CLOSED. The three-slot entry
+            # point's caller stores the result through `MealPlan.from_courses`,
+            # which requires exactly three — so quietly grading a two-slot day
+            # because lunch came back empty would turn a "no candidates"
+            # warning into a 500 two frames later. The caller degrades to the
+            # unranked pool on `[]`, which is the right answer here.
+            names = [str(n) for n in slots]
+            empty = [n for n in names if not candidates.get(n)]
+            if empty:
+                logger.warning(
+                    "No candidates for %s — cannot grade the requested shape",
+                    ", ".join(empty),
+                )
+                return []
+        else:
+            # An inferred shape takes whatever the pool actually filled: there
+            # is no downstream contract to break, and a day of two real meals
+            # beats no ranking at all.
+            names = [
+                n for n in sorted(candidates, key=slot_sort_key) if candidates.get(n)
+            ]
+        if not names:
+            logger.warning("No slot has candidates — nothing to grade")
             return []
 
-        # combos[0] is top-of-ranking in every slot by construction of
-        # itertools.product over best-first lists.
-        rest = random.sample(combos[1:], min(len(combos) - 1, self.max_plans_to_score - 1))
-        sampled = [combos[0]] + rest
+        # The product is bounded before it is built, not after.
+        #
+        # Three slots of eight candidates is 512 combinations; the old code
+        # materialised all of them and sampled ten. Seven slots of eight is
+        # two million, and a day with a main and two sides is worse — so a
+        # generalised grader that kept `list(itertools.product(...))` would
+        # hang the turn on exactly the plans this change exists to support.
+        #
+        # `islice` walks the product lazily and stops. Because `product`
+        # iterates its LAST argument fastest, walking a prefix would vary only
+        # the final slot — so the prefix is taken for its guaranteed
+        # top-of-ranking first element, and the variety comes from independent
+        # per-slot sampling below.
+        pools = [candidates[n] for n in names]
+        best_combo = tuple(pool[0] for pool in pools)
+        head = list(itertools.islice(itertools.product(*pools), _COMBO_SCAN_LIMIT))
+        logger.info(
+            "Grading %d-slot days (%s) — scanned %d combination(s)",
+            len(names), ", ".join(names), len(head),
+        )
+
+        # The top-of-ranking day is always graded; the rest of the batch is
+        # sampled per slot so the judge sees variety across every slot rather
+        # than across the last one only.
+        wanted = max(0, self.max_plans_to_score - 1)
+        rest: list[tuple] = []
+        seen = {best_combo}
+        for _ in range(wanted * 4):          # bounded attempts, not a while-true
+            if len(rest) >= wanted:
+                break
+            combo = tuple(random.choice(pool) for pool in pools)
+            if combo in seen:
+                continue
+            seen.add(combo)
+            rest.append(combo)
+        # A pool small enough to enumerate gets exhaustive coverage instead of
+        # sampling, which is the old behaviour for three short slots.
+        if len(head) <= self.max_plans_to_score:
+            rest = [c for c in head if c != best_combo][:wanted]
+        sampled = [best_combo] + rest
 
         def course_text(slot: str, course) -> str:
             lines = [f"{slot}: {course.title}"]
@@ -183,15 +264,15 @@ class DocumentGrader:
         plans_text = "\n\n".join(
             f"PLAN {i}\n" + "\n".join(
                 course_text(slot, course)
-                for slot, course in (("breakfast", b), ("lunch", l), ("dinner", d))
+                for slot, course in zip(names, combo)
             )
-            for i, (b, l, d) in enumerate(sampled)
+            for i, combo in enumerate(sampled)
         )
 
         try:
             result = self.grader.invoke([
-                SystemMessage(content=GRADER_SYSTEM.compile()),
-                HumanMessage(content=BATCH_GRADER_USER.compile(
+                SystemMessage(content=PLAN_GRADER_SYSTEM.compile()),
+                HumanMessage(content=PLAN_GRADER_USER.compile(
                     plan_count=len(sampled),
                     query=query,
                     plans=plans_text,
@@ -209,11 +290,11 @@ class DocumentGrader:
         for grade in grades:
             try:
                 index = int(grade.get("plan_index"))
-                breakfast, lunch, dinner = sampled[index]
+                combo = sampled[index]
             except (TypeError, ValueError, IndexError):
                 continue
             scored.append(ScoredPlan(
-                breakfast=breakfast, lunch=lunch, dinner=dinner,
+                slots=dict(zip(names, combo)),
                 score=int(grade.get("score", 0)),
                 reasoning=str(grade.get("reasoning", "")),
             ))

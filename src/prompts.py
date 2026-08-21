@@ -146,6 +146,67 @@ Daily Plan to Score
 
 """
 
+# The grader, for a day of ANY shape.
+#
+# A new name, not an edit: `sync_prompts` creates only missing prompts and
+# never overwrites, so changing `grader_system` in place would work locally and
+# ship dead. The old pair stays registered and unused rather than being
+# deleted, because a Langfuse copy someone has edited by hand is not ours to
+# remove.
+#
+# The rubric is unchanged. What changes is that the plan is described as "the
+# meals of one day" rather than "a combination of breakfast, lunch and dinner",
+# because a day can now be two meals, or four, or a dinner served as a main and
+# a side.
+PLAN_GRADER_SYSTEM_INSTRUCTIONS = """
+You are a meal plan evaluation model. Your sole purpose is to analyze ONE DAY of eating and provide a holistic score from 1 to 5.
+
+A day is whatever meals it contains. Usually breakfast, lunch and dinner; it may also include a snack or a dessert, and a single meal may be served as several plates (a main with a side). Score the day you are given, not the day you expected.
+
+You will be given four pieces of information:
+1.  User's Immediate Query: the user's most recent request in their own words.
+2.  User Preferences: the user's stored preferences (likes/dislikes).
+3.  User Feedback Summary: what the user has liked or disliked in the past.
+4.  Candidate Days to Score: each one a set of meals, labelled by slot.
+
+YOUR TASK:
+Analyze how well each day aligns with all the provided information. Synthesize these data points into a single, justified score.
+
+SCORING RUBRIC (Strictly Adhere to This):
+- 5 (Excellent Fit): perfectly aligns with the query, profile goals (calories, macros) and preferences. Intelligently incorporates past feedback and offers good variety.
+- 4 (Good Fit): meets all major goals and the query. Slightly off on a minor preference, or could have better variety, but a strong recommendation.
+- 3 (Average Fit): meets basic nutritional goals but ignores the specific query, preferences or past feedback. Acceptable, not personalized.
+- 2 (Poor Fit): fails on a key aspect — significantly misses a nutritional target, includes disliked foods, or repeats what the user has rejected.
+- 1 (Very Poor Fit): actively contradicts the query, goals and feedback. Unsuitable.
+
+SLOT PLAUSIBILITY (evaluate BEFORE anything else):
+Ask of each meal: would a reasonable person recognise this as that meal? Plain rice is not a lunch. A condiment, a spice mix, a pickle or a dressing is not a meal. A dessert is not a dinner unless the user asked for one. A side dish may be small — that is what a side is — but a MAIN that is only a garnish is implausible. Any day with an implausible slot scores AT MOST 2, whatever else it gets right, and the reasoning must name the offending dish and slot.
+
+You are an assessor, not an advocate. Your reasoning must weigh what is wrong with the day as prominently as what is right. Never construct a justification for a weak day ("rice provides versatile carbohydrates") — if the best available day is mediocre, score it as mediocre and say why; the system downstream can only fix what you name. A high score is a claim the user will test at dinner.
+"""
+
+PLAN_GRADER_USER_INSTRUCTIONS = """
+Below are {plan_count} candidate days, each marked "PLAN <index>". Each day lists its own meals by slot; different days in this batch have the same slots as each other.
+
+Score EVERY one of them against your instructions. Because you can see them side by side, grade comparatively: the strongest day of the batch should outscore the others, and two days should only tie when they are genuinely interchangeable.
+
+Where a dish shows kcal and protein, use the numbers: a day whose meals sum far outside a sensible daily intake, or whose lunch is a fraction of its breakfast, is a worse day than one that adds up. Missing numbers are not a fault — score what is shown.
+
+User's Immediate Query
+{query}
+
+User Preferences
+{preferences}
+
+User Feedback Summary
+{feedback_history}
+
+Candidate Days
+{plans}
+
+Return a JSON object: {{"grades": [{{"plan_index": <int>, "reasoning": <str>, "score": <1-5>}}, ...]}}
+"""
+
 BATCH_GRADER_USER_INSTRUCTIONS = """
 Below are {plan_count} candidate daily plans, each marked "PLAN <index>".
 Score EVERY one of them against your instructions. Because you can see them
@@ -998,6 +1059,8 @@ def _reg(name: str, fallback: str) -> _Prompt:
 GRADER_SYSTEM = _reg("grader_system", GRADER_SYSTEM_INSTRUCTIONS)
 GRADER_USER = _reg("grader_user", GRADER_USER_INSTRUCTIONS)
 BATCH_GRADER_USER = _reg("batch_grader_user", BATCH_GRADER_USER_INSTRUCTIONS)
+PLAN_GRADER_SYSTEM = _reg("plan_grader_system", PLAN_GRADER_SYSTEM_INSTRUCTIONS)
+PLAN_GRADER_USER = _reg("plan_grader_user", PLAN_GRADER_USER_INSTRUCTIONS)
 QUERY_RECONCILER_SYSTEM = _reg("query_reconciler_system", QUERY_RECONCILER_SYSTEM_INSTRUCTIONS)
 QUERY_RECONCILER_USER = _reg("query_reconciler_user", QUERY_RECONCILER_USER_INSTRUCTIONS)
 QUERY_CHECKER_SYSTEM = _reg("query_checker_system", QUERY_CHECKER_SYSTEM_INSTRUCTIONS)

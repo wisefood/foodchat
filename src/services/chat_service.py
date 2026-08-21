@@ -119,7 +119,7 @@ def _extract_ingredient_names(ingredients_text: str) -> list[str]:
 
 
 def _food_variety_score(plan: ScoredPlan) -> tuple[int, str]:
-    """Count unique food items across the plan's three courses (FVS metric)."""
+    """Count unique food items across every course of the plan (FVS metric)."""
     items: list[str] = []
     for course in plan.courses:
         items.extend(_extract_ingredient_names(course.ingredients))
@@ -132,12 +132,49 @@ def _food_variety_score(plan: ScoredPlan) -> tuple[int, str]:
 
 
 def _plan_as_text(plan: ScoredPlan) -> str:
+    """Every course, labelled by its own slot.
+
+    Was hardcoded to Breakfast/Lunch/Dinner, which is fine while those are the
+    only three slots that can exist and an `AttributeError` on `None.title` the
+    moment they are not. It reads whatever slots the plan has, in eating order.
+    """
     return "\n".join(
-        f"{name}: {course.title}\nIngredients: {course.ingredients}\nDirections: {course.directions}\n"
-        for name, course in (
-            ("Breakfast", plan.breakfast), ("Lunch", plan.lunch), ("Dinner", plan.dinner),
-        )
+        f"{name.replace('_', ' ').title()}: {course.title}\n"
+        f"Ingredients: {course.ingredients}\nDirections: {course.directions}\n"
+        for name, course in ((n, plan.slots[n]) for n in plan.slot_names)
     )
+
+
+def scored_plan_from(meal_plan, score: int = 0, reasoning: str = "") -> ScoredPlan:
+    """A produced plan, in the shape the quality metrics read.
+
+    The structured path shipped with no metrics because `_compute_metrics`
+    needed a `ScoredPlan` and a `ScoredPlan` could only be three named courses.
+    Now that it holds a mapping, a plan of any shape can be scored.
+
+    Every plate on every day, not day one: the metrics are variety, diversity
+    and guideline adherence, and all three mean "across what the member will
+    actually eat". Judging a seven-day plan on its first day would report the
+    variety of a Monday.
+
+    Slots are labelled `day 2 dinner (side)` so the grader's prompt reads as a
+    plan rather than a list of dishes, and so two dinners in a week do not
+    collapse onto one key.
+    """
+    multi_day = len(meal_plan.day_plans) > 1
+    slots: dict = {}
+    for day in meal_plan.day_plans:
+        for meal in day.meals:
+            for plate in meal.plates:
+                if not getattr(plate, "recipe_id", ""):
+                    continue
+                name = meal.meal_type
+                if multi_day:
+                    name = f"day {day.day} {name}"
+                if len(meal.plates) > 1:
+                    name = f"{name} ({getattr(plate, 'role', 'main')})"
+                slots[name] = plate.to_candidate()
+    return ScoredPlan(score=score, reasoning=reasoning, slots=slots)
 
 
 class ChatService:
@@ -651,6 +688,30 @@ class ChatService:
         # are appended to the ones it built rather than overwritten.
         pantry_facts = pantry_service.annotate_daily_plan(meal_plan, pantry)
         pantry_note = pantry_service.describe_coverage(pantry_facts)
+
+        # Quality metrics, which this path has never had.
+        #
+        # `_compute_metrics` needed a `ScoredPlan` and a `ScoredPlan` could only
+        # be three named courses, so a multi-day or multi-plate plan arrived
+        # with every score at zero — indistinguishable, in the UI, from a plan
+        # that had been judged and found wanting.
+        #
+        # There is no `llm_score` here and there deliberately is not one:
+        # `plan_meals` returns ONE recipe per slot, not a pool, so there is no
+        # combination to rank and a fabricated ranking would be worse than an
+        # absent one. Variety, diversity and guideline adherence all judge a
+        # produced plan, which is exactly what this is.
+        if turn_budget.skip("quality metrics", turn_budget.COST_METRICS):
+            structured_metrics: dict = {}
+        else:
+            structured_metrics = self._compute_metrics(
+                session_id, scored_plan_from(meal_plan, reasoning=meal_plan.reasoning),
+            )
+            for key, value in structured_metrics.items():
+                # `llm_score`/`llm_reasoning` carry the plan's own reasoning
+                # through; the rest are measured here.
+                if key not in ("llm_score", "llm_reasoning"):
+                    setattr(meal_plan, key, value)
 
         # Now measure. Everything above reports what was REQUESTED; this reads
         # the plates that came back and says what is actually true of them.
