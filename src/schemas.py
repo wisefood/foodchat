@@ -145,6 +145,37 @@ class PlanIntentSchema(BaseModel):
     food_groups: list[str] = []
 
 
+class PlanStrategySchema(BaseModel):
+    """How to approach ONE planning request, before any recipe is fetched.
+
+    A proposal, not a decision: `PlanBrief.with_strategy` validates every value
+    against the live vocabulary and the corpus's claim tags before any of it
+    reaches a search. A strategist is allowed to be wrong; it is not allowed to
+    be wrong in a way that empties the result set and offers no explanation.
+
+    Notice what is absent. There is no allergen field and no diet field — a
+    reasoning step may decide HOW to search, and may not decide to drop a
+    safety constraint. Those come from the profile and the member's own words,
+    deterministically, and the verifier checks them on the way back.
+    """
+    cuisines: list[str] = []
+    moods: list[str] = []
+    flavor_profiles: list[str] = []
+    food_groups: list[str] = []
+    # Corpus claim tags — high_protein, low_calorie, 30_minutes_or_less …
+    claim_tags: list[str] = []
+    # A daily calorie budget, when the request implies one and the profile has
+    # none. Ignored outside 1200-4000: outside that range it is an arithmetic
+    # error, not a plan.
+    kcal_target: Optional[int] = None
+    # What to give up first if a slot cannot be filled. May REORDER the known
+    # steps; anything unknown is dropped.
+    relaxation_order: list[str] = []
+    # One sentence on why. Shown to nobody by default, logged always, and
+    # available to the reply writer as grounded fact.
+    rationale: str = ""
+
+
 class MealPlateSchema(BaseModel):
     """The plates one meal is served as.
 

@@ -34,6 +34,8 @@ from backend.groq import GROQ_CHAT
 from backend.observability import build_trace_config
 from models.recipe import CandidatesBySlot, ScoredPlan
 from prompts import (
+    PLAN_STRATEGIST_SYSTEM,
+    PLAN_STRATEGIST_USER,
     BATCH_GRADER_USER,
     GRADER_SYSTEM,
     GRADER_USER,
@@ -65,6 +67,7 @@ from prompts import (
     PLAN_INTENT_EXTRACTOR_USER,
 )
 from schemas import (
+    PlanStrategySchema,
     BatchScoringSchema,
     ScoringSchema,
     QueryReconcilerSchema,
@@ -696,6 +699,85 @@ class PlanIntentExtractor:
                     )
             out[family] = kept
         return out
+
+
+class PlanStrategist:
+    """Decides HOW to search, before a recipe is fetched.
+
+    The reasoning half of the hybrid. The pipeline stays the executor and the
+    verifier stays deterministic; what this adds is a step that reads what the
+    member actually meant and shapes the search accordingly, instead of a fixed
+    chain that maps the same words to the same filters every time.
+
+    It runs on the REASONING tier, not the fast one, and that is the point:
+    "something light after the gym" becoming high protein with a light mood is
+    a judgement about food, not a span to pick out of a sentence.
+
+    Three things keep it safe:
+
+    * It cannot touch allergens or diet. Those are not in its schema, they are
+      derived deterministically, and the verifier checks them on the way back.
+      A reasoning step may decide how to search; it may not decide to drop a
+      safety constraint.
+    * Every value it proposes is validated against the LIVE vocabulary by
+      `PlanBrief.with_strategy` before it reaches a search — because the search
+      ANDs facet values and never relaxes an unknown one, so an invented mood
+      empties the result set rather than narrowing it.
+    * A failure returns `{}`, leaving the deterministic brief exactly as it
+      was. The plan that used to be built is the floor, never the casualty.
+    """
+
+    def __init__(self, model: str = None, temperature: float = None):
+        self.llm = GROQ_CHAT.get_client(
+            model=model or DEFAULT_MODEL,
+            temperature=(
+                temperature if temperature is not None else DEFAULT_TEMPERATURE
+            ),
+            format=PlanStrategySchema.model_json_schema(),
+        )
+
+    def propose(self, message: str, brief, vocabularies: dict) -> dict:
+        """A proposal dict for `PlanBrief.with_strategy`. Never raises.
+
+        Returns `{}` — meaning "no adjustment" — whenever the vocabulary is
+        unavailable or the call fails. With no live list there is no value that
+        is safe to add, and the deterministic brief is a working plan on its
+        own.
+        """
+        families = ("cuisines", "moods", "flavor_profiles", "food_groups")
+        allowed = {
+            family: [str(v).lower() for v in (vocabularies.get(family) or [])]
+            for family in families
+        }
+        if not any(allowed.values()):
+            return {}
+
+        try:
+            vocab_text = "\n".join(
+                f"{family}: {', '.join(allowed[family]) or '(none)'}"
+                for family in families
+            )
+            system_text = PLAN_STRATEGIST_SYSTEM.compile()
+            user_text = PLAN_STRATEGIST_USER.compile(
+                message=(message or "")[:600],
+                standing=brief.describe(),
+                vocabularies=vocab_text,
+            )
+            if "json" not in f"{system_text} {user_text}".lower():
+                system_text += "\nReturn the result as a JSON object."
+            result = self.llm.invoke([
+                SystemMessage(content=system_text),
+                HumanMessage(content=user_text),
+            ], config=build_trace_config(run_name="plan_strategy", tags=["planning"]))
+            payload = json.loads(result.content)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("PlanStrategist failed, using the plain brief: %s", exc)
+            return {}
+
+        if not isinstance(payload, dict):
+            return {}
+        logger.info("Plan strategy: %s", payload.get("rationale") or payload)
+        return payload
 
 
 class SessionTitler:

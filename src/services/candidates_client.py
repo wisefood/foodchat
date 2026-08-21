@@ -530,6 +530,7 @@ class RecipeCandidatesClient:
                 nutri_score_label=r.get("nutri_score_label"),
                 tags=[str(t).lower() for t in (r.get("tags") or [])],
                 dish_types=[str(d).lower() for d in (r.get("dish_types") or [])],
+                diet_tags=[str(d).lower() for d in (r.get("diet_tags") or [])],
                 allergens=[str(a).lower() for a in (r.get("allergens") or [])],
             )
         return enriched

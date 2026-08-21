@@ -21,13 +21,19 @@ import logging
 import re
 from typing import Optional, Tuple
 
-from agents import GuidelineAdherenceGrader, MealDiversityGrader, ResponseWriter, SimpleChatBot
+from agents import (
+    GuidelineAdherenceGrader,
+    MealDiversityGrader,
+    PlanStrategist,
+    ResponseWriter,
+    SimpleChatBot,
+)
 from models.plan_spec import PlanSpec
 from models.recipe import CandidateRecipe, ScoredPlan
 from models.session import MealPlan
 from models.planning_state import PlanningStateDelta
 from services.adapted_recipes import overlay_plan
-from services import pantry_service
+from services import pantry_service, plan_verifier
 from services import diet_intent, intent_facets
 from services.planning_delta import extract_state_delta
 from services.candidates_client import CANDIDATES
@@ -147,6 +153,10 @@ class ChatService:
         # Used to re-resolve anchors carried from earlier turns.
         self.client = CANDIDATES
         self.response_writer = ResponseWriter()
+        # Decides HOW to search; the pipeline still executes and the
+        # verifier still checks. Constructed here rather than per turn
+        # so the pooled Groq client is shared like every other agent's.
+        self.strategist = PlanStrategist()
         self.diversity_grader = MealDiversityGrader()
         self.guideline_grader = GuidelineAdherenceGrader()
         logger.info("ChatService initialized.")
@@ -580,6 +590,12 @@ class ChatService:
         )
         # Before plan_structured pops "_pantry" — coverage badges need it.
         pantry = pantry_service.normalize_items(profile.get("_pantry") or [])
+
+        # The brief: what this plan is trying to do, written down before a
+        # single recipe is fetched. Deterministic on its own; the strategist
+        # only ever adds to it, and only values the corpus actually carries.
+        brief = self._brief_for(final_query, profile, spec)
+
         meal_plan = self.pipeline.plan_structured(
             profile, spec, exclude_recipe_ids=excluded, pinned=pinned,
             # The member's words. This path had no query parameter at all, so
@@ -624,6 +640,19 @@ class ChatService:
         # are appended to the ones it built rather than overwritten.
         pantry_facts = pantry_service.annotate_daily_plan(meal_plan, pantry)
         pantry_note = pantry_service.describe_coverage(pantry_facts)
+
+        # Now measure. Everything above reports what was REQUESTED; this reads
+        # the plates that came back and says what is actually true of them.
+        report = plan_verifier.verify(meal_plan, brief.to_requested(), enrichment)
+        logger.info("[%s] Verified: %s", session_id, plan_verifier.describe(report))
+        if report.checks:
+            # Measured rows sit alongside the declarative ledger rather than
+            # replacing it: the declarative rows carry `source` (which diner a
+            # constraint is for), which a measurement cannot know, and the
+            # measured rows carry evidence, which a declaration cannot have.
+            meal_plan.constraints_applied = (
+                list(meal_plan.constraints_applied or []) + report.as_ledger_rows()
+            )
 
         if is_refinement:
             # `is_refinement` was accepted and never used: every refinement
@@ -672,6 +701,15 @@ class ChatService:
         # facts so the reply is at least written in light of it.
         if signals.history_text:
             facts["feedback_history"] = signals.history_text
+        # What the measurement found, as facts the writer may phrase. A failed
+        # check the reply does not mention is a failure the member discovers by
+        # eating it.
+        if report.failed:
+            facts["verified_problems"] = [
+                {"constraint": c.name, "detail": c.detail} for c in report.failed
+            ]
+        if brief.rationale:
+            facts["strategy"] = brief.rationale
         if pantry_facts:
             facts["pantry"] = {
                 "used": pantry_facts["used"],
@@ -689,6 +727,37 @@ class ChatService:
         )
         self.session_service.add_message(session_id, "assistant", formatted)
         return formatted, False, meal_plan
+
+    def _brief_for(self, query: str, profile: dict, spec=None):
+        """The brief for this request: deterministic, then adjusted by reasoning.
+
+        The order is the safety property. `PlanBrief.build` produces a working
+        plan from the profile and the standing state with no model involved;
+        the strategist can only add facets and claim tags the corpus carries,
+        cannot touch allergens or diet, and a failure leaves the deterministic
+        brief untouched. The plan that used to be built is the floor.
+        """
+        from models.plan_brief import PlanBrief
+
+        state = None
+        try:
+            state = self.session_service.get_planning_state(
+                profile.get("_session_id") or ""
+            )
+        except Exception:  # noqa: BLE001 - the profile already carries the stash
+            state = None
+
+        brief = PlanBrief.build(profile, state, spec)
+        try:
+            vocab = CANDIDATES.vocabularies() or {}
+            if vocab:
+                brief = brief.with_strategy(
+                    self.strategist.propose(query, brief, vocab), vocab
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Strategy step skipped: %s", exc)
+        logger.info("Brief: %s", brief.describe())
+        return brief
 
     def _compute_metrics(self, session_id: str, plan: ScoredPlan) -> dict:
         """Compute the four plan-quality metrics surfaced in the API response."""

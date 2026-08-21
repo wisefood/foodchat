@@ -62,6 +62,10 @@ class RecipeEnrichment:
     nutri_score_label: Optional[str] = None
     tags: list[str] = None
     dish_types: list[str] = None
+    # The recipe's OWN dietary tags, straight from the corpus. The difference
+    # from `profile["diet"]` matters: that is what was asked for, this is what
+    # arrived, and only the second one can verify the first.
+    diet_tags: list[str] = None
     allergens: list[str] = None
 
     def nutrition_dict(self) -> Optional[dict]:

@@ -718,6 +718,40 @@ User message: {message}
 """
 
 # Edit-command extraction (M4b) — targeted slot edits with a directive.
+PLAN_STRATEGIST_SYSTEM_INSTRUCTIONS = """
+You decide HOW to search for a meal plan, before any recipe is fetched. You do not choose recipes and you do not write prose to the user.
+
+You are given: the member's request, what is already standing for this session, and the CLOSED VOCABULARIES the recipe corpus actually carries.
+
+Your job is to turn what the member wants into search terms that exist.
+
+RULES:
+1. Every cuisine, mood, flavour and food group MUST be copied from the vocabulary lists you are given. The search ANDs these values and never relaxes an unknown one — so an invented value does not narrow the search, it EMPTIES it, and the member is told no meals exist. If nothing in the vocabulary fits, return an empty list. An empty list is a correct answer.
+2. Claim tags must come from this list only: high_protein, low_fat, high_fibre, low_calorie, healthy_and_nutritious, 30_minutes_or_less, 5_ingredients_or_less.
+3. Prefer FEW strong terms over many weak ones. Three ANDed facets over a 4,500-recipe corpus is often zero results. Two is usually plenty.
+4. Do NOT restate the member's diet or allergies. Those are handled separately and are not yours to set, soften or drop.
+5. `relaxation_order` may only REORDER these: tags, moods, flavor_profiles, food_groups, cuisines, max_minutes. Put the thing that matters LEAST to this member first. Anything else you write is ignored.
+6. `kcal_target` only when the request implies a daily calorie budget and the member has not set one. Between 1200 and 4000.
+7. `rationale`: one sentence, concrete, about THIS request. "Read 'something light after the gym' as high protein with a light mood" — not "I will find suitable recipes."
+
+Think about what the words MEAN in food terms before mapping them:
+- "energy boost" is sustaining food — protein and fibre — not a mood that exists.
+- "comfort food" is usually a mood, not a cuisine.
+- "something light" is a mood AND often a calorie claim.
+- A named country is a cuisine; a named dish is not a facet at all.
+
+OUTPUT (MANDATORY): a single JSON object with exactly these keys: cuisines, moods, flavor_profiles, food_groups, claim_tags, kcal_target, relaxation_order, rationale.
+"""
+
+PLAN_STRATEGIST_USER_INSTRUCTIONS = """
+Member request: {message}
+
+Already standing for this session: {standing}
+
+Vocabularies the corpus carries (copy from these, exactly):
+{vocabularies}
+"""
+
 EDIT_COMMAND_EXTRACTOR_SYSTEM_INSTRUCTIONS = """
 You parse a user's request to change ONE slot of an existing meal plan into a structured edit command.
 
@@ -989,6 +1023,10 @@ PANTRY_EXTRACTOR_SYSTEM = _reg("pantry_extractor_system", PANTRY_EXTRACTOR_SYSTE
 PANTRY_EXTRACTOR_USER = _reg("pantry_extractor_user", PANTRY_EXTRACTOR_USER_INSTRUCTIONS)
 PREFERENCE_EXTRACTOR_SYSTEM = _reg("preference_extractor_system", PREFERENCE_EXTRACTOR_SYSTEM_INSTRUCTIONS)
 PREFERENCE_EXTRACTOR_USER = _reg("preference_extractor_user", PREFERENCE_EXTRACTOR_USER_INSTRUCTIONS)
+# New names, not edits to existing ones: `sync_prompts` creates only missing
+# prompts and never overwrites, so a changed prompt body would ship dead.
+PLAN_STRATEGIST_SYSTEM = _reg("plan_strategist_system", PLAN_STRATEGIST_SYSTEM_INSTRUCTIONS)
+PLAN_STRATEGIST_USER = _reg("plan_strategist_user", PLAN_STRATEGIST_USER_INSTRUCTIONS)
 EDIT_COMMAND_EXTRACTOR_SYSTEM = _reg("edit_command_extractor_system", EDIT_COMMAND_EXTRACTOR_SYSTEM_INSTRUCTIONS)
 EDIT_COMMAND_EXTRACTOR_USER = _reg("edit_command_extractor_user", EDIT_COMMAND_EXTRACTOR_USER_INSTRUCTIONS)
 RESPONSE_WRITER_SYSTEM = _reg("response_writer_system", RESPONSE_WRITER_SYSTEM_INSTRUCTIONS)
