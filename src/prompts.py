@@ -859,6 +859,40 @@ SESSION_TITLE_USER_INSTRUCTIONS = """Opening message:
 
 Name:"""
 
+PLAN_INTENT_EXTRACTOR_SYSTEM_INSTRUCTIONS = """You read one message and name the
+recipe qualities it asks for, using ONLY the vocabularies given to you.
+
+Return JSON with four lists: "cuisines", "moods", "flavor_profiles",
+"food_groups". Every value MUST be copied exactly from the matching vocabulary
+below. Anything you cannot match to a listed value is left out — a value that is
+not in the list is worse than nothing, because it becomes a hard filter that
+matches no recipe at all and the member is told no meals exist.
+
+VOCABULARIES
+cuisines: {cuisines}
+moods: {moods}
+flavor_profiles: {flavor_profiles}
+food_groups: {food_groups}
+
+Read for INTENT, not keywords. Map the member's own words onto the closest
+listed value:
+- "cosy", "comforting", "something warming" -> the mood that means that
+- "I want energy", "something sustaining" -> nothing here; energy is not a mood
+- "not too heavy", "something small" -> the mood meaning light
+- "more veg" -> the food group for vegetables
+- "Thai tonight" -> the cuisine
+
+Only take what the member ASKED FOR. A dish they mention as an example of what
+they do NOT want is not a request. A food named as an ingredient they have at
+home is not a food-group request.
+
+Empty lists when the message asks for none of this. Most messages do."""
+
+PLAN_INTENT_EXTRACTOR_USER_INSTRUCTIONS = """Message:
+\"\"\"{message}\"\"\"
+
+JSON:"""
+
 _NS = "foodchat/"
 
 # Populated as each _Prompt is constructed; consumed by sync_prompts + the
@@ -966,6 +1000,12 @@ RESPONSE_WRITER_USER = _reg("response_writer_user", RESPONSE_WRITER_USER_INSTRUC
 CHATBOT_SYSTEM = _reg("chatbot_system_v2", CHATBOT_SYSTEM_INSTRUCTIONS)
 SESSION_TITLE_SYSTEM = _reg("session_title_system", SESSION_TITLE_SYSTEM_INSTRUCTIONS)
 SESSION_TITLE_USER = _reg("session_title_user", SESSION_TITLE_USER_INSTRUCTIONS)
+PLAN_INTENT_EXTRACTOR_SYSTEM = _reg(
+    "plan_intent_extractor_system", PLAN_INTENT_EXTRACTOR_SYSTEM_INSTRUCTIONS
+)
+PLAN_INTENT_EXTRACTOR_USER = _reg(
+    "plan_intent_extractor_user", PLAN_INTENT_EXTRACTOR_USER_INSTRUCTIONS
+)
 
 
 def sync_prompts(*, client=None, registry=None) -> dict:

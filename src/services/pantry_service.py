@@ -184,6 +184,7 @@ def fetch_pantry_candidates(
     courgette got a 90-minute bake ranked first. The pantry is an input to
     search, never a way around what the member asked for.
     """
+    from services import intent_facets
     from services.candidates_client import (
         effective_diet,
         normalize_diet_tags,

@@ -17,6 +17,7 @@ neutral, never blocking the plan.
 import logging
 from typing import Any, Dict, List, Union
 
+from services import intent_facets
 from services.candidates_client import CANDIDATES, normalize_diet_tags
 
 # The failure path below logs; without this the except clause itself raised
@@ -181,7 +182,7 @@ def _fetch_candidate_pool(
             count_per_slot=limit_per_slot,
             allergens=allergens,
             diet=normalize_diet_tags(diet),
-            cuisines=cuisines,
+            **intent_facets.facet_kwargs(profile, cuisines),
             exclude_ingredients=profile.get("food_dislikes") or [],
             exclude_recipe_ids=exclude_recipe_ids,
             favorite_recipe_ids=profile.get("favorite_recipe_ids") or [],

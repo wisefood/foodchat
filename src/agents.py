@@ -61,6 +61,8 @@ from prompts import (
     CHATBOT_SYSTEM,
     SESSION_TITLE_SYSTEM,
     SESSION_TITLE_USER,
+    PLAN_INTENT_EXTRACTOR_SYSTEM,
+    PLAN_INTENT_EXTRACTOR_USER,
 )
 from schemas import (
     BatchScoringSchema,
@@ -73,6 +75,7 @@ from schemas import (
     PantryExtractionSchema,
     PreferenceExtractionSchema,
     EditCommandSchema,
+    PlanIntentSchema,
 )
 
 logger = logging.getLogger(__name__)
@@ -624,6 +627,75 @@ class PlanAnalyst:
             messages,
             config=build_trace_config(run_name="plan_analyst", tags=["plan_qa"]),
         ).content
+
+
+class PlanIntentExtractor:
+    """Names the recipe qualities a message asks for, as RecipeWrangler facets.
+
+    A separate agent from `DietaryIntentExtractor` rather than an extension of
+    it: that one's prompt is Langfuse-managed and a deploy never overwrites an
+    existing copy, so adding facets there would work locally and ship dead.
+
+    The live vocabulary is injected into the prompt at call time. It is not
+    decoration — RecipeWrangler ANDs facet values and an unlisted one matches no
+    recipe, so a hallucinated "energising" mood would empty every slot and the
+    member would be told no meals exist. Post-validated against the same
+    vocabulary anyway, because a prompt instruction is not a guarantee.
+    """
+
+    def __init__(self, model: str = None, temperature: float = None):
+        self.llm = GROQ_CHAT.get_client(
+            model=model or FAST_MODEL,
+            temperature=(
+                temperature if temperature is not None else DEFAULT_TEMPERATURE
+            ),
+            format=PlanIntentSchema.model_json_schema(),
+        )
+
+    def extract(self, message: str, vocabularies: dict) -> dict:
+        """{"cuisines": [...], "moods": [...], ...} — only listed values."""
+        families = ("cuisines", "moods", "flavor_profiles", "food_groups")
+        allowed = {
+            family: [str(v).lower() for v in (vocabularies.get(family) or [])]
+            for family in families
+        }
+        if not any(allowed.values()):
+            # No vocabulary means no safe value to send. Sending nothing is the
+            # behaviour that existed before facets were wired at all.
+            return {family: [] for family in families}
+
+        empty = {family: [] for family in families}
+        try:
+            system_text = PLAN_INTENT_EXTRACTOR_SYSTEM.compile(
+                **{f: ", ".join(allowed[f]) or "(none)" for f in families}
+            )
+            user_text = PLAN_INTENT_EXTRACTOR_USER.compile(message=message)
+            if "json" not in f"{system_text} {user_text}".lower():
+                system_text += "\nReturn the result as a JSON object."
+            result = self.llm.invoke([
+                SystemMessage(content=system_text),
+                HumanMessage(content=user_text),
+            ], config=build_trace_config(run_name="plan_intent", tags=["planning"]))
+            payload = json.loads(result.content)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("PlanIntentExtractor failed: %s", exc)
+            return empty
+
+        out = {}
+        for family in families:
+            values = payload.get(family) or []
+            permitted = set(allowed[family])
+            kept = []
+            for value in values:
+                slug = str(value).strip().lower().replace("-", "_").replace(" ", "_")
+                if slug in permitted and slug not in kept:
+                    kept.append(slug)
+                elif slug:
+                    logger.info(
+                        "Dropping %s=%r — not in the live vocabulary", family, value
+                    )
+            out[family] = kept
+        return out
 
 
 class SessionTitler:

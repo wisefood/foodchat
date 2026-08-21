@@ -23,7 +23,7 @@ from agents import DocumentGrader
 from models.plan_spec import PlanSpec
 from models.recipe import CandidateRecipe, ScoredPlan
 from models.session import MealPlan
-from services import pantry_service, plan_parameters
+from services import intent_facets, pantry_service, plan_parameters
 from services.candidates_client import CANDIDATES, effective_diet, screening_allergens
 
 logger = logging.getLogger(__name__)
@@ -246,7 +246,7 @@ class PlanningPipeline:
                 # never relaxes them, so one unknown value ("balanced",
                 # "omnivore") empties every slot. See candidates_client.
                 diet=effective_diet(profile),
-                cuisines=cuisines,
+                **intent_facets.facet_kwargs(profile, cuisines),
                 exclude_ingredients=profile.get("food_dislikes") or [],
                 exclude_recipe_ids=list(exclude_recipe_ids or []),
                 favorite_recipe_ids=boost_ids,
@@ -434,7 +434,7 @@ def _fetch_candidate_pool(
             count_per_slot=limit_per_slot,
             allergens=screening_allergens(profile),
             diet=effective_diet(profile),
-            cuisines=cuisines,
+            **intent_facets.facet_kwargs(profile, cuisines),
             exclude_ingredients=profile.get("food_dislikes") or [],
             exclude_recipe_ids=exclude_recipe_ids,
             favorite_recipe_ids=(

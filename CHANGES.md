@@ -2,6 +2,59 @@
 
 ---
 
+# "Energy boost meal plan for today" now matches something (Phase 1a)
+
+> **Date:** 2026-08-21
+> **Branch:** fix/stated-diet-and-honest-constraints
+> No RecipeWrangler change — these are parameters it has always accepted.
+> Wire-compatible: the four facet tuples are additive on the planning-state
+> blob and absent on anything stored earlier.
+
+That request matched nothing, for three reasons stacked on top of each other:
+
+1. `plan_client.plan_meals` **declares** `moods`, `flavor_profiles` and
+   `food_groups`; RecipeWrangler accepts all three, describes them in its
+   manifest, and puts them **first in its relaxation ladder** so they degrade
+   gracefully. **No caller ever passed any of them.** `cuisines` was the only
+   facet ever sent, and only from the stored profile.
+2. There is **no cuisine extractor anywhere**. "Something Thai tonight" never
+   became a `cuisines` filter on any path.
+3. **"energy" is in no vocabulary at all** — not a mood, not a flavour, not a
+   food group. It is a `plan_parameters.goal` value that only ever became prose
+   for a grader that two of the three planning paths do not even run.
+
+So the words reached the grader as text over a pool that had never been shaped
+by them, and the plan came back indistinguishable from one with no request.
+
+| Piece | What it does |
+|---|---|
+| `CANDIDATES.split_preferences` | Generalises `split_cuisines` to all four families, keeping both properties that made it work: the vocabulary is fetched **live** from RW's manifest, and the sort happens at **read** time so existing profiles are fixed with no migration. A stored "comfort" now drives a mood instead of being searched for as an ingredient. |
+| `PlanningState.cuisines/moods/flavor_profiles/food_groups` | Standing session state, mirroring `diet_tags`: additive, never cleared by silence, with `facets_remove` for an explicit take-back — which is also what the UI's removable chips will call. |
+| `PlanIntentExtractor` | A **new** agent under **new** prompt names, because `DietaryIntentExtractor`'s prompt is Langfuse-managed and extending it would ship dead. The live vocabulary is injected into the prompt *and* re-validated after the model answers. |
+| `intent_facets.facet_kwargs` | One `**` replaces one `cuisines=` at every fetch site, so no site had to learn about the other three families. |
+| `GOAL_FACETS` / `GOAL_CLAIM_TAGS` | Slider goals map onto vocabulary that exists. **`energy` → the `hearty` mood + the `high_protein` and `high_fibre` claim tags** — read as sustaining food rather than inventing an "energising" facet the corpus does not carry. The judgement is written down in the table instead of buried in a prompt. |
+
+**The rule this is all built around:** never send a value the corpus does not
+carry. RecipeWrangler ANDs facet values and does not relax an unlisted one to
+nothing — it matches no recipe. So a hallucinated mood does not soften the
+search, it empties it, and the member is told no meals exist. That is the same
+failure shape as the `low-carb` outage found yesterday, and the reason the
+vocabulary is checked twice.
+
+Facets now reach the request on the classic daily pool, the structured path, the
+weekly pool, the pantry fan-out and slot candidates — verified by capturing the
+actual `plan_meals` kwargs.
+
+`tests/test_intent_facets.py` is new (25 tests, LLM-free), verified regressive:
+stopping the facet merge fails 3. 589 passing.
+
+**Not yet wired**: the claim tags. `plan_meals` has no `tags` parameter, so
+`claim_tags_for()` returns the right answer and nothing can send it — that is
+the RecipeWrangler half of Phase 1, and it deploys first because the request
+model is `extra="forbid"`.
+
+---
+
 # Never claim a constraint we did not enforce (P0)
 
 > **Date:** 2026-08-21

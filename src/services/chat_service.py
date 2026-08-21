@@ -28,7 +28,7 @@ from models.session import MealPlan
 from models.planning_state import PlanningStateDelta
 from services.adapted_recipes import overlay_plan
 from services import pantry_service
-from services import diet_intent
+from services import diet_intent, intent_facets
 from services.planning_delta import extract_state_delta
 from services.candidates_client import CANDIDATES
 from services.clarification import ClarificationManager, ClarificationState
@@ -233,6 +233,11 @@ class ChatService:
         # Filterable diets become standing state that every fetch site unions
         # with the profile; nutrition claims ride `notes` to the grader.
         state = state.merge(diet_intent.extract_diet_delta(message))
+        # Recipe qualities asked for — "something comforting", "Thai tonight",
+        # "more veg". RAW message, same reasoning as diet and pantry. These are
+        # the facet families the client declared and never sent, so every such
+        # request used to reach the grader as prose over an unshaped pool.
+        state = state.merge(intent_facets.extract_facet_delta(message))
 
         if seeds:
             resolutions = self.seed_service.resolve_seeds(seeds, profile)
@@ -287,6 +292,11 @@ class ChatService:
             # unlike "_pantry" it is never popped — the base pool, the pantry
             # fan-out and a seed lookup all have to agree on the diet.
             profile["_diet_tags"] = list(state.diet_tags)
+        facets = state.facets()
+        if facets:
+            # Same convention, same reason: read at every fetch site, never
+            # popped, so the pools cannot disagree about what was asked for.
+            profile["_facets"] = facets
         self.session_service.set_planning_state(session_id, state)
         logger.info("[%s] Standing plan state: %s", session_id, state.describe())
 

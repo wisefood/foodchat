@@ -81,6 +81,33 @@ class PlanningState:
     # nudge (kind "diet"); until then it dies with the session.
     diet_tags: tuple[str, ...] = ()
 
+    # Facet preferences stated in chat — "something comforting", "light and
+    # fresh", "more vegetables", "Thai tonight". One tuple per RecipeWrangler
+    # facet family, mirroring `diet_tags`: standing for the session, additive,
+    # and never cleared by silence.
+    #
+    # These are the families FoodChat's own client declared and never passed,
+    # so every one of those requests reached the grader as prose over a pool
+    # that had never been shaped by it. Cuisine is here too because nothing
+    # extracted a cuisine from a message at all — the only `cuisines` filter
+    # ever sent came from the stored profile.
+    cuisines: tuple[str, ...] = ()
+    moods: tuple[str, ...] = ()
+    flavor_profiles: tuple[str, ...] = ()
+    food_groups: tuple[str, ...] = ()
+
+    #: The facet families carried above, in the order RecipeWrangler relaxes
+    #: them last-to-first. Iterating this beats four copies of everything.
+    FACET_FIELDS = ("cuisines", "moods", "flavor_profiles", "food_groups")
+
+    def facets(self) -> dict[str, list[str]]:
+        """The stated facets as a fetch-ready mapping (empty families omitted)."""
+        return {
+            family: list(getattr(self, family))
+            for family in self.FACET_FIELDS
+            if getattr(self, family)
+        }
+
     def merge(self, delta: "PlanningStateDelta") -> "PlanningState":
         """Apply one turn's changes. Absent fields leave state untouched."""
         if delta.reset:
@@ -127,9 +154,23 @@ class PlanningState:
             if value and value not in diet_tags:
                 diet_tags.append(value)
 
+        # Facets: additive per family, with an explicit removal list so a
+        # member can take one back ("actually not spicy") — and so the UI's
+        # removable chips have something to call.
+        removed = {str(r).strip().lower() for r in (delta.facets_remove or ()) if r}
+        facet_values: dict[str, tuple[str, ...]] = {}
+        for family in self.FACET_FIELDS:
+            current = [v for v in getattr(self, family) if v not in removed]
+            for value in getattr(delta, family, ()) or ():
+                slug = str(value).strip().lower()
+                if slug and slug not in current and slug not in removed:
+                    current.append(slug)
+            facet_values[family] = tuple(current)
+
         return replace(
             self,
             spec=spec,
+            **facet_values,
             anchors=anchors,
             excluded_recipe_ids=tuple(excluded),
             use_favorites=(
@@ -161,6 +202,8 @@ class PlanningState:
             parts.append("pantry to use up: " + ", ".join(self.pantry))
         if self.diet_tags:
             parts.append("diet stated in chat: " + ", ".join(self.diet_tags))
+        for family, values in self.facets().items():
+            parts.append(f"{family.replace('_', ' ')}: " + ", ".join(values))
         if self.notes:
             parts.append("; ".join(self.notes))
         return " · ".join(parts)
@@ -176,6 +219,7 @@ class PlanningState:
             "notes": list(self.notes),
             "pantry": list(self.pantry),
             "diet_tags": list(self.diet_tags),
+            **{family: list(getattr(self, family)) for family in self.FACET_FIELDS},
         }
 
     @classmethod
@@ -210,6 +254,12 @@ class PlanningState:
             diet_tags=tuple(
                 str(d).strip().lower() for d in (raw.get("diet_tags") or []) if d
             ),
+            **{
+                family: tuple(
+                    str(v).strip().lower() for v in (raw.get(family) or []) if v
+                )
+                for family in PlanningState.FACET_FIELDS
+            },
         )
 
 
@@ -235,6 +285,13 @@ class PlanningStateDelta:
     # my profile" (answered NO to the dietary-conflict question).
     diet_tags: tuple[str, ...] = ()
     diet_clear: bool = False
+    # Facets stated this turn, plus values to take back (the UI's removable
+    # chips, and "actually not spicy").
+    cuisines: tuple[str, ...] = ()
+    moods: tuple[str, ...] = ()
+    flavor_profiles: tuple[str, ...] = ()
+    food_groups: tuple[str, ...] = ()
+    facets_remove: tuple[str, ...] = ()
     reset: bool = False
 
     @property
@@ -249,5 +306,10 @@ class PlanningStateDelta:
             or self.pantry_remove
             or self.diet_tags
             or self.diet_clear
+            or self.cuisines
+            or self.moods
+            or self.flavor_profiles
+            or self.food_groups
+            or self.facets_remove
             or self.reset
         )

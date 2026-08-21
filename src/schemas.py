@@ -132,6 +132,19 @@ class PantryExtractionSchema(BaseModel):
     used_up: list[str] = []
 
 
+class PlanIntentSchema(BaseModel):
+    """Recipe qualities asked for in one message, as RecipeWrangler facets.
+
+    Every value must come from the live vocabulary handed to the extractor: an
+    unlisted value becomes a hard filter matching zero recipes, which the member
+    experiences as "no meals exist" rather than as a narrower search.
+    """
+    cuisines: list[str] = []
+    moods: list[str] = []
+    flavor_profiles: list[str] = []
+    food_groups: list[str] = []
+
+
 class MealPlateSchema(BaseModel):
     """The plates one meal is served as.
 

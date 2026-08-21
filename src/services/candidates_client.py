@@ -322,6 +322,52 @@ class RecipeCandidatesClient:
         RecipeCandidatesClient._vocab_cache = vocab
         return vocab
 
+    # The four facet families RecipeWrangler annotates and relaxes. Cuisine was
+    # the only one FoodChat ever sent, even though its own client declared all
+    # four and the persona promised them — so "something comforting", "light and
+    # fresh" and "more vegetables" reached the grader as prose over a pool that
+    # had never been shaped by them.
+    FACET_FAMILIES = ("cuisines", "moods", "flavor_profiles", "food_groups")
+
+    def split_preferences(self, words: list[str]) -> dict[str, list[str]]:
+        """Sort free-text preference words into the facet family each belongs to.
+
+        Returns ``{"cuisines": [...], "moods": [...], "flavor_profiles": [...],
+        "food_groups": [...], "ingredients": [...]}`` — everything unrecognised
+        falls through to ``ingredients``, which is the pre-existing behaviour.
+
+        Generalises `split_cuisines`, and keeps its two properties: the
+        vocabulary is fetched LIVE from RecipeWrangler's manifest, so a value
+        that only becomes a recognised mood next month starts working then; and
+        the sort happens at READ time, so existing profiles are fixed with no
+        migration.
+
+        A word in two families goes to the first that claims it, in
+        FACET_FAMILIES order — cuisine is the most specific signal and the one
+        RecipeWrangler relaxes last.
+        """
+        vocab = self.vocabularies()
+        known = {
+            family: {str(v).lower() for v in (vocab.get(family) or [])}
+            for family in self.FACET_FAMILIES
+        }
+        out: dict[str, list[str]] = {f: [] for f in self.FACET_FAMILIES}
+        out["ingredients"] = []
+
+        for raw in words or []:
+            value = str(raw or "").strip().lower()
+            if not value:
+                continue
+            slug = value.replace("-", "_").replace(" ", "_")
+            for family in self.FACET_FAMILIES:
+                if slug in known[family]:
+                    if slug not in out[family]:
+                        out[family].append(slug)
+                    break
+            else:
+                out["ingredients"].append(raw)
+        return out
+
     def split_cuisines(self, likes: list[str]) -> tuple[list[str], list[str]]:
         """Separate cuisines from ingredients in a member's `food_likes`.
 
@@ -365,6 +411,7 @@ class RecipeCandidatesClient:
         the other meals, and asking for them would spend the exclusion budget on
         recipes nobody will look at.
         """
+        from services import intent_facets
         from services.plan_client import PLANNER
 
         cuisines, _ = self.split_cuisines(profile.get("food_likes") or [])
@@ -376,7 +423,7 @@ class RecipeCandidatesClient:
                 allergens=screening_allergens(profile),
                 # Normalised: an unknown tag ANDs to zero candidates.
                 diet=effective_diet(profile),
-                cuisines=cuisines,
+                **intent_facets.facet_kwargs(profile, cuisines),
                 exclude_ingredients=profile.get("food_dislikes") or [],
                 exclude_recipe_ids=list(exclude_ids),
                 favorite_recipe_ids=profile.get("favorite_recipe_ids") or [],
