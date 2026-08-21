@@ -44,6 +44,10 @@ class Message:
     # FoodScholar provenance (dict form of models.attribution.Attribution) —
     # persisted so the citation box survives conversation reloads.
     attribution: Optional[dict] = None
+    # Everything else the turn produced: memory nudges, slot-edit proofs, the
+    # plan-parameter card. Persisted for the same reason `attribution` is —
+    # they were grafted onto the message client-side, so a reload erased them.
+    extras: Optional[dict] = None
 
 
 @dataclass

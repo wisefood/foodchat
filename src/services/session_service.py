@@ -45,6 +45,7 @@ from db import (
     db_save_meal_plan,
     db_get_session_meal_plans,
     db_get_meal_plan,
+    db_set_last_assistant_extras,
     db_update_meal_plan_payload,
 )
 from models.recipe import CandidateRecipe
@@ -320,6 +321,35 @@ class SessionService:
 
         return message
 
+    def attach_turn_extras(self, session_id: str, extras: Optional[dict]) -> bool:
+        """Persist what a turn produced besides its text, on its own message.
+
+        Best-effort by design: the turn has already happened and its plan is
+        already stored, so failing to record the nudge that went with it must
+        not turn a successful turn into an error. It costs the nudge on reload,
+        which is what happened on every turn before this existed.
+        """
+        if not extras:
+            return False
+        db = SessionLocal()
+        try:
+            ok = db_set_last_assistant_extras(db, session_id, json.dumps(extras))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[%s] Could not persist turn extras: %s", session_id, exc)
+            return False
+        finally:
+            db.close()
+
+        # Mirror onto the in-memory message so a caller reading the session
+        # without a round trip sees the same thing the database now holds.
+        session = self._sessions.get(session_id)
+        if session:
+            for message in reversed(session.conversation):
+                if message.role == "assistant":
+                    message.extras = extras
+                    break
+        return ok
+
     def get_messages_page(
         self,
         session_id: str,
@@ -340,6 +370,7 @@ class SessionService:
                 "intent": r.intent,
                 "plan_id": r.plan_id,
                 "attribution": json.loads(r.attribution) if getattr(r, "attribution", None) else None,
+                "extras": json.loads(r.extras) if getattr(r, "extras", None) else None,
                 "timestamp": r.timestamp,
             }
             for r in rows

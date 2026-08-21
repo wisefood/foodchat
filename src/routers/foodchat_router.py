@@ -669,6 +669,40 @@ def unified_chat(session_id: str, request: ChatRequest):
         logger.error("[%s] /chat 500: %s", session_id, e, exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
+    return _finalize_turn(session_id, turn)
+
+
+def _turn_extras(turn) -> dict:
+    """What this turn produced besides its text.
+
+    Exactly the three things the UI used to graft onto the last assistant
+    message client-side — and therefore lost on every reload: the memory nudge,
+    the slot-edit proof, and the plan-parameter card. Empty when the turn
+    produced none, so a plain answer stores nothing.
+    """
+    extras = {}
+    if turn.memory_suggestions:
+        extras["memory_suggestions"] = turn.memory_suggestions
+    if turn.changed_slots:
+        extras["changed_slots"] = turn.changed_slots
+    if turn.plan_parameters:
+        extras["plan_parameters"] = turn.plan_parameters
+    return extras
+
+
+def _finalize_turn(session_id: str, turn) -> ChatTurnResponse:
+    """Persist the turn's extras, then return it on the wire.
+
+    The single funnel for every turn-shaped endpoint — /chat, /compose,
+    /plan-parameters, /replan — because the alternative is four places that
+    each have to remember, and the one that forgets loses a memory nudge with
+    no error anywhere.
+
+    The write is best-effort inside `attach_turn_extras`: the turn has already
+    happened and its plan is already stored, so failing to record the nudge
+    must not turn a successful turn into a 500.
+    """
+    services.session_service.attach_turn_extras(session_id, _turn_extras(turn))
     return _chat_turn_response(turn)
 
 
@@ -760,7 +794,7 @@ def compose_plan(session_id: str, request: ComposeRequest):
         logger.error("[%s] /compose 500: %s", session_id, e, exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
-    return _chat_turn_response(turn)
+    return _finalize_turn(session_id, turn)
 
 
 @router.post("/sessions/{session_id}/plan-parameters", response_model=ChatTurnResponse)
@@ -796,7 +830,7 @@ def apply_plan_parameters(session_id: str, request: PlanParametersRequest):
         logger.error("[%s] /plan-parameters 500: %s", session_id, e, exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
-    return _chat_turn_response(turn)
+    return _finalize_turn(session_id, turn)
 
 
 @router.get("/sessions/{session_id}/conversation", response_model=ConversationPage)
@@ -831,6 +865,10 @@ def get_conversation(
                 "intent": m["intent"],
                 "plan_id": m["plan_id"],
                 "attribution": m.get("attribution"),
+                # The nudge, the edit proof and the settings card that went with
+                # this message. Client-side grafting meant a reload showed the
+                # plan with none of the explanation that came with it.
+                "extras": m.get("extras"),
                 "timestamp": m["timestamp"].isoformat(),
             }
             for m in page
@@ -1237,7 +1275,7 @@ def replan(session_id: str, request: RegenerateRequest):
         logger.error("[%s] /replan 500: %s", session_id, e, exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
-    return _chat_turn_response(turn)
+    return _finalize_turn(session_id, turn)
 
 
 @router.get("/vocabularies")

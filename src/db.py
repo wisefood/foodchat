@@ -100,6 +100,11 @@ class MessageRow(Base):
     plan_id = Column(String, nullable=True)
     timestamp = Column(DateTime(timezone=True), default=utcnow)
     attribution = Column(Text, nullable=True)  # JSON Attribution (FoodScholar provenance) or NULL
+    # What the turn produced besides its text: memory nudges, slot-edit proofs,
+    # the plan-parameter card. Same precedent as `attribution` — the UI used to
+    # graft these onto the last assistant message client-side, so a reload
+    # silently erased every one of them.
+    extras = Column(Text, nullable=True)       # JSON {memory_suggestions, changed_slots, plan_parameters}
 
 
 class MealPlanRow(Base):
@@ -160,8 +165,9 @@ def _migrate_existing_db() -> None:
 
         # messages table migrations
         existing_message_cols = {c["name"] for c in inspector.get_columns("messages")}
-        if "attribution" not in existing_message_cols:
-            conn.execute(sa.text("ALTER TABLE messages ADD COLUMN attribution TEXT"))
+        for col_name, col_type in [("attribution", "TEXT"), ("extras", "TEXT")]:
+            if col_name not in existing_message_cols:
+                conn.execute(sa.text(f"ALTER TABLE messages ADD COLUMN {col_name} {col_type}"))
 
         # sessions backward compat: drop active_context if it exists (no data needed)
         # — we leave it in place to avoid destructive migration; it's simply ignored
@@ -344,6 +350,7 @@ def db_add_message(
     intent: Optional[str] = None,
     plan_id: Optional[str] = None,
     attribution: Optional[str] = None,
+    extras: Optional[str] = None,
 ) -> MessageRow:
     row = MessageRow(
         session_id=session_id,
@@ -352,11 +359,36 @@ def db_add_message(
         intent=intent,
         plan_id=plan_id,
         attribution=attribution,
+        extras=extras,
     )
     db.add(row)
     db.commit()
     db.refresh(row)
     return row
+
+
+def db_set_last_assistant_extras(
+    db: DBSession, session_id: str, extras: Optional[str],
+) -> bool:
+    """Attach a turn's extras to the assistant message it belongs to.
+
+    Written after the fact rather than at insert: the extras are assembled by
+    the orchestrator from what the handlers produced, and by then the message
+    row already exists. The newest assistant row of the session IS that message
+    — handlers add exactly one per turn, and the turn has not returned yet, so
+    nothing can have been appended after it.
+    """
+    row = (
+        db.query(MessageRow)
+        .filter(MessageRow.session_id == session_id, MessageRow.role == "assistant")
+        .order_by(MessageRow.id.desc())
+        .first()
+    )
+    if row is None:
+        return False
+    row.extras = extras
+    db.commit()
+    return True
 
 
 def db_get_messages(
