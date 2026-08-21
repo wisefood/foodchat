@@ -416,6 +416,53 @@ class SessionService:
         self._persist_canvases(session_id, session)
         return meal_plan
 
+    def refine_prepared_meal_plan(
+        self, session_id: str, meal_plan: MealPlan
+    ) -> MealPlan:
+        """Store an already-assembled plan as the NEXT version of the canvas.
+
+        `refine_meal_plan` rebuilds from three courses, which flattens `days`
+        back into single-plate slots — the exact shape the structured path
+        exists to escape. So a refinement on that path had no lossless option
+        and used `add_prepared_meal_plan` instead, which starts a fresh canvas:
+        every "make it lighter" on a multi-day plan silently became version 1
+        of a new lineage, and the history the member could scroll back through
+        was gone.
+        """
+        session = self.get_session(session_id)
+        if not session:
+            raise ValueError(f"Session {session_id} not found")
+
+        canvas = session.daily_canvas
+        current = session.get_current_daily_plan()
+        if canvas is None or current is None:
+            # Nothing to refine from — this is a first plan by any other name.
+            return self.add_prepared_meal_plan(session_id, meal_plan)
+
+        meal_plan.version = current.version + 1
+        meal_plan.parent_id = current.id
+        session.meal_plans.append(meal_plan)
+
+        db = SessionLocal()
+        try:
+            db_save_meal_plan(
+                db, meal_plan.id, session_id, "daily",
+                _serialize_meal_plan(meal_plan),
+                version=meal_plan.version, parent_id=meal_plan.parent_id,
+            )
+        finally:
+            db.close()
+
+        # Same canvas, new head: the root is preserved so version history
+        # stays walkable.
+        session.daily_canvas = PlanCanvas(
+            plan_type="daily",
+            current_id=meal_plan.id,
+            root_id=canvas.root_id,
+        )
+        self._persist_canvases(session_id, session)
+        return meal_plan
+
     def refine_meal_plan(
         self,
         session_id: str,

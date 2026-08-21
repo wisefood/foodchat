@@ -192,8 +192,17 @@ class PlanningPipeline:
         spec: "PlanSpec",
         exclude_recipe_ids: list[str] | None = None,
         pinned: dict | None = None,
+        query: str = "",
     ) -> "MealPlan | None":
         """Generate a plan of any shape — N days, N meals, multi-plate meals.
+
+        ``query`` is the member's request. This method had no such parameter at
+        all: the shape was honoured and the words were not, so "three days of
+        Italian dinners with a salad on the side" produced a correctly-shaped
+        plan built from profile fields only — and the reply was then phrased
+        around a request that had reached nothing. Facets and claim tags are
+        extracted from it upstream; it is carried here so the pool can be
+        ranked against what was actually asked for.
 
         This is Phase 2 of DYNAMIC_MEALS_PLAN.md. The core model landed in
         Phase 1; what blocked generation was the plan's own open question —
@@ -234,9 +243,17 @@ class PlanningPipeline:
         # float — so pantry-matching recipe ids ride that signal. Hard
         # filters still decide eligibility; this reorders, never widens.
         pantry = pantry_service.normalize_items(profile.pop("_pantry", None) or [])
-        boost_ids = (
-            pantry_service.pantry_boost_ids(profile, pantry) if pantry else []
-        )
+        # The member's OWN favourites, plus any pantry-matching ids. This path
+        # sent only the pantry boost, so a member who had said yes to the
+        # favourites offer had their favourites ignored on every plan whose
+        # shape was not the default three meals — and with no pantry the field
+        # went out empty.
+        boost_ids = list(profile.get("favorite_recipe_ids") or []) \
+            if profile.get("use_favorites") is not False else []
+        if pantry:
+            for recipe_id in pantry_service.pantry_boost_ids(profile, pantry):
+                if recipe_id not in boost_ids:
+                    boost_ids.append(recipe_id)
 
         try:
             envelope = PLANNER.plan_meals(

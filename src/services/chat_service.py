@@ -582,6 +582,10 @@ class ChatService:
         pantry = pantry_service.normalize_items(profile.get("_pantry") or [])
         meal_plan = self.pipeline.plan_structured(
             profile, spec, exclude_recipe_ids=excluded, pinned=pinned,
+            # The member's words. This path had no query parameter at all, so
+            # the shape was honoured and the request was not — and the reply
+            # was then phrased around something that reached nothing.
+            query=final_query,
         )
         if meal_plan is None:
             logger.warning("[%s] Structured plan came back empty — apology.", session_id)
@@ -589,15 +593,58 @@ class ChatService:
             self.session_service.add_message(session_id, "assistant", apology)
             return apology, False, None
 
-        # Pantry coverage badges + ledger row, before the plan is stored.
+        # Everything below ran on the classic path and not on this one, so a
+        # multi-plate or multi-day plan arrived with no nutrition on any plate,
+        # no reason chips, an empty constraints ledger, no personalization
+        # summary, and the member's own adapted recipes ignored.
+        all_plates = [
+            plate
+            for day in meal_plan.day_plans
+            for meal in day.meals
+            for plate in meal.plates
+            if getattr(plate, "recipe_id", "")
+        ]
+        pinned_ids = {r.recipe_id for r in pinned.values()}
+        enrichment = CANDIDATES.fetch_details([p.recipe_id for p in all_plates])
+        apply_transparency(
+            meal_plan, profile, pinned_ids, enrichment,
+            downvoted_count=len(signals.downvoted_recipe_ids or []),
+            feedback_lines=(
+                len(signals.history_text.splitlines()) if signals.history_text else 0
+            ),
+        )
+        adapted_count = overlay_plan(meal_plan, profile)
+        if adapted_count:
+            logger.info(
+                "[%s] %d plate(s) use the member's adapted version.",
+                session_id, adapted_count,
+            )
+
+        # Pantry coverage badges + ledger row, AFTER transparency so the chips
+        # are appended to the ones it built rather than overwritten.
         pantry_facts = pantry_service.annotate_daily_plan(meal_plan, pantry)
         pantry_note = pantry_service.describe_coverage(pantry_facts)
 
-        meal_plan = self.session_service.add_prepared_meal_plan(session_id, meal_plan)
-        logger.info(
-            "[%s] Structured plan %s stored (%s).",
-            session_id, meal_plan.id, spec.describe(),
-        )
+        if is_refinement:
+            # `is_refinement` was accepted and never used: every refinement
+            # called add_prepared_meal_plan, which starts a fresh canvas, so
+            # each "make it lighter" became version 1 of a new lineage and the
+            # member's history was silently discarded.
+            meal_plan = self.session_service.refine_prepared_meal_plan(
+                session_id, meal_plan
+            )
+            logger.info(
+                "[%s] Refined structured plan → %s (v%d, parent=%s).",
+                session_id, meal_plan.id, meal_plan.version, meal_plan.parent_id,
+            )
+        else:
+            meal_plan = self.session_service.add_prepared_meal_plan(
+                session_id, meal_plan
+            )
+            logger.info(
+                "[%s] Structured plan %s stored (%s).",
+                session_id, meal_plan.id, spec.describe(),
+            )
 
         concerns = spec.concerns()
         facts = {
@@ -614,6 +661,17 @@ class ChatService:
             "concerns": concerns,
             "notes": meal_plan.reasoning[:300],
         }
+        # The ledger this path now builds, split by status like the classic
+        # path — so a relaxed constraint cannot be announced as honoured, and
+        # the reply can say plainly what could not be met.
+        honored, not_honored = split_ledger(meal_plan.constraints_applied)
+        facts["constraints_honored"] = honored
+        facts["constraints_not_honored"] = not_honored
+        # And the rating history, which this path dropped: the classic path
+        # feeds it to the grader, and with no grader here it belongs in the
+        # facts so the reply is at least written in light of it.
+        if signals.history_text:
+            facts["feedback_history"] = signals.history_text
         if pantry_facts:
             facts["pantry"] = {
                 "used": pantry_facts["used"],

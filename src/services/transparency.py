@@ -12,8 +12,6 @@ Reason kinds (shared contract with the UI):
     pinned | favorite | memory | profile | feedback | diner | guideline
 """
 
-from models.session import MealCourse
-
 
 def match_reasons(
     course_recipe_id: str,
@@ -253,14 +251,26 @@ def apply_transparency(
     downvoted_count: int = 0,
     feedback_lines: int = 0,
 ) -> None:
-    """Attach enrichment + transparency to a freshly built MealPlan in place."""
-    for course in (meal_plan.breakfast, meal_plan.lunch, meal_plan.dinner):
-        rich = enrichment.get(course.recipe_id)
-        if rich:
-            course.nutrition = rich.nutrition_dict()
-            course.image_url = rich.image_url
-        course.match_reasons = match_reasons(
-            course.recipe_id, course.ingredients, profile, pinned_recipe_ids,
-        )
+    """Attach enrichment + transparency to a freshly built MealPlan in place.
+
+    Iterates `day_plans`, the uniform days→meals→plates view, rather than the
+    three legacy scalar accessors. Those only ever reach day 1's main plates —
+    a compatibility projection — so on a multi-plate or multi-day plan every
+    side, dessert and every day after the first got no nutrition, no image and
+    no reason chip. The same iteration `pantry_service.annotate_daily_plan`
+    already uses, and it reads a legacy plan identically.
+    """
+    for day in meal_plan.day_plans:
+        for meal in day.meals:
+            for plate in meal.plates:
+                if not getattr(plate, "recipe_id", ""):
+                    continue  # `from_days` inserts blanks for absent legacy slots
+                rich = enrichment.get(plate.recipe_id)
+                if rich:
+                    plate.nutrition = rich.nutrition_dict()
+                    plate.image_url = rich.image_url
+                plate.match_reasons = match_reasons(
+                    plate.recipe_id, plate.ingredients, profile, pinned_recipe_ids,
+                )
     meal_plan.constraints_applied = constraints_ledger(profile, downvoted_count)
     meal_plan.personalization_summary = personalization_summary(profile, feedback_lines)
