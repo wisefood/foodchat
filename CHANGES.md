@@ -2,6 +2,34 @@
 
 ---
 
+# Sessions name themselves
+
+> **Date:** 2026-08-21
+> **Branch:** main
+> Pairs with the gateway proxy (wisefood-api `feat/foodchat-plan-library-proxy`)
+> that makes rename reachable from the UI. Wire-compatible: `title` was already
+> nullable in every response.
+
+Sessions were only ever named by an explicit rename, which almost nobody does —
+so the session picker showed a wall of timestamps, and a saved plan inherited
+no name at all (the save path borrows the session title). The router comment
+even claimed the client falls back to the first user message; it never did —
+it falls back to `created_at`.
+
+| Piece | Behaviour |
+|---|---|
+| `SessionTitler` (agents.py) | Names the conversation from its opening message. Fast tier, plain text (the whole answer IS the title — a schema would only add a wrapper), 3–6 words, `NONE` sentinel for unnameable openings. A rambling or over-long answer is rejected rather than truncated into a half-name. |
+| Prompts | `session_title_system` / `session_title_user` — NEW managed-prompt names, per the standing rule: deploys never overwrite an existing Langfuse copy, so extending an existing prompt ships dead to production. |
+| Wiring (orchestrator `process()`) | Fires once, AFTER the turn completes, only when the session has no title and no prior user message — so it can never delay or break an answer, a member rename always wins, and it never re-fires. Failure is a log line, never a 500. |
+
+The first-turn signal is read BEFORE routing: handlers append the message, after
+which "no user messages yet" is no longer true.
+
+457 passing (LLM-free: the titler is constructed against the fake key like
+every agent; `_clean` is covered by direct calls).
+
+---
+
 # Pantry review follow-ups
 
 > **Date:** 2026-08-20

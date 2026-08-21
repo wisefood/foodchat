@@ -60,7 +60,11 @@ class SessionResponse(BaseModel):
     state: str
     message_count: int
     created_at: datetime
-    # None = never titled; the client falls back to the first user message.
+    # Auto-named from the opening message on the first turn, and renamable
+    # thereafter (PATCH /sessions/{id}) — a member name always wins. None
+    # only when titling declined or failed; the client then falls back to
+    # the created_at timestamp. It never fell back to the first user
+    # message, which is what this comment used to claim.
     title: Optional[str] = None
 
 

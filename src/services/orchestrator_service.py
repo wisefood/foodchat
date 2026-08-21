@@ -173,6 +173,13 @@ class OrchestratorService:
             if limit_turn is not None:
                 return limit_turn
 
+            # Read BEFORE routing: the handlers append this message, after
+            # which "no user messages yet" is no longer true and the
+            # opening-turn signal is gone.
+            opening_turn = session.title is None and not any(
+                m.role == "user" for m in session.conversation
+            )
+
             # Mid-clarification turns usually bypass classification — the user
             # is answering our question. Handlers may still bounce the turn
             # back to normal routing when the reply clearly isn't an answer.
@@ -181,7 +188,33 @@ class OrchestratorService:
             else:
                 turn = self._classify_and_route(session, session_id, message)
 
-            return self._attach_memory_suggestions(session, turn, message)
+            result = self._attach_memory_suggestions(session, turn, message)
+            if opening_turn:
+                self._autotitle_session(session_id, member_id, message)
+            return result
+
+    def _autotitle_session(self, session_id: str, member_id: str, message: str) -> None:
+        """Name a session from its opening message. Best-effort, never fatal.
+
+        Sessions were only ever named by an explicit rename, which almost nobody
+        does — so the picker showed a wall of timestamps, and a saved plan
+        inherited no name at all, because the save path borrows the session
+        title. Same idea as foodscholar's SESSION_TITLE_MODEL, on the fast tier.
+
+        Runs AFTER the turn so a title can never delay or break the answer, and
+        only when the session has no title — a member rename always wins, and
+        this never fires again once one exists.
+        """
+        try:
+            from agents import SessionTitler
+
+            title = SessionTitler().title(message)
+            if not title:
+                return
+            self.session_service.rename_session(session_id, member_id, title)
+            logger.info("[%s] Auto-titled session: %r", session_id, title)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[%s] Auto-title failed: %s", session_id, exc)
 
     # Explicit FoodScholar consults bypass classification entirely: "can you
     # check with food scholar?" is a request to ask the expert, and the

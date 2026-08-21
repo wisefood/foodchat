@@ -59,6 +59,8 @@ from prompts import (
     RESPONSE_WRITER_SYSTEM,
     RESPONSE_WRITER_USER,
     CHATBOT_SYSTEM,
+    SESSION_TITLE_SYSTEM,
+    SESSION_TITLE_USER,
 )
 from schemas import (
     BatchScoringSchema,
@@ -622,6 +624,62 @@ class PlanAnalyst:
             messages,
             config=build_trace_config(run_name="plan_analyst", tags=["plan_qa"]),
         ).content
+
+
+class SessionTitler:
+    """Names a planning conversation from its opening message.
+
+    Sessions were only ever named by an explicit rename, which almost nobody
+    does — so the picker showed a wall of timestamps, and a saved plan inherited
+    `undefined` as its name because the save path borrows the session title.
+
+    Plain text, not JSON: the whole answer IS the title, and a schema would only
+    add a wrapper to unwrap. Runs on the fast tier — naming a conversation is
+    not a reasoning task, and it happens once per session.
+    """
+
+    # Longer than any name this prompt should produce; the column allows 120.
+    _MAX_LEN = 60
+
+    def __init__(self, model: str = None, temperature: float = None):
+        self.llm = GROQ_CHAT.get_client(
+            model=model or FAST_MODEL,
+            temperature=(
+                temperature if temperature is not None else DEFAULT_TEMPERATURE
+            ),
+        )
+
+    @staticmethod
+    def _clean(raw: str) -> Optional[str]:
+        """The title, or None when the model declined or rambled.
+
+        None is the safe direction: the caller leaves the session untitled and
+        the client falls back to its timestamp, which is worse than a good name
+        but better than a wrong one — and a member rename still wins either way.
+        """
+        text = (raw or "").strip()
+        # A reasoning model with reasoning hidden still occasionally prefixes a
+        # line; the title is the last non-empty line in that case.
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if not lines:
+            return None
+        title = lines[-1].strip().strip('"').strip("'").rstrip(".").strip()
+        if not title or title.upper() == "NONE":
+            return None
+        if len(title) > SessionTitler._MAX_LEN:
+            return None  # a rambling answer is not a name
+        return title
+
+    def title(self, message: str) -> Optional[str]:
+        try:
+            result = self.llm.invoke([
+                SystemMessage(content=SESSION_TITLE_SYSTEM.compile()),
+                HumanMessage(content=SESSION_TITLE_USER.compile(message=message)),
+            ], config=build_trace_config(run_name="session_title", tags=["session"]))
+            return self._clean(result.content)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("SessionTitler failed: %s", exc)
+            return None
 
 
 class OrchestratorAgent:

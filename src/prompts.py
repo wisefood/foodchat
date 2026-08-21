@@ -826,6 +826,37 @@ _prompt_logger = _logging.getLogger(__name__)
 
 # Namespace within the shared Langfuse project (FoodScholar reports to the same
 # instance). A slash renders as a folder in the Langfuse UI.
+SESSION_TITLE_SYSTEM_INSTRUCTIONS = """You name a meal-planning conversation from its opening message.
+
+Return ONLY the name. No quotes, no punctuation at the end, no preamble, no
+explanation. Three to six words. Title Case.
+
+The name has to be recognisable in a list of a dozen others weeks later, so it
+must say what this conversation was ABOUT — the food, the occasion, the
+constraint — never how it was phrased.
+
+Good:
+- Vegetarian Week Without Nuts
+- Quick Weeknight Dinners
+- High Protein Meal Plan
+- Birthday Dinner For Six
+- Using Up Leftover Rice
+
+Bad, and why:
+- "Meal Plan" — every conversation here is a meal plan
+- "User Wants Vegetarian Food" — describes the message, not the topic
+- "Help" or "Question" — says nothing
+- "I Need Something Vegetarian" — echoes the phrasing instead of naming it
+
+If the message is too vague to name (a greeting, a single word), return exactly:
+NONE
+"""
+
+SESSION_TITLE_USER_INSTRUCTIONS = """Opening message:
+\"\"\"{message}\"\"\"
+
+Name:"""
+
 _NS = "foodchat/"
 
 # Populated as each _Prompt is constructed; consumed by sync_prompts + the
@@ -927,6 +958,8 @@ EDIT_COMMAND_EXTRACTOR_USER = _reg("edit_command_extractor_user", EDIT_COMMAND_E
 RESPONSE_WRITER_SYSTEM = _reg("response_writer_system", RESPONSE_WRITER_SYSTEM_INSTRUCTIONS)
 RESPONSE_WRITER_USER = _reg("response_writer_user", RESPONSE_WRITER_USER_INSTRUCTIONS)
 CHATBOT_SYSTEM = _reg("chatbot_system", CHATBOT_SYSTEM_INSTRUCTIONS)
+SESSION_TITLE_SYSTEM = _reg("session_title_system", SESSION_TITLE_SYSTEM_INSTRUCTIONS)
+SESSION_TITLE_USER = _reg("session_title_user", SESSION_TITLE_USER_INSTRUCTIONS)
 
 
 def sync_prompts(*, client=None, registry=None) -> dict:
