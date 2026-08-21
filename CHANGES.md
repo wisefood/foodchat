@@ -2,6 +2,35 @@
 
 ---
 
+# A named dish obeys the same constraints as a plan (Phase 1d)
+
+> **Date:** 2026-08-21
+> **Branch:** fix/stated-diet-and-honest-constraints
+> Pairs with RecipeWrangler `fix(tools): find_recipes honours the favourites it
+> already accepted`. Independent of it — foodchat sending `favorite_recipe_ids`
+> to a RecipeWrangler that ignores them is harmless.
+
+`find_recipes` resolves "I want pancakes". It took the member's allergens and
+diet — added precisely so a seed the member cannot eat is never offered — but
+not the **Nutri-Score floor** or the **cooking-time slider**, both of which
+applied to every other fetch in the service. So a member with a 20-minute limit
+could have a 90-minute dish anchored into their plan, by a lookup that ignored
+the constraint the plan itself was built under. Now sent, along with the
+member's favourites and standing exclusions, at all three call sites: seed
+resolution, the edit path's named-dish lookup, and the pantry boost.
+
+**A test that read source instead of running it hid a NameError.** The first
+version asserted `min_nutri_score` appeared in `pantry_boost_ids`' source, and
+passed — while the function raised `NameError` on every call, because the local
+import block it needed was in a *different* function. `ruff` caught it (`F821
+Undefined name`), not the suite. The test now executes the path with a stubbed
+client and asserts the arguments that arrive; reverting the import makes it
+fail. A source assertion cannot see an undefined name.
+
+611 passing.
+
+---
+
 # The sliders and standing answers that did nothing (Phase 1c)
 
 > **Date:** 2026-08-21

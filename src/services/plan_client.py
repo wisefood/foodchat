@@ -252,6 +252,10 @@ class PlanClient:
         diet: Optional[list[str]] = None,
         exclude_ingredients: Optional[list[str]] = None,
         course_types: Optional[list[str]] = None,
+        exclude_recipe_ids: Optional[list[str]] = None,
+        favorite_recipe_ids: Optional[list[str]] = None,
+        max_minutes: Optional[int] = None,
+        min_nutri_score: Optional[str] = None,
     ) -> list[CandidateRecipe]:
         """Search the corpus by free text, honouring the member's constraints.
 
@@ -265,7 +269,9 @@ class PlanClient:
         More importantly it takes the member's allergens and diet. Resolving a
         named dish without them means offering someone a seed they cannot eat
         and discovering it one step later, which is how "I'd love that" becomes
-        an apology.
+        an apology. It also takes the Nutri-Score floor and the cooking-time
+        slider, which every other fetch applied and this one did not — so a
+        seed could be anchored that the planner would have refused.
 
         Returns `[]` on failure — a seed that cannot be resolved is simply not
         anchored, which the caller already handles.
@@ -282,7 +288,18 @@ class PlanClient:
             "diet": diet or [],
             "exclude_ingredients": exclude_ingredients or [],
             "course_types": course_types or [],
+            "exclude_recipe_ids": exclude_recipe_ids or [],
+            "favorite_recipe_ids": favorite_recipe_ids or [],
         }
+        # The member's numeric constraints, which this call used to skip. A
+        # named dish resolved without them can be anchored into a plan the
+        # planner itself would never have chosen it for — the Nutri-Score floor
+        # and the cooking-time slider applied to every other fetch and not to
+        # this one.
+        if max_minutes:
+            payload["max_minutes"] = int(max_minutes)
+        if min_nutri_score:
+            payload["min_nutri_score"] = str(min_nutri_score).upper()
         try:
             with httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS) as client:
                 response = client.post(

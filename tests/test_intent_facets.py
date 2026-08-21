@@ -450,3 +450,104 @@ class TestGoalAcceptedMidSessionTakesEffect:
         session = S()
         svc._apply_to_session_profile(session, "dietary_goal", "lose_weight")
         assert session.user_profile["min_nutri_score"] == "B"
+
+
+class TestNamedDishResolutionRespectsTheSameConstraints:
+    """`find_recipes` resolves "I want pancakes". It took allergens and diet but
+    NOT the Nutri-Score floor or the cooking-time slider, so a seed could be
+    anchored into a plan the planner itself would have refused to pick it for."""
+
+    def _capture(self):
+        import services.plan_client as pc
+
+        captured: dict = {}
+
+        class Resp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"results": []}
+
+        class Client:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def post(self, url, json=None, **k):
+                captured.clear()
+                captured.update(json or {})
+                return Resp()
+
+        pc.httpx.Client = Client
+        return pc, captured
+
+    def test_the_nutri_score_floor_is_sent(self):
+        pc, captured = self._capture()
+        pc.PLANNER.find_recipes("pancakes", min_nutri_score="B")
+        assert captured.get("min_nutri_score") == "B"
+
+    def test_the_cooking_time_slider_is_sent(self):
+        pc, captured = self._capture()
+        pc.PLANNER.find_recipes("pancakes", max_minutes=20)
+        assert captured.get("max_minutes") == 20
+
+    def test_favourites_and_exclusions_are_sent(self):
+        pc, captured = self._capture()
+        pc.PLANNER.find_recipes(
+            "pancakes", favorite_recipe_ids=["r1"], exclude_recipe_ids=["r2"]
+        )
+        assert captured.get("favorite_recipe_ids") == ["r1"]
+        assert captured.get("exclude_recipe_ids") == ["r2"]
+
+    def test_absent_constraints_are_omitted_not_nulled(self):
+        """A null max_minutes would be a 422 against the ge=1 bound."""
+        pc, captured = self._capture()
+        pc.PLANNER.find_recipes("pancakes")
+        assert "max_minutes" not in captured
+        assert "min_nutri_score" not in captured
+
+    def test_the_pantry_boost_actually_sends_them(self):
+        """EXECUTED, not text-matched. The first version of this test read the
+        source and passed while the function raised NameError on every call —
+        the local import block it needed was in a different function. A source
+        assertion cannot see an undefined name."""
+        import services.plan_client as pc
+        from services.candidates_client import CANDIDATES
+
+        CANDIDATES.__class__._vocab_cache = dict(VOCAB)
+        calls: list[dict] = []
+        original = pc.PLANNER.find_recipes
+        try:
+            pc.PLANNER.find_recipes = lambda *a, **k: calls.append(k) or []
+            from services.pantry_service import pantry_boost_ids
+
+            pantry_boost_ids({
+                "allergies": [], "diet": [],
+                "plan_parameters": {"cooking_time": 20},
+                "min_nutri_score": "B",
+                "favorite_recipe_ids": ["r1"],
+            }, ["zucchini"])
+        finally:
+            pc.PLANNER.find_recipes = original
+
+        assert calls, "find_recipes was never called"
+        assert calls[0]["max_minutes"] == 20
+        assert calls[0]["min_nutri_score"] == "B"
+        assert calls[0]["favorite_recipe_ids"] == ["r1"]
+
+    def test_the_seed_resolver_sends_them(self):
+        import inspect
+
+        from services import seed_service
+
+        src = inspect.getsource(seed_service)
+        call = src[src.find("PLANNER.find_recipes("):]
+        call = call[:call.find(")\n")]
+        assert "min_nutri_score" in call
+        assert "max_minutes" in call

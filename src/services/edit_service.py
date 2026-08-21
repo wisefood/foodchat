@@ -30,6 +30,7 @@ from typing import Optional
 
 from agents import EditCommandExtractor
 from models.recipe import CandidateRecipe, RecipeEnrichment
+from services import plan_parameters
 from services.candidates_client import CANDIDATES, effective_diet, screening_allergens
 from .session_service import SessionService
 from .weekly_planner.day_summary import build_day_summaries
@@ -422,6 +423,11 @@ class EditService:
                 allergens=screening_allergens(profile),
                 diet=effective_diet(profile),
                 exclude_ingredients=profile.get("food_dislikes") or [],
+                max_minutes=plan_parameters.max_duration_minutes(
+                    profile.get("plan_parameters") or {}
+                ),
+                min_nutri_score=profile.get("min_nutri_score"),
+                favorite_recipe_ids=profile.get("favorite_recipe_ids") or [],
                 limit=3,
             )
         except Exception as exc:  # noqa: BLE001

@@ -286,6 +286,7 @@ def pantry_boost_ids(
     `favorite_recipe_ids` float within their slot while hard filters still
     decide eligibility. These ids ride that signal.
     """
+    from services import plan_parameters
     from services.candidates_client import effective_diet, screening_allergens
     from services.plan_client import PLANNER
 
@@ -298,6 +299,11 @@ def pantry_boost_ids(
                 allergens=screening_allergens(profile),
                 diet=effective_diet(profile),
                 exclude_ingredients=profile.get("food_dislikes") or [],
+                max_minutes=plan_parameters.max_duration_minutes(
+                    profile.get("plan_parameters") or {}
+                ),
+                min_nutri_score=profile.get("min_nutri_score"),
+                favorite_recipe_ids=profile.get("favorite_recipe_ids") or [],
             )
         except Exception as exc:  # noqa: BLE001
             logger.info("Pantry boost lookup failed for %r: %s", item, exc)

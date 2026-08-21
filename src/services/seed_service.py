@@ -26,6 +26,7 @@ from typing import Optional
 from agents import SeedExtractor
 from models.recipe import CandidateRecipe, ResolvedRecipe
 from services.adapted_recipes import overlay_resolved
+from services import plan_parameters
 from services.candidates_client import (
     CANDIDATES,
     RecipeCandidatesClient,
@@ -168,6 +169,11 @@ class SeedService:
             # member's named dish would silently fail to resolve.
             diet=effective_diet(profile),
             exclude_ingredients=profile.get("food_dislikes") or [],
+            max_minutes=plan_parameters.max_duration_minutes(
+                profile.get("plan_parameters") or {}
+            ),
+            min_nutri_score=profile.get("min_nutri_score"),
+            favorite_recipe_ids=profile.get("favorite_recipe_ids") or [],
         )
 
     def _autocomplete_tolerant(self, name: str) -> list[tuple[str, str]]:
