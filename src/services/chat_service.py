@@ -33,7 +33,7 @@ from models.recipe import CandidateRecipe, ScoredPlan
 from models.session import MealPlan
 from models.planning_state import PlanningStateDelta
 from services.adapted_recipes import overlay_plan
-from services import pantry_service, plan_verifier, turn_budget
+from services import pantry_service, plan_repair, plan_verifier, turn_budget
 from services import diet_intent, intent_facets
 from services.planning_delta import extract_state_delta
 from services.candidates_client import CANDIDATES
@@ -595,6 +595,27 @@ class ChatService:
                 list(meal_plan.constraints_applied or []) + report.as_ledger_rows()
             )
 
+        # One repair pass. The verifier names the plates that failed a hard
+        # check; until this existed `report.offenders` had no consumer anywhere
+        # in the codebase, so a plan that failed its own vegetarian check was
+        # rendered with a red chip and handed over. Bounded to one pass on
+        # purpose (see plan_repair), and it re-verifies — a repair that did not
+        # work must not be announced as one.
+        repair_note = None
+        if report.blocking and not turn_budget.skip("plan repair", turn_budget.COST_FETCH):
+            outcome = plan_repair.repair(meal_plan, brief, report, profile)
+            if outcome.changed:
+                report = outcome.report
+                # The measured rows describe the plan the member is GIVEN, so
+                # the pre-repair ones are replaced rather than appended to. The
+                # declarative rows stay: they carry `source`, which a
+                # measurement cannot know.
+                meal_plan.constraints_applied = [
+                    row for row in (meal_plan.constraints_applied or [])
+                    if row.get("source") != "measured on the plan"
+                ] + report.as_ledger_rows()
+            repair_note = plan_repair.describe(outcome)
+
         self.session_service.resave_meal_plan(meal_plan)
 
         # Grounded response writer (M4c): prose from facts, canned fallback.
@@ -631,7 +652,11 @@ class ChatService:
             ]
         if brief.rationale:
             facts["strategy"] = brief.rationale
-        fallback_extras = " ".join(p for p in (seed_note, pantry_note) if p)
+        if repair_note:
+            facts["repair"] = repair_note
+        fallback_extras = " ".join(
+            p for p in (seed_note, pantry_note, repair_note) if p
+        )
         canned = f"{fallback} {fallback_extras}".strip() if fallback_extras else fallback
         # The writer phrases facts that are already a usable sentence. Last
         # optional stage to go, because a plainer reply is a smaller loss than
@@ -756,6 +781,27 @@ class ChatService:
                 list(meal_plan.constraints_applied or []) + report.as_ledger_rows()
             )
 
+        # One repair pass. The verifier names the plates that failed a hard
+        # check; until this existed `report.offenders` had no consumer anywhere
+        # in the codebase, so a plan that failed its own vegetarian check was
+        # rendered with a red chip and handed over. Bounded to one pass on
+        # purpose (see plan_repair), and it re-verifies — a repair that did not
+        # work must not be announced as one.
+        repair_note = None
+        if report.blocking and not turn_budget.skip("plan repair", turn_budget.COST_FETCH):
+            outcome = plan_repair.repair(meal_plan, brief, report, profile)
+            if outcome.changed:
+                report = outcome.report
+                # The measured rows describe the plan the member is GIVEN, so
+                # the pre-repair ones are replaced rather than appended to. The
+                # declarative rows stay: they carry `source`, which a
+                # measurement cannot know.
+                meal_plan.constraints_applied = [
+                    row for row in (meal_plan.constraints_applied or [])
+                    if row.get("source") != "measured on the plan"
+                ] + report.as_ledger_rows()
+            repair_note = plan_repair.describe(outcome)
+
         if is_refinement:
             # `is_refinement` was accepted and never used: every refinement
             # called add_prepared_meal_plan, which starts a fresh canvas, so
@@ -818,11 +864,15 @@ class ChatService:
                 "unused": pantry_facts["unused"],
                 "note": pantry_note,
             }
+        if repair_note:
+            facts["repair"] = repair_note
         fallback_parts = [f"Here's your plan — {spec.describe()}."]
         if seed_note:
             fallback_parts.append(seed_note)
         if pantry_note:
             fallback_parts.append(pantry_note)
+        if repair_note:
+            fallback_parts.append(repair_note)
         fallback_parts.extend(concerns)
         canned = " ".join(fallback_parts)
         formatted = (
