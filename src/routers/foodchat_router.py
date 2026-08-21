@@ -34,7 +34,8 @@ import logging
 from datetime import datetime
 from typing import Dict, List, Literal, Optional
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, HTTPException, Query, Response, status
+from sqlalchemy import text as sa_text
 from pydantic import BaseModel, Field
 
 import auth
@@ -259,8 +260,15 @@ class WeeklyMealPlanResponse(BaseModel):
         )
 
 
+# What a person types, with room to paste a recipe or describe a week — and a
+# ceiling, because every one of these is stored, replayed into a prompt, and
+# billed by the token. Unbounded, one paste could carry a megabyte into the
+# conversation history and into every subsequent turn's context.
+MAX_MESSAGE_CHARS = 4000
+
+
 class ChatRequest(BaseModel):
-    content: str
+    content: str = Field(..., min_length=1, max_length=MAX_MESSAGE_CHARS)
     member_id: str
 
 
@@ -368,8 +376,10 @@ class ConversationPage(BaseModel):
 
 class FeedbackRequest(BaseModel):
     member_id: str
-    rating: str          # "up" | "down"
-    comment: Optional[str] = None
+    # Declared rather than checked in the handler: an unknown rating was a
+    # value that reached the database and skewed the feedback the grader reads.
+    rating: Literal["up", "down"]
+    comment: Optional[str] = Field(None, max_length=1000)
 
 
 class MemoryDecisionRequest(BaseModel):
@@ -402,11 +412,13 @@ class ComposePick(BaseModel):
 
 class ComposeRequest(BaseModel):
     member_id: str
-    picks: List[ComposePick]
+    # One pick per addressed slot. 21 is a full week; a longer list is not a
+    # compose, and each pick is resolved against the corpus one at a time.
+    picks: List[ComposePick] = Field(..., max_length=21)
     plan_type: Literal["daily", "weekly"] = "daily"
     # Optional chat text sent alongside ("fill out the rest, keep it light");
     # empty → a canonical completion query
-    message: Optional[str] = None
+    message: Optional[str] = Field(None, max_length=MAX_MESSAGE_CHARS)
 
 
 class MemoryDecisionResponse(BaseModel):
@@ -1513,5 +1525,57 @@ def invoke_tool(tool_name: str, request: ToolInvokeRequest):
 
 @router.get("/health")
 def health_check():
-    """Health check endpoint."""
+    """Liveness: is this process running and able to answer.
+
+    Deliberately shallow and deliberately dependency-free. A liveness probe
+    that fails when Groq or RecipeWrangler is down restarts a pod that is
+    working perfectly — and restarting it does not bring the dependency back.
+    Use `/ready` to decide whether to send traffic.
+    """
     return {"status": "ok", "service": "foodchat"}
+
+
+@router.get("/ready")
+def readiness_check(response: Response):
+    """Readiness: can this process actually serve a request.
+
+    Two classes of dependency, and only one of them can say no.
+
+    REQUIRED is the database and the orchestrator. Without either, every
+    session-scoped route 500s, so the pod should not be in the load balancer —
+    503, and Kubernetes takes it out until it recovers.
+
+    OPTIONAL is everything the app degrades around: RecipeWrangler, the data
+    catalog, Groq. FoodChat is built to answer without them — an unreachable
+    catalog costs regional guidelines, an unreachable RecipeWrangler costs a
+    plan and produces an apology. Reporting them keeps the check useful for a
+    human reading it, and NOT failing on them keeps a recipe-service blip from
+    taking the whole chat offline.
+    """
+    checks: Dict[str, str] = {}
+
+    try:
+        db = SessionLocal()
+        try:
+            db.execute(sa_text("SELECT 1"))
+            checks["database"] = "ok"
+        finally:
+            db.close()
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Readiness: database unreachable: %s", exc)
+        checks["database"] = "unavailable"
+
+    checks["orchestrator"] = (
+        "ok" if services.orchestrator_service is not None else "unavailable"
+    )
+    # Reported, never fatal. `available()` is a config check, not a call.
+    from backend.catalog import CATALOG
+
+    checks["catalog"] = "configured" if CATALOG.available() else "not configured"
+    checks["member_assertions"] = "enforced" if auth.enforcing() else "not configured"
+
+    required = ("database", "orchestrator")
+    ready = all(checks[name] == "ok" for name in required)
+    if not ready:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    return {"ready": ready, "checks": checks}

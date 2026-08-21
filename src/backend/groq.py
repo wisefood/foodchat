@@ -28,6 +28,21 @@ GROQ_DEFAULT_MODEL = os.getenv("GROQ_DEFAULT_MODEL", "openai/gpt-oss-120b")
 GROQ_DEFAULT_TEMPERATURE = float(os.getenv("GROQ_DEFAULT_TEMPERATURE", "0.0"))
 GROQ_DEFAULT_MAX_TOKENS = int(os.getenv("GROQ_DEFAULT_MAX_TOKENS", "4096"))
 
+# How long one LLM call may take, and how many times it may be retried.
+#
+# There was no timeout at all. A hung connection to Groq held a FastAPI worker
+# indefinitely — the gateway gave up at 90 seconds and the worker stayed on the
+# call, so a provider incident drained the pool rather than degrading it. A
+# planning turn makes several of these calls in sequence, so the per-call
+# budget has to leave room for the others inside the turn budget
+# (`services.turn_budget`), which is why it is well under it.
+#
+# Retries are bounded and low: LangChain's default of 2 turns one slow call
+# into three, and a reasoning model that timed out once is not usually about to
+# answer quickly.
+GROQ_TIMEOUT_SECONDS = float(os.getenv("GROQ_TIMEOUT", "45"))
+GROQ_MAX_RETRIES = int(os.getenv("GROQ_MAX_RETRIES", "1"))
+
 
 class GroqConnectionPool:
     """
@@ -187,6 +202,12 @@ class GroqConnectionPool:
                     callbacks.append(handler)
                     final_kwargs["callbacks"] = callbacks
 
+                # A caller may override either, but neither may be absent:
+                # `ChatGroq` defaults `request_timeout` to None, which is what
+                # let a hung call hold a worker for as long as the socket
+                # stayed open.
+                final_kwargs.setdefault("request_timeout", GROQ_TIMEOUT_SECONDS)
+                final_kwargs.setdefault("max_retries", GROQ_MAX_RETRIES)
                 self._pool[pool_key] = ChatGroq(
                     model=model,
                     temperature=temperature,

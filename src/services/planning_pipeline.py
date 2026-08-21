@@ -25,6 +25,7 @@ from models.recipe import CandidateRecipe, ScoredPlan
 from models.session import MealPlan
 from services import intent_facets, pantry_service, plan_parameters
 from services.candidates_client import CANDIDATES, effective_diet, screening_allergens
+from services import turn_budget
 
 logger = logging.getLogger(__name__)
 
@@ -160,6 +161,16 @@ class PlanningPipeline:
                 f"{query}\n\nThe user has these ingredients at home to use up "
                 f"(reduce food waste): {', '.join(pantry)}. Prefer combinations "
                 "that together use as many of them as possible."
+            )
+
+        # Running late? Take the same exit a failed grader takes. The pool is
+        # already constraint-correct and ordered by planning tier and
+        # Nutri-Score, so its top pick is a real plan — just not a ranked one.
+        # An unranked plan the member receives beats a ranked one the gateway
+        # cuts off before it arrives.
+        if turn_budget.skip("plan grading", turn_budget.COST_GRADING):
+            return self._assemble_from_pool(
+                candidates, "not ranked — the plan was taking too long"
             )
 
         try:

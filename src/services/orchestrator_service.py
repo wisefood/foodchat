@@ -35,8 +35,11 @@ Returns a unified ChatTurn so the router needs one response model.
 """
 
 import logging
-import uuid as _uuid
 import re
+import threading
+import time
+import uuid as _uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -44,7 +47,7 @@ from agents import OrchestratorAgent, PlanAnalyst
 from backend.observability import trace_context
 from models.attribution import Attribution
 from models.session import MealPlan, WeeklyMealPlan
-from . import plan_parameters
+from . import plan_parameters, turn_budget
 from .edit_service import EditService
 from .foodscholar_service import FoodScholarService
 from .seed_service import SeedService
@@ -61,6 +64,13 @@ _AFFIRMATIVE = re.compile(
 )
 # Favorites shown by title in the offer message (each needs a detail fetch).
 MAX_OFFERED_FAVORITES = 3
+
+
+# A turn is abandoned this long after it started. The turn budget is 70s, so
+# this is that plus room for storage and serialisation: long enough that a slow
+# turn is never treated as dead, short enough that a crash frees the session
+# before the member gives up on it.
+_TURN_GUARD_TTL = 120.0
 
 
 class SessionAccessError(ValueError):
@@ -96,6 +106,19 @@ class ChatTurn:
 
 
 class OrchestratorService:
+
+    # Sessions with a turn currently running, and when it started. Guarded by
+    # its own lock so checking and claiming is one step — two threads checking
+    # an unguarded dict would both find it free.
+    #
+    # Class-level, not per instance, for two reasons. The damage it prevents is
+    # per PROCESS — the in-memory session cache and the canvas write both live
+    # there — so two service instances in one process must still not run two
+    # turns on one session. And an instance built without `__init__` (which the
+    # test suite does routinely) would otherwise have no guard at all, which is
+    # a failure mode that only shows up under load.
+    _turns_in_flight: dict[str, float] = {}
+    _turn_lock = threading.Lock()
 
     def __init__(
         self,
@@ -139,6 +162,57 @@ class OrchestratorService:
             ),
             intent="chat",
             at_message_limit=True,
+        )
+
+    @contextmanager
+    def _one_turn_at_a_time(self, session_id: str):
+        """Refuse a second turn on a session while the first is still running.
+
+        Two turns on one session both load it, both plan, and both write the
+        canvas pointer. Last write wins and the loser's plan is orphaned —
+        stored, paid for, and unreachable. A single tab cannot do this (the
+        composer disables while sending), but a second tab, or a slider apply
+        landing on top of a chat turn, can.
+
+        Refused rather than queued. Queueing would hold a worker for the length
+        of the first turn and then run a plan the member asked for a minute
+        ago; saying "still working" is both cheaper and truer.
+
+        The guard is per process, which matches where the damage is: the
+        in-memory session cache and the canvas write both live here. Across
+        replicas the same member would need two tabs on two pods, and the
+        database write is still atomic.
+        """
+        now = time.monotonic()
+        with self._turn_lock:
+            started = self._turns_in_flight.get(session_id)
+            # A stale entry means a turn died without unwinding. Bounded by the
+            # budget plus slack, so a crash cannot lock a session out for good.
+            busy = started is not None and (now - started) < _TURN_GUARD_TTL
+            if not busy:
+                self._turns_in_flight[session_id] = now
+        try:
+            # A boolean rather than an exception: `@contextmanager` runs this
+            # body at `__enter__`, so a `try/except` around the CALL would never
+            # fire and the exception would escape to the router as a 500. The
+            # check and the claim still happen together under the lock, so this
+            # is not check-then-act.
+            yield not busy
+        finally:
+            if not busy:
+                with self._turn_lock:
+                    self._turns_in_flight.pop(session_id, None)
+
+    @staticmethod
+    def _busy_turn() -> ChatTurn:
+        """What the member sees when they send twice."""
+        return ChatTurn(
+            role="assistant",
+            content=(
+                "I'm still working on your last message — give me a moment and "
+                "then try again."
+            ),
+            intent="chat",
         )
 
     def _attach_memory_suggestions(self, session, turn: ChatTurn, message: str) -> ChatTurn:
@@ -215,7 +289,15 @@ class OrchestratorService:
         call (classify, clarify, plan grading, response writing, …) groups
         under one Langfuse Session (session_id) and User (member_id).
         """
-        with trace_context(session_id=session_id, user_id=member_id):
+        # One budget and one in-flight claim per turn, at the only four
+        # places a turn begins. Nested calls keep the outermost deadline, so a
+        # slider apply that routes into the chat handlers does not hand the
+        # inner stage a fresh full allowance.
+        with self._one_turn_at_a_time(session_id) as claimed, \
+                trace_context(session_id=session_id, user_id=member_id), \
+                turn_budget.start():
+            if not claimed:
+                return self._busy_turn()
             session = self._owned_session(session_id, member_id)
             limit_turn = self._limit_turn(session)
             if limit_turn is not None:
@@ -1053,7 +1135,15 @@ class OrchestratorService:
         regenerate a weekly plan created since. Omitted (older clients) →
         the active canvas, as before.
         """
-        with trace_context(session_id=session_id, user_id=member_id):
+        # One budget and one in-flight claim per turn, at the only four
+        # places a turn begins. Nested calls keep the outermost deadline, so a
+        # slider apply that routes into the chat handlers does not hand the
+        # inner stage a fresh full allowance.
+        with self._one_turn_at_a_time(session_id) as claimed, \
+                trace_context(session_id=session_id, user_id=member_id), \
+                turn_budget.start():
+            if not claimed:
+                return self._busy_turn()
             session = self._owned_session(session_id, member_id)
             limit_turn = self._limit_turn(session)
             if limit_turn is not None:
@@ -1105,7 +1195,15 @@ class OrchestratorService:
         The query comes from `PlanningState.as_query()`, so it describes what
         is still wanted rather than what was just taken away.
         """
-        with trace_context(session_id=session_id, user_id=member_id):
+        # One budget and one in-flight claim per turn, at the only four
+        # places a turn begins. Nested calls keep the outermost deadline, so a
+        # slider apply that routes into the chat handlers does not hand the
+        # inner stage a fresh full allowance.
+        with self._one_turn_at_a_time(session_id) as claimed, \
+                trace_context(session_id=session_id, user_id=member_id), \
+                turn_budget.start():
+            if not claimed:
+                return self._busy_turn()
             session = self._owned_session(session_id, member_id)
             limit_turn = self._limit_turn(session)
             if limit_turn is not None:
@@ -1146,7 +1244,15 @@ class OrchestratorService:
         generation composes the rest deterministically: no intent
         classification, no clarification round.
         """
-        with trace_context(session_id=session_id, user_id=member_id):
+        # One budget and one in-flight claim per turn, at the only four
+        # places a turn begins. Nested calls keep the outermost deadline, so a
+        # slider apply that routes into the chat handlers does not hand the
+        # inner stage a fresh full allowance.
+        with self._one_turn_at_a_time(session_id) as claimed, \
+                trace_context(session_id=session_id, user_id=member_id), \
+                turn_budget.start():
+            if not claimed:
+                return self._busy_turn()
             session = self._owned_session(session_id, member_id)
             limit_turn = self._limit_turn(session)
             if limit_turn is not None:

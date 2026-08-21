@@ -33,7 +33,7 @@ from models.recipe import CandidateRecipe, ScoredPlan
 from models.session import MealPlan
 from models.planning_state import PlanningStateDelta
 from services.adapted_recipes import overlay_plan
-from services import pantry_service, plan_verifier
+from services import pantry_service, plan_verifier, turn_budget
 from services import diet_intent, intent_facets
 from services.planning_delta import extract_state_delta
 from services.candidates_client import CANDIDATES
@@ -482,7 +482,13 @@ class ChatService:
             return apology, False, None
 
         best = plans[0]
-        metrics = self._compute_metrics(session_id, best)
+        # Scores describe a plan that has already been chosen — they make the
+        # card richer and change nothing about what the member eats. First
+        # thing to drop when the turn is running late.
+        metrics = (
+            {} if turn_budget.skip("quality metrics", turn_budget.COST_METRICS)
+            else self._compute_metrics(session_id, best)
+        )
 
         if is_refinement:
             meal_plan = self.session_service.refine_meal_plan(
@@ -559,9 +565,14 @@ class ChatService:
                 "note": pantry_note,
             }
         fallback_extras = " ".join(p for p in (seed_note, pantry_note) if p)
-        formatted = self.response_writer.write(
-            facts, final_query,
-            fallback=f"{fallback} {fallback_extras}".strip() if fallback_extras else fallback,
+        canned = f"{fallback} {fallback_extras}".strip() if fallback_extras else fallback
+        # The writer phrases facts that are already a usable sentence. Last
+        # optional stage to go, because a plainer reply is a smaller loss than
+        # any of the others — and every caller already keeps this fallback for
+        # the case where the writer fails outright.
+        formatted = (
+            canned if turn_budget.skip("response writer", turn_budget.COST_WRITER)
+            else self.response_writer.write(facts, final_query, fallback=canned)
         )
 
         self.session_service.add_message(session_id, "assistant", formatted)
@@ -722,8 +733,10 @@ class ChatService:
         if pantry_note:
             fallback_parts.append(pantry_note)
         fallback_parts.extend(concerns)
-        formatted = self.response_writer.write(
-            facts, final_query, fallback=" ".join(fallback_parts),
+        canned = " ".join(fallback_parts)
+        formatted = (
+            canned if turn_budget.skip("response writer", turn_budget.COST_WRITER)
+            else self.response_writer.write(facts, final_query, fallback=canned)
         )
         self.session_service.add_message(session_id, "assistant", formatted)
         return formatted, False, meal_plan

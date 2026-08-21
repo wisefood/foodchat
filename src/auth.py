@@ -201,7 +201,11 @@ async def assertion_middleware(request, call_next):
 # (identical for everyone), and the docs.
 _OPEN_PATHS = frozenset({
     "/", "/docs", "/redoc", "/openapi.json",
-    "/foodchat/health", "/foodchat/vocabularies", "/foodchat/tools",
+    # Both probes. The kubelet has no assertion to send, so enforcing here
+    # would fail every liveness and readiness check the moment the secret is
+    # set — the deployment would go down BECAUSE it was secured.
+    "/foodchat/health", "/foodchat/ready",
+    "/foodchat/vocabularies", "/foodchat/tools",
 })
 
 

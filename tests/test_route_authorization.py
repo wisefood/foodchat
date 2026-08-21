@@ -232,6 +232,7 @@ def _routes(session_id: str):
 # Routes that carry no member identity, with the reason each one is open.
 OPEN_ROUTES = {
     "health_check": "kubelet has no assertion to send",
+    "readiness_check": "same — and a probe that 401s takes the deployment down",
     "list_tools": "the manifest is identical for every member",
     "get_vocabularies": "the corpus vocabulary is identical for every member",
 }
@@ -418,3 +419,33 @@ class TestNoRouteEscapesTheAudit:
         }
         stale = sorted(set(_routes("x")) - registered)
         assert not stale, f"audited routes that no longer exist: {stale}"
+
+
+class TestTheProbesStayReachable:
+    """A probe that 401s takes the deployment down.
+
+    The kubelet has no member assertion and never will. If enforcement covered
+    the probe paths, setting the shared secret — the act of SECURING the
+    service — would fail every liveness and readiness check and roll the
+    deployment into a crash loop.
+    """
+
+    @pytest.mark.parametrize("path", ["/foodchat/health", "/foodchat/ready"])
+    def test_a_probe_path_is_never_gated(self, path):
+        assert auth._is_open_path(path)
+
+    @pytest.mark.parametrize("path", [
+        "/foodchat/vocabularies", "/foodchat/tools",
+    ])
+    def test_the_memberless_reads_are_open_too(self, path):
+        assert auth._is_open_path(path)
+
+    @pytest.mark.parametrize("path", [
+        "/foodchat/sessions", "/foodchat/sessions/abc/chat",
+        "/foodchat/members/m1/sessions", "/foodchat/sessions/abc/pantry",
+    ])
+    def test_everything_member_scoped_is_gated(self, path):
+        assert not auth._is_open_path(path)
+
+    def test_a_trailing_slash_does_not_open_a_gated_path(self):
+        assert not auth._is_open_path("/foodchat/sessions/abc/chat/")
