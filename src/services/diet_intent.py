@@ -17,10 +17,9 @@ Two kinds come back from the extractor and they must not be conflated:
 
 * **Filterable diets** (vegetarian, vegan, gluten_free, …) → `diet_tags`, which
   every fetch site unions with the profile via `candidates_client.effective_diet`.
-* **Nutrition claims** (low-carb, low-fat, high-protein) → `notes`, i.e. grader
-  prose. They are NOT diet tags: no recipe in the corpus carries them, so
-  sending one as a filter empties every slot. They become real numeric targets
-  once the planning endpoint grows nutrition targets.
+* **Nutrition claims** (low-carb, low-fat, high-protein) → `claim_tags`, which
+  reach RecipeWrangler's `tags` field. They are NOT diet tags: no recipe carries
+  one as a diet tag, so sending a claim as a diet filter empties every slot.
 
 A retraction is explicit. Silence never clears a stated diet — same rule as
 every other field in `PlanningState`.
@@ -62,11 +61,16 @@ def extract_diet_delta(message: str, *, extractor=None) -> PlanningStateDelta:
     filterable, claims = split_diet_intent(raw)
     if filterable or claims:
         logger.info("Diet intent: filters=%s claims=%s", filterable, claims)
+    from services.intent_facets import claim_tags_for
+
     return PlanningStateDelta(
         diet_tags=tuple(filterable),
-        # A claim carries no filter, so say it out loud to the grader rather
-        # than dropping it — the member asked for something.
-        notes=tuple(f"prefers {c} meals" for c in claims),
+        # A claim is not a diet — no recipe carries one as a diet tag — but it
+        # IS a RecipeWrangler claim tag, a different request field. These went
+        # to `notes` until `notes` turned out to be write-only (read only by
+        # `describe()`, which is only logged), so the claim was saved from
+        # emptying every slot and then dropped on the floor instead.
+        claim_tags=tuple(claim_tags_for(None, claims)),
     )
 
 

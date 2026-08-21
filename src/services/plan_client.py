@@ -160,6 +160,7 @@ class PlanClient:
         moods: Optional[list[str]] = None,
         flavor_profiles: Optional[list[str]] = None,
         food_groups: Optional[list[str]] = None,
+        tags: Optional[list[str]] = None,
         include_ingredients: Optional[list[str]] = None,
         exclude_ingredients: Optional[list[str]] = None,
         exclude_recipe_ids: Optional[list[str]] = None,
@@ -207,6 +208,22 @@ class PlanClient:
             "favorite_recipe_ids": favorite_recipe_ids or [],
             "allow_relaxation": True,
         }
+        # Claim tags (high_protein, high_fibre, low_calorie, …) ride a
+        # parameter that older RecipeWrangler deployments do not have, and its
+        # request model rejects unknown fields with a 422 rather than ignoring
+        # them. So the key is only added when the live manifest advertises the
+        # vocabulary — the vocabulary IS the capability flag, and it is already
+        # cached, so this costs nothing per call.
+        if tags:
+            from services.candidates_client import CANDIDATES
+
+            if CANDIDATES.vocabularies().get("tags"):
+                payload["tags"] = list(tags)
+            else:
+                logger.info(
+                    "Not sending tags=%s — this RecipeWrangler does not "
+                    "advertise the vocabulary", tags,
+                )
         if max_minutes:
             payload["max_minutes"] = int(max_minutes)
         if min_nutri_score:

@@ -2,6 +2,67 @@
 
 ---
 
+# Claim tags reach the search (Phase 1b)
+
+> **Date:** 2026-08-21
+> **Branch:** fix/stated-diet-and-honest-constraints
+> **Requires RecipeWrangler** to gain the `tags` parameter — but is safe to
+> deploy in either order: the key is only sent when the live manifest advertises
+> the vocabulary, so an older RecipeWrangler never sees it.
+
+Nutrition claims — "high protein", "low carb" — had nowhere to go. They are not
+diets (no recipe carries one as a `diet_tag`, so sending one as a diet filter
+empties every slot, which is the outage found yesterday), and the field they
+DO belong on did not exist upstream.
+
+**RecipeWrangler** now takes `tags` on `plan_meals`, filtering the corpus's
+human-authored claim field: `high_protein` (1676 recipes),
+`30_minutes_or_less` (2809), `healthy_and_nutritious` (2535), `low_fat` (1081),
+`5_ingredients_or_less` (563), `high_fibre` (457), `low_calorie` (184).
+
+The design decision worth keeping: **`tags` leads the relaxation ladder.** A
+claim is the softest thing a caller can ask for and the scarcest annotation in
+the corpus — `high_fibre` is on 10% of recipes, so two claims ANDed across 21
+slots would starve most of them. Dropping it first means "high protein and high
+fibre" narrows the search when it can and widens when it cannot, instead of
+returning an empty week. The vocabulary is published in the manifest so a caller
+can avoid asking for a claim nothing carries, and it is an *open* field, so an
+unlisted value is reported and still applied — it relaxes first, so it cannot
+strand a slot.
+
+**FoodChat** now sends them, from two sources:
+
+| Source | Example |
+|---|---|
+| The slider goal | `energy` → `high_protein` + `high_fibre`, alongside the `hearty` mood |
+| A claim stated in words | "high protein please" → `high_protein` |
+
+**This fixes a dead end I shipped yesterday.** Claims were routed to
+`PlanningState.notes` and described as reaching "the grader as soft signals".
+`notes` is **write-only** — read solely by `describe()`, which is only logged. So
+a claim was correctly saved from becoming an empty filter and then dropped on the
+floor. They now live in `PlanningState.claim_tags` and reach the request. The two
+tests that asserted the `notes` behaviour have been corrected, and one now
+asserts `notes == ()` so nothing is routed there again.
+
+**The capability gate.** RecipeWrangler's request model is `extra="forbid"` — an
+unknown field is a 422, not a shrug — so foodchat only adds `tags` to the payload
+when `GET /api/v2/tools` advertises the vocabulary. The vocabulary IS the
+capability flag, it is already cached, and it costs nothing per call. Verified
+both ways: advertised → sent, not advertised → withheld with the rest of the
+request untouched.
+
+Also on the RecipeWrangler side: `applied` now reports `tags` (it is the
+service's own account of what it filtered on, and a missing entry would make the
+plan unexplainable downstream), and `never_relaxed` no longer under-declares —
+it listed three constraints while `include_ingredients`, `min_nutri_score`,
+`sources`, `exclude_recipe_ids` and `course_types` were equally hard. A new test
+asserts the two lists cannot overlap, since together they are the whole contract.
+
+597 passing in foodchat, 19 new tests in RecipeWrangler.
+
+---
+
 # "Energy boost meal plan for today" now matches something (Phase 1a)
 
 > **Date:** 2026-08-21

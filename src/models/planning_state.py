@@ -81,6 +81,17 @@ class PlanningState:
     # nudge (kind "diet"); until then it dies with the session.
     diet_tags: tuple[str, ...] = ()
 
+    # Nutrition claims the member asked for — "high protein", "low carb".
+    # These are NOT diets: no recipe carries them as a diet tag, so sending one
+    # as a diet filter empties every slot. They are RecipeWrangler claim tags,
+    # which is a different request field.
+    #
+    # They used to be written to `notes`, which turned out to be write-only
+    # (read solely by `describe()`, which is only logged) — so a claim was
+    # correctly stopped from becoming an empty filter and then dropped on the
+    # floor instead of reaching anything.
+    claim_tags: tuple[str, ...] = ()
+
     # Facet preferences stated in chat — "something comforting", "light and
     # fresh", "more vegetables", "Thai tonight". One tuple per RecipeWrangler
     # facet family, mirroring `diet_tags`: standing for the session, additive,
@@ -154,6 +165,14 @@ class PlanningState:
             if value and value not in diet_tags:
                 diet_tags.append(value)
 
+        # Claims ride the same retraction as the diet they arrive with: a
+        # member taking back "vegetarian" is taking back that whole statement.
+        claim_tags = [] if delta.diet_clear else list(self.claim_tags)
+        for tag in delta.claim_tags or ():
+            value = str(tag).strip().lower()
+            if value and value not in claim_tags:
+                claim_tags.append(value)
+
         # Facets: additive per family, with an explicit removal list so a
         # member can take one back ("actually not spicy") — and so the UI's
         # removable chips have something to call.
@@ -179,6 +198,7 @@ class PlanningState:
             notes=tuple(notes),
             pantry=tuple(pantry),
             diet_tags=tuple(diet_tags),
+            claim_tags=tuple(claim_tags),
         )
 
     def describe(self) -> str:
@@ -202,6 +222,8 @@ class PlanningState:
             parts.append("pantry to use up: " + ", ".join(self.pantry))
         if self.diet_tags:
             parts.append("diet stated in chat: " + ", ".join(self.diet_tags))
+        if self.claim_tags:
+            parts.append("asked for: " + ", ".join(self.claim_tags))
         for family, values in self.facets().items():
             parts.append(f"{family.replace('_', ' ')}: " + ", ".join(values))
         if self.notes:
@@ -219,6 +241,7 @@ class PlanningState:
             "notes": list(self.notes),
             "pantry": list(self.pantry),
             "diet_tags": list(self.diet_tags),
+            "claim_tags": list(self.claim_tags),
             **{family: list(getattr(self, family)) for family in self.FACET_FIELDS},
         }
 
@@ -254,6 +277,9 @@ class PlanningState:
             diet_tags=tuple(
                 str(d).strip().lower() for d in (raw.get("diet_tags") or []) if d
             ),
+            claim_tags=tuple(
+                str(c).strip().lower() for c in (raw.get("claim_tags") or []) if c
+            ),
             **{
                 family: tuple(
                     str(v).strip().lower() for v in (raw.get(family) or []) if v
@@ -284,6 +310,9 @@ class PlanningStateDelta:
     # Diet tags stated this turn, and the retraction flag for "never mind, use
     # my profile" (answered NO to the dietary-conflict question).
     diet_tags: tuple[str, ...] = ()
+    # Nutrition claims stated this turn — they reach RecipeWrangler's `tags`
+    # field, not the diet filter.
+    claim_tags: tuple[str, ...] = ()
     diet_clear: bool = False
     # Facets stated this turn, plus values to take back (the UI's removable
     # chips, and "actually not spicy").
@@ -305,6 +334,7 @@ class PlanningStateDelta:
             or self.pantry_add
             or self.pantry_remove
             or self.diet_tags
+            or self.claim_tags
             or self.diet_clear
             or self.cuisines
             or self.moods

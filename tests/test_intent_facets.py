@@ -203,7 +203,7 @@ class TestFetchArguments:
     def test_facet_kwargs_always_carries_all_four_families(self):
         self._cands()
         got = F.facet_kwargs({"food_likes": []})
-        assert set(got) == {"cuisines", "moods", "flavor_profiles", "food_groups"}
+        assert {"cuisines", "moods", "flavor_profiles", "food_groups", "tags"} == set(got)
 
     def test_stated_facets_reach_the_request(self):
         self._cands()
@@ -239,3 +239,116 @@ class TestFetchArguments:
             assert all(v == [] for v in got.values())
         finally:
             CANDIDATES.__class__._vocab_cache = dict(VOCAB)
+
+
+# ── claim tags: the fix for a dead end ───────────────────────────────────
+
+class TestClaimTags:
+    """Nutrition claims stopped being empty diet filters yesterday and were
+    routed to `notes` — which turned out to be write-only, read only by
+    `describe()`, which is only logged. So the claim was saved from breaking
+    the plan and then dropped on the floor. They are RecipeWrangler claim tags,
+    a different request field entirely."""
+
+    def test_a_stated_claim_becomes_a_claim_tag_not_a_note(self):
+        from services import diet_intent
+
+        class Fake:
+            def extract(self, q):
+                return ["vegetarian", "high-protein"]
+
+        delta = diet_intent.extract_diet_delta("veggie and high protein",
+                                               extractor=Fake())
+        assert delta.diet_tags == ("vegetarian",)
+        assert delta.claim_tags == ("high_protein",)
+        assert delta.notes == (), "notes is write-only; nothing may be routed there"
+
+    def test_claim_tags_are_standing_state(self):
+        state = PlanningState().merge(PlanningStateDelta(claim_tags=("high_protein",)))
+        state = state.merge(PlanningStateDelta(pantry_add=("rice",)))
+        assert state.claim_tags == ("high_protein",)
+
+    def test_they_round_trip(self):
+        import json
+
+        state = PlanningState().merge(PlanningStateDelta(claim_tags=("high_fibre",)))
+        back = PlanningState.from_dict(json.loads(json.dumps(state.to_dict())))
+        assert back.claim_tags == ("high_fibre",)
+
+    def test_a_diet_retraction_clears_them_too(self):
+        """They arrive on the same turn as the diet they accompany."""
+        state = PlanningState().merge(
+            PlanningStateDelta(diet_tags=("vegetarian",), claim_tags=("high_protein",))
+        )
+        cleared = state.merge(PlanningStateDelta(diet_clear=True))
+        assert cleared.claim_tags == () and cleared.diet_tags == ()
+
+    def test_the_goal_slider_contributes_tags_and_facets(self):
+        from services.candidates_client import CANDIDATES
+
+        CANDIDATES.__class__._vocab_cache = {**VOCAB, "tags": ["high_protein",
+                                                              "high_fibre"]}
+        got = F.facet_kwargs({"plan_parameters": {"goal": "energy"},
+                              "food_likes": []})
+        assert got["tags"] == ["high_protein", "high_fibre"]
+        assert got["moods"] == ["hearty"]
+
+
+class TestTheCapabilityGate:
+    """RecipeWrangler's request model is extra="forbid", so sending `tags` to a
+    deployment that predates the parameter is a 422, not a shrug. The published
+    vocabulary is the capability flag."""
+
+    def _capture(self):
+        import services.plan_client as pc
+
+        captured: dict = {}
+
+        class Resp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"days": []}
+
+        class Client:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def post(self, url, json=None, **k):
+                captured.clear()
+                captured.update(json or {})
+                return Resp()
+
+        pc.httpx.Client = Client
+        return pc, captured
+
+    def test_tags_are_sent_when_advertised(self):
+        from services.candidates_client import CANDIDATES
+
+        pc, captured = self._capture()
+        CANDIDATES.__class__._vocab_cache = {"tags": ["high_protein"]}
+        pc.PLANNER.plan_meals(days=1, tags=["high_protein"])
+        assert captured.get("tags") == ["high_protein"]
+
+    def test_tags_are_withheld_when_not_advertised(self):
+        from services.candidates_client import CANDIDATES
+
+        pc, captured = self._capture()
+        CANDIDATES.__class__._vocab_cache = {"cuisines": ["greek"]}
+        pc.PLANNER.plan_meals(days=1, tags=["high_protein"])
+        assert "tags" not in captured, "would 422 against an older RecipeWrangler"
+
+    def test_the_rest_of_the_request_is_unaffected(self):
+        from services.candidates_client import CANDIDATES
+
+        pc, captured = self._capture()
+        CANDIDATES.__class__._vocab_cache = {"cuisines": ["greek"]}
+        pc.PLANNER.plan_meals(days=1, tags=["high_protein"], cuisines=["greek"])
+        assert captured.get("cuisines") == ["greek"]

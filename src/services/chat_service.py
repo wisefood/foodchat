@@ -292,6 +292,9 @@ class ChatService:
             # unlike "_pantry" it is never popped — the base pool, the pantry
             # fan-out and a seed lookup all have to agree on the diet.
             profile["_diet_tags"] = list(state.diet_tags)
+        if state.claim_tags:
+            # Read at every fetch site like the other underscore keys.
+            profile["_claim_tags"] = list(state.claim_tags)
         facets = state.facets()
         if facets:
             # Same convention, same reason: read at every fetch site, never

@@ -213,7 +213,7 @@ def fetch_pantry_candidates(
                 count_per_slot=count,
                 allergens=screening_allergens(profile),
                 diet=normalized_diet,
-                cuisines=list(cuisines or []),
+                **intent_facets.facet_kwargs(profile, list(cuisines or [])),
                 include_ingredients=[item],
                 exclude_ingredients=profile.get("food_dislikes") or [],
                 exclude_recipe_ids=list(exclude_recipe_ids or []),

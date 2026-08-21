@@ -100,8 +100,11 @@ def test_a_nutrition_claim_never_becomes_a_diet_filter():
         "something low-carb", extractor=FakeDietExtractor(["low-carb"])
     )
     assert delta.diet_tags == ()
-    # but it is not swallowed either — the grader hears it
-    assert any("low-carb" in n for n in delta.notes)
+    # And it is not swallowed either. This assertion used to check `notes`,
+    # which turned out to be write-only — so the claim was saved from emptying
+    # the plan and then dropped. It now reaches RecipeWrangler's `tags` field.
+    assert delta.claim_tags, "a stated claim must reach the request"
+    assert delta.notes == (), "notes is write-only; nothing may be routed there"
 
 
 def test_a_mixed_statement_routes_both_ways():
@@ -110,7 +113,7 @@ def test_a_mixed_statement_routes_both_ways():
         extractor=FakeDietExtractor(["vegetarian", "low-carb"]),
     )
     assert delta.diet_tags == ("vegetarian",)
-    assert any("low-carb" in n for n in delta.notes)
+    assert delta.claim_tags, "the claim half must reach the tags field"
 
 
 @pytest.mark.parametrize("claim", ["low-carb", "low_fat", "high-protein"])

@@ -171,17 +171,33 @@ def facet_kwargs(profile: dict, cuisines: Optional[list[str]] = None) -> dict:
     varying between call sites for no reason.
     """
     merged = effective_facets(profile)
+    # The slider goal implies facets as well as tags — "weight loss" means the
+    # `light` mood, and that was prose to a grader two of three paths never run.
+    goal_facets = facets_for_goal((profile.get("plan_parameters") or {}).get("goal"))
+    for family, values in goal_facets.items():
+        existing = merged.setdefault(family, [])
+        for value in values:
+            if value not in existing:
+                existing.append(value)
     if cuisines:
         existing = merged.setdefault("cuisines", [])
         for value in cuisines:
             slug = str(value).strip().lower()
             if slug and slug not in existing:
                 existing.append(slug)
+    # Claim tags ride the same splat so a fetch site does not need to know
+    # they exist. They come from two places: the slider goal, and claims the
+    # member stated in words ("high protein"). `plan_client` decides whether
+    # the live RecipeWrangler can actually receive them.
+    goal = (profile.get("plan_parameters") or {}).get("goal")
+    tags = claim_tags_for(goal, list(profile.get("_claim_tags") or []))
+
     return {
         "cuisines": merged.get("cuisines") or [],
         "moods": merged.get("moods") or [],
         "flavor_profiles": merged.get("flavor_profiles") or [],
         "food_groups": merged.get("food_groups") or [],
+        "tags": tags,
     }
 
 
