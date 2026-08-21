@@ -23,6 +23,46 @@ from models.session import WeeklyMealPlan
 
 logger = logging.getLogger(__name__)
 
+
+def _as_meal_plan(plan_entries: list[dict]):
+    """Weekly entries in the shape `plan_verifier` reads.
+
+    The verifier walks `day_plans` -> meals -> plates, which every daily plan
+    already is. Weekly is a flat list of `{day, meal_idx, meal_type, recipe}`
+    dicts, so rather than teach the verifier a second shape — and have two
+    definitions of "every plate in a plan" drift apart — the entries are
+    adapted into the one it knows.
+
+    Nothing is stored from this. It exists to be measured.
+    """
+    from models.session import DayPlan, Meal, MealCourse, MealPlan
+
+    by_day: dict[int, dict[str, list]] = {}
+    for entry in sorted(plan_entries, key=lambda e: (e.get("day", 0), e.get("meal_idx", 0))):
+        recipe = entry.get("recipe") or {}
+        recipe_id = str(recipe.get("recipe_id") or "").strip()
+        if not recipe_id:
+            continue
+        day = int(entry.get("day") or 1)
+        slot = str(entry.get("meal_type") or "meal")
+        by_day.setdefault(day, {}).setdefault(slot, []).append(MealCourse(
+            recipe_id=recipe_id,
+            title=str(recipe.get("recipe_title") or recipe.get("title") or ""),
+            ingredients=str(
+                recipe.get("recipe_ingredients") or recipe.get("ingredients") or ""
+            ),
+            directions=str(
+                recipe.get("recipe_directions") or recipe.get("directions") or ""
+            ),
+            nutrition=recipe.get("nutrition"),
+        ))
+
+    days = [
+        DayPlan(day=day, meals=[Meal(slot, plates) for slot, plates in slots.items()])
+        for day, slots in sorted(by_day.items())
+    ]
+    return MealPlan.from_days(days, "weekly") if days else None
+
 DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
 
@@ -270,6 +310,36 @@ class WeeklyPlanService:
         )
         pantry_note = pantry_service.describe_coverage(pantry_facts)
 
+        # Measure the week, the same way the daily paths measure a day.
+        #
+        # Weekly reported the declarative ledger and nothing else: `vegetarian`
+        # rendered as satisfied because the word had been sent, across 21 meals
+        # rather than three. The verifier reads the plates that came back.
+        report = None
+        try:
+            from models.plan_brief import PlanBrief
+            from services import plan_verifier
+
+            adapted = _as_meal_plan(plan_entries)
+            if adapted is not None:
+                brief = PlanBrief.build(session.user_profile)
+                report = plan_verifier.verify(
+                    adapted, brief.to_requested(), enrichment,
+                )
+                logger.info(
+                    "[%s] Weekly verified: %s",
+                    session_id, plan_verifier.describe(report),
+                )
+                if report.checks:
+                    explainability["constraints_applied"] = (
+                        list(explainability.get("constraints_applied") or [])
+                        + report.as_ledger_rows()
+                    )
+        except Exception as exc:  # noqa: BLE001
+            # Verification describes a plan that already exists. Losing it
+            # costs the measured rows, never the week.
+            logger.warning("[%s] Weekly verification failed: %s", session_id, exc)
+
         if is_refinement:
             weekly_plan = self.session_service.refine_weekly_meal_plan(
                 session_id, plan_entries, day_summaries=day_summaries,
@@ -299,9 +369,16 @@ class WeeklyPlanService:
         weekly_honored, weekly_not_honored = split_ledger(
             explainability["constraints_applied"]
         )
+        # A failed check the reply does not mention is a failure the member
+        # discovers by eating it — 21 chances of that on a week.
+        weekly_problems = (
+            [{"constraint": c.name, "detail": c.detail} for c in report.failed]
+            if report is not None else []
+        )
         facts = {
             "action": "refined_weekly_plan" if is_refinement else "new_weekly_plan",
             "days": 7, "meals": 21,
+            "verified_problems": weekly_problems,
             "anchored_dishes": pinned_titles,
             "seed_note": seed_note,
             "cooking_for": session.user_profile.get("cooking_for_names") or [],

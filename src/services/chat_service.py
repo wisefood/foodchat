@@ -506,6 +506,16 @@ class ChatService:
         # come back on a regeneration. `_excluded_recipe_ids` reached only the
         # structured path, so on the classic path — the default — the standing
         # exclusion was recorded, persisted, and then ignored at the fetch.
+        # The brief, on the path that actually gets used.
+        #
+        # `PlanBrief` -> `PlanStrategist` -> `plan_verifier` were wired into the
+        # structured path only — the one a member reaches by asking for an
+        # unusual SHAPE. A plain "plan my day" comes here, and here had no
+        # brief, no strategist, and not one measured constraint: it reported
+        # the request back as though it were a result, which is the whole
+        # failure the verifier was built to end.
+        brief = self._brief_for(final_query, profile)
+
         plans = self.pipeline.generate(
             final_query, profile, pinned=pinned,
             exclude_recipe_ids=list(signals.downvoted_recipe_ids or [])
@@ -573,6 +583,18 @@ class ChatService:
         # they persist.
         pantry_facts = pantry_service.annotate_daily_plan(meal_plan, pantry)
         pantry_note = pantry_service.describe_coverage(pantry_facts)
+
+        # Measure what came back, not what was asked for. The declarative rows
+        # above carry `source` — which diner a constraint is there for — which
+        # a measurement cannot know; these carry evidence, which a declaration
+        # cannot have. Both, in that order.
+        report = plan_verifier.verify(meal_plan, brief.to_requested(), enrichment)
+        logger.info("[%s] Verified: %s", session_id, plan_verifier.describe(report))
+        if report.checks:
+            meal_plan.constraints_applied = (
+                list(meal_plan.constraints_applied or []) + report.as_ledger_rows()
+            )
+
         self.session_service.resave_meal_plan(meal_plan)
 
         # Grounded response writer (M4c): prose from facts, canned fallback.
@@ -601,6 +623,14 @@ class ChatService:
                 "unused": pantry_facts["unused"],
                 "note": pantry_note,
             }
+        # A failed check the reply does not mention is a failure the member
+        # discovers by eating it.
+        if report.failed:
+            facts["verified_problems"] = [
+                {"constraint": c.name, "detail": c.detail} for c in report.failed
+            ]
+        if brief.rationale:
+            facts["strategy"] = brief.rationale
         fallback_extras = " ".join(p for p in (seed_note, pantry_note) if p)
         canned = f"{fallback} {fallback_extras}".strip() if fallback_extras else fallback
         # The writer phrases facts that are already a usable sentence. Last
