@@ -152,6 +152,16 @@ class WeeklyPlanService:
             }
             seed_note = self.seed_service.describe(resolutions, dropped)
 
+        # "No thanks" to the favourites offer is a standing answer, and it was
+        # honoured on the daily path only — weekly kept adding +5 per favourite
+        # and putting them in the plan. A member who says no and sees their
+        # favourite anyway has been told their answer does not matter.
+        if state.use_favorites is False and session.user_profile.get("favorite_recipe_ids"):
+            session.user_profile = {
+                **session.user_profile, "favorite_recipe_ids": [],
+            }
+            logger.info("[%s] Favourites declined — not used for this week.", session_id)
+
         logger.info("[%s] Initializing action space and environment.", session_id)
         action_space = RecipeActionSpace(
             session.user_profile, additional_diet=standing_diet, pantry=pantry,
@@ -163,6 +173,12 @@ class WeeklyPlanService:
         signals = self.feedback_service.get_signals(session.member_id)
         for recipe_id in signals.downvoted_recipe_ids:
             action_space.mark_selected(recipe_id)
+        # Nor does anything the member rejected in conversation. This used the
+        # same channel as downvotes and simply was not connected to it, so
+        # "not that one" held on the daily canvas and not the weekly one.
+        for recipe_id in state.excluded_recipe_ids:
+            if recipe_id:
+                action_space.mark_selected(recipe_id)
         env = WeeklyMealPlanEnv(
             user_profile=session.user_profile,
             action_space=action_space,

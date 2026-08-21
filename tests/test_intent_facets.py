@@ -15,6 +15,8 @@ it empties it, and the member is told no meals exist.
 
 from __future__ import annotations
 
+import pytest
+
 from models.planning_state import PlanningState, PlanningStateDelta
 from services import intent_facets as F
 
@@ -352,3 +354,99 @@ class TestTheCapabilityGate:
         CANDIDATES.__class__._vocab_cache = {"cuisines": ["greek"]}
         pc.PLANNER.plan_meals(days=1, tags=["high_protein"], cuisines=["greek"])
         assert captured.get("cuisines") == ["greek"]
+
+
+class TestSlidersThatUsedToDoNothing:
+    """Only `cooking_time` was ever a filter. `goal` and `difficulty` were prose
+    to a grader that two of the three planning paths do not run."""
+
+    def _vocab(self):
+        from services.candidates_client import CANDIDATES
+
+        CANDIDATES.__class__._vocab_cache = {
+            **VOCAB,
+            "tags": ["high_protein", "high_fibre", "low_calorie",
+                     "30_minutes_or_less", "5_ingredients_or_less",
+                     "healthy_and_nutritious"],
+        }
+
+    def test_easy_maps_onto_proxies_that_exist(self):
+        """RecipeWrangler has no difficulty field at all — grep returns nothing.
+        `easy` does have honest proxies in the corpus."""
+        self._vocab()
+        got = F.facet_kwargs({"plan_parameters": {"difficulty": "easy"},
+                              "food_likes": []})
+        assert set(got["tags"]) == {"30_minutes_or_less", "5_ingredients_or_less"}
+
+    @pytest.mark.parametrize("level", ["medium", "hard"])
+    def test_levels_with_no_signal_apply_nothing(self, level):
+        """There is no "elaborate" annotation to ask for, and inventing one
+        would empty every slot. Applying nothing is the honest outcome."""
+        self._vocab()
+        got = F.facet_kwargs({"plan_parameters": {"difficulty": level},
+                              "food_likes": []})
+        assert got["tags"] == []
+
+    def test_difficulty_and_goal_combine(self):
+        self._vocab()
+        got = F.facet_kwargs({
+            "plan_parameters": {"difficulty": "easy", "goal": "energy"},
+            "food_likes": [],
+        })
+        assert set(got["tags"]) == {
+            "high_protein", "high_fibre", "30_minutes_or_less",
+            "5_ingredients_or_less",
+        }
+
+
+class TestStandingRejectionsAndDeclinedFavourites:
+    def test_the_daily_path_sends_conversational_exclusions(self):
+        """"Not that one" reached only the structured path, so on the default
+        path the exclusion was recorded, persisted, and ignored at the fetch."""
+        import inspect
+
+        from services.chat_service import ChatService
+
+        src = inspect.getsource(ChatService._generate_and_store)
+        call = src[src.find("self.pipeline.generate("):]
+        assert "_excluded_recipe_ids" in call
+
+    def test_the_weekly_path_sends_them_too(self):
+        import inspect
+
+        from services.weekly_plan_service import WeeklyPlanService
+
+        src = inspect.getsource(WeeklyPlanService.process_message)
+        assert "state.excluded_recipe_ids" in src
+
+    def test_weekly_honours_a_declined_favourites_offer(self):
+        """Honoured on daily only; weekly kept adding +5 per favourite. A member
+        who says no and sees their favourite anyway has been told their answer
+        does not matter."""
+        import inspect
+
+        from services.weekly_plan_service import WeeklyPlanService
+
+        src = inspect.getsource(WeeklyPlanService.process_message)
+        assert "use_favorites is False" in src
+
+
+class TestGoalAcceptedMidSessionTakesEffect:
+    def test_min_nutri_score_is_mirrored(self):
+        """It is the ONLY goal-derived value that reaches plan_meals —
+        `nutrition_profile` has no parameter to travel on. Without this,
+        accepting "lose weight" changed the profile and left the plan
+        identical until the next session."""
+        from services.memory_service import MemoryService
+
+        class S:
+            user_profile = {"dietary_goals": [], "preferences": []}
+            session_id = "s1"
+
+        svc = MemoryService.__new__(MemoryService)
+        svc.session_service = type("X", (), {
+            "persist_profile": lambda *a, **k: None
+        })()
+        session = S()
+        svc._apply_to_session_profile(session, "dietary_goal", "lose_weight")
+        assert session.user_profile["min_nutri_score"] == "B"

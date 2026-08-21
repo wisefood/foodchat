@@ -74,6 +74,24 @@ GOAL_CLAIM_TAGS: dict[str, list[str]] = {
     "energy": ["high_protein", "high_fibre"],
 }
 
+# Difficulty, mapped onto the only signals that exist for it.
+#
+# RecipeWrangler has NO difficulty field — `grep -ri difficulty` across its
+# source returns nothing. So the slider was a pure no-op: prose to a grader that
+# two of the three planning paths never run. `easy` does have honest proxies in
+# the corpus (`5_ingredients_or_less` 563 recipes, `30_minutes_or_less` 2809),
+# so it becomes real here.
+#
+# `medium` and `hard` map to nothing, and that is deliberate rather than an
+# omission: there is no "elaborate" annotation to ask for, and inventing one
+# would empty every slot. They stay selectable — removing an option is a UI
+# contract change — but they now apply nothing instead of pretending.
+DIFFICULTY_CLAIM_TAGS: dict[str, list[str]] = {
+    "easy": ["30_minutes_or_less", "5_ingredients_or_less"],
+    "medium": [],
+    "hard": [],
+}
+
 # The nutrition claims a member states directly, as opposed to via the slider.
 # `diet_intent.split_diet_intent` already separates these from real diets
 # (they are on zero recipes as diet tags); this is where they become searchable.
@@ -140,6 +158,7 @@ def facets_for_goal(goal: Optional[str]) -> dict[str, list[str]]:
 def claim_tags_for(
     goal: Optional[str] = None,
     claims: Optional[list[str]] = None,
+    difficulty: Optional[str] = None,
 ) -> list[str]:
     """RecipeWrangler claim tags implied by a goal and any stated claims.
 
@@ -150,6 +169,9 @@ def claim_tags_for(
     """
     tags: list[str] = []
     for tag in GOAL_CLAIM_TAGS.get(str(goal or "").strip().lower(), []):
+        if tag not in tags:
+            tags.append(tag)
+    for tag in DIFFICULTY_CLAIM_TAGS.get(str(difficulty or "").strip().lower(), []):
         if tag not in tags:
             tags.append(tag)
     for claim in claims or []:
@@ -189,8 +211,12 @@ def facet_kwargs(profile: dict, cuisines: Optional[list[str]] = None) -> dict:
     # they exist. They come from two places: the slider goal, and claims the
     # member stated in words ("high protein"). `plan_client` decides whether
     # the live RecipeWrangler can actually receive them.
-    goal = (profile.get("plan_parameters") or {}).get("goal")
-    tags = claim_tags_for(goal, list(profile.get("_claim_tags") or []))
+    params = profile.get("plan_parameters") or {}
+    tags = claim_tags_for(
+        params.get("goal"),
+        list(profile.get("_claim_tags") or []),
+        params.get("difficulty"),
+    )
 
     return {
         "cuisines": merged.get("cuisines") or [],

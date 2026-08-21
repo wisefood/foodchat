@@ -30,6 +30,7 @@ from typing import Optional
 from agents import PreferenceExtractor
 from .profile_service import (
     GOAL_PREFERENCE_STRINGS,
+    goals_min_nutri_score,
     goals_nutrition_profile,
     ProfileService,
     goal_preference_strings,
@@ -278,6 +279,15 @@ class MemoryService:
                     else:
                         existing[key] = max(existing[key], bound) if key in existing else bound
                 profile["nutrition_profile"] = existing
+            # `min_nutri_score` is the ONLY goal-derived value that reaches
+            # `plan_meals` — `nutrition_profile` above has no parameter to
+            # travel on. It was the one thing this mirror did not set, so
+            # accepting "lose weight" mid-conversation changed the profile,
+            # the preferences and a field nothing reads, and left the plan
+            # identical until the next session or a diner change.
+            floor = goals_min_nutri_score(goals)
+            if floor:
+                profile["min_nutri_score"] = floor
             # The ledger reads goals from `goal_reconciliation`, which
             # `merge_profiles` wrote when the diners were chosen — so a goal
             # accepted afterwards had no row at all, not even a demoted one.

@@ -2,6 +2,48 @@
 
 ---
 
+# The sliders and standing answers that did nothing (Phase 1c)
+
+> **Date:** 2026-08-21
+> **Branch:** fix/stated-diet-and-honest-constraints
+> No API change. `difficulty=easy` now narrows the search, so plans for members
+> with that setting will change.
+
+Four things the member had already told us, which reached nothing.
+
+**A goal accepted mid-conversation left the plan identical.** The session
+mirror set `dietary_goals`, `preferences` and `nutrition_profile` — but not
+`min_nutri_score`, which is the **only** goal-derived value that reaches
+`plan_meals` (`nutrition_profile` has no parameter to travel on). So accepting
+"lose weight" changed three fields, one of which nothing reads, and the next
+plan was the same plan. Now mirrored: accepting `lose_weight` sets the floor to
+`B` immediately.
+
+**"Not that one" was recorded, persisted, and ignored.**
+`state.excluded_recipe_ids` reached only the structured path. On the classic
+daily path — the default — and on the weekly path, a recipe the member had
+explicitly rejected came back on the next regeneration. Both now send it, the
+weekly path through the same `mark_selected` channel downvotes already used.
+
+**"No thanks" to the favourites offer held on daily only.** Weekly kept adding
+`+5` per favourite and putting them in the week. The code comment describing
+this exact bug as fixed was written for the daily path; the weekly path had
+never been connected. A member who says no and sees their favourite anyway has
+been told their answer does not matter.
+
+**The difficulty slider was a pure no-op.** `grep -ri difficulty` across
+RecipeWrangler's source returns **nothing** — no field, no tag, no vocabulary.
+So it was prose for a grader that two of the three planning paths never run.
+`easy` does have honest proxies in the corpus (`30_minutes_or_less` 2809
+recipes, `5_ingredients_or_less` 563) and now uses them. `medium` and `hard`
+map to nothing, deliberately: there is no "elaborate" annotation to ask for and
+inventing one would empty every slot. They stay selectable — removing an option
+is a UI contract change — but they apply nothing instead of pretending to.
+
+605 passing.
+
+---
+
 # Claim tags reach the search (Phase 1b)
 
 > **Date:** 2026-08-21

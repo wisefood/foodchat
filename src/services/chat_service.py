@@ -455,9 +455,14 @@ class ChatService:
                 signals, is_refinement,
             )
 
+        # A recipe the member rejected in conversation ("not that one") must not
+        # come back on a regeneration. `_excluded_recipe_ids` reached only the
+        # structured path, so on the classic path — the default — the standing
+        # exclusion was recorded, persisted, and then ignored at the fetch.
         plans = self.pipeline.generate(
             final_query, profile, pinned=pinned,
-            exclude_recipe_ids=signals.downvoted_recipe_ids,
+            exclude_recipe_ids=list(signals.downvoted_recipe_ids or [])
+            + list(profile.get("_excluded_recipe_ids") or []),
             feedback_history=signals.history_text,
         )
         if not plans:
