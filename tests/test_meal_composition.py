@@ -433,3 +433,84 @@ class TestThePromptsAreNew:
         from prompts import MEAL_COMPOSER_USER
 
         assert "{meals}" in MEAL_COMPOSER_USER.fallback
+
+
+# ── the request actually asks for a choice ──────────────────────────────────
+
+class TestTheDepthReachesTheRequest:
+    """The near-miss worth a test of its own.
+
+    `plan_meals` documented that "a spec supersedes slots/count_per_slot/days",
+    and `to_request_slots` hardcoded `count: 1`. So a composer asking for four
+    candidates per plate was silently handed one — one composition, no choice to
+    make, the scoring rubric inert and the judge never invoked. Every unit test
+    in this file would still have passed, because they build pools directly.
+    """
+
+    def test_a_spec_can_ask_for_more_than_one_per_plate(self):
+        spec = PlanSpec(meals=("dinner",), plates={"dinner": ("main", "side")})
+        assert [e["count"] for e in spec.to_request_slots(count=4)] == [4, 4]
+
+    def test_one_is_still_the_default(self):
+        """A plan needs one per plate. Only a composer needs more, and it has
+        to say so."""
+        spec = PlanSpec(meals=("dinner",), plates={"dinner": ("main", "side")})
+        assert [e["count"] for e in spec.to_request_slots()] == [1, 1]
+
+    def test_plan_meals_no_longer_drops_it_when_a_spec_is_passed(self, monkeypatch):
+        from services.plan_client import PlanClient
+
+        sent = {}
+
+        class _Response:
+            @staticmethod
+            def raise_for_status():
+                return None
+
+            @staticmethod
+            def json():
+                return {"days": []}
+
+        class _Client:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def post(self, url, json=None):
+                sent.update(json or {})
+                return _Response()
+
+        import httpx
+        monkeypatch.setattr(httpx, "Client", _Client)
+
+        spec = PlanSpec(meals=("dinner",), plates={"dinner": ("main", "side")})
+        PlanClient().plan_meals(spec=spec, count_per_slot=4)
+
+        assert [s["count"] for s in sent["slots"]] == [4, 4]
+
+    def test_the_composer_asks_for_a_pool_deep_enough_to_choose_from(self, monkeypatch):
+        """End to end: what `role_pools` actually puts on the wire."""
+        import services.plan_client as plan_module
+
+        sent = {}
+
+        class _Planner:
+            @staticmethod
+            def plan_meals(**kwargs):
+                sent.update(kwargs)
+                return {"days": []}
+
+            describe_relaxations = staticmethod(lambda e: [])
+            to_role_pools = staticmethod(lambda e, s, allergens=None: {})
+
+        monkeypatch.setattr(plan_module, "PLANNER", _Planner())
+
+        spec = PlanSpec(meals=("dinner",), plates={"dinner": ("main", "side")})
+        meal_composer.role_pools({"allergies": []}, spec, per_plate=4)
+
+        assert sent["count_per_slot"] == 4

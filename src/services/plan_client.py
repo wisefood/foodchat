@@ -180,11 +180,18 @@ class PlanClient:
         degrade from that, and inventing a second failure convention for the
         same kind of problem would mean two sets of error handling.
         """
-        # A spec supersedes `slots`/`count_per_slot`/`days`. Those remain for
-        # the simple case — three meals, one recipe each — because most callers
-        # want exactly that and should not have to construct an object to say so.
+        # A spec supersedes `slots` and `days`. Those remain for the simple
+        # case — three meals, one recipe each — because most callers want
+        # exactly that and should not have to construct an object to say so.
+        #
+        # `count_per_slot` is NOT superseded: it is recipes per plate, which is
+        # orthogonal to the shape. It used to be silently ignored whenever a
+        # spec was passed, so a caller asking a shaped plan for four candidates
+        # per plate got one — and a composer handed one candidate per plate has
+        # nothing to compose. A parameter that reaches nothing is worse than one
+        # that does not exist.
         if spec is not None:
-            request_slots = spec.to_request_slots()
+            request_slots = spec.to_request_slots(count=max(1, int(count_per_slot)))
             days = spec.num_days
         else:
             request_slots = [

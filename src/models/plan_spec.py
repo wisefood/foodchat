@@ -207,7 +207,7 @@ class PlanSpec:
 
         return notes
 
-    def to_request_slots(self) -> list[dict[str, Any]]:
+    def to_request_slots(self, count: int = 1) -> list[dict[str, Any]]:
         """The `slots` payload `/api/v2/tools/plan_meals` expects.
 
         **One entry per plate**, not one per meal. RecipeWrangler treats a
@@ -218,6 +218,11 @@ class PlanSpec:
 
         Entries keep the same slot name, which the service echoes back, so the
         plates regroup into one `Meal` on the way home.
+
+        `count` is recipes per PLATE, and it defaults to one because that is
+        what a plan needs. More than one is what a composer needs: choosing
+        which side goes with which main is not possible when the service was
+        only ever asked for one of each.
         """
         out: list[dict[str, Any]] = []
         for slot in self.meals:
@@ -225,7 +230,7 @@ class PlanSpec:
                 out.append(
                     {
                         "slot": slot,
-                        "count": 1,
+                        "count": max(1, int(count)),
                         "course_types": list(ROLE_COURSE_TYPES.get(role, ())),
                     }
                 )
