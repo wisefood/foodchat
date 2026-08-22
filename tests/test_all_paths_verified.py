@@ -186,12 +186,31 @@ class TestEveryPathIsWired:
         assert '"verified_problems"' in src
 
     def test_weekly_verification_never_costs_the_week(self):
-        """It describes a plan that already exists."""
+        """It describes a plan that already exists, so losing it must cost the
+        measured rows and never the week.
+
+        Asserted on the AST rather than a character window: the block has grown
+        twice already (repair, then quality metrics), and a window is a magic
+        number that fails for the wrong reason each time it does.
+        """
+        import ast
+
         from services.weekly_plan_service import WeeklyPlanService
 
-        src = inspect.getsource(WeeklyPlanService.process_message)
-        verify_at = src.index("plan_verifier.verify(")
-        assert "except Exception" in src[verify_at:verify_at + 900]
+        tree = ast.parse(inspect.getsource(WeeklyPlanService.process_message).lstrip())
+        guarded = False
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Try):
+                continue
+            body = ast.dump(ast.Module(body=node.body, type_ignores=[]))
+            if "plan_verifier" not in body:
+                continue
+            if any(
+                h.type is not None and getattr(h.type, "id", "") == "Exception"
+                for h in node.handlers
+            ):
+                guarded = True
+        assert guarded, "the verify/repair/metrics block is not guarded"
 
 
 class TestOneContract:

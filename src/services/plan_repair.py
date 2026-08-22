@@ -164,6 +164,11 @@ def repair(plan, brief, report, profile: dict, *, client=None) -> RepairOutcome:
         outcome.repaired.append({
             "slot": meal.meal_type, "check": check_name,
             "was": plate.title, "now": replacement.title,
+            # Ids as well as titles: a caller that stores its plan in another
+            # shape — the weekly path holds entry dicts, not a MealPlan — needs
+            # to find the row it must rewrite, and titles are not unique.
+            "was_id": recipe_id, "now_id": replacement.recipe_id,
+            "day": getattr(_day_of(plan, replacement.recipe_id), "day", None),
         })
         logger.info(
             "Repaired %s: %r -> %r (%s)",
@@ -204,6 +209,16 @@ def repair(plan, brief, report, profile: dict, *, client=None) -> RepairOutcome:
             "reason": "still not right after one attempt",
         })
     return outcome
+
+
+def _day_of(plan, recipe_id: str):
+    """The day a recipe sits on, so a weekly caller can address the right row."""
+    for day in plan.day_plans:
+        for meal in day.meals:
+            for plate in meal.plates:
+                if plate.recipe_id == recipe_id:
+                    return day
+    return None
 
 
 def _locate(plan, recipe_id: str):

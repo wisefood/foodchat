@@ -18,7 +18,6 @@ survives restarts and works across replicas (see ``services.clarification``).
 """
 
 import logging
-import re
 from typing import Optional, Tuple
 
 from agents import (
@@ -33,7 +32,13 @@ from models.recipe import CandidateRecipe, ScoredPlan
 from models.session import MealPlan
 from models.planning_state import PlanningStateDelta
 from services.adapted_recipes import overlay_plan
-from services import pantry_service, plan_repair, plan_verifier, turn_budget
+from services import (
+    pantry_service,
+    plan_quality,
+    plan_repair,
+    plan_verifier,
+    turn_budget,
+)
 from services import diet_intent, intent_facets
 from services.planning_delta import extract_state_delta
 from services.candidates_client import CANDIDATES
@@ -103,78 +108,15 @@ def _format_plan_as_context(plan: MealPlan) -> str:
     return "\n".join(lines)
 
 
-def _extract_ingredient_names(ingredients_text: str) -> list[str]:
-    """Normalize a free-text ingredients blob into comparable item names."""
-    if not isinstance(ingredients_text, str):
-        return []
-    cleaned = []
-    for part in re.split(r"[\n,;•\-]+", ingredients_text):
-        t = part.strip().lower()
-        t = re.sub(r"\([^\)]*\)", "", t)
-        t = re.sub(r"[^a-zA-Z\s]", " ", t)
-        t = re.sub(r"\s+", " ", t).strip()
-        if t:
-            cleaned.append(t)
-    return cleaned
-
-
-def _food_variety_score(plan: ScoredPlan) -> tuple[int, str]:
-    """Count unique food items across every course of the plan (FVS metric)."""
-    items: list[str] = []
-    for course in plan.courses:
-        items.extend(_extract_ingredient_names(course.ingredients))
-    unique_items = sorted(set(items))
-    reasoning = (
-        f"Unique food items across meals: {len(unique_items)} "
-        f"(e.g., {', '.join(unique_items[:8])}{'...' if len(unique_items) > 8 else ''})"
-    )
-    return len(unique_items), reasoning
-
-
-def _plan_as_text(plan: ScoredPlan) -> str:
-    """Every course, labelled by its own slot.
-
-    Was hardcoded to Breakfast/Lunch/Dinner, which is fine while those are the
-    only three slots that can exist and an `AttributeError` on `None.title` the
-    moment they are not. It reads whatever slots the plan has, in eating order.
-    """
-    return "\n".join(
-        f"{name.replace('_', ' ').title()}: {course.title}\n"
-        f"Ingredients: {course.ingredients}\nDirections: {course.directions}\n"
-        for name, course in ((n, plan.slots[n]) for n in plan.slot_names)
-    )
-
-
-def scored_plan_from(meal_plan, score: int = 0, reasoning: str = "") -> ScoredPlan:
-    """A produced plan, in the shape the quality metrics read.
-
-    The structured path shipped with no metrics because `_compute_metrics`
-    needed a `ScoredPlan` and a `ScoredPlan` could only be three named courses.
-    Now that it holds a mapping, a plan of any shape can be scored.
-
-    Every plate on every day, not day one: the metrics are variety, diversity
-    and guideline adherence, and all three mean "across what the member will
-    actually eat". Judging a seven-day plan on its first day would report the
-    variety of a Monday.
-
-    Slots are labelled `day 2 dinner (side)` so the grader's prompt reads as a
-    plan rather than a list of dishes, and so two dinners in a week do not
-    collapse onto one key.
-    """
-    multi_day = len(meal_plan.day_plans) > 1
-    slots: dict = {}
-    for day in meal_plan.day_plans:
-        for meal in day.meals:
-            for plate in meal.plates:
-                if not getattr(plate, "recipe_id", ""):
-                    continue
-                name = meal.meal_type
-                if multi_day:
-                    name = f"day {day.day} {name}"
-                if len(meal.plates) > 1:
-                    name = f"{name} ({getattr(plate, 'role', 'main')})"
-                slots[name] = plate.to_candidate()
-    return ScoredPlan(score=score, reasoning=reasoning, slots=slots)
+# These moved to `services/plan_quality.py` so the weekly service can reach
+# them too — it produces 21 meals and had no variety score, no diversity
+# judgement and no guideline adherence, because the graders were instance
+# attributes on this class. Kept as aliases: the names are used by tests and by
+# readers who know where they were.
+_extract_ingredient_names = plan_quality.extract_ingredient_names
+_food_variety_score = plan_quality.food_variety
+_plan_as_text = plan_quality.as_text
+scored_plan_from = plan_quality.scored_from_plan
 
 
 class ChatService:
@@ -914,32 +856,15 @@ class ChatService:
         return brief
 
     def _compute_metrics(self, session_id: str, plan: ScoredPlan) -> dict:
-        """Compute the four plan-quality metrics surfaced in the API response."""
-        plan_text = _plan_as_text(plan)
+        """The four plan-quality metrics surfaced in the API response.
 
-        fvs_count, fvs_reasoning = _food_variety_score(plan)
-        logger.info("[%s] FVS: %d unique ingredients.", session_id, fvs_count)
-
-        diversity = self.diversity_grader.score(plan_text)
-
-        # No guideline corpus is wired up yet, so this grades on the prompt's
-        # own rubric. It used to read a `.cypher` file that is not in the repo
-        # at all — so every score came from an empty context, and had the file
-        # existed it would have pasted raw Cypher statements into the prompt.
-        # Rules come from the data catalog as faceted texts (rule_text with
-        # region/audience/nutrient facets); that is the seam to fill.
-        adherence = self.guideline_grader.score(plan_text, "")
-
-        return {
-            "llm_score": plan.score,
-            "llm_reasoning": plan.reasoning,
-            "fvs_count": fvs_count,
-            "fvs_reasoning": fvs_reasoning,
-            "diversity_llm_score": int(diversity.get("score", 0)),
-            "diversity_llm_reasoning": str(diversity.get("reasoning", "")),
-            "guideline_adherence_score": int(adherence.get("score", 0)),
-            "guideline_adherence_reasoning": str(adherence.get("reasoning", "")),
-        }
+        Delegates to `plan_quality`, which the weekly service uses too — one
+        implementation, so a change to how a plan is scored cannot land on one
+        path and not the other.
+        """
+        result = plan_quality.metrics(plan)
+        logger.info("[%s] FVS: %d unique ingredients.", session_id, result["fvs_count"])
+        return result
 
     # ------------------------------------------------------------------ #
     # Helpers                                                              #

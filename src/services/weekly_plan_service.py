@@ -63,6 +63,61 @@ def _as_meal_plan(plan_entries: list[dict]):
     ]
     return MealPlan.from_days(days, "weekly") if days else None
 
+
+def _apply_repairs(plan_entries: list[dict], adapted, outcome) -> int:
+    """Write a repair made on the adapted plan back into the weekly entries.
+
+    The repair runs against a `MealPlan` because that is the one shape the
+    verifier and the repair both understand. Weekly stores entry dicts, so the
+    swap has to be carried across — and it is carried by RECIPE ID, not by
+    title or position: two dishes in a week can share a title, and an entry's
+    index shifts if anything upstream ever reorders.
+
+    Returns how many entries were rewritten, so a mismatch is visible rather
+    than a plan that silently kept the dish the repair thought it removed.
+    """
+    replacements = {
+        row["was_id"]: row["now_id"]
+        for row in outcome.repaired
+        if row.get("was_id") and row.get("now_id")
+    }
+    if not replacements:
+        return 0
+
+    # The repaired plates, by their new id, so the entry can be rebuilt from
+    # the same MealCourse the verifier just re-measured.
+    fresh = {
+        plate.recipe_id: plate
+        for day in adapted.day_plans for meal in day.meals for plate in meal.plates
+        if plate.recipe_id
+    }
+
+    applied = 0
+    for entry in plan_entries:
+        recipe = entry.get("recipe") or {}
+        old_id = str(recipe.get("recipe_id") or "")
+        new_id = replacements.get(old_id)
+        plate = fresh.get(new_id) if new_id else None
+        if plate is None:
+            continue
+        recipe["recipe_id"] = plate.recipe_id
+        recipe["recipe_title"] = plate.title
+        recipe["recipe_ingredients"] = plate.ingredients
+        recipe["recipe_directions"] = plate.directions
+        # The old nutrition and image belonged to the dish that was removed.
+        recipe["nutrition"] = plate.nutrition
+        recipe["image_url"] = plate.image_url
+        recipe["match_reasons"] = list(plate.match_reasons or [])
+        entry["recipe"] = recipe
+        applied += 1
+
+    if applied != len(replacements):
+        logger.warning(
+            "Repair wrote back %d of %d swaps — an entry could not be matched",
+            applied, len(replacements),
+        )
+    return applied
+
 DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
 
@@ -316,9 +371,10 @@ class WeeklyPlanService:
         # rendered as satisfied because the word had been sent, across 21 meals
         # rather than three. The verifier reads the plates that came back.
         report = None
+        repair_note = None
         try:
             from models.plan_brief import PlanBrief
-            from services import plan_verifier
+            from services import plan_quality, plan_repair, plan_verifier, turn_budget
 
             adapted = _as_meal_plan(plan_entries)
             if adapted is not None:
@@ -330,14 +386,44 @@ class WeeklyPlanService:
                     "[%s] Weekly verified: %s",
                     session_id, plan_verifier.describe(report),
                 )
+
+                # One repair pass, same as the daily paths. Across 21 meals a
+                # hard-constraint failure is more likely than on three, and
+                # weekly was the path where nothing acted on it.
+                if report.blocking and not turn_budget.skip(
+                    "weekly repair", turn_budget.COST_FETCH,
+                ):
+                    outcome = plan_repair.repair(
+                        adapted, brief, report, session.user_profile,
+                    )
+                    if outcome.changed:
+                        applied = _apply_repairs(plan_entries, adapted, outcome)
+                        if applied:
+                            report = outcome.report
+                            repair_note = plan_repair.describe(outcome)
+                            logger.info(
+                                "[%s] Weekly repair: %d entry(ies) rewritten",
+                                session_id, applied,
+                            )
+
                 if report.checks:
                     explainability["constraints_applied"] = (
                         list(explainability.get("constraints_applied") or [])
                         + report.as_ledger_rows()
                     )
+
+                # Quality metrics, which weekly has never had: the graders were
+                # instance attributes on ChatService, so the path that produces
+                # 21 meals said the least about them. Measured across the whole
+                # week — judging it on Monday reports the variety of a Monday.
+                if not turn_budget.skip("weekly quality", turn_budget.COST_METRICS):
+                    explainability.setdefault("metrics", {})
+                    explainability["metrics"]["quality"] = plan_quality.metrics(
+                        plan_quality.scored_from_plan(_as_meal_plan(plan_entries)),
+                    )
         except Exception as exc:  # noqa: BLE001
-            # Verification describes a plan that already exists. Losing it
-            # costs the measured rows, never the week.
+            # All of this describes a plan that already exists. Losing any of
+            # it costs the measured rows or the scores, never the week.
             logger.warning("[%s] Weekly verification failed: %s", session_id, exc)
 
         if is_refinement:
@@ -371,6 +457,8 @@ class WeeklyPlanService:
         )
         # A failed check the reply does not mention is a failure the member
         # discovers by eating it — 21 chances of that on a week.
+        if repair_note:
+            explainability.setdefault("metrics", {})["repair"] = repair_note
         weekly_problems = (
             [{"constraint": c.name, "detail": c.detail} for c in report.failed]
             if report is not None else []
@@ -379,6 +467,7 @@ class WeeklyPlanService:
             "action": "refined_weekly_plan" if is_refinement else "new_weekly_plan",
             "days": 7, "meals": 21,
             "verified_problems": weekly_problems,
+            "repair": repair_note,
             "anchored_dishes": pinned_titles,
             "seed_note": seed_note,
             "cooking_for": session.user_profile.get("cooking_for_names") or [],
