@@ -188,11 +188,18 @@ class WeeklyPlanService:
         # "a high-protein week" was heard, stored, and dropped. Intake puts the
         # claim on `claim_tags`, which every fetch site reads, and adds the two
         # extractions weekly never had: facets ("a Thai week") and shape.
-        from services import pantry_service, turn_intake
+        from services import pantry_service, plan_parameters, turn_intake
 
         state = turn_intake.intake(
             session_id, content, session_service=self.session_service,
         )
+        # A cooking-time ceiling stated in words belongs where the slider's
+        # value lives — `RecipeActionSpace`, the pantry fan-out and the brief
+        # all read it from there.
+        session.user_profile = plan_parameters.apply_state(
+            dict(session.user_profile or {}), state,
+        )
+
         pantry = state.pantry
         if pantry:
             logger.info("[%s] Pantry to use up: %s", session_id, ", ".join(pantry))

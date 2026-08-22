@@ -914,11 +914,22 @@ CHATBOT_SYSTEM_INSTRUCTIONS = (
     "asks what you can do, mention this; if their request implies a shape "
     "('I skip breakfast', 'we want a starter too'), plan that shape rather than "
     "defaulting to three meals. "
-    "You can steer by cuisine and cooking time, and set a minimum Nutri-Score. "
-    "Do NOT promise to steer by mood, flavour or food group, and do NOT promise "
-    "calorie or protein targets — those are not wired up yet, and offering them "
-    "makes the next turn a disappointment. Allergies and dietary requirements "
-    "are never relaxed to make a plan fit. "
+    # What follows must stay a description of what the planner can actually
+    # do. It has been wrong in both directions: it promised mood, flavour,
+    # food group, calorie and protein steering when none of it was wired, and
+    # then — after the facets WERE wired — it went on telling the model to
+    # refuse three capabilities the planner had gained.
+    "You can steer by cuisine, mood, flavour and food group ('something "
+    "comforting', 'light and fresh', 'more vegetables', 'Thai tonight'), by "
+    "cooking time ('under 20 minutes'), by nutrition claims the recipes carry "
+    "('high protein', 'low fat', 'quick'), and by a minimum Nutri-Score. You "
+    "can also use up what someone has in ('I have spinach to use') and keep "
+    "a dish they name. "
+    "Do NOT promise calorie or protein TARGETS from chat — a plan is checked "
+    "against a calorie budget when the member's profile carries one, but they "
+    "cannot set a number by asking, and offering that makes the next turn a "
+    "disappointment. Allergies and dietary requirements are never relaxed to "
+    "make a plan fit. "
     "Nutrition-science questions are answered for you by FoodScholar, WiseFood's "
     "evidence-based Q&A service, so never tell the user a question can't be answered here. "
     "For this conversation: respond warmly and briefly, stay food-related where natural, "
@@ -1126,11 +1137,18 @@ EDIT_COMMAND_EXTRACTOR_SYSTEM = _reg("edit_command_extractor_system", EDIT_COMMA
 EDIT_COMMAND_EXTRACTOR_USER = _reg("edit_command_extractor_user", EDIT_COMMAND_EXTRACTOR_USER_INSTRUCTIONS)
 RESPONSE_WRITER_SYSTEM = _reg("response_writer_system", RESPONSE_WRITER_SYSTEM_INSTRUCTIONS)
 RESPONSE_WRITER_USER = _reg("response_writer_user", RESPONSE_WRITER_USER_INSTRUCTIONS)
-# Registered as v2: `chatbot_system` already exists in Langfuse and a deploy
-# never overwrites an existing copy, so correcting the in-code text would have
-# left the false capability promise live in production forever. The old name is
-# deliberately abandoned rather than edited.
-CHATBOT_SYSTEM = _reg("chatbot_system_v2", CHATBOT_SYSTEM_INSTRUCTIONS)
+# v3, and the reason is the same one that made it v2: `sync_prompts` creates
+# only MISSING prompts and never overwrites, so editing this text under an
+# existing name ships it dead and leaves the wrong description live forever.
+#
+# v2 stopped the persona promising four things the planner could not do. v3
+# stops it refusing three it can: mood, flavour and food group became real
+# filters when the facet extractor was wired, and the prompt went on telling
+# the model to say no. A capability nobody is told about is the same defect as
+# one that does not exist — this file has now shipped both directions of it,
+# which is the argument for the prompt being derived from the code rather than
+# describing it.
+CHATBOT_SYSTEM = _reg("chatbot_system_v3", CHATBOT_SYSTEM_INSTRUCTIONS)
 SESSION_TITLE_SYSTEM = _reg("session_title_system", SESSION_TITLE_SYSTEM_INSTRUCTIONS)
 SESSION_TITLE_USER = _reg("session_title_user", SESSION_TITLE_USER_INSTRUCTIONS)
 PLAN_INTENT_EXTRACTOR_SYSTEM = _reg(

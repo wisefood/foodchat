@@ -107,6 +107,19 @@ class PlanningState:
     flavor_profiles: tuple[str, ...] = ()
     food_groups: tuple[str, ...] = ()
 
+    # A cooking-time ceiling the member stated in words, in minutes.
+    #
+    # The same constraint the cooking-time slider expresses, and it reaches the
+    # same place: `profile["plan_parameters"]["cooking_time"]`, which all seven
+    # fetch sites already read through `plan_parameters.max_duration_minutes`.
+    # Held here rather than written straight to the profile because it is a
+    # standing statement like every other — "keep it under 20 minutes" still
+    # means that next turn.
+    #
+    # The persona has promised for a long time that a member can steer by
+    # cooking time. Only the slider ever could.
+    max_minutes: Optional[int] = None
+
     #: The facet families carried above, in the order RecipeWrangler relaxes
     #: them last-to-first. Iterating this beats four copies of everything.
     FACET_FIELDS = ("cuisines", "moods", "flavor_profiles", "food_groups")
@@ -186,9 +199,15 @@ class PlanningState:
                     current.append(slug)
             facet_values[family] = tuple(current)
 
+        max_minutes = (
+            None if delta.max_minutes_clear
+            else (self.max_minutes if delta.max_minutes is None else delta.max_minutes)
+        )
+
         return replace(
             self,
             spec=spec,
+            max_minutes=max_minutes,
             **facet_values,
             anchors=anchors,
             excluded_recipe_ids=tuple(excluded),
@@ -224,6 +243,8 @@ class PlanningState:
             parts.append("diet stated in chat: " + ", ".join(self.diet_tags))
         if self.claim_tags:
             parts.append("asked for: " + ", ".join(self.claim_tags))
+        if self.max_minutes:
+            parts.append(f"under {self.max_minutes} min per meal")
         for family, values in self.facets().items():
             parts.append(f"{family.replace('_', ' ')}: " + ", ".join(values))
         if self.notes:
@@ -267,6 +288,7 @@ class PlanningState:
             "pantry": list(self.pantry),
             "diet_tags": list(self.diet_tags),
             "claim_tags": list(self.claim_tags),
+            "max_minutes": self.max_minutes,
             **{family: list(getattr(self, family)) for family in self.FACET_FIELDS},
         }
 
@@ -305,6 +327,7 @@ class PlanningState:
             claim_tags=tuple(
                 str(c).strip().lower() for c in (raw.get("claim_tags") or []) if c
             ),
+            max_minutes=_as_minutes(raw.get("max_minutes")),
             **{
                 family: tuple(
                     str(v).strip().lower() for v in (raw.get(family) or []) if v
@@ -339,6 +362,11 @@ class PlanningStateDelta:
     # field, not the diet filter.
     claim_tags: tuple[str, ...] = ()
     diet_clear: bool = False
+    # A cooking-time ceiling stated in words, and its retraction ("take as long
+    # as you need"). A flag rather than a sentinel value because 0 minutes is
+    # not a retraction, it is a nonsense constraint.
+    max_minutes: Optional[int] = None
+    max_minutes_clear: bool = False
     # Facets stated this turn, plus values to take back (the UI's removable
     # chips, and "actually not spicy").
     cuisines: tuple[str, ...] = ()
@@ -361,6 +389,8 @@ class PlanningStateDelta:
             or self.diet_tags
             or self.claim_tags
             or self.diet_clear
+            or self.max_minutes is not None
+            or self.max_minutes_clear
             or self.cuisines
             or self.moods
             or self.flavor_profiles
@@ -368,3 +398,14 @@ class PlanningStateDelta:
             or self.facets_remove
             or self.reset
         )
+
+
+def _as_minutes(value: Any) -> Optional[int]:
+    """A stored minute count, or None. Tolerates anything a session row holds."""
+    if value is None:
+        return None
+    try:
+        minutes = int(value)
+    except (TypeError, ValueError):
+        return None
+    return minutes if minutes > 0 else None

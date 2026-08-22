@@ -1,9 +1,9 @@
 """
 Hearing the member, once per turn, whatever the turn turns out to be.
 
-FoodChat has four extractors — shape, pantry, diet, facets — and until now they
-lived inside the handlers rather than in front of them. The daily path ran all
-four. The weekly path ran two. **Every other kind of turn ran none.** So this
+FoodChat's extractors — shape, pantry, diet, facets, cooking time — lived
+inside the handlers rather than in front of them. The daily path ran four of
+them. The weekly path ran two. **Every other kind of turn ran none.** So this
 conversation lost a hard constraint:
 
     "swap Tuesday's dinner"        → edit turn
@@ -19,7 +19,7 @@ Intake is that missing seam. It runs before routing, so every turn — smalltalk
 a question about the plan, a slot edit, a tool call — updates the standing
 constraints, and every path downstream reads the same state it always did.
 
-**Concurrent, because it is four independent HTTP calls.** Run in sequence the
+**Concurrent, because they are independent HTTP calls.** Run in sequence the
 daily path already paid four fast-tier round trips before planning began;
 hoisting that onto every turn in sequence would have made the cheap turns
 expensive. Fanned out, intake costs roughly one call of latency, and the daily
@@ -101,7 +101,7 @@ def extract(message: str) -> list[PlanningStateDelta]:
     replaced. Reading the raw message is the consistent choice and the cheaper
     one — the context dump was the longest input any extractor received.
     """
-    from services import diet_intent, intent_facets, pantry_service
+    from services import diet_intent, intent_facets, pantry_service, plan_parameters
     from services.planning_delta import extract_state_delta
 
     text = (message or "").strip()
@@ -113,6 +113,9 @@ def extract(message: str) -> list[PlanningStateDelta]:
         lambda: pantry_service.extract_pantry_delta(text),
         lambda: diet_intent.extract_diet_delta(text),
         lambda: intent_facets.extract_facet_delta(text),
+        # A regex, not a model call, and cheap enough that it rides the same
+        # fan-out rather than earning its own branch.
+        lambda: plan_parameters.extract_time_delta(text),
     ])
     # Reset first, so "start over — but I still have the spinach" keeps the
     # spinach. `merge` returns a blank state for a reset delta and discards
@@ -160,3 +163,22 @@ def intake(session_id: str, message: str, *,
 def forget() -> None:
     """Drop the memo. For tests, and for a caller replaying one session."""
     _TURN.set(None)
+
+
+def current(session_id: str, *, session_service=None) -> PlanningState:
+    """The standing state for this turn, without extracting anything.
+
+    For paths that need to read the constraints but are not the turn's entry
+    point — an edit fetching a replacement, say. Returns the memo when intake
+    has already run this turn, and the stored state otherwise, so a handler
+    called outside a turn still sees the member's accumulated constraints
+    rather than a blank slate.
+    """
+    cached = _TURN.get()
+    if cached is not None and cached[0] == session_id:
+        return cached[2]
+    if session_service is None:
+        import services as _services
+
+        session_service = _services.session_service
+    return session_service.get_planning_state(session_id)

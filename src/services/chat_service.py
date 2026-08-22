@@ -34,6 +34,7 @@ from models.planning_state import PlanningStateDelta
 from services.adapted_recipes import overlay_plan
 from services import (
     pantry_service,
+    plan_parameters,
     plan_quality,
     plan_repair,
     plan_verifier,
@@ -266,6 +267,11 @@ class ChatService:
         # exactly those turns — intermittently, since clarification is an LLM
         # decision. `_generate_and_store` coerces it back.
         profile["_plan_spec"] = state.spec.to_dict()
+        # "Keep it under 20 minutes" and the cooking-time slider are one
+        # constraint. This puts the spoken one where the slider's value already
+        # lives, so all seven fetch sites filter on it without a seventh place
+        # to remember.
+        plan_parameters.apply_state(profile, state)
         if state.pantry:
             # Rides the profile snapshot like the other underscore keys, so
             # the pantry survives an intervening clarification round-trip.

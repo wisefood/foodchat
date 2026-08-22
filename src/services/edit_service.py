@@ -382,7 +382,16 @@ class EditService:
 
         Returns (choice, old_enrichment, new_enrichment, facts).
         """
-        profile = session.user_profile
+        # The standing constraints, applied to the profile this fetch uses. An
+        # edit is a fetch like any other: "swap the dinner, but keep it under
+        # 20 minutes" has to narrow the replacement pool, and the pool is
+        # narrowed by `plan_parameters.max_duration_minutes(profile[...])`.
+        from services import plan_parameters, turn_intake
+
+        profile = plan_parameters.apply_state(
+            dict(session.user_profile or {}),
+            turn_intake.current(session.session_id, session_service=self.session_service),
+        )
 
         # A directive that names a dish resolves BY NAME, before any slot
         # candidates. "i want apple pie for breakfast" used to classify as an

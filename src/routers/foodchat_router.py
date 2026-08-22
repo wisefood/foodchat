@@ -1184,6 +1184,11 @@ class PlanningStateResponse(BaseModel):
     # client-side would mean a second implementation of `PlanSpec.describe()`
     # that drifts from the one the planner actually builds from.
     plan_shape_summary: str
+    # A cooking-time ceiling in force, in minutes, whether it came from the
+    # slider or from a sentence. Surfaced so the ribbon can show one constraint
+    # once — the card would otherwise render the slider's own value and say
+    # nothing about a limit the member spoke.
+    max_minutes: Optional[int]
     # The query a regeneration would run, so the UI can show what it is about
     # to ask for rather than describing the button.
     query: str
@@ -1209,6 +1214,7 @@ class PlanningStateResponse(BaseModel):
             plan_shape=state.spec.to_dict(),
             plan_shape_is_default=state.spec.is_default,
             plan_shape_summary=state.spec.describe(),
+            max_minutes=state.max_minutes,
             query=state.as_query(),
         )
 
