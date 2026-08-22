@@ -100,11 +100,12 @@ def test_a_nutrition_claim_never_becomes_a_diet_filter():
         "something low-carb", extractor=FakeDietExtractor(["low-carb"])
     )
     assert delta.diet_tags == ()
-    # And it is not swallowed either. This assertion used to check `notes`,
-    # which turned out to be write-only — so the claim was saved from emptying
-    # the plan and then dropped. It now reaches RecipeWrangler's `tags` field.
+    # And it is not swallowed either. This used to be routed to `notes`, which
+    # turned out to be write-only — so the claim was saved from emptying the
+    # plan and then dropped. It reaches RecipeWrangler's `tags` field now, and
+    # `notes` has been deleted rather than left as somewhere to lose the next
+    # thing.
     assert delta.claim_tags, "a stated claim must reach the request"
-    assert delta.notes == (), "notes is write-only; nothing may be routed there"
 
 
 def test_a_mixed_statement_routes_both_ways():

@@ -60,9 +60,13 @@ class PlanningState:
     # suppress the offer while the second must not.
     use_favorites: Optional[bool] = None
 
-    # Free-text constraints the member stated that no filter captures
-    # ("nothing too heavy in the evening"). Carried into the grader's prompt.
-    notes: tuple[str, ...] = ()
+    # `notes` was here: free-text constraints "carried into the grader's
+    # prompt", which they never were. It was read only by `describe()`, which
+    # is only logged, and its one writer was the weekly path filing nutrition
+    # claims under it — a claim saved from becoming an empty diet filter and
+    # then dropped on the floor instead. Claims now ride `claim_tags`, which
+    # every fetch site reads, and the field is gone rather than left as a
+    # place a future writer could lose something else.
 
     # On-hand ingredients the member wants used up ("I have zucchini and
     # spinach") — the food-waste pantry. Normalized lowercase names, insertion
@@ -153,11 +157,6 @@ class PlanningState:
             if recipe_id and recipe_id not in excluded:
                 excluded.append(recipe_id)
 
-        notes = list(self.notes)
-        for note in delta.notes or ():
-            if note and note not in notes:
-                notes.append(note)
-
         # Pantry: additive, with explicit removal ("I used up the zucchini").
         # Silence leaves it alone, like everything else here.
         pantry = list(self.pantry)
@@ -214,7 +213,6 @@ class PlanningState:
             use_favorites=(
                 self.use_favorites if delta.use_favorites is None else delta.use_favorites
             ),
-            notes=tuple(notes),
             pantry=tuple(pantry),
             diet_tags=tuple(diet_tags),
             claim_tags=tuple(claim_tags),
@@ -247,8 +245,6 @@ class PlanningState:
             parts.append(f"under {self.max_minutes} min per meal")
         for family, values in self.facets().items():
             parts.append(f"{family.replace('_', ' ')}: " + ", ".join(values))
-        if self.notes:
-            parts.append("; ".join(self.notes))
         return " · ".join(parts)
 
     def as_query(self) -> str:
@@ -284,7 +280,6 @@ class PlanningState:
             "anchors": dict(self.anchors),
             "excluded_recipe_ids": list(self.excluded_recipe_ids),
             "use_favorites": self.use_favorites,
-            "notes": list(self.notes),
             "pantry": list(self.pantry),
             "diet_tags": list(self.diet_tags),
             "claim_tags": list(self.claim_tags),
@@ -317,7 +312,6 @@ class PlanningState:
                 str(r) for r in (raw.get("excluded_recipe_ids") or []) if r
             ),
             use_favorites=favourites if isinstance(favourites, bool) else None,
-            notes=tuple(str(n) for n in (raw.get("notes") or []) if n),
             pantry=tuple(
                 str(p).strip().lower() for p in (raw.get("pantry") or []) if p
             ),
@@ -350,7 +344,6 @@ class PlanningStateDelta:
     anchors: Optional[dict[str, str]] = None
     excluded_recipe_ids: tuple[str, ...] = ()
     use_favorites: Optional[bool] = None
-    notes: tuple[str, ...] = ()
     # Pantry items this turn added ("I have …") / declared spent ("used up
     # the …"). Separate tuples so adding and removing in one turn both land.
     pantry_add: tuple[str, ...] = ()
@@ -383,7 +376,6 @@ class PlanningStateDelta:
             or self.anchors
             or self.excluded_recipe_ids
             or self.use_favorites is not None
-            or self.notes
             or self.pantry_add
             or self.pantry_remove
             or self.diet_tags

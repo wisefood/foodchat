@@ -263,7 +263,6 @@ class TestClaimTags:
                                                extractor=Fake())
         assert delta.diet_tags == ("vegetarian",)
         assert delta.claim_tags == ("high_protein",)
-        assert delta.notes == (), "notes is write-only; nothing may be routed there"
 
     def test_claim_tags_are_standing_state(self):
         state = PlanningState().merge(PlanningStateDelta(claim_tags=("high_protein",)))

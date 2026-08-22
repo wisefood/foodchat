@@ -1169,7 +1169,6 @@ class PlanningStateResponse(BaseModel):
     facets: Dict[str, List[str]]
     diet_tags: List[str]
     claim_tags: List[str]
-    notes: List[str]
     anchors: Dict[str, str]
     excluded_recipe_ids: List[str]
     # None means never offered, False means offered and declined. The
@@ -1207,7 +1206,6 @@ class PlanningStateResponse(BaseModel):
             },
             diet_tags=list(state.diet_tags),
             claim_tags=list(state.claim_tags),
-            notes=list(state.notes),
             anchors=dict(state.anchors),
             excluded_recipe_ids=list(state.excluded_recipe_ids),
             use_favorites=state.use_favorites,
