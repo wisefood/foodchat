@@ -11,7 +11,7 @@ Consumers: agents.py, services/clarification.py.
 
 from typing import Literal, Optional
 
-from pydantic import BaseModel, conint
+from pydantic import BaseModel, conint, constr
 
 
 class ScoringSchema(BaseModel):
@@ -155,12 +155,21 @@ class ToolChoiceSchema(BaseModel):
 
     Arguments are NOT free-form. The registry validates them (`tools._validate`)
     and a bad day number is a member-facing error rather than something the
-    planner has to survive — so this only has to name the tool and the day.
+    planner has to survive — so this only names the tool and the handful of
+    arguments a member can state in a sentence. Anything a tool needs beyond
+    these it derives itself from the session.
     """
     tool: str = ""
     # 1-based, and only for a tool that is about one day. Null otherwise.
     day: Optional[conint(ge=1, le=14)] = None
     plan_type: Optional[Literal["daily", "weekly"]] = None
+    # A name the member gave the thing — "save this as Meatless Monday".
+    # Capped here rather than trusted: it is member text on its way to a
+    # database column, and the column is 120 wide.
+    title: Optional[constr(max_length=120)] = None
+    # False only for taking something back off a list. Null means "not stated",
+    # which the caller reads as the tool's own default.
+    saved: Optional[bool] = None
     # One short sentence, for the log and for the reply's grounding.
     reason: str = ""
 

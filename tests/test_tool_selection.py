@@ -301,12 +301,25 @@ class TestThePromptsAreNew:
         assert "{tools}" in TOOL_SELECTOR_SYSTEM.fallback
 
     def test_the_schema_cannot_express_free_form_arguments(self):
-        """The registry validates arguments; the selector only names the tool
-        and the day."""
+        """The registry validates arguments. The selector names the tool and
+        only the arguments a member can state in a sentence — a closed set, so
+        no tool can be handed something nobody checked."""
         from schemas import ToolChoiceSchema
 
         fields = set(ToolChoiceSchema.model_fields)
-        assert fields == {"tool", "day", "plan_type", "reason"}
+        assert fields == {"tool", "day", "plan_type", "title", "saved", "reason"}
+
+    def test_a_member_supplied_title_cannot_outrun_its_column(self):
+        """`saved_title` is 120 wide. Capping at the schema means the cap is
+        not a thing the tool has to remember."""
+        import pydantic
+        import pytest as _pytest
+
+        from schemas import ToolChoiceSchema
+
+        assert ToolChoiceSchema(tool="save_plan", title="x" * 120).title
+        with _pytest.raises(pydantic.ValidationError):
+            ToolChoiceSchema(tool="save_plan", title="x" * 121)
 
 
 class TestTheSelectorItself:

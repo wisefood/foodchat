@@ -562,3 +562,162 @@ def swap_meal(
         "changed": bool(getattr(outcome, "changed_slots", None)),
         "changed_slots": getattr(outcome, "changed_slots", None) or [],
     }
+
+
+@tool(
+    "save_plan",
+    summary="Keep the plan on screen so it outlives this conversation.",
+    description=(
+        "Saves the plan currently on the canvas — daily or weekly — to the "
+        "member's saved plans, optionally under a name they choose. Saved "
+        "plans appear in their library and survive the session being closed. "
+        "Pass saved=false to take one back off the list. Deterministic: no "
+        "model call, and it changes nothing about the plan itself."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "session_id": {"type": "string", "description": "The conversation whose plan to save."},
+            "title": {
+                "type": "string",
+                "description": "What to call it — 'Meatless Monday', 'the "
+                               "week I liked'. Optional; omit to save it "
+                               "unnamed.",
+            },
+            "saved": {
+                "type": "string", "enum": ["true", "false"],
+                "description": "'false' un-saves a plan that was saved before.",
+            },
+        },
+        "required": ["session_id"],
+    },
+    examples=("save this plan", "save my week as Meatless Monday",
+              "actually don't keep that one"),
+)
+def save_plan(session_id: str, title: str = "", saved: str = "true") -> dict:
+    """Save the plan the member is looking at.
+
+    The endpoint for this has existed since saved plans were built, and chat
+    could not reach it: "save this" was small talk. The tool is a reader in the
+    sense that matters — it does not touch the plan, only whether the plan
+    outlives the conversation — so `mutates` stays false and the canvas is not
+    reloaded afterwards.
+    """
+    session = _session(session_id)
+    canvas = session.active_canvas
+    if canvas is None or not canvas.current_id:
+        raise ToolError(
+            "There's no plan in this conversation yet — ask for one and I'll "
+            "save it for you."
+        )
+
+    keep = str(saved).strip().lower() != "false"
+    name = str(title or "").strip()[:120]
+    ok = _services().session_service.set_plan_saved(
+        session_id, session.member_id, canvas.current_id, keep, name or None,
+    )
+    if not ok:
+        # The session check inside `set_plan_saved` is the same one the router
+        # already ran, so a false here means the plan id has gone — worth
+        # saying rather than reporting a save that did not happen.
+        raise ToolError("I couldn't find that plan to save.")
+
+    return {
+        "saved": keep,
+        "title": name or None,
+        "plan_type": canvas.plan_type,
+        "plan_id": canvas.current_id,
+    }
+
+
+@tool(
+    "shopping_list",
+    summary="Everything the plan needs to buy, gathered from its own recipes.",
+    description=(
+        "Collects the ingredient lines from every dish on the plan and groups "
+        "the ones that repeat, so a week's plan becomes one list rather than "
+        "21. Works on the daily canvas or the weekly one. Deterministic — the "
+        "lines come from the stored recipes, nothing is estimated, and no "
+        "quantities are invented: the corpus stores ingredients as text, so "
+        "the list says which meals need each item rather than how much."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "session_id": {"type": "string", "description": "The conversation to read."},
+            "plan_type": {
+                "type": "string", "enum": ["daily", "weekly"],
+                "description": "Which canvas. Defaults to whichever is active.",
+            },
+        },
+        "required": ["session_id"],
+    },
+    examples=("what do I need to buy?", "shopping list for the week"),
+)
+def shopping_list(session_id: str, plan_type: str = "") -> dict:
+    """One list for the whole plan, with what each item is for.
+
+    Quantities are deliberately absent. The recipe corpus stores ingredients as
+    free text ("2 tbsp olive oil", "olive oil", "olive oil, to serve"), and
+    adding those up would mean parsing units the data does not reliably carry.
+    A list that says "olive oil — for 4 meals" is true; one that says "6 tbsp"
+    would be a number with nothing behind it.
+    """
+    session = _session(session_id)
+    wanted = str(plan_type or "").strip().lower()
+    if not wanted:
+        canvas = session.active_canvas
+        wanted = canvas.plan_type if canvas else "daily"
+
+    if wanted == "weekly":
+        _, plan = _weekly_plan(session_id)
+        dishes = [
+            (
+                f"{_day_label(e.get('day'))} {e.get('meal_type') or 'meal'}",
+                _entry_title(e),
+                ((e.get("recipe") or {}).get("recipe_ingredients") or ""),
+            )
+            for e in plan.entries
+        ]
+    else:
+        _, plan = _daily_plan(session_id)
+        dishes = [
+            (
+                (f"day {day.day} {meal.meal_type}"
+                 if len(plan.day_plans) > 1 else meal.meal_type),
+                plate.title,
+                plate.ingredients or "",
+            )
+            for day in plan.day_plans
+            for meal in day.meals
+            for plate in meal.plates
+            if plate.recipe_id
+        ]
+
+    if not dishes:
+        raise ToolError("That plan has no dishes to shop for yet.")
+
+    # item -> the meals that need it, in the order the plan runs.
+    items: dict[str, dict] = {}
+    from services.plan_quality import extract_ingredient_names
+
+    for where, title, text in dishes:
+        # The plan's own normalizer, not a second one. A shopping list that
+        # groups items differently from the way the variety score counts them
+        # is two answers to "what is in this plan".
+        for name in extract_ingredient_names(text):
+            row = items.setdefault(name, {"item": name, "for": []})
+            if where not in row["for"]:
+                row["for"].append(where)
+
+    ordered = sorted(
+        items.values(), key=lambda r: (-len(r["for"]), r["item"]),
+    )
+    return {
+        "plan_type": wanted,
+        "dishes": len(dishes),
+        "items": ordered,
+        "item_count": len(ordered),
+        # Said explicitly so a reply cannot imply the list carries amounts.
+        "quantities": "not available — the recipes store ingredients as text",
+    }

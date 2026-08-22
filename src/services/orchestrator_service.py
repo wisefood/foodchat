@@ -506,12 +506,26 @@ class OrchestratorService:
                     session_id, name,
                 )
             return None
-        arguments: dict = {"session_id": session_id}
-        if choice.get("day") is not None:
-            arguments["day"] = int(choice["day"])
         spec = tools.get(name)
-        if spec is not None and (spec.parameters.get("properties") or {}).get("plan_type"):
+        # Only the arguments the chosen tool actually declares. The selector
+        # answers one schema for every tool, so it can name a title for a tool
+        # that has no title — and the registry rejects an unknown key as a
+        # member-facing error, which would turn a routable message into a
+        # complaint about a field the member never mentioned.
+        props = (spec.parameters.get("properties") or {}) if spec is not None else {}
+        arguments: dict = {"session_id": session_id}
+        if "day" in props and choice.get("day") is not None:
+            arguments["day"] = int(choice["day"])
+        if "plan_type" in props:
+            # Defaulted to the canvas rather than left out: a tool that takes a
+            # plan type should act on what the member is looking at.
             arguments["plan_type"] = choice.get("plan_type") or plan_type
+        if "title" in props and str(choice.get("title") or "").strip():
+            arguments["title"] = str(choice["title"]).strip()
+        if "saved" in props and choice.get("saved") is not None:
+            # The registry's enum is a string, so the boolean the selector
+            # answers is converted here rather than widening the tool's schema.
+            arguments["saved"] = "true" if choice["saved"] else "false"
 
         try:
             result = tools.invoke(name, arguments)
@@ -610,6 +624,22 @@ class OrchestratorService:
             return f"{result['name']}: {dishes}." if dishes else f"Here's {result['name']}."
         if result.get("days"):
             return f"Here's the week — {len(result['days'])} days on the plan."
+        if result.get("items") and result.get("item_count") is not None:
+            # A shopping list, and the sentence must not imply amounts: the
+            # corpus stores ingredients as text, so the tool reports what each
+            # item is FOR rather than how much of it to buy.
+            head = ", ".join(str(row["item"]) for row in result["items"][:6])
+            return (
+                f"{result['item_count']} things to buy across "
+                f"{result.get('dishes', 0)} dishes — {head}"
+                f"{'…' if result['item_count'] > 6 else ''}. "
+                "No quantities: the recipes list ingredients as text."
+            )
+        if "saved" in result and result.get("plan_type"):
+            if not result["saved"]:
+                return "Taken off your saved plans."
+            name = result.get("title")
+            return f"Saved as “{name}”." if name else "Saved to your plans."
         return "Done."
 
     def _route(self, session, session_id: str, message: str, intent: str,

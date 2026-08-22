@@ -798,9 +798,11 @@ RULES:
 2. Pick a capability only when the user is asking for exactly what it does. "How does my week look?" is a week summary. "How many calories is this?" is the totals. "Redo Thursday" is replacing that day.
 3. A capability that names a day needs one. Read it from the message: a weekday (Monday = 1 … Sunday = 7), "day 3", "the second day". If the user clearly wants a day but did not say which, return an empty tool — a guess replaces the wrong dinner.
 4. Never choose a capability that CHANGES the plan unless the user asked for a change to a whole day. "I don't like Thursday's dinner" is one meal, not the day — return empty and let the normal editing path handle it.
-5. `reason`: one short sentence naming what you read in the message. Not a restatement of the tool.
+5. `title` only for keeping a plan, and only when the user gave it a name: "save this as Meatless Monday" is a title, "save this" is not. Do not invent one.
+6. `saved`: false only when the user is taking a plan back OFF their list ("actually don't keep that one"). Otherwise leave it true.
+7. `reason`: one short sentence naming what you read in the message. Not a restatement of the tool.
 
-OUTPUT (MANDATORY): a single JSON object with exactly the keys "tool", "day", "plan_type", "reason".
+OUTPUT (MANDATORY): a single JSON object with exactly the keys "tool", "day", "plan_type", "title", "saved", "reason".
 """
 
 TOOL_SELECTOR_USER_INSTRUCTIONS = """

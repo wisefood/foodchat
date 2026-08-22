@@ -147,6 +147,19 @@ def intake(session_id: str, message: str, *,
         if not delta.is_empty:
             state = state.merge(delta)
 
+    # Taking a facet back, last and against the merged state.
+    #
+    # Last because it can only remove something that is standing, and the thing
+    # being retracted may have arrived this very turn — a facet extractor that
+    # reads "not spicy" as a request for spicy is repaired here rather than
+    # shipping the opposite of what was said. The UI has always been able to do
+    # this: a chip has an × and it calls DELETE /facets/{value}. Chat could not.
+    from services import intent_facets
+
+    removals = intent_facets.extract_facet_removals(message, state)
+    if not removals.is_empty:
+        state = state.merge(removals)
+
     if state != before:
         try:
             session_service.set_planning_state(session_id, state)

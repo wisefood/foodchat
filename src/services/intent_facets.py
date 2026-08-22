@@ -150,6 +150,66 @@ def extract_facet_delta(message: str, *, extractor=None, vocabularies=None):
     return delta
 
 
+# Taking a facet back.
+#
+# The UI could always do this — a chip has an × and it calls
+# `DELETE /facets/{value}`. Chat could not: the extractor answers with what a
+# member ASKED for, and nothing read "actually not spicy" as a retraction. So
+# the removable-chip affordance existed on one channel only, and a member who
+# said it out loud watched the chip stay.
+#
+# Deterministic, and deliberately narrow: it can only remove a value that is
+# ALREADY standing. That is what makes a regex safe here — there is nothing to
+# invent, only a known list to match against, so the failure mode is missing a
+# retraction rather than inventing one.
+_NEGATION = (
+    r"(?:not|no|no more|not more|without|drop|forget|skip|lose|remove|"
+    r"stop|less|nothing)"
+)
+# Words that can sit between the negation and the thing: "not too spicy",
+# "no more of the Thai food", "drop that comfort food".
+_FILLER = r"(?:the|a|an|any|more|that|too|so|of|it|them)"
+
+
+def extract_facet_removals(message: str, state) -> PlanningStateDelta:
+    """Facets this turn takes back. Never raises.
+
+    Matched against what is standing, so "not spicy" removes the spicy flavour
+    only if the member ever asked for it. A negation naming something they never
+    said is not a retraction — it is a new request, and the facet extractor
+    reads that.
+    """
+    import re
+
+    text = (message or "").strip()
+    if not text:
+        return PlanningStateDelta()
+
+    standing: list[str] = []
+    for family in PlanningState.FACET_FIELDS:
+        standing.extend(getattr(state, family, ()) or ())
+    if not standing:
+        return PlanningStateDelta()
+
+    removals: list[str] = []
+    for value in standing:
+        if value in removals:
+            continue
+        # Slugs are stored with underscores; a member says them with spaces or
+        # hyphens ("comfort food", "comfort-food").
+        parts = [re.escape(part) for part in str(value).split("_") if part]
+        if not parts:
+            continue
+        spelled = r"[\s_-]+".join(parts)
+        pattern = rf"\b{_NEGATION}\s+(?:{_FILLER}\s+)*{spelled}\b"
+        if re.search(pattern, text, re.IGNORECASE):
+            removals.append(value)
+
+    if removals:
+        logger.info("Facets taken back: %s", ", ".join(removals))
+    return PlanningStateDelta(facets_remove=tuple(removals))
+
+
 def facets_for_goal(goal: Optional[str]) -> dict[str, list[str]]:
     """The facets a plan-parameter goal implies, or `{}`."""
     return dict(GOAL_FACETS.get(str(goal or "").strip().lower(), {}))
