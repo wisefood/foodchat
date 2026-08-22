@@ -21,6 +21,7 @@ class WeeklyMealPlanEnv:
         reward_calculator: RewardCalculator,
         user_query: Optional[str] = None,
         stated_diet: Optional[list] = None,
+        spec: Optional[object] = None,
     ):
         """
         Initialize the environment with user preferences and components.
@@ -42,24 +43,56 @@ class WeeklyMealPlanEnv:
         self.user_query = user_query
         self.stated_diet = list(stated_diet or [])
 
-        self.tracker = WeeklyNutritionalTracker(user_profile, self.stated_diet)
-        self.current_day = 1
-        self.current_meal_idx = 0  # 0: Breakfast, 1: Lunch, 2: Dinner
+        # The shape being planned.
+        #
+        # This walk was a hardcoded 7 days x ["breakfast", "lunch", "dinner"],
+        # with the 7 and the 3 written as literals in `step()`. So "plan me
+        # three days" and "a week with a snack" were both unbuildable on this
+        # path — `PlanSpec` exists to express exactly that and never reached
+        # here. The default is the old shape, so every existing caller is
+        # unchanged.
+        self.num_days = 7
         self.meal_types = ["breakfast", "lunch", "dinner"]
+        if spec is not None:
+            days = int(getattr(spec, "num_days", 0) or 0)
+            slots = [str(m) for m in (getattr(spec, "meals", ()) or ())]
+            # `> 1`, not `> 0`. `PlanSpec.default()` is ONE day, and the
+            # default is what a spec looks like when the extractor found no
+            # shape in the message — so honouring it here would turn "plan my
+            # week" into a single day whenever the words did not happen to
+            # name a number. The extractor does set num_days=7 for weekly
+            # language, so a real request still lands.
+            if days > 1:
+                self.num_days = days
+            if slots:
+                self.meal_types = slots
+
+        self.tracker = WeeklyNutritionalTracker(
+            user_profile, self.stated_diet, num_days=self.num_days,
+        )
+        self.current_day = 1
+        self.current_meal_idx = 0
         self.done = False
         self.plan = [] # To store the generated plan details
         # Selection events recorded while picking (M7 explainability) —
         # meat-pool prunes and limit relaxations, appended by the planner.
         self.selection_events: List[Dict[str, Any]] = []
 
+    @property
+    def total_slots(self) -> int:
+        """Every slot this plan will fill. Was the constant `TOTAL_SLOTS = 21`."""
+        return self.num_days * len(self.meal_types)
+
     def reset(self, user_query: Optional[str] = None) -> Dict[str, Any]:
         """
-        Reset the environment to start a new 7-day planning cycle.
+        Reset the environment to start a new planning cycle.
         
         Args:
             user_query: Optional update to the user query for the new cycle.
         """
-        self.tracker = WeeklyNutritionalTracker(self.user_profile, self.stated_diet)
+        self.tracker = WeeklyNutritionalTracker(
+            self.user_profile, self.stated_diet, num_days=self.num_days,
+        )
         self.current_day = 1
         self.current_meal_idx = 0
         self.done = False
@@ -146,11 +179,13 @@ class WeeklyMealPlanEnv:
         logger.info("-" * 40)
 
         self.current_meal_idx += 1
-        if self.current_meal_idx >= 3:
+        # `>= 3` and `> 7` were literals here, which is what made the shape
+        # fixed no matter what the member asked for.
+        if self.current_meal_idx >= len(self.meal_types):
             self.current_meal_idx = 0
             self.current_day += 1
-            
-        if self.current_day > 7:
+
+        if self.current_day > self.num_days:
             self.done = True
             
         return self._get_state(), reward, self.done, {}

@@ -274,17 +274,24 @@ class WeeklyPlanService:
         for recipe_id in state.excluded_recipe_ids:
             if recipe_id:
                 action_space.mark_selected(recipe_id)
+        # The shape the member asked for, if they asked for one. The weekly
+        # walk was a hardcoded 7 days x three meals, so "two weeks" and "a week
+        # with a snack" were both unbuildable here — `PlanSpec` expresses
+        # exactly that and never reached this path.
         env = WeeklyMealPlanEnv(
             user_profile=session.user_profile,
             action_space=action_space,
             reward_calculator=self.reward_calculator,
             user_query=effective_query,
             stated_diet=standing_diet,
+            spec=state.spec,
         )
         planner = WeeklyPlanner(env)
 
         logger.info(
-            "[%s] Generating 7-day plan (21 meals, %d pinned).", session_id, len(pinned)
+            "[%s] Generating %d-day plan (%d meals: %s, %d pinned).",
+            session_id, env.num_days, env.total_slots,
+            ", ".join(env.meal_types), len(pinned),
         )
         try:
             plan_entries = planner.generate_full_plan(

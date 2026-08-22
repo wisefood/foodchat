@@ -7,7 +7,11 @@ from .reward_logic import apply_hard_constraints, constraint_score
 
 logger = logging.getLogger(__name__)
 
-TOTAL_SLOTS = 21  # 7 days x 3 meals
+# The old fixed shape, kept only as the fallback for an environment that does
+# not report its own size. The env computes `total_slots` from the plan spec it
+# was given, so a 3-day plan or a week with snacks no longer walks 21 steps
+# regardless of what was asked for.
+TOTAL_SLOTS = 21  # 7 days x 3 meals — the default shape
 
 
 class PlanGenerationError(RuntimeError):
@@ -153,7 +157,11 @@ class WeeklyPlanner:
         scorer: Optional[Callable] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Run the 21-step (7 days × 3 meals) planning loop.
+        Run the planning loop, one step per slot of the plan's shape.
+
+        21 steps for the default week; fewer for a shorter plan, more for one
+        with a snack. The step count comes from the environment, which gets it
+        from the plan spec — it used to be the literal 21.
 
         Args:
             user_query: Optional user query to guide reward evaluation.
@@ -163,7 +171,7 @@ class WeeklyPlanner:
                     Without it, selection is uniformly random.
 
         Returns:
-            The 21 generated entries with day, meal type, recipe, and reward.
+            One entry per slot, with day, meal type, recipe, and reward.
         """
         pinned = pinned or {}
         # Scorers written before the food-waste axis take (candidate, titles);
@@ -216,7 +224,10 @@ class WeeklyPlanner:
                 # rank the pool; random tiebreak among equals keeps variety.
                 # Without a scorer and without nutrition data every score is
                 # 0.0 and selection stays uniformly random, as before.
-                slots_remaining = TOTAL_SLOTS - len(self.env.plan)
+                slots_remaining = (
+                    getattr(self.env, "total_slots", TOTAL_SLOTS)
+                    - len(self.env.plan)
+                )
                 scored = [
                     (
                         (
