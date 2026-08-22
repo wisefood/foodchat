@@ -224,9 +224,13 @@ class WeeklyPlanner:
                 # rank the pool; random tiebreak among equals keeps variety.
                 # Without a scorer and without nutrition data every score is
                 # 0.0 and selection stays uniformly random, as before.
+                # Meals left, not rows left. `env.plan` holds one row per
+                # PLATE now, so `len(plan)` counts a two-plate dinner twice and
+                # the remaining-budget divisor would run to zero and then
+                # negative halfway through a composed week.
                 slots_remaining = (
                     getattr(self.env, "total_slots", TOTAL_SLOTS)
-                    - len(self.env.plan)
+                    - getattr(self.env, "slots_filled", len(self.env.plan))
                 )
                 scored = [
                     (
@@ -246,9 +250,15 @@ class WeeklyPlanner:
                 top = [c for s, c in scored if s == best_score]
                 chosen_recipe = random.choice(top)
 
-            chosen_titles.append(str(chosen_recipe.get("recipe_title", "")))
+            # Variety and food waste are about everything on the table, so a
+            # composed meal contributes every plate's title and every plate's
+            # perishables. Counting the main alone would let the same salad
+            # reappear as a side all week without the variety penalty noticing.
+            for plate in (chosen_recipe.get("plates") or [chosen_recipe]):
+                chosen_titles.append(str(plate.get("recipe_title", "")))
             chosen_perishables |= perishable_tokens(
-                chosen_recipe.get("recipe_ingredients", "")
+                chosen_recipe.get("meal_ingredients")
+                or chosen_recipe.get("recipe_ingredients", "")
             )
             # Advance the environment (updates tracker, computes reward).
             state, reward, done, info = self.env.step(chosen_recipe)

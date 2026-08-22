@@ -174,6 +174,30 @@ class ToolChoiceSchema(BaseModel):
     reason: str = ""
 
 
+class MealChoiceSchema(BaseModel):
+    """Which composition fills one meal, and why."""
+
+    # Position in the list this meal was offered, 0-based. Out of range is
+    # treated as "no preference" by the caller rather than an error: a judge
+    # that miscounts must not cost the meal its deterministic winner.
+    pick: conint(ge=0, le=9) = 0
+    # Echoed back so a caller can tell whether the model answered about the
+    # meal it was asked about. Ordering is not trusted — the label is.
+    meal: str = ""
+    reason: str = ""
+
+
+class MealCompositionSchema(BaseModel):
+    """One choice per multi-plate meal in the plan.
+
+    A single call for the whole plan rather than one per meal: a week with a
+    side at dinner is seven judgements, and seven round trips inside one turn
+    budget is how a plan stops arriving.
+    """
+
+    choices: list[MealChoiceSchema] = []
+
+
 class PlanStrategySchema(BaseModel):
     """How to approach ONE planning request, before any recipe is fetched.
 

@@ -66,8 +66,11 @@ from prompts import (
     SESSION_TITLE_USER,
     PLAN_INTENT_EXTRACTOR_SYSTEM,
     PLAN_INTENT_EXTRACTOR_USER,
+    MEAL_COMPOSER_SYSTEM,
+    MEAL_COMPOSER_USER,
 )
 from schemas import (
+    MealCompositionSchema,
     PlanStrategySchema,
     ToolChoiceSchema,
     BatchScoringSchema,
@@ -928,6 +931,106 @@ class PlanStrategist:
             return {}
         logger.info("Plan strategy: %s", payload.get("rationale") or payload)
         return payload
+
+
+class MealJudge:
+    """Chooses between complete meals the arithmetic could not separate.
+
+    The last step of composition, and deliberately the only part of it that
+    costs a model call. Whether two plates are the same dish, repeat an
+    ingredient, or add up to the meal's share of the day is measurable, and
+    `meal_composer` measures it. Whether a dish SUITS another one is not: the
+    corpus's cuisine annotation does not survive into the planning envelope in
+    any shape this service reads, and texture and richness are not annotated
+    at all. So that judgement goes to a judgement.
+
+    **One call for the whole plan.** A week with a side at dinner is seven of
+    these, and seven round trips inside one turn budget is how a plan stops
+    arriving. The options are batched, labelled, and matched back by label
+    rather than by position — a model that answers in a different order is
+    common and is not a reason to lose the answer.
+
+    Reasoning tier, like the strategist: this is a judgement about food, not a
+    span to pick out of a sentence.
+
+    Returns `{}` on any failure. The deterministic winner is already the first
+    option, so a judge that is down costs the plan its polish and never its
+    existence.
+    """
+
+    def __init__(self, model: str = None, temperature: float = None):
+        self.llm = GROQ_CHAT.get_client(
+            model=model or DEFAULT_MODEL,
+            temperature=(
+                temperature if temperature is not None else DEFAULT_TEMPERATURE
+            ),
+            format=MealCompositionSchema.model_json_schema(),
+        )
+
+    def choose(self, message: str, offers: list[dict]) -> dict:
+        """`{meal label: (index, reason)}` for the meals it ruled on.
+
+        `offers` is `[{"meal": label, "options": [text, …]}]`. A label the
+        caller did not ask about, or an index outside the options offered, is
+        dropped rather than corrected — the caller's fallback is the option the
+        arithmetic already chose, which is a good answer, so a confused reply
+        should cost nothing rather than land somewhere unintended.
+        """
+        usable = [o for o in offers if o.get("meal") and len(o.get("options") or []) > 1]
+        if not usable:
+            return {}
+
+        blocks = []
+        for offer in usable:
+            lines = [f"MEAL: {offer['meal']}"]
+            for index, text in enumerate(offer["options"]):
+                lines.append(f"  [{index}] {text}")
+            blocks.append("\n".join(lines))
+
+        try:
+            system_text = MEAL_COMPOSER_SYSTEM.compile()
+            user_text = MEAL_COMPOSER_USER.compile(
+                message=(message or "a meal plan")[:400],
+                meals="\n\n".join(blocks),
+            )
+            if "json" not in f"{system_text} {user_text}".lower():
+                system_text += "\nReturn the result as a JSON object."
+            result = self.llm.invoke([
+                SystemMessage(content=system_text),
+                HumanMessage(content=user_text),
+            ], config=build_trace_config(run_name="meal_compose", tags=["planning"]))
+            payload = json.loads(result.content)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("MealJudge failed, keeping the measured order: %s", exc)
+            return {}
+
+        if not isinstance(payload, dict):
+            return {}
+        sizes = {o["meal"]: len(o["options"]) for o in usable}
+        chosen: dict[str, tuple[int, str]] = {}
+        for entry in payload.get("choices") or []:
+            if not isinstance(entry, dict):
+                continue
+            label = str(entry.get("meal") or "").strip()
+            if label not in sizes:
+                continue
+            try:
+                pick = int(entry.get("pick") or 0)
+            except (TypeError, ValueError):
+                continue
+            if not 0 <= pick < sizes[label]:
+                logger.info(
+                    "MealJudge chose option %d for %r, which was not offered",
+                    pick, label,
+                )
+                continue
+            chosen[label] = (pick, str(entry.get("reason") or ""))
+        if chosen:
+            logger.info(
+                "Meal judge: %s",
+                "; ".join(f"{k}->{v[0]}" for k, v in sorted(chosen.items())),
+            )
+        return chosen
 
 
 class SessionTitler:

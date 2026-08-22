@@ -23,7 +23,7 @@ from agents import DocumentGrader
 from models.plan_spec import PlanSpec
 from models.recipe import CandidateRecipe, ScoredPlan
 from models.session import MealPlan
-from services import intent_facets, pantry_service, plan_parameters
+from services import intent_facets, meal_composer, pantry_service, plan_parameters
 from services.candidates_client import CANDIDATES, effective_diet, screening_allergens
 from services import turn_budget
 
@@ -33,6 +33,19 @@ logger = logging.getLogger(__name__)
 # grading space (8³ = 512 combos, sampled down by DocumentGrader) while keeping
 # enough variety for refinements to find alternatives.
 CANDIDATE_LIMIT = int(os.getenv("FOODCHAT_CANDIDATE_LIMIT", "8"))
+
+
+def _day_kcal_target(profile: dict) -> float | None:
+    """The member's daily calorie budget, or None when nobody set one.
+
+    Delegated to `PlanBrief`, which already owns this rule — including the part
+    that matters: a target nobody set is None, not a default, because a plate
+    scored against 2000 kcal the member never chose is being marked down for
+    someone else's number.
+    """
+    from models.plan_brief import PlanBrief
+
+    return PlanBrief.build(profile).kcal_target
 
 
 class PlanningPipeline:
@@ -231,7 +244,6 @@ class PlanningPipeline:
         would hand the user a day with meals silently missing.
         """
         from models.session import DayPlan, Meal, MealCourse, MealPlan
-        from services.plan_client import PLANNER, _meal_nutrition
 
         # Anchors the member named — "I want apple pie for breakfast".
         #
@@ -244,14 +256,12 @@ class PlanningPipeline:
             anchor.recipe_id for anchor in pinned.values() if anchor.recipe_id
         ]
 
-        cuisines, _ = CANDIDATES.split_cuisines(profile.get("food_likes") or [])
-        max_minutes = plan_parameters.max_duration_minutes(
-            profile.get("plan_parameters") or {}
-        )
-
-        # Pantry boost for the structured path. Assembly is delegated wholly
-        # to `plan_meals`, whose only soft rank signal is the favourites
-        # float — so pantry-matching recipe ids ride that signal. Hard
+        # Pantry boost for the structured path. Fetching is `meal_composer`'s
+        # job now — including the cuisine split, the diet, the allergens and
+        # the time ceiling, which it applies for both callers so the weekly and
+        # structured pools cannot disagree about the member's constraints.
+        # What stays here is the boost list: `plan_meals`'s only soft rank
+        # signal is the favourites float, so pantry-matching ids ride it. Hard
         # filters still decide eligibility; this reorders, never widens.
         pantry = pantry_service.normalize_items(profile.pop("_pantry", None) or [])
         # The member's OWN favourites, plus any pantry-matching ids. This path
@@ -266,71 +276,118 @@ class PlanningPipeline:
                 if recipe_id not in boost_ids:
                     boost_ids.append(recipe_id)
 
-        try:
-            envelope = PLANNER.plan_meals(
-                spec=spec,
-                allergens=screening_allergens(profile),
-                # Normalised, never raw: RecipeWrangler ANDs diet tags and
-                # never relaxes them, so one unknown value ("balanced",
-                # "omnivore") empties every slot. See candidates_client.
-                diet=effective_diet(profile),
-                **intent_facets.facet_kwargs(profile, cuisines),
-                exclude_ingredients=profile.get("food_dislikes") or [],
-                exclude_recipe_ids=list(exclude_recipe_ids or []),
-                favorite_recipe_ids=boost_ids,
-                max_minutes=max_minutes,
-                min_nutri_score=profile.get("min_nutri_score"),
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Structured planning failed: %s", exc)
+        # A pool per PLATE, and more than one candidate in it when the meal has
+        # more than one plate.
+        #
+        # This path used to take RecipeWrangler's first recipe for each plate —
+        # assembly "delegated wholly to plan_meals", in this module's own
+        # earlier words. The request was already one entry per plate with its
+        # own course types, so the role-scoped fetch was never the blocker;
+        # what was missing was asking for a CHOICE and then making it. Nothing
+        # was in a position to notice that a lasagne main and a macaroni salad
+        # side are two plates of pasta.
+        #
+        # Single-plate specs still ask for one candidate each, so the common
+        # three-meal plan sends exactly the request it always did.
+        multi_plate = any(len(spec.roles_for(slot)) > 1 for slot in spec.meals)
+        per_plate = meal_composer.POOL_PER_PLATE if multi_plate else 1
+
+        pools_by_day, relaxations = meal_composer.role_pools(
+            profile, spec,
+            exclude_recipe_ids=list(exclude_recipe_ids or []),
+            boost_ids=boost_ids,
+            per_plate=per_plate,
+        )
+        if not pools_by_day:
             return None
 
-        notes = PLANNER.describe_relaxations(envelope)
-        if notes:
-            logger.info("Structured plan relaxations: %s", notes)
-
-        # The response carries the slot but not the role — roles are FoodChat's
-        # vocabulary. `role_sequence()` regenerates the same (slot, role) order
-        # the request was built from, so the two zip back together by position.
-        sequence = spec.role_sequence()
-        days: list[DayPlan] = []
-
-        for day_payload in envelope.get("days") or []:
-            returned = [
-                (slot.get("slot"), recipe)
-                for slot in (day_payload.get("slots") or [])
-                for recipe in (slot.get("recipes") or [])
-            ]
-            by_slot: dict[str, list[MealCourse]] = {}
-            for (expected_slot, role), (slot_name, recipe) in zip(sequence, returned):
-                recipe_id = str(recipe.get("recipe_id") or "").strip()
-                if not recipe_id:
-                    continue
-                slot = str(slot_name or expected_slot)
-                by_slot.setdefault(slot, []).append(
-                    MealCourse(
-                        recipe_id=recipe_id,
-                        title=str(recipe.get("title") or ""),
-                        # The envelope carries the text (same keys
-                        # to_candidates reads); the pantry coverage matcher
-                        # and the UI read it downstream.
-                        ingredients=str(recipe.get("ingredients") or ""),
-                        directions=str(
-                            recipe.get("directions")
-                            or recipe.get("instructions")
-                            or ""
-                        ),
-                        nutrition=_meal_nutrition(recipe),
-                        image_url=recipe.get("image_url"),
-                        role=role,
-                    )
+        kcal_target = _day_kcal_target(profile)
+        # Compose every meal first, then judge them all in one call. Judging as
+        # each meal is built would mean one round trip per meal, which for a
+        # week with a side at dinner is seven inside one turn budget.
+        options: dict[str, list] = {}
+        placement: dict[str, tuple[int, str]] = {}
+        used: set = set()
+        for day in sorted(pools_by_day):
+            for slot in spec.meals:
+                roles = spec.roles_for(slot)
+                composed = meal_composer.compose(
+                    slot, roles, pools_by_day[day],
+                    kcal_split=spec.kcal_split(slot),
+                    meal_kcal_target=(
+                        kcal_target / max(1, len(spec.meals)) if kcal_target else None
+                    ),
+                    exclude_ids=used,
+                    enrichment={},
                 )
+                if not composed:
+                    logger.info("day %s %s could not be filled", day, slot)
+                    continue
+                label = meal_composer.label_for(day, slot)
+                options[label] = composed
+                placement[label] = (day, slot)
+                # Reserved against the measured winner so two meals cannot
+                # claim the same dish while the judge is still deciding. The
+                # judge only ever swaps within one meal's own options, all of
+                # which were drawn from that plate's pool, so a swap cannot
+                # introduce a duplicate this reservation missed.
+                used.update(composed[0].recipe_ids)
 
-            meals = [
-                Meal(meal_type=slot, plates=plates)
-                for slot, plates in by_slot.items()
-                if plates
+        chosen = meal_composer.judge(query, options)
+
+        # A judge that moves a meal off its measured winner can, in principle,
+        # land on a dish another meal already took: the reservation above was
+        # made against the winner, and a plate's pool is not guaranteed
+        # disjoint from another plate's. So the result is swept, and a collision
+        # falls back to that meal's measured winner — which WAS reserved and is
+        # therefore collision-free by construction. Cheaper and more certain
+        # than re-running the whole reservation pass, and it degrades toward
+        # the answer arithmetic already produced.
+        committed: set = set()
+        for label in sorted(chosen):
+            composition = chosen[label]
+            if committed & set(composition.recipe_ids):
+                measured = options[label][0]
+                if composition is not measured:
+                    logger.info(
+                        "%s: the judged pick repeats a dish already on the "
+                        "plan — keeping the measured one", label,
+                    )
+                    chosen[label] = measured
+                    composition = measured
+            committed.update(composition.recipe_ids)
+
+        days: list[DayPlan] = []
+        by_day_meals: dict[int, list] = {}
+        for label, composition in chosen.items():
+            day, slot = placement[label]
+            plates = [
+                MealCourse(
+                    recipe_id=plate.recipe_id,
+                    title=plate.title,
+                    # The envelope carries the text; the pantry coverage
+                    # matcher and the UI read it downstream.
+                    ingredients=str(getattr(plate.candidate, "ingredients", "") or ""),
+                    directions=str(getattr(plate.candidate, "directions", "") or ""),
+                    nutrition=getattr(plate.candidate, "nutrition", None),
+                    image_url=getattr(plate.candidate, "image_url", None),
+                    role=plate.role,
+                )
+                for plate in composition.plates
             ]
+            if plates:
+                by_day_meals.setdefault(day, []).append(Meal(meal_type=slot, plates=plates))
+
+        findings = [
+            f"{label}: {finding}"
+            for label, composition in sorted(chosen.items())
+            for finding in composition.findings
+        ]
+        if findings:
+            logger.info("Composition findings: %s", "; ".join(findings[:6]))
+
+        for day in sorted(by_day_meals):
+            meals = by_day_meals[day]
 
             if not days:  # day 1 only
                 for meal in meals:
@@ -353,8 +410,7 @@ class PlanningPipeline:
                             logger.info("Anchored %s to %r", meal.meal_type, anchor.title)
                             break
             if meals:
-                days.append(DayPlan(day=int(day_payload.get("day") or len(days) + 1),
-                                    meals=meals))
+                days.append(DayPlan(day=int(day), meals=meals))
 
         if not days:
             logger.warning("plan_meals returned no usable days for %s", spec.describe())
@@ -377,8 +433,14 @@ class PlanningPipeline:
                 f"{expected - produced} of {expected} plates could not be "
                 "filled from the recipes that match your requirements"
             )
-        if notes:
-            parts.append("; ".join(notes))
+        if relaxations:
+            parts.append("; ".join(relaxations))
+        if findings:
+            # Measured, and said. A plate that runs to twice its share of the
+            # meal, or two plates leaning on the same vegetable, is exactly the
+            # thing a member would spot themselves and wonder why nobody
+            # mentioned. Capped so the reasoning stays a sentence.
+            parts.append("; ".join(findings[:3]))
 
         concerns = spec.concerns()
         reasoning = ". ".join(parts) + "."

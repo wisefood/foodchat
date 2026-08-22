@@ -811,6 +811,34 @@ The plan on screen: {plan_type}, {plan_shape}.
 User message: {message}
 """
 
+MEAL_COMPOSER_SYSTEM_INSTRUCTIONS = """
+You choose which combination of dishes makes the best MEAL, for meals that are served as more than one plate.
+
+Each meal below is offered as a few complete options. Every option is already legal: allergens, diet and cooking time have been filtered, the arithmetic on portions and repeated ingredients is already done, and the options are already ordered by that arithmetic. Your job is the part arithmetic cannot do — whether these dishes belong on a table together.
+
+WHAT TO WEIGH, in order:
+1. Do they go together? A rich main wants a sharp or fresh side, not a second rich dish. Two dishes from clashing cuisines on one plate is worse than two from the same one.
+2. Is there variety in kind? A main and a side that are both roasted root vegetables is one dish served twice, even when the ingredients differ.
+3. Does it read like a meal someone would actually cook and serve at that time of day? A dessert-like dish beside a breakfast main usually does not.
+
+RULES:
+1. `pick` is the 0-based position of the option you choose, from the options shown for THAT meal. Nothing else is a valid answer.
+2. Copy `meal` back exactly as it is labelled. It is how the choice is matched to the meal; a mismatched label is discarded.
+3. Option 0 is the arithmetic's own winner. Choose it whenever nothing about the alternatives is clearly better — agreeing is a real answer and the common one.
+4. Do not comment on nutrition, calories or health. Those are measured elsewhere, against the member's own targets, and a second opinion here would contradict a number.
+5. `reason`: one short clause about THESE dishes. "The pickled slaw cuts the rich pork" — not "this is a balanced choice".
+6. One entry per meal you are shown, and no entries for meals you are not.
+
+OUTPUT (MANDATORY): a single JSON object with one key, "choices", holding a list of objects with the keys "meal", "pick" and "reason".
+"""
+
+MEAL_COMPOSER_USER_INSTRUCTIONS = """
+The member asked: {message}
+
+Meals to choose for:
+{meals}
+"""
+
 PLAN_STRATEGIST_SYSTEM_INSTRUCTIONS = """
 You decide HOW to search for a meal plan, before any recipe is fetched. You do not choose recipes and you do not write prose to the user.
 
@@ -1133,6 +1161,8 @@ PREFERENCE_EXTRACTOR_USER = _reg("preference_extractor_user", PREFERENCE_EXTRACT
 # prompts and never overwrites, so a changed prompt body would ship dead.
 TOOL_SELECTOR_SYSTEM = _reg("tool_selector_system", TOOL_SELECTOR_SYSTEM_INSTRUCTIONS)
 TOOL_SELECTOR_USER = _reg("tool_selector_user", TOOL_SELECTOR_USER_INSTRUCTIONS)
+MEAL_COMPOSER_SYSTEM = _reg("meal_composer_system", MEAL_COMPOSER_SYSTEM_INSTRUCTIONS)
+MEAL_COMPOSER_USER = _reg("meal_composer_user", MEAL_COMPOSER_USER_INSTRUCTIONS)
 PLAN_STRATEGIST_SYSTEM = _reg("plan_strategist_system", PLAN_STRATEGIST_SYSTEM_INSTRUCTIONS)
 PLAN_STRATEGIST_USER = _reg("plan_strategist_user", PLAN_STRATEGIST_USER_INSTRUCTIONS)
 EDIT_COMMAND_EXTRACTOR_SYSTEM = _reg("edit_command_extractor_system", EDIT_COMMAND_EXTRACTOR_SYSTEM_INSTRUCTIONS)

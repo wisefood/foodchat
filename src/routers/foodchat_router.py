@@ -217,6 +217,15 @@ class WeeklyMealPlanEntryResponse(BaseModel):
     meal_type: str
     recipe: dict
     reward: float
+    # Which plate of the meal this is. Two entries share a day, a slot and a
+    # `meal_idx` when a dinner is served as a main and a salad; this is the only
+    # thing that says which is which, and without it the field would be dropped
+    # here by pydantic's default extra='ignore' and the UI would label the
+    # plates "Dinner 1" and "Dinner 2".
+    #
+    # "main" for every plan made before meals could have plates, which is what
+    # a single-dish entry is.
+    role: str = "main"
 
 
 class WeeklyMealPlanResponse(BaseModel):

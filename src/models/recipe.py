@@ -36,6 +36,11 @@ class CandidateRecipe:
     nutrition: Optional[dict] = None
     # Letter grade, from the v2 planning surface only.
     nutri_score: Optional[str] = None
+    # Card image, also from the v2 planning surface. Carried for the same
+    # reason as the macros: it is already in the response, and a plate composed
+    # straight from a pool would otherwise render blank until something made a
+    # second details call for a URL it had already been handed.
+    image_url: Optional[str] = None
 
 
 # Slot name ("breakfast"/"lunch"/"dinner") → candidates for that slot.

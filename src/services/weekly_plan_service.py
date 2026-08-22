@@ -54,6 +54,10 @@ def _as_meal_plan(plan_entries: list[dict]):
                 recipe.get("recipe_directions") or recipe.get("directions") or ""
             ),
             nutrition=recipe.get("nutrition"),
+            # Carried so the verifier and the repair pass keep a side a side.
+            # Two entries sharing a slot already became two plates here; what
+            # they lacked was which plate each one was.
+            role=str(entry.get("role") or "main"),
         ))
 
     days = [
@@ -245,6 +249,11 @@ class WeeklyPlanService:
         logger.info("[%s] Initializing action space and environment.", session_id)
         action_space = RecipeActionSpace(
             session.user_profile, additional_diet=standing_diet, pantry=pantry,
+            # The standing shape, so a week that was asked for with a salad
+            # beside dinner keeps it through a refinement. Without this the
+            # action space had no notion of a plate and every refinement
+            # flattened a multi-plate week back to single dishes.
+            spec=state.spec,
         )
         # Anchored recipes must never repeat elsewhere in the week.
         for entry in pinned.values():

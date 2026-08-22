@@ -406,6 +406,10 @@ class TestStructuredPlan:
         class FakePlanner:
             plan_meals = staticmethod(fake_plan_meals)
             describe_relaxations = staticmethod(PlanClient.describe_relaxations)
+            # The real reader, not a stub: pairing the response's slot entries
+            # back to FoodChat's roles is the part that used to be wrong, so a
+            # test that fakes it away tests nothing.
+            to_role_pools = staticmethod(PlanClient.to_role_pools)
 
         import services.plan_client as plan_module
         monkeypatch.setattr(plan_module, "PLANNER", FakePlanner())
@@ -472,6 +476,7 @@ class TestStructuredPlan:
         class Empty:
             plan_meals = staticmethod(lambda **k: {"days": []})
             describe_relaxations = staticmethod(lambda e: [])
+            to_role_pools = staticmethod(PlanClient.to_role_pools)
 
         monkeypatch.setattr(plan_module, "PLANNER", Empty())
 

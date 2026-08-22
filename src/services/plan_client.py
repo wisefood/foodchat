@@ -408,6 +408,98 @@ class PlanClient:
         return by_slot
 
     @staticmethod
+    def to_role_pools(
+        envelope: dict[str, Any],
+        spec: "PlanSpec",
+        allergens: Optional[list[str]] = None,
+    ) -> dict[int, dict[tuple[str, str], list[CandidateRecipe]]]:
+        """`{day: {(slot, role): [CandidateRecipe]}}` — a pool per PLATE.
+
+        `to_candidates` buckets by slot name alone, which is right for the
+        three-single-plate case and wrong the moment a meal has two plates: a
+        main and a salad both land in `by_slot["lunch"]`, mixed together, with
+        nothing left to say which was which. That is the whole reason multi-plate
+        planning had no producer — the renderer was ready, the request was
+        already one entry per plate, and the reply was being read back through a
+        function that threw the distinction away.
+
+        **Paired entry-wise, not recipe-wise.** `to_request_slots` emits one
+        entry per plate and `role_sequence` regenerates the same order, so the
+        Nth entry of the response is the Nth plate — whatever number of recipes
+        it contains. `plan_structured` zipped the FLATTENED recipe list against
+        the role sequence instead, which is correct only while every plate
+        returns exactly one recipe: a plate the corpus could not fill shifts
+        every role after it by one, so a two-plate lunch with an empty main
+        rendered the salad as the main and the next slot's main as a side. Here
+        the count per plate is deliberately greater than one — there is no
+        composition to make without a choice — so recipe-wise pairing is not
+        merely fragile, it is wrong.
+        """
+        from services.candidates_client import allergen_conflict
+
+        sequence = spec.role_sequence()
+        out: dict[int, dict[tuple[str, str], list[CandidateRecipe]]] = {}
+        dropped = 0
+
+        for index, day_payload in enumerate(envelope.get("days") or []):
+            day = int(day_payload.get("day") or index + 1)
+            entries = day_payload.get("slots") or []
+            if len(entries) != len(sequence):
+                # Worth a line rather than a silent truncation: the pairing is
+                # positional, so a response that does not echo one entry per
+                # requested plate means the plates below this point are being
+                # matched to the wrong roles.
+                logger.warning(
+                    "day %s returned %d slot entries for %d requested plates — "
+                    "pairing what lines up and dropping the rest",
+                    day, len(entries), len(sequence),
+                )
+            pools: dict[tuple[str, str], list[CandidateRecipe]] = {}
+            for (expected_slot, role), entry in zip(sequence, entries):
+                # The slot name comes from the response so a service that
+                # reorders is still read correctly; the role comes from the
+                # request because roles are FoodChat's vocabulary and the
+                # response has never carried them.
+                slot = str(entry.get("slot") or expected_slot)
+                bucket = pools.setdefault((slot, role), [])
+                for recipe in entry.get("recipes") or []:
+                    recipe_id = str(recipe.get("recipe_id") or "").strip()
+                    if not recipe_id:
+                        continue
+                    candidate = CandidateRecipe(
+                        recipe_id=recipe_id,
+                        title=str(recipe.get("title") or ""),
+                        ingredients=str(recipe.get("ingredients") or ""),
+                        directions=str(
+                            recipe.get("directions") or recipe.get("instructions") or ""
+                        ),
+                        nutrition=_meal_nutrition(recipe),
+                        nutri_score=recipe.get("default_nutri_score"),
+                        image_url=recipe.get("image_url"),
+                    )
+                    # Same backstop, same reason: the corpus's allergen tags
+                    # have been wrong in production, and a server-side filter
+                    # cannot be the only thing between a member and an
+                    # allergen.
+                    conflict = allergen_conflict(
+                        f"{candidate.title} {candidate.ingredients}", allergens or [],
+                    )
+                    if conflict:
+                        dropped += 1
+                        logger.warning(
+                            "Dropping %r from %s %s — mentions %r despite the "
+                            "server-side allergen filter",
+                            candidate.title, slot, role, conflict,
+                        )
+                        continue
+                    bucket.append(candidate)
+            out[day] = pools
+
+        if dropped:
+            logger.warning("Allergen backstop dropped %d candidate(s)", dropped)
+        return out
+
+    @staticmethod
     def describe_relaxations(envelope: dict[str, Any]) -> list[str]:
         """Human-readable lines for anything the service could not honour.
 
