@@ -82,7 +82,7 @@ def _run(fns: list[Callable[[], PlanningStateDelta]]) -> list[PlanningStateDelta
                 # Each extractor already promises not to raise, so this is the
                 # belt to that brace — and it is worth having, because the
                 # alternative is one extractor's bug taking down the turn AND
-                # the three statements its siblings heard correctly.
+                # the statements its siblings heard correctly.
                 logger.warning("Intake extractor failed: %s", exc)
                 out.append(PlanningStateDelta())
         return out
@@ -119,8 +119,8 @@ def extract(message: str) -> list[PlanningStateDelta]:
     ])
     # Reset first, so "start over — but I still have the spinach" keeps the
     # spinach. `merge` returns a blank state for a reset delta and discards
-    # everything already on it, so a reset arriving last would wipe the three
-    # statements this same turn made.
+    # everything already on it, so a reset arriving last would wipe every other
+    # statement this same turn made.
     return sorted(deltas, key=lambda d: 0 if d.reset else 1)
 
 
