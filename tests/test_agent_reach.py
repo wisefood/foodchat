@@ -336,3 +336,90 @@ class TestTakingAFacetBackInWords:
             session.session_id, "not spicy", session_service=session_service,
         )
         assert state.flavor_profiles == ()
+
+
+# ── "don't give me that one again" ───────────────────────────────────────
+
+class TestARejectedDishStaysRejected:
+    """`excluded_recipe_ids` had every consumer and no producer.
+
+    The daily fetch read it, the structured fetch read it, and
+    `_standing_exclusions` read it inside the swap itself — with a docstring
+    naming "not that one" as the case it existed for. Nothing ever wrote to it.
+    So a member could swap Tuesday's stew away and get the same stew back on
+    the next regeneration, which reads as not listening.
+
+    The producer is the swap: the dish you replaced is a standing rejection,
+    recorded the same way a dish you named is a standing choice.
+    """
+
+    def _swap(self, session_service, sample_profile):
+        from conftest import make_candidates
+        from models.recipe import CandidateRecipe
+        from services.edit_service import EditService
+        from test_edit_and_transparency import (
+            FakeEditClient, FakeEditExtractor, _rich,
+        )
+
+        session = session_service.create_session(
+            f"member-{uuid.uuid4()}", sample_profile,
+        )
+        session_service.add_meal_plan(
+            session.session_id, make_candidates("cur"), "r", {"llm_score": 4},
+        )
+        light = CandidateRecipe("new-1", "Grilled fish", "fish, lemon", "grill")
+        svc = EditService(
+            session_service,
+            client=FakeEditClient({"dinner": [light]}, {
+                "cur-d": _rich("cur-d", "Veggie stew", kcal=700),
+                "new-1": _rich("new-1", "Grilled fish", kcal=420),
+            }),
+            extractor=FakeEditExtractor({
+                "meal_type": "dinner", "day": None, "directive": "lighter",
+                "needs_slot_clarification": False, "question": None,
+            }),
+        )
+        outcome = svc.process(session.session_id, "swap the dinner for something lighter")
+        return session, outcome
+
+    def test_the_dish_swapped_away_is_recorded(self, session_service, sample_profile):
+        session, outcome = self._swap(session_service, sample_profile)
+        assert outcome.meal_plan is not None
+        state = session_service.get_planning_state(session.session_id)
+        assert "cur-d" in state.excluded_recipe_ids
+
+    def test_the_slots_that_were_not_touched_are_not_excluded(self, session_service,
+                                                              sample_profile):
+        session, _ = self._swap(session_service, sample_profile)
+        state = session_service.get_planning_state(session.session_id)
+        assert "cur-b" not in state.excluded_recipe_ids
+        assert "cur-l" not in state.excluded_recipe_ids
+
+    def test_it_narrows_the_next_search(self, session_service, sample_profile):
+        """The whole point. After the swap, "cur-d" is no longer ON the plan,
+        so the current-plan exclusion the fetch already did would not cover it —
+        only the standing rejection does."""
+        from models.recipe import CandidateRecipe
+        from services.edit_service import EditService
+        from test_edit_and_transparency import (
+            FakeEditClient, FakeEditExtractor, _rich,
+        )
+
+        session, outcome = self._swap(session_service, sample_profile)
+        assert outcome.meal_plan.dinner.recipe_id == "new-1"
+
+        second = EditService(
+            session_service,
+            client=FakeEditClient({"dinner": [
+                CandidateRecipe("new-3", "Bean chilli", "beans", "simmer"),
+            ]}, {
+                "new-1": _rich("new-1", "Grilled fish", kcal=420),
+                "new-3": _rich("new-3", "Bean chilli", kcal=380),
+            }),
+            extractor=FakeEditExtractor({
+                "meal_type": "dinner", "day": None, "directive": "lighter",
+                "needs_slot_clarification": False, "question": None,
+            }),
+        )
+        second.process(session.session_id, "swap the dinner for something lighter")
+        assert "cur-d" in second.client.fetch_args["exclude_ids"]

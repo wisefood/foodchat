@@ -597,13 +597,14 @@ class EditService:
         # property of this turn: pin it so the next refinement re-anchors it
         # instead of regenerating it away — which is exactly how the apple
         # pie vanished one turn after being served.
-        if facts.get("named_dish"):
-            from models.planning_state import PlanningStateDelta
-            state = self.session_service.get_planning_state(session.session_id)
-            self.session_service.set_planning_state(
-                session.session_id,
-                state.merge(PlanningStateDelta(anchors={meal_type: choice.recipe_id})),
-            )
+        #
+        # And the dish they swapped AWAY is a standing rejection, recorded the
+        # same way. `_standing_exclusions` has read that list since it was
+        # written and nothing ever wrote to it: every consumer of
+        # `excluded_recipe_ids` was in place — the daily fetch, the structured
+        # fetch, the swap itself — with no producer, so a regenerate could hand
+        # back the exact dinner the member had just replaced.
+        self._record_edit(session, meal_type, old_course, choice, facts)
         self.session_service.add_message(session.session_id, "assistant", text)
         return EditOutcome(
             text=text, meal_plan=new_plan, changed_slots=changed, facts=facts,
@@ -714,13 +715,7 @@ class EditService:
         facts.update({"changed": changed[0]})
         text = self._success_text(changed[0], predicate)
 
-        if facts.get("named_dish"):
-            from models.planning_state import PlanningStateDelta
-            state = self.session_service.get_planning_state(session.session_id)
-            self.session_service.set_planning_state(
-                session.session_id,
-                state.merge(PlanningStateDelta(anchors={meal_type: choice.recipe_id})),
-            )
+        self._record_edit(session, meal_type, old_course, choice, facts)
         self.session_service.add_message(session.session_id, "assistant", text)
         return EditOutcome(
             text=text, meal_plan=new_plan, changed_slots=changed, facts=facts,
@@ -874,6 +869,41 @@ class EditService:
         else:
             text += ". Want me to relax the requirement or another constraint?"
         return text
+
+    def _record_edit(self, session, meal_type: str, old_course, choice, facts: dict) -> None:
+        """What this swap means for the NEXT plan, not just this one.
+
+        Two standing facts, and both were previously half-wired:
+
+        * a dish the member NAMED and got is anchored, so the next refinement
+          re-pins it instead of regenerating it away;
+        * the dish they swapped away is excluded, so it cannot come back.
+
+        Best-effort: a state write that fails costs the memory, never the swap
+        the member can already see.
+        """
+        from models.planning_state import PlanningStateDelta
+
+        rejected = getattr(old_course, "recipe_id", "") or ""
+        anchors = (
+            {meal_type: choice.recipe_id} if facts.get("named_dish") else None
+        )
+        if not rejected and not anchors:
+            return
+        try:
+            state = self.session_service.get_planning_state(session.session_id)
+            self.session_service.set_planning_state(
+                session.session_id,
+                state.merge(PlanningStateDelta(
+                    anchors=anchors,
+                    excluded_recipe_ids=(rejected,) if rejected else (),
+                )),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[%s] Could not record the edit as standing state: %s",
+                session.session_id, exc,
+            )
 
     def _standing_exclusions(self, session) -> list[str]:
         """Recipes the member already rejected (downvote, "not that one").
