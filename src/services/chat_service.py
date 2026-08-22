@@ -38,9 +38,9 @@ from services import (
     plan_repair,
     plan_verifier,
     turn_budget,
+    turn_intake,
 )
-from services import diet_intent, intent_facets
-from services.planning_delta import extract_state_delta
+from services import diet_intent
 from services.candidates_client import CANDIDATES
 from services.clarification import ClarificationManager, ClarificationState
 from services.feedback_service import FeedbackService
@@ -209,24 +209,18 @@ class ChatService:
         # and rebuilt the request from a rewritten query, so "no favourites",
         # an anchored dish and "salads on the side" all evaporated the moment
         # the next message arrived.
-        state = self.session_service.get_planning_state(session_id)
-        delta = extract_state_delta(effective_message)
-        state = state.merge(delta)
-        # Pantry statements ("I have zucchini and spinach") — read from the
-        # RAW message, not the refinement context, so ingredients quoted from
-        # the current plan are never mistaken for the member's fridge.
-        state = state.merge(pantry_service.extract_pantry_delta(message))
-        # Diet stated in chat ("I need something vegetarian"). RAW message for
-        # the same reason as the pantry: a refinement context quotes the
-        # current plan's ingredients, and "chicken" in there is not a request.
-        # Filterable diets become standing state that every fetch site unions
-        # with the profile; nutrition claims ride `notes` to the grader.
-        state = state.merge(diet_intent.extract_diet_delta(message))
-        # Recipe qualities asked for — "something comforting", "Thai tonight",
-        # "more veg". RAW message, same reasoning as diet and pantry. These are
-        # the facet families the client declared and never sent, so every such
-        # request used to reach the grader as prose over an unshaped pool.
-        state = state.merge(intent_facets.extract_facet_delta(message))
+        # Shape, pantry, diet and facets, all from the RAW message — never the
+        # refinement context, which quotes the plan on screen, and the chicken
+        # in a recipe the member is looking at is not a request for chicken.
+        #
+        # This lived here as four sequential extractions, which is why only the
+        # daily path heard all four. It is now one fanned-out pass that runs in
+        # front of the router, so every kind of turn records what was said; the
+        # call here is the same pass, memoised, and costs nothing the second
+        # time.
+        state = turn_intake.intake(
+            session_id, message, session_service=self.session_service,
+        )
 
         if seeds:
             resolutions = self.seed_service.resolve_seeds(seeds, profile)

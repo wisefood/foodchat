@@ -263,13 +263,17 @@ class TestClarificationStateIsPersistable:
 
         # import_module, not `from services import chat_service`: the package's
         # singleton placeholders shadow submodule names on attribute lookup.
-        chat_service_module = importlib.import_module("services.chat_service")
+        planning_delta = importlib.import_module("services.planning_delta")
+        turn_intake = importlib.import_module("services.turn_intake")
+        turn_intake.forget()
 
         # Shape extraction is an LLM call; pin it so the turn is offline and
         # the standing spec is definitely non-default — the exact combination
-        # that used to raise.
+        # that used to raise. Patched at `planning_delta`, which is where the
+        # extraction now happens: `chat_service` no longer calls it directly,
+        # it reads the one intake pass that runs in front of the router.
         monkeypatch.setattr(
-            chat_service_module, "extract_state_delta",
+            planning_delta, "extract_state_delta",
             lambda *a, **k: PlanningStateDelta(
                 spec=PlanSpec(num_days=3, meals=("lunch",),
                               plates={"lunch": ("main", "salad")}),

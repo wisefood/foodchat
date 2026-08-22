@@ -48,7 +48,7 @@ from agents import OrchestratorAgent, PlanAnalyst, ToolSelector
 from backend.observability import trace_context
 from models.attribution import Attribution
 from models.session import MealPlan, WeeklyMealPlan
-from . import plan_parameters, turn_budget
+from . import plan_parameters, turn_budget, turn_intake
 from .edit_service import EditService
 from .foodscholar_service import FoodScholarService
 from .seed_service import SeedService
@@ -299,6 +299,9 @@ class OrchestratorService:
                 turn_budget.start():
             if not claimed:
                 return self._busy_turn()
+            # A new turn hears the message fresh. The intake memo exists to stop
+            # one turn extracting twice, not to carry an answer into the next.
+            turn_intake.forget()
             session = self._owned_session(session_id, member_id)
             limit_turn = self._limit_turn(session)
             if limit_turn is not None:
@@ -385,6 +388,19 @@ class OrchestratorService:
 
     def _classify_and_route(self, session, session_id: str, message: str) -> ChatTurn:
         """One classifier call, then dispatch — the only intent decision per turn."""
+        # Hear the member BEFORE deciding what kind of turn this is.
+        #
+        # The four extractors used to live inside the handlers, so what got
+        # heard depended on where the turn was routed: the daily path ran all
+        # four, weekly ran two, and an edit, a question, a tool call or plain
+        # conversation ran none. "Swap Tuesday's dinner — by the way I'm coeliac
+        # now" recorded the swap and lost the coeliac. Standing here, in front
+        # of the routing, the statement lands whatever the turn turns out to be.
+        #
+        # Memoised per turn, so the handlers below still call intake where they
+        # always extracted and neither pays twice.
+        turn_intake.intake(session_id, message, session_service=self.session_service)
+
         if self._SCHOLAR_CONSULT_RE.search(message):
             logger.info("Explicit FoodScholar consult — routing to the M1 bridge")
             return self._handle_nutrition_question(
@@ -625,13 +641,18 @@ class OrchestratorService:
                 # natively without reusing a recipe. Route the request there;
                 # the spec extractor reads "week" as num_days=7, and the plan
                 # lands on the plan canvas with every day rendered.
-                from services.planning_delta import extract_state_delta
-                delta = extract_state_delta(message)
-                if delta.spec is not None and delta.spec.plates:
+                # The shape intake already read, not a second extraction of
+                # the same sentence — this branch used to pay its own
+                # `extract_state_delta` call and then throw the result away
+                # except for this one boolean.
+                spec = turn_intake.intake(
+                    session_id, message, session_service=self.session_service,
+                ).spec
+                if spec is not None and spec.plates:
                     logger.info(
                         "[%s] Weekly request carries a multi-plate shape (%s) — "
                         "routing through the structured path",
-                        session_id, delta.spec.describe(),
+                        session_id, spec.describe(),
                     )
                     return self._handle_plan(
                         session_id, message, "daily_plan", is_refinement=False, seeds=seeds
@@ -1339,6 +1360,9 @@ class OrchestratorService:
                 turn_budget.start():
             if not claimed:
                 return self._busy_turn()
+            # A new turn hears the message fresh. The intake memo exists to stop
+            # one turn extracting twice, not to carry an answer into the next.
+            turn_intake.forget()
             session = self._owned_session(session_id, member_id)
             limit_turn = self._limit_turn(session)
             if limit_turn is not None:
@@ -1399,6 +1423,9 @@ class OrchestratorService:
                 turn_budget.start():
             if not claimed:
                 return self._busy_turn()
+            # A new turn hears the message fresh. The intake memo exists to stop
+            # one turn extracting twice, not to carry an answer into the next.
+            turn_intake.forget()
             session = self._owned_session(session_id, member_id)
             limit_turn = self._limit_turn(session)
             if limit_turn is not None:
@@ -1448,6 +1475,9 @@ class OrchestratorService:
                 turn_budget.start():
             if not claimed:
                 return self._busy_turn()
+            # A new turn hears the message fresh. The intake memo exists to stop
+            # one turn extracting twice, not to carry an answer into the next.
+            turn_intake.forget()
             session = self._owned_session(session_id, member_id)
             limit_turn = self._limit_turn(session)
             if limit_turn is not None:
