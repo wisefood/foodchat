@@ -1401,6 +1401,20 @@ class OrchestratorService:
             applied = dict(session.user_profile.get("plan_parameters") or {})
             applied.update(values)
             session.user_profile["plan_parameters"] = applied
+            if values.get("cooking_time") is not None:
+                # The slider and a spoken "under 20 minutes" are one
+                # constraint, so moving the knob is a NEW statement of it and
+                # has to update the standing state. Without this the planning
+                # paths would re-apply the older spoken value over the newer
+                # slider one and the member would watch their drag undo itself.
+                from models.planning_state import PlanningStateDelta
+
+                self.session_service.set_planning_state(
+                    session_id,
+                    self.session_service.get_planning_state(session_id).merge(
+                        PlanningStateDelta(max_minutes=int(values["cooking_time"])),
+                    ),
+                )
             history = session.user_profile.get("history", "") or ""
             line = plan_parameters.history_line(values)
             session.user_profile["history"] = f"{history}\n{line}" if history else line

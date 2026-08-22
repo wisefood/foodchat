@@ -223,3 +223,75 @@ class TestThePersonaDescribesWhatExists:
         names = {f.name for f in dataclasses.fields(PlanningState)}
         assert not [n for n in names if "kcal" in n or "calorie" in n or "protein" in n]
         assert "do not promise calorie or protein targets" in self._persona()
+
+
+class TestTheSliderAndTheSentenceCannotFight:
+    """One constraint means the newer statement wins, whichever channel it
+    arrived on.
+
+    The spoken limit is standing state, and the planning paths write it over
+    `profile["plan_parameters"]["cooking_time"]` on every turn. So a member who
+    said "under 20 minutes" on Monday and dragged the knob to 60 on Tuesday
+    would watch their drag undo itself: the state would re-apply 20 over the
+    slider value that had just been saved.
+    """
+
+    def _orch(self, session_service):
+        from services.orchestrator_service import OrchestratorService
+
+        orch = OrchestratorService.__new__(OrchestratorService)
+        orch.session_service = session_service
+        orch._owned_session = lambda sid, mid: session_service.get_session(sid)
+        orch._limit_turn = staticmethod(lambda _s: None)
+        orch._handle_plan = lambda *a, **k: _StubTurn()
+        orch._handle_weekly = lambda *a, **k: _StubTurn()
+        return orch
+
+    def test_moving_the_knob_replaces_a_spoken_limit(self, session_service,
+                                                    sample_profile):
+        from models.planning_state import PlanningStateDelta
+
+        session = session_service.create_session(
+            f"member-{uuid.uuid4()}", sample_profile,
+        )
+        session_service.set_planning_state(
+            session.session_id,
+            session_service.get_planning_state(session.session_id).merge(
+                PlanningStateDelta(max_minutes=20),
+            ),
+        )
+
+        self._orch(session_service).apply_plan_parameters(
+            session.session_id, session.member_id, {"cooking_time": 60},
+        )
+
+        state = session_service.get_planning_state(session.session_id)
+        assert state.max_minutes == 60
+        profile = plan_parameters.apply_state(
+            dict(session_service.get_session(session.session_id).user_profile), state,
+        )
+        assert profile["plan_parameters"]["cooking_time"] == 60
+
+    def test_a_slider_apply_that_says_nothing_about_time_leaves_it_alone(
+        self, session_service, sample_profile,
+    ):
+        from models.planning_state import PlanningStateDelta
+
+        session = session_service.create_session(
+            f"member-{uuid.uuid4()}", sample_profile,
+        )
+        session_service.set_planning_state(
+            session.session_id,
+            session_service.get_planning_state(session.session_id).merge(
+                PlanningStateDelta(max_minutes=20),
+            ),
+        )
+        self._orch(session_service).apply_plan_parameters(
+            session.session_id, session.member_id, {"goal": "energy"},
+        )
+        assert session_service.get_planning_state(session.session_id).max_minutes == 20
+
+
+class _StubTurn:
+    """Enough of a ChatTurn for `apply_plan_parameters` to finish."""
+    plan_parameters = None
