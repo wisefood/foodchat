@@ -153,6 +153,10 @@ class PlanClient:
         days: int = 1,
         slots: tuple[str, ...] = MEAL_SLOTS,
         count_per_slot: int = 1,
+        # Spend `count_per_slot` only on plates of meals that have more than
+        # one. A single-plate meal has nothing to compose, so a deeper pool for
+        # it is recipes fetched and ranked to arrive at the first one anyway.
+        deepen_multiplate_only: bool = False,
         spec: Optional["PlanSpec"] = None,
         allergens: Optional[list[str]] = None,
         diet: Optional[list[str]] = None,
@@ -191,7 +195,10 @@ class PlanClient:
         # nothing to compose. A parameter that reaches nothing is worse than one
         # that does not exist.
         if spec is not None:
-            request_slots = spec.to_request_slots(count=max(1, int(count_per_slot)))
+            request_slots = spec.to_request_slots(
+                count=max(1, int(count_per_slot)),
+                only_multiplate=deepen_multiplate_only,
+            )
             days = spec.num_days
         else:
             request_slots = [

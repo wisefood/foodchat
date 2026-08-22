@@ -541,3 +541,158 @@ class TestOnlyMealsWithMoreThanOnePlateAreJudged:
             "day 1 dinner": _two_options(),
         }, agent=judge)
         assert [o["meal"] for o in judge.offers] == ["day 1 dinner"]
+
+
+class TestDepthIsSpentWhereThereIsAChoice:
+    """A single-plate meal in a shaped spec has nothing to compose — no second
+    dish for it to sit beside — so four candidates for it are three recipes
+    fetched, enriched and ranked by RecipeWrangler's own order to arrive at the
+    one that was first anyway."""
+
+    SPEC = PlanSpec(
+        meals=("breakfast", "lunch", "dinner"), plates={"dinner": ("main", "side")},
+    )
+
+    def test_only_the_multi_plate_meal_gets_a_deep_pool(self):
+        slots = self.SPEC.to_request_slots(count=4, only_multiplate=True)
+        assert [(e["slot"], e["count"]) for e in slots] == [
+            ("breakfast", 1), ("lunch", 1), ("dinner", 4), ("dinner", 4),
+        ]
+
+    def test_it_is_a_third_off_a_shaped_week(self):
+        uniform = sum(e["count"] for e in self.SPEC.to_request_slots(count=4))
+        trimmed = sum(
+            e["count"] for e in self.SPEC.to_request_slots(count=4, only_multiplate=True)
+        )
+        assert (uniform, trimmed) == (16, 10)
+
+    def test_an_all_single_plate_spec_is_untouched_by_the_flag(self):
+        spec = PlanSpec(meals=("breakfast", "lunch"))
+        assert [e["count"] for e in spec.to_request_slots(count=4, only_multiplate=True)] \
+            == [1, 1]
+
+    def test_the_flag_is_off_by_default(self):
+        """A caller that wants a uniform pool still gets one."""
+        assert [e["count"] for e in self.SPEC.to_request_slots(count=4)] == [4, 4, 4, 4]
+
+    def test_the_composer_asks_for_it(self, monkeypatch):
+        import services.plan_client as plan_module
+
+        sent = {}
+
+        class _Planner:
+            @staticmethod
+            def plan_meals(**kwargs):
+                sent.update(kwargs)
+                return {"days": []}
+
+            describe_relaxations = staticmethod(lambda e: [])
+            to_role_pools = staticmethod(lambda e, s, allergens=None: {})
+
+        monkeypatch.setattr(plan_module, "PLANNER", _Planner())
+        meal_composer.role_pools({"allergies": []}, self.SPEC, per_plate=4)
+        assert sent["deepen_multiplate_only"] is True
+
+    def test_it_reaches_the_wire(self, monkeypatch):
+        from services.plan_client import PlanClient
+
+        sent = {}
+
+        class _Response:
+            @staticmethod
+            def raise_for_status():
+                return None
+
+            @staticmethod
+            def json():
+                return {"days": []}
+
+        class _Client:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def post(self, url, json=None):
+                sent.update(json or {})
+                return _Response()
+
+        import httpx
+        monkeypatch.setattr(httpx, "Client", _Client)
+
+        PlanClient().plan_meals(
+            spec=self.SPEC, count_per_slot=4, deepen_multiplate_only=True,
+        )
+        assert [s["count"] for s in sent["slots"]] == [1, 1, 4, 4]
+
+
+class TestTheVerifierReadsWhatThePlanCarries:
+    """`_check_kcal` and `_check_nutri_score` read the enrichment only, so a
+    plan carrying its own macros was reported as `calories: unknown` — a
+    measurement missing, nothing said, and the member reading silence as
+    agreement. The planning envelope carries macros with every card and the
+    composer now keeps them on the plate instead of throwing them away and
+    re-fetching the same numbers.
+    """
+
+    @staticmethod
+    def _plan(kcal=700.0, label="A"):
+        from models.session import DayPlan, Meal, MealCourse, MealPlan
+
+        plate = MealCourse(
+            recipe_id="r1", title="Stew", ingredients="beans", directions="cook",
+            nutrition={"kcal": kcal, "nutri_score_label": label},
+        )
+        return MealPlan.from_days(
+            [DayPlan(day=1, meals=[Meal(meal_type="dinner", plates=[plate])])],
+            reasoning="",
+        )
+
+    def _check(self, plan, requested, name):
+        from services import plan_verifier
+
+        report = plan_verifier.verify(plan, requested, {})
+        return next((c for c in report.checks if c.name == name), None)
+
+    def test_calories_are_measured_without_a_details_call(self):
+        check = self._check(self._plan(kcal=700.0), {"kcal_target": 700}, "calories")
+        assert check is not None and check.status == "passed"
+
+    def test_a_miss_is_still_a_miss(self):
+        check = self._check(self._plan(kcal=2400.0), {"kcal_target": 700}, "calories")
+        assert check.status == "failed"
+
+    def test_a_plate_with_no_macros_is_still_unknown(self):
+        """The honest state, and it must survive: reporting 0 kcal for missing
+        data would be a measurement of nothing presented as a measurement."""
+        from models.session import DayPlan, Meal, MealCourse, MealPlan
+
+        bare = MealCourse("r1", "Stew", "beans", "cook")
+        plan = MealPlan.from_days(
+            [DayPlan(day=1, meals=[Meal(meal_type="dinner", plates=[bare])])],
+            reasoning="",
+        )
+        assert self._check(plan, {"kcal_target": 700}, "calories").status == "unknown"
+
+    def test_the_nutri_score_floor_reads_the_plate_too(self):
+        check = self._check(
+            self._plan(label="D"), {"min_nutri_score": "B"}, "nutri-score",
+        )
+        assert check.status == "failed" and check.offenders == ("r1",)
+
+    def test_a_fresh_details_call_still_wins(self):
+        """Enrichment is a live fetch, so it is the more current of the two."""
+        from models.recipe import RecipeEnrichment
+        from services import plan_verifier
+
+        plan = self._plan(kcal=700.0)
+        report = plan_verifier.verify(
+            plan, {"kcal_target": 700},
+            {"r1": RecipeEnrichment("r1", "Stew", kcal=2400.0)},
+        )
+        calories = next(c for c in report.checks if c.name == "calories")
+        assert calories.status == "failed", "the live figure should have been used"

@@ -176,6 +176,11 @@ def role_pools(
         envelope = PLANNER.plan_meals(
             spec=request_spec,
             count_per_slot=max(1, int(per_plate)),
+            # Depth only where a choice exists. A single-plate meal in a shaped
+            # spec has no second dish to sit beside, so the extra candidates
+            # would be fetched, enriched and ranked to arrive at the one
+            # RecipeWrangler put first anyway.
+            deepen_multiplate_only=True,
             allergens=screening_allergens(profile),
             diet=effective_diet(profile),
             **intent_facets.facet_kwargs(profile, cuisines),

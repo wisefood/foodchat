@@ -338,6 +338,26 @@ def _check_claim_tags(plates, requested, enrichment) -> Optional[Check]:
                  observed=observed, of=len(plates))
 
 
+def _measured(plate, enrichment, attribute: str, nutrition_key: str):
+    """A per-recipe figure, from the fresh details call or from the plate itself.
+
+    Enrichment first: it is a live fetch, so it is the more current of the two.
+    The plate's own `nutrition` is the fallback, and it exists more often than
+    it used to — the planning envelope carries macros with every card, and the
+    composer now keeps them on the plate rather than throwing them away and
+    re-fetching the same numbers.
+
+    Without this the verifier reported `calories: unknown` for a plan that was
+    carrying its calories, which is the exact failure the ledger exists to
+    prevent: a measurement is missing, so nothing is said, so the member reads
+    silence as agreement.
+    """
+    value = getattr(enrichment.get(plate.recipe_id), attribute, None)
+    if value is not None:
+        return value
+    return (getattr(plate, "nutrition", None) or {}).get(nutrition_key)
+
+
 def _check_kcal(plan, requested, enrichment) -> Optional[Check]:
     """Per DAY, because that is the unit a calorie target is set in.
 
@@ -361,9 +381,8 @@ def _check_kcal(plan, requested, enrichment) -> Optional[Check]:
         counted = 0
         plates = [p for meal in day.meals for p in meal.plates if p.recipe_id]
         for plate in plates:
-            rich = enrichment.get(plate.recipe_id)
-            kcal = getattr(rich, "kcal", None)
-            if kcal is None:
+            kcal = _measured(plate, enrichment, "kcal", "kcal")
+            if not isinstance(kcal, (int, float)):
                 continue
             total += float(kcal)
             counted += 1
@@ -448,8 +467,9 @@ def _check_nutri_score(plates, requested, enrichment) -> Optional[Check]:
     offenders: list[str] = []
     observed = 0
     for plate in plates:
-        rich = enrichment.get(plate.recipe_id)
-        label = str(getattr(rich, "nutri_score_label", None) or "").strip().lower()
+        label = str(
+            _measured(plate, enrichment, "nutri_score_label", "nutri_score_label") or ""
+        ).strip().lower()
         if label not in _NUTRI_ORDER:
             continue
         observed += 1

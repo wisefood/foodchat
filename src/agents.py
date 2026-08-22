@@ -137,6 +137,44 @@ _COMBO_SCAN_LIMIT = 512
 CHATBOT_HISTORY_TURNS = int(os.getenv("FOODCHAT_CHATBOT_HISTORY_TURNS", "12"))
 
 
+
+def as_json_messages(messages: list) -> list:
+    """The same messages, guaranteed to contain the word Groq requires.
+
+    Groq rejects any `json_object` request whose messages do not contain the
+    string "json" — a 400 on every call. Each agent's `except` turns that into
+    a silent fallback ("no shape extracted", "no diet found"), so the symptom is
+    a feature that quietly does nothing.
+
+    It has happened. The in-code prompt said "json"; the managed copy in
+    Langfuse did not, and prompts are served from Langfuse at runtime while
+    existing copies are never overwritten by a deploy — so multi-plate planning
+    was disabled in production while every local test passed.
+
+    That is why the guarantee cannot live in the prompt text. It lives here, at
+    the last point before the call, applied to whatever the messages turned out
+    to be. `tests/test_prompt_contracts.py` fails the build if a schema agent
+    invokes without it, so a new agent cannot inherit the bug by forgetting.
+    """
+    if not messages:
+        return messages
+    if "json" in " ".join(
+        str(getattr(m, "content", "") or "") for m in messages
+    ).lower():
+        return messages
+    head, *rest = messages
+    logger.info(
+        "Prompt reached the client without the word 'json' — adding the "
+        "instruction Groq requires rather than taking a 400."
+    )
+    return [
+        SystemMessage(
+            content=f"{getattr(head, 'content', '')}\nReturn the result as a JSON object."
+        ),
+        *rest,
+    ]
+
+
 class DocumentGrader:
     """Scores candidate days against the query + profile.
 
@@ -276,7 +314,7 @@ class DocumentGrader:
         )
 
         try:
-            result = self.grader.invoke([
+            result = self.grader.invoke(as_json_messages([
                 SystemMessage(content=PLAN_GRADER_SYSTEM.compile()),
                 HumanMessage(content=PLAN_GRADER_USER.compile(
                     plan_count=len(sampled),
@@ -285,7 +323,7 @@ class DocumentGrader:
                     preferences=",".join(user_profile.get("preferences", [])),
                     feedback_history=feedback_history or "No prior feedback.",
                 )),
-            ], config=build_trace_config(run_name="plan_grade_batch", tags=["planning"]))
+            ]), config=build_trace_config(run_name="plan_grade_batch", tags=["planning"]))
             grades = json.loads(result.content).get("grades", [])
         except Exception as exc:  # noqa: BLE001
             # The caller already degrades to the unranked pool on [].
@@ -322,10 +360,10 @@ class MealDiversityGrader:
         )
 
     def score(self, plan_text: str) -> dict:
-        result = self.client.invoke([
+        result = self.client.invoke(as_json_messages([
             SystemMessage(content=MEAL_DIVERSITY_SYSTEM.compile()),
             HumanMessage(content=plan_text),
-        ], config=build_trace_config(run_name="meal_diversity", tags=["metrics"]))
+        ]), config=build_trace_config(run_name="meal_diversity", tags=["metrics"]))
         try:
             return json.loads(result.content)
         except Exception:
@@ -343,10 +381,10 @@ class GuidelineAdherenceGrader:
         )
 
     def score(self, plan_text: str, guidelines_text: str) -> dict:
-        result = self.client.invoke([
+        result = self.client.invoke(as_json_messages([
             SystemMessage(content=GUIDELINE_ADHERENCE_SYSTEM.compile()),
             HumanMessage(content=f"GUIDELINES:\n{guidelines_text}\n\nMEAL PLAN:\n{plan_text}"),
-        ], config=build_trace_config(run_name="guideline_adherence", tags=["metrics"]))
+        ]), config=build_trace_config(run_name="guideline_adherence", tags=["metrics"]))
         try:
             return json.loads(result.content)
         except Exception:
@@ -409,7 +447,7 @@ class QueryReconciler:
             ", ".join(f"likes {l}" for l in (user_profile.get("food_likes") or [])[:5]),
         ])) or "(nothing on file)"
 
-        result = self.query_reconciler.invoke([
+        result = self.query_reconciler.invoke(as_json_messages([
             SystemMessage(content=QUERY_RECONCILER_SYSTEM.compile()),
             HumanMessage(content=QUERY_RECONCILER_USER.compile(
                 query=query,
@@ -417,7 +455,7 @@ class QueryReconciler:
                 allergies=user_profile.get("allergies", []),
                 known_facts=known_facts,
             )),
-        ], config=build_trace_config(run_name="query_reconcile", tags=["clarify"]))
+        ]), config=build_trace_config(run_name="query_reconcile", tags=["clarify"]))
         return json.loads(result.content)
 
 
@@ -435,10 +473,10 @@ class DietaryIntentExtractor:
 
     def extract(self, query: str) -> list[str]:
         try:
-            result = self.llm.invoke([
+            result = self.llm.invoke(as_json_messages([
                 SystemMessage(content=DIETARY_INTENT_EXTRACTOR_SYSTEM.compile()),
                 HumanMessage(content=DIETARY_INTENT_EXTRACTOR_USER.compile(query=query)),
-            ], config=build_trace_config(run_name="dietary_intent", tags=["extract"]))
+            ]), config=build_trace_config(run_name="dietary_intent", tags=["extract"]))
             return json.loads(result.content).get("dietary_tags", [])
         except Exception as e:
             logger.warning("DietaryIntentExtractor failed: %s", e)
@@ -479,20 +517,10 @@ class PlanSpecExtractor:
         try:
             system_text = PLAN_SPEC_EXTRACTOR_SYSTEM.compile()
             user_text = PLAN_SPEC_EXTRACTOR_USER.compile(query=query)
-            # Groq rejects any json_object request whose messages don't
-            # contain the word "json" — a 400 on every call, which this
-            # except swallows into "no shape extracted", silently. The
-            # in-code prompt says it, but prompts are served from Langfuse
-            # at runtime and existing managed copies are never overwritten
-            # by a deploy — so a stale managed prompt disabled multi-plate
-            # planning in production while every local test passed. This
-            # guard makes the requirement structural instead of editorial.
-            if "json" not in f"{system_text} {user_text}".lower():
-                system_text += "\nReturn the result as a JSON object."
-            result = self.llm.invoke([
+            result = self.llm.invoke(as_json_messages([
                 SystemMessage(content=system_text),
                 HumanMessage(content=user_text),
-            ], config=build_trace_config(run_name="plan_spec", tags=["extract"]))
+            ]), config=build_trace_config(run_name="plan_spec", tags=["extract"]))
             payload = json.loads(result.content)
         except Exception as e:
             logger.warning("PlanSpecExtractor failed: %s", e)
@@ -535,10 +563,10 @@ class PreferenceExtractor:
 
     def extract(self, message: str) -> list[dict]:
         try:
-            result = self.llm.invoke([
+            result = self.llm.invoke(as_json_messages([
                 SystemMessage(content=PREFERENCE_EXTRACTOR_SYSTEM.compile()),
                 HumanMessage(content=PREFERENCE_EXTRACTOR_USER.compile(message=message)),
-            ], config=build_trace_config(run_name="preference_extract", tags=["memory"]))
+            ]), config=build_trace_config(run_name="preference_extract", tags=["memory"]))
             memories = json.loads(result.content).get("memories", [])
             return [m for m in memories if isinstance(m, dict) and m.get("value") and m.get("kind")]
         except Exception as e:
@@ -565,10 +593,10 @@ class SeedExtractor:
 
     def extract(self, query: str) -> list[dict]:
         try:
-            result = self.llm.invoke([
+            result = self.llm.invoke(as_json_messages([
                 SystemMessage(content=SEED_EXTRACTOR_SYSTEM.compile()),
                 HumanMessage(content=SEED_EXTRACTOR_USER.compile(query=query)),
-            ], config=build_trace_config(run_name="seed_extract", tags=["planning"]))
+            ]), config=build_trace_config(run_name="seed_extract", tags=["planning"]))
             seeds = json.loads(result.content).get("seeds", [])
             return [s for s in seeds if isinstance(s, dict) and s.get("name")]
         except Exception as e:
@@ -606,12 +634,10 @@ class PantryExtractor:
             # Same structural guard as PlanSpecExtractor: Groq 400s any
             # json_object request whose messages omit the word "json", and a
             # managed prompt edit can strip it silently.
-            if "json" not in f"{system_text} {user_text}".lower():
-                system_text += "\nReturn the result as a JSON object."
-            result = self.llm.invoke([
+            result = self.llm.invoke(as_json_messages([
                 SystemMessage(content=system_text),
                 HumanMessage(content=user_text),
-            ], config=build_trace_config(run_name="pantry_extract", tags=["planning"]))
+            ]), config=build_trace_config(run_name="pantry_extract", tags=["planning"]))
             payload = json.loads(result.content)
         except Exception as e:
             logger.warning("PantryExtractor failed: %s", e)
@@ -640,12 +666,12 @@ class EditCommandExtractor:
         """Returns the command dict, or None when parsing fails (caller
         degrades to a whole-plan refinement)."""
         try:
-            result = self.llm.invoke([
+            result = self.llm.invoke(as_json_messages([
                 SystemMessage(content=EDIT_COMMAND_EXTRACTOR_SYSTEM.compile()),
                 HumanMessage(content=EDIT_COMMAND_EXTRACTOR_USER.compile(
                     plan_type=plan_type, message=message,
                 )),
-            ], config=build_trace_config(run_name="edit_command", tags=["edit"]))
+            ]), config=build_trace_config(run_name="edit_command", tags=["edit"]))
             command = json.loads(result.content)
             if not command.get("directive"):
                 command["directive"] = "different"
@@ -760,12 +786,10 @@ class PlanIntentExtractor:
                 **{f: ", ".join(allowed[f]) or "(none)" for f in families}
             )
             user_text = PLAN_INTENT_EXTRACTOR_USER.compile(message=message)
-            if "json" not in f"{system_text} {user_text}".lower():
-                system_text += "\nReturn the result as a JSON object."
-            result = self.llm.invoke([
+            result = self.llm.invoke(as_json_messages([
                 SystemMessage(content=system_text),
                 HumanMessage(content=user_text),
-            ], config=build_trace_config(run_name="plan_intent", tags=["planning"]))
+            ]), config=build_trace_config(run_name="plan_intent", tags=["planning"]))
             payload = json.loads(result.content)
         except Exception as exc:  # noqa: BLE001
             logger.warning("PlanIntentExtractor failed: %s", exc)
@@ -828,12 +852,10 @@ class ToolSelector:
             user_text = TOOL_SELECTOR_USER.compile(
                 message=message[:400], plan_type=plan_type, plan_shape=plan_shape,
             )
-            if "json" not in f"{system_text} {user_text}".lower():
-                system_text += "\nReturn the result as a JSON object."
-            result = self.llm.invoke([
+            result = self.llm.invoke(as_json_messages([
                 SystemMessage(content=system_text),
                 HumanMessage(content=user_text),
-            ], config=build_trace_config(run_name="tool_select", tags=["tools"]))
+            ]), config=build_trace_config(run_name="tool_select", tags=["tools"]))
             payload = json.loads(result.content)
         except Exception as exc:  # noqa: BLE001
             logger.warning("ToolSelector failed, routing normally: %s", exc)
@@ -916,12 +938,10 @@ class PlanStrategist:
                 standing=brief.describe(),
                 vocabularies=vocab_text,
             )
-            if "json" not in f"{system_text} {user_text}".lower():
-                system_text += "\nReturn the result as a JSON object."
-            result = self.llm.invoke([
+            result = self.llm.invoke(as_json_messages([
                 SystemMessage(content=system_text),
                 HumanMessage(content=user_text),
-            ], config=build_trace_config(run_name="plan_strategy", tags=["planning"]))
+            ]), config=build_trace_config(run_name="plan_strategy", tags=["planning"]))
             payload = json.loads(result.content)
         except Exception as exc:  # noqa: BLE001
             logger.warning("PlanStrategist failed, using the plain brief: %s", exc)
@@ -993,12 +1013,10 @@ class MealJudge:
                 message=(message or "a meal plan")[:400],
                 meals="\n\n".join(blocks),
             )
-            if "json" not in f"{system_text} {user_text}".lower():
-                system_text += "\nReturn the result as a JSON object."
-            result = self.llm.invoke([
+            result = self.llm.invoke(as_json_messages([
                 SystemMessage(content=system_text),
                 HumanMessage(content=user_text),
-            ], config=build_trace_config(run_name="meal_compose", tags=["planning"]))
+            ]), config=build_trace_config(run_name="meal_compose", tags=["planning"]))
             payload = json.loads(result.content)
         except Exception as exc:  # noqa: BLE001
             logger.warning("MealJudge failed, keeping the measured order: %s", exc)
@@ -1133,7 +1151,7 @@ class OrchestratorAgent:
         config = build_trace_config(run_name="orchestrate", tags=["router"])
         for attempt in range(MAX_RETRIES):
             try:
-                result = self.llm.invoke(messages, config=config)
+                result = self.llm.invoke(as_json_messages(messages), config=config)
                 parsed = json.loads(result.content)
                 intent = parsed.get("intent", "chat")
                 if intent in self.VALID_INTENTS:

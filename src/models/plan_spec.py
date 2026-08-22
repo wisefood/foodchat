@@ -207,7 +207,9 @@ class PlanSpec:
 
         return notes
 
-    def to_request_slots(self, count: int = 1) -> list[dict[str, Any]]:
+    def to_request_slots(
+        self, count: int = 1, *, only_multiplate: bool = False,
+    ) -> list[dict[str, Any]]:
         """The `slots` payload `/api/v2/tools/plan_meals` expects.
 
         **One entry per plate**, not one per meal. RecipeWrangler treats a
@@ -223,14 +225,24 @@ class PlanSpec:
         what a plan needs. More than one is what a composer needs: choosing
         which side goes with which main is not possible when the service was
         only ever asked for one of each.
+
+        `only_multiplate` spends that depth where it can be used. A single-plate
+        meal in a shaped spec has nothing to compose — there is no second dish
+        for it to sit beside — so four candidates for it are three recipes
+        fetched, enriched and ranked by RecipeWrangler's own order to arrive at
+        the one that was first anyway. On a week of three meals with a side at
+        dinner it is the difference between 112 recipes and 70.
         """
         out: list[dict[str, Any]] = []
+        depth = max(1, int(count))
         for slot in self.meals:
-            for role in self.roles_for(slot):
+            roles = self.roles_for(slot)
+            wanted = depth if (len(roles) > 1 or not only_multiplate) else 1
+            for role in roles:
                 out.append(
                     {
                         "slot": slot,
-                        "count": max(1, int(count)),
+                        "count": wanted,
                         "course_types": list(ROLE_COURSE_TYPES.get(role, ())),
                     }
                 )
