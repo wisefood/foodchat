@@ -417,8 +417,17 @@ def judge(
     good plan, and one that never arrives is not.
     """
     chosen = {label: entries[0] for label, entries in options.items() if entries}
+    # Only meals that are actually served as more than one plate, and only
+    # where there is something to choose between.
+    #
+    # A single-plate meal inside a multi-plate spec has a pool too, but picking
+    # among four mains is RANKING, not composition — the prompt asks whether
+    # these dishes belong on a table together, and for one dish that is not a
+    # question. Offering them made the judge answer "the slaw cuts it" about a
+    # lunch with no slaw in it.
     offerable = {
-        label: entries for label, entries in options.items() if len(entries) > 1
+        label: entries for label, entries in options.items()
+        if len(entries) > 1 and len(entries[0].plates) > 1
     }
     if not offerable:
         return chosen

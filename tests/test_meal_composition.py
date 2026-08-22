@@ -514,3 +514,30 @@ class TestTheDepthReachesTheRequest:
         meal_composer.role_pools({"allergies": []}, spec, per_plate=4)
 
         assert sent["count_per_slot"] == 4
+
+
+class TestOnlyMealsWithMoreThanOnePlateAreJudged:
+    """A single-plate meal inside a multi-plate spec has a pool too, and
+    picking among four mains is RANKING, not composition. The prompt asks
+    whether these dishes belong on a table together; for one dish that is not a
+    question, and offering it made the judge answer "the slaw cuts it" about a
+    lunch with no slaw in it."""
+
+    def test_a_one_plate_meal_with_four_options_is_not_offered(self):
+        pools = {("lunch", "main"): [_c(f"m{n}", f"M{n}", f"x{n}") for n in range(4)]}
+        single = meal_composer.compose("lunch", ("main",), pools, limit=4)
+        assert len(single) == 4
+
+        judge = _Judge({"lunch": (2, "?")})
+        chosen = meal_composer.judge("q", {"lunch": single}, agent=judge)
+        assert judge.offers is None
+        assert chosen["lunch"] is single[0]
+
+    def test_a_mixed_plan_offers_only_its_multi_plate_meals(self):
+        pools = {("lunch", "main"): [_c(f"m{n}", f"M{n}", f"x{n}") for n in range(3)]}
+        judge = _Judge()
+        meal_composer.judge("q", {
+            "day 1 lunch": meal_composer.compose("lunch", ("main",), pools, limit=3),
+            "day 1 dinner": _two_options(),
+        }, agent=judge)
+        assert [o["meal"] for o in judge.offers] == ["day 1 dinner"]
