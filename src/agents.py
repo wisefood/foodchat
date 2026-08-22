@@ -35,6 +35,8 @@ from backend.observability import build_trace_config
 from models.recipe import CandidatesBySlot, ScoredPlan, slot_sort_key
 from prompts import (
     PLAN_GRADER_SYSTEM,
+    TOOL_SELECTOR_SYSTEM,
+    TOOL_SELECTOR_USER,
     PLAN_GRADER_USER,
     PLAN_STRATEGIST_SYSTEM,
     PLAN_STRATEGIST_USER,
@@ -67,6 +69,7 @@ from prompts import (
 )
 from schemas import (
     PlanStrategySchema,
+    ToolChoiceSchema,
     BatchScoringSchema,
     ScoringSchema,
     QueryReconcilerSchema,
@@ -780,6 +783,72 @@ class PlanIntentExtractor:
                     )
             out[family] = kept
         return out
+
+
+class ToolSelector:
+    """Chooses one of FoodChat's own capabilities, or none.
+
+    The tool registry has been complete and unreachable from chat: `manifest()`
+    and `describe_tools()` are generated from it, and neither reached a prompt.
+    The only in-chat tool call was one hardcoded `plan_totals` to stop the
+    analyst doing arithmetic in prose. So "summarise my week" and "redo
+    Thursday" had no path — the closest available action was a full refinement,
+    which regenerates every slot and throws away a swap the member already
+    approved.
+
+    Fast tier, and a small prompt. This is a routing decision over a handful of
+    named capabilities, not a judgement about food — and it runs before the
+    intent classifier, so it must be cheap enough that a turn which selects
+    NOTHING has barely paid for the question.
+
+    Returns `{}` for "no tool", which is the expected answer for most messages.
+    A failure is also `{}`: the turn then routes exactly as it did before this
+    existed.
+    """
+
+    def __init__(self, model: str = None, temperature: float = None):
+        self.llm = GROQ_CHAT.get_client(
+            model=model or FAST_MODEL,
+            temperature=(
+                temperature if temperature is not None else DEFAULT_TEMPERATURE
+            ),
+            format=ToolChoiceSchema.model_json_schema(),
+        )
+
+    def choose(self, message: str, *, plan_type: str, plan_shape: str,
+               manifest: str, allowed: set) -> dict:
+        """`{"tool": name, "day": int|None, ...}` or `{}`. Never raises."""
+        if not message.strip() or not allowed:
+            return {}
+        try:
+            system_text = TOOL_SELECTOR_SYSTEM.compile(tools=manifest)
+            user_text = TOOL_SELECTOR_USER.compile(
+                message=message[:400], plan_type=plan_type, plan_shape=plan_shape,
+            )
+            if "json" not in f"{system_text} {user_text}".lower():
+                system_text += "\nReturn the result as a JSON object."
+            result = self.llm.invoke([
+                SystemMessage(content=system_text),
+                HumanMessage(content=user_text),
+            ], config=build_trace_config(run_name="tool_select", tags=["tools"]))
+            payload = json.loads(result.content)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("ToolSelector failed, routing normally: %s", exc)
+            return {}
+
+        if not isinstance(payload, dict):
+            return {}
+        name = str(payload.get("tool") or "").strip()
+        if not name:
+            return {}
+        if name not in allowed:
+            # A tool that does not exist, or one this canvas cannot serve.
+            # Dropped rather than attempted: the registry would reject it, but
+            # a 400 is a worse answer than routing the message normally.
+            logger.info("ToolSelector chose %r, which is not available here", name)
+            return {}
+        logger.info("Tool selected: %s — %s", name, payload.get("reason") or "")
+        return payload
 
 
 class PlanStrategist:

@@ -779,6 +779,36 @@ User message: {message}
 """
 
 # Edit-command extraction (M4b) — targeted slot edits with a directive.
+# Tool selection.
+#
+# A new pair, not an edit to `orchestrator_system`: that prompt is
+# Langfuse-managed and `sync_prompts` never overwrites, so adding tool intents
+# there would work locally and ship dead. This runs on the same
+# pre-classification seam the FoodScholar bypass uses.
+TOOL_SELECTOR_SYSTEM_INSTRUCTIONS = """
+You decide whether one of FoodChat's capabilities answers the user's message, and which one. You do not answer the message yourself.
+
+The user HAS a meal plan on screen. Every capability below acts on it.
+
+CAPABILITIES:
+{tools}
+
+RULES:
+1. Most messages are NOT a capability. Return an empty tool for anything that is a new plan request, a change to the plan's content ("make dinner lighter", "swap the salmon"), a nutrition question, or conversation. Empty is the correct and common answer — forcing a choice turns "thanks, that looks great" into a week summary nobody asked for.
+2. Pick a capability only when the user is asking for exactly what it does. "How does my week look?" is a week summary. "How many calories is this?" is the totals. "Redo Thursday" is replacing that day.
+3. A capability that names a day needs one. Read it from the message: a weekday (Monday = 1 … Sunday = 7), "day 3", "the second day". If the user clearly wants a day but did not say which, return an empty tool — a guess replaces the wrong dinner.
+4. Never choose a capability that CHANGES the plan unless the user asked for a change to a whole day. "I don't like Thursday's dinner" is one meal, not the day — return empty and let the normal editing path handle it.
+5. `reason`: one short sentence naming what you read in the message. Not a restatement of the tool.
+
+OUTPUT (MANDATORY): a single JSON object with exactly the keys "tool", "day", "plan_type", "reason".
+"""
+
+TOOL_SELECTOR_USER_INSTRUCTIONS = """
+The plan on screen: {plan_type}, {plan_shape}.
+
+User message: {message}
+"""
+
 PLAN_STRATEGIST_SYSTEM_INSTRUCTIONS = """
 You decide HOW to search for a meal plan, before any recipe is fetched. You do not choose recipes and you do not write prose to the user.
 
@@ -1088,6 +1118,8 @@ PREFERENCE_EXTRACTOR_SYSTEM = _reg("preference_extractor_system", PREFERENCE_EXT
 PREFERENCE_EXTRACTOR_USER = _reg("preference_extractor_user", PREFERENCE_EXTRACTOR_USER_INSTRUCTIONS)
 # New names, not edits to existing ones: `sync_prompts` creates only missing
 # prompts and never overwrites, so a changed prompt body would ship dead.
+TOOL_SELECTOR_SYSTEM = _reg("tool_selector_system", TOOL_SELECTOR_SYSTEM_INSTRUCTIONS)
+TOOL_SELECTOR_USER = _reg("tool_selector_user", TOOL_SELECTOR_USER_INSTRUCTIONS)
 PLAN_STRATEGIST_SYSTEM = _reg("plan_strategist_system", PLAN_STRATEGIST_SYSTEM_INSTRUCTIONS)
 PLAN_STRATEGIST_USER = _reg("plan_strategist_user", PLAN_STRATEGIST_USER_INSTRUCTIONS)
 EDIT_COMMAND_EXTRACTOR_SYSTEM = _reg("edit_command_extractor_system", EDIT_COMMAND_EXTRACTOR_SYSTEM_INSTRUCTIONS)

@@ -145,6 +145,26 @@ class PlanIntentSchema(BaseModel):
     food_groups: list[str] = []
 
 
+class ToolChoiceSchema(BaseModel):
+    """Which capability answers this message, if any.
+
+    `tool` is empty when nothing fits, and empty is the expected answer most of
+    the time: the great majority of messages are plan requests, refinements or
+    conversation, and forcing a choice would turn "thanks, that looks great"
+    into a week summary nobody asked for.
+
+    Arguments are NOT free-form. The registry validates them (`tools._validate`)
+    and a bad day number is a member-facing error rather than something the
+    planner has to survive — so this only has to name the tool and the day.
+    """
+    tool: str = ""
+    # 1-based, and only for a tool that is about one day. Null otherwise.
+    day: Optional[conint(ge=1, le=14)] = None
+    plan_type: Optional[Literal["daily", "weekly"]] = None
+    # One short sentence, for the log and for the reply's grounding.
+    reason: str = ""
+
+
 class PlanStrategySchema(BaseModel):
     """How to approach ONE planning request, before any recipe is fetched.
 

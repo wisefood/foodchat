@@ -34,6 +34,7 @@ preference stated while answering a question is never silently dropped.
 Returns a unified ChatTurn so the router needs one response model.
 """
 
+import json
 import logging
 import re
 import threading
@@ -43,7 +44,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from agents import OrchestratorAgent, PlanAnalyst
+from agents import OrchestratorAgent, PlanAnalyst, ToolSelector
 from backend.observability import trace_context
 from models.attribution import Attribution
 from models.session import MealPlan, WeeklyMealPlan
@@ -391,6 +392,17 @@ class OrchestratorService:
                 question=self._compose_scholar_question(session, message),
             )
 
+        # The agent's own capabilities, offered to the model on the same
+        # pre-classification seam. `manifest()` and `describe_tools()` have been
+        # generated from the registry since the tools were written and neither
+        # reached a prompt, so "summarise my week" and "redo Thursday" had no
+        # path at all — the closest available action was a full refinement,
+        # which regenerates every slot and throws away a swap the member had
+        # already approved.
+        tool_turn = self._maybe_use_tool(session, session_id, message)
+        if tool_turn is not None:
+            return tool_turn
+
         history = [
             {"role": m.role, "content": m.content}
             for m in session.conversation[-12:]
@@ -400,6 +412,189 @@ class OrchestratorService:
         target_plan_type = classification.get("target_plan_type")
         logger.info("[%s] intent=%s target=%s", session_id, intent, target_plan_type)
         return self._route(session, session_id, message, intent, target_plan_type)
+
+    # Chooses one of FoodChat's own capabilities, or none. Fast tier: routing
+    # over a handful of named tools, running before the intent classifier on
+    # every eligible turn.
+    #
+    # Lazily built and held on the CLASS, not assigned in `__init__`. An
+    # instance constructed without `__init__` — which this test suite does
+    # routinely — would otherwise have no selector at all, and the first turn
+    # through it would raise `AttributeError` where it used to route fine. Same
+    # reason the in-flight guard is class-level.
+    _tool_selector = None
+
+    @property
+    def tool_selector(self) -> ToolSelector:
+        if OrchestratorService._tool_selector is None:
+            OrchestratorService._tool_selector = ToolSelector()
+        return OrchestratorService._tool_selector
+
+    def _maybe_use_tool(self, session, session_id: str, message: str):
+        """Run one of FoodChat's capabilities, or return None to route normally.
+
+        Gated before the model is asked anything, because the selector runs on
+        every eligible turn and a question nobody needed is still a question
+        that was paid for:
+
+        * **A plan must be on the canvas.** Every tool acts on one, so with no
+          plan there is nothing to summarise, total or replace, and the answer
+          is known without asking.
+        * **The turn must not be mid-clarification.** Handled earlier, but
+          stated here because a tool firing on "yes please" would answer a
+          question the member was not asking.
+
+        Returns None on anything unexpected. A tool surface that can break an
+        ordinary turn is worse than no tool surface.
+        """
+        canvas = session.active_canvas
+        if canvas is None:
+            return None
+        plan_type = canvas.plan_type
+        plan = (
+            session.get_current_weekly_plan() if plan_type == "weekly"
+            else session.get_current_daily_plan()
+        )
+        if plan is None:
+            return None
+
+        try:
+            import tools
+
+            # Only what this canvas can actually serve. A day-scoped tool needs
+            # a day, and every tool needs a session — the registry enforces
+            # both, but offering an unusable capability invites the model to
+            # pick it and turns a routable message into a 400.
+            available = {t.name for t in tools.all_tools()}
+            manifest = tools.describe_tools()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Tool registry unavailable: %s", exc)
+            return None
+
+        shape = self._describe_canvas_shape(plan, plan_type)
+        choice = self.tool_selector.choose(
+            message, plan_type=plan_type, plan_shape=shape,
+            manifest=manifest, allowed=available,
+        )
+        # Re-checked here, not just inside the selector. `_maybe_use_tool` is
+        # the thing that spends the tool call, so it verifies its own
+        # precondition rather than trusting a caller's discipline: a choice of
+        # `{"tool": ""}` is a truthy dict, and an unchecked one would reach
+        # `tools.invoke("")` and turn an ordinary message into a 400-flavoured
+        # reply instead of routing it normally.
+        name = str((choice or {}).get("tool") or "").strip()
+        if not name or name not in available:
+            if name:
+                logger.info(
+                    "[%s] Ignoring tool choice %r — not available here",
+                    session_id, name,
+                )
+            return None
+        arguments: dict = {"session_id": session_id}
+        if choice.get("day") is not None:
+            arguments["day"] = int(choice["day"])
+        spec = tools.get(name)
+        if spec is not None and (spec.parameters.get("properties") or {}).get("plan_type"):
+            arguments["plan_type"] = choice.get("plan_type") or plan_type
+
+        try:
+            result = tools.invoke(name, arguments)
+        except tools.ToolError as exc:
+            # Member-facing prose from the registry — "this plan covers Monday
+            # to Wednesday". Worth saying verbatim rather than routing on and
+            # answering a different question.
+            logger.info("[%s] Tool %s declined: %s", session_id, name, exc)
+            self.session_service.add_message(session_id, "user", message)
+            self.session_service.add_message(session_id, "assistant", str(exc))
+            return ChatTurn(role="assistant", content=str(exc), intent="chat")
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[%s] Tool %s failed: %s", session_id, name, exc, exc_info=True)
+            return None
+
+        return self._answer_from_tool(
+            session, session_id, message, name, spec, result, choice,
+        )
+
+    @staticmethod
+    def _describe_canvas_shape(plan, plan_type: str) -> str:
+        """The plan's shape, so the selector knows which days exist."""
+        if plan_type == "weekly":
+            days = sorted({int(e.get("day") or 0) for e in (plan.entries or [])})
+            return f"{len(days)} day(s), {len(plan.entries or [])} meals"
+        groups = plan.day_plans
+        slots = ", ".join(m.meal_type for m in groups[0].meals) if groups else ""
+        return f"{len(groups)} day(s): {slots}"
+
+    def _answer_from_tool(self, session, session_id: str, message: str,
+                          name: str, spec, result: dict, choice: dict) -> ChatTurn:
+        """Turn a tool result into a reply, and a plan change into a canvas.
+
+        A read is answered from the tool's own numbers — it summed them, so the
+        model must not re-add them. A mutation reloads the canvas so the member
+        sees the plan the tool produced rather than the one before it.
+        """
+        self.session_service.add_message(session_id, "user", message)
+
+        canned = self._tool_fallback(name, result)
+        if turn_budget.skip("tool reply", turn_budget.COST_WRITER):
+            answer = canned
+        else:
+            # The PlanAnalyst, not the ResponseWriter: this is a question ABOUT
+            # the plan, which is exactly what the analyst is for, and it is the
+            # agent this service already owns. The tool's own output is the
+            # entire grounding — it summed the numbers, so the model is told
+            # not to re-add them.
+            summary = (
+                f"{name} returned:\n{json.dumps(result, default=str)[:2500]}\n\n"
+                "These figures are already computed. Report them; do not "
+                "recalculate or add anything to them."
+            )
+            history = [(m.role, m.content) for m in session.conversation[-6:]]
+            try:
+                answer = self.plan_analyst.answer(message, summary, history)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[%s] Tool reply failed: %s", session_id, exc)
+                answer = canned
+            if not (answer or "").strip():
+                answer = canned
+
+        turn = ChatTurn(role="assistant", content=answer, intent="chat")
+        if spec is not None and spec.mutates:
+            # The tool rewrote part of the plan. Reload the canvas so the
+            # response carries what the member is now looking at.
+            refreshed = session.get_current_weekly_plan()
+            if refreshed is not None:
+                turn.weekly_meal_plan = refreshed
+                turn.plan_version = refreshed.version
+                turn.plan_parent_id = refreshed.parent_id
+        self.session_service.add_message(
+            session_id, "assistant", answer, intent="chat",
+        )
+        return turn
+
+    @staticmethod
+    def _tool_fallback(name: str, result: dict) -> str:
+        """A usable sentence without the writer, from the tool's own numbers."""
+        total = result.get("week_totals") or result.get("total") or result.get("totals")
+        if isinstance(total, dict) and total.get("calories"):
+            line = f"That comes to about {round(float(total['calories'])):,} kcal"
+            if result.get("daily_average_kcal"):
+                line += f" — roughly {round(float(result['daily_average_kcal']))} a day"
+            if total.get("complete") is False:
+                line += (
+                    f" (counted {total.get('meals_counted')} of "
+                    f"{total.get('meals_total')} meals; the rest carry no "
+                    "nutrition data)"
+                )
+            return line + "."
+        if result.get("name") and result.get("meals"):
+            dishes = ", ".join(
+                str(m.get("title")) for m in result["meals"] if m.get("title")
+            )
+            return f"{result['name']}: {dishes}." if dishes else f"Here's {result['name']}."
+        if result.get("days"):
+            return f"Here's the week — {len(result['days'])} days on the plan."
+        return "Done."
 
     def _route(self, session, session_id: str, message: str, intent: str,
                target_plan_type: Optional[str]) -> ChatTurn:
