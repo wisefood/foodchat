@@ -49,12 +49,22 @@ def _session(session_id: str):
     return session
 
 
-def _day_label(day: Any) -> str:
+def _day_label(day: Any, *, weekdays: bool = True) -> str:
+    """Name a day the way its plan is entitled to name it.
+
+    A weekly plan is calendar-anchored: its day 1 IS Monday. A multi-day plan
+    on the daily canvas is not — it starts whenever the member cooks it — so
+    calling its day 2 "Tuesday" states a fact the plan never carried.
+    `services.edit_service._named_day` refuses to READ weekdays on such a plan
+    for the same reason; a reader that WRITES them puts the two out of step.
+    """
     try:
         d = int(day)
     except (TypeError, ValueError):
         return str(day)
-    return DAY_NAMES[d - 1] if 1 <= d <= 7 else f"Day {d}"
+    if weekdays and 1 <= d <= 7:
+        return DAY_NAMES[d - 1]
+    return f"Day {d}"
 
 
 def _weekly_plan(session_id: str):
@@ -74,6 +84,53 @@ def _daily_plan(session_id: str):
     if plan is None:
         raise ToolError("There's no daily plan in this conversation yet.")
     return session, plan
+
+
+def _canvas_kind(session) -> str:
+    """Which canvas the member is looking at. Daily when there is nothing."""
+    canvas = session.active_canvas
+    return canvas.plan_type if canvas else "daily"
+
+
+def _day_plan(session_id: str, plan_type: Optional[str] = None):
+    """The plan a day-aware reader should read: (session, plan, kind).
+
+    `summarize_week` and `summarize_day` read the weekly canvas and nothing
+    else, so they answered "there's no weekly plan in this conversation yet" to
+    a member sitting in front of a three-day plan. Multi-day plans live on the
+    DAILY canvas — that is the shape `plan_structured` produces — and a tool
+    whose whole job is to summarise days had no business refusing to look at
+    them over which canvas they were stored on.
+
+    An explicit `plan_type` wins, because the UI passes the canvas the menu was
+    opened on and the member's own screen is the least ambiguous answer. With
+    nothing passed, whichever canvas actually holds a plan is used, weekly
+    first — a session that has both was most recently planning a week.
+    """
+    session = _session(session_id)
+    wanted = str(plan_type or "").strip().lower()
+
+    weekly = session.get_current_weekly_plan()
+    has_weekly = weekly is not None and bool(weekly.entries)
+    daily = session.get_current_daily_plan()
+
+    if wanted == "weekly" or (not wanted and has_weekly):
+        if not has_weekly:
+            raise ToolError(
+                "There's no weekly plan in this conversation yet — ask for a "
+                "weekly plan first and I'll have something to work with."
+            )
+        return session, weekly, "weekly"
+
+    if wanted == "daily" or (not wanted and daily is not None):
+        if daily is None:
+            raise ToolError("There's no daily plan in this conversation yet.")
+        return session, daily, "daily"
+
+    raise ToolError(
+        "There's no plan in this conversation yet — ask for one and I'll have "
+        "something to work with."
+    )
 
 
 def _sum_nutrition(pairs: list[tuple[str, dict]]) -> dict:
@@ -115,6 +172,124 @@ def _entry_title(entry: dict) -> str:
     return str(recipe.get("recipe_title") or recipe.get("title") or "")
 
 
+def _plate_pairs(day) -> list[tuple[str, dict]]:
+    """Every plate of a day, for totalling. Sides count — a meal is its plates."""
+    return [
+        (plate.title, plate.nutrition or {})
+        for meal in day.meals
+        for plate in meal.plates
+    ]
+
+
+def _meal_rows(day) -> list[dict]:
+    """One row per meal of a daily-canvas day, with every plate named.
+
+    A multi-plate meal has no single title: reporting a two-side dinner as
+    "dinner: roast chicken" is the same silent drop the weekly grid used to do
+    with `.find()`. `title` joins the plates so a reader that only knows about
+    titles still sees the whole meal, and `plates` carries the structure for
+    one that does.
+    """
+    rows = []
+    for meal in day.meals:
+        totals = _sum_nutrition([(p.title, p.nutrition or {}) for p in meal.plates])
+        rows.append({
+            "meal_type": str(getattr(meal, "meal_type", "")),
+            "title": " + ".join(p.title for p in meal.plates if p.title),
+            "plates": [
+                {
+                    "title": p.title,
+                    "role": str(getattr(p, "role", "") or ""),
+                    "recipe_id": str(getattr(p, "recipe_id", "") or ""),
+                }
+                for p in meal.plates
+            ],
+            "kcal": totals["calories"] if totals["meals_counted"] else None,
+        })
+    return rows
+
+
+# --------------------------------------------------------------------------- #
+# The daily canvas, read day by day
+# --------------------------------------------------------------------------- #
+#
+# A multi-day plan is stored on the daily canvas as `MealPlan.days`, so these
+# two read `day_plans` where the weekly digests read `plan.entries`. What they
+# deliberately do NOT do is invent the parts a daily plan has no equivalent of:
+# no weekday names, no per-day headline (the weekly planner writes those, this
+# path has none), and no guideline checklist (a weekly metric). An empty field
+# says "this plan does not carry that"; a zero would say "it scored nothing".
+
+
+def _summarize_daily_plan(plan) -> dict:
+    """Digest every day of a plan on the daily canvas."""
+    from services.transparency import split_ledger
+
+    days = []
+    for day in plan.day_plans:
+        totals = _sum_nutrition(_plate_pairs(day))
+        days.append({
+            "day": day.day,
+            "name": _day_label(day.day, weekdays=False),
+            "meals": _meal_rows(day),
+            "kcal": totals["calories"],
+            "nutrition_coverage":
+                f"{totals['meals_counted']} of {totals['meals_total']} plates",
+        })
+
+    overall = _sum_nutrition(
+        [pair for day in plan.day_plans for pair in _plate_pairs(day)]
+    )
+    honored, not_honored = split_ledger(plan.constraints_applied, limit=12)
+    return {
+        "plan_type": "daily",
+        "plan_version": plan.version,
+        "days": days,
+        "total": overall,
+        "daily_average_kcal": round(overall["calories"] / max(len(days), 1), 1),
+        "constraints_honored": honored,
+        "constraints_not_honored": not_honored,
+        "personalization": plan.personalization_summary or {},
+        "plan_summary": plan.reasoning or "",
+    }
+
+
+def _summarize_daily_day(plan, day: int) -> dict:
+    """One day of a plan on the daily canvas, plate by plate."""
+    match = next((d for d in plan.day_plans if int(d.day) == int(day)), None)
+    if match is None:
+        covers = ", ".join(
+            _day_label(d.day, weekdays=False) for d in plan.day_plans
+        )
+        raise ToolError(
+            f"{_day_label(day, weekdays=False)} isn't in this plan — it covers "
+            f"{covers or 'nothing yet'}."
+        )
+
+    meals = []
+    for meal in match.meals:
+        for plate in meal.plates:
+            meals.append({
+                "meal_type": str(getattr(meal, "meal_type", "")),
+                "title": plate.title,
+                "recipe_id": str(getattr(plate, "recipe_id", "") or ""),
+                "role": str(getattr(plate, "role", "") or ""),
+                "ingredients": plate.ingredients or "",
+                "nutrition": plate.nutrition or {},
+                "why": [
+                    r.get("label", "") for r in (plate.match_reasons or [])
+                ],
+            })
+
+    return {
+        "plan_type": "daily",
+        "day": int(day),
+        "name": _day_label(day, weekdays=False),
+        "meals": meals,
+        "totals": _sum_nutrition(_plate_pairs(match)),
+    }
+
+
 # --------------------------------------------------------------------------- #
 # summarize_week
 # --------------------------------------------------------------------------- #
@@ -134,15 +309,24 @@ def _entry_title(entry: dict) -> str:
         "type": "object",
         "properties": {
             "session_id": {"type": "string", "description": "The conversation to read."},
+            "plan_type": {
+                "type": "string", "enum": ["daily", "weekly"],
+                "description": "Which canvas to digest. Defaults to whichever "
+                               "holds a plan. A multi-day plan on the daily "
+                               "canvas is summarised day by day like a week.",
+            },
         },
         "required": ["session_id"],
     },
-    examples=("summarise my week", "how does the week look overall?"),
+    examples=("summarise my week", "how does the week look overall?",
+              "summarise the whole plan"),
 )
-def summarize_week(session_id: str) -> dict:
+def summarize_week(session_id: str, plan_type: str = "") -> dict:
     from services.transparency import split_ledger
 
-    _session_obj, plan = _weekly_plan(session_id)
+    _session_obj, plan, kind = _day_plan(session_id, plan_type)
+    if kind == "daily":
+        return _summarize_daily_plan(plan)
 
     by_day: dict[int, list[dict]] = {}
     for entry in plan.entries:
@@ -213,15 +397,24 @@ def summarize_week(session_id: str) -> dict:
             "session_id": {"type": "string", "description": "The conversation to read."},
             "day": {
                 "type": "integer", "minimum": 1, "maximum": 7,
-                "description": "1 = Monday through 7 = Sunday.",
+                "description": "On a weekly plan, 1 = Monday through 7 = "
+                               "Sunday. On a multi-day daily plan, 1 is its "
+                               "first day — such a plan carries no weekdays.",
+            },
+            "plan_type": {
+                "type": "string", "enum": ["daily", "weekly"],
+                "description": "Which canvas the day belongs to. Defaults to "
+                               "whichever holds a plan.",
             },
         },
         "required": ["session_id", "day"],
     },
     examples=("what's on Thursday?", "tell me about day 3"),
 )
-def summarize_day(session_id: str, day: int) -> dict:
-    _session_obj, plan = _weekly_plan(session_id)
+def summarize_day(session_id: str, day: int, plan_type: str = "") -> dict:
+    _session_obj, plan, kind = _day_plan(session_id, plan_type)
+    if kind == "daily":
+        return _summarize_daily_day(plan, day)
 
     entries = sorted(
         (e for e in plan.entries if int(e.get("day", 0)) == day),
@@ -320,17 +513,34 @@ def plan_totals(session_id: str, plan_type: str = "daily") -> dict:
                 nutrition = plate.nutrition or {}
                 pairs.append((plate.title, nutrition))
                 meals.append({
+                    "day": day.day,
                     "meal_type": getattr(meal, "meal_type", ""),
                     "title": plate.title,
                     "role": getattr(plate, "role", "") or "",
                     "nutrition": nutrition,
                 })
-    return {
+    result = {
         "plan_type": "daily",
         "plan_version": plan.version,
         "plates": meals,
         "total": _sum_nutrition(pairs),
     }
+    # A three-day plan totalled as one number reads as one enormous day. The
+    # weekly branch has always split per day; the daily branch summed straight
+    # through `day_plans` as though there could only ever be one.
+    if len(plan.day_plans) > 1:
+        result["per_day"] = [
+            {
+                "day": day.day,
+                "name": _day_label(day.day, weekdays=False),
+                **_sum_nutrition(_plate_pairs(day)),
+            }
+            for day in plan.day_plans
+        ]
+        result["daily_average_kcal"] = round(
+            result["total"]["calories"] / len(plan.day_plans), 1
+        )
+    return result
 
 
 # --------------------------------------------------------------------------- #
@@ -369,6 +579,7 @@ def plan_totals(session_id: str, plan_type: str = "daily") -> dict:
     },
     uses_model=False,
     mutates=True,
+    canvases=("weekly",),
     examples=("redo Thursday", "replace day 3 with something lighter"),
 )
 def replace_day(session_id: str, day: int, note: str = "") -> dict:
@@ -532,7 +743,9 @@ def replace_day(session_id: str, day: int, note: str = "") -> dict:
             },
             "day": {
                 "type": "integer", "minimum": 1, "maximum": 7,
-                "description": "Weekly plans only. Omit for the daily canvas.",
+                "description": "Which day, on any plan that has more than one "
+                               "— a weekly plan, or a multi-day plan on the "
+                               "daily canvas. Omit for a single-day plan.",
             },
         },
         "required": ["session_id", "meal_type", "directive"],
@@ -548,7 +761,13 @@ def swap_meal(
 
     edit_service = EditService(_services().session_service)
 
-    where = f"{_day_label(day)} " if day else ""
+    # The phrasing has to match what the edit reader will accept. On a weekly
+    # plan that is the weekday; on a multi-day daily plan it is "day 2", and
+    # `edit_service._named_day(weekdays=False)` reads NOTHING ELSE there — so
+    # passing "Tuesday" asked a question the reader could not answer and the
+    # edit came back asking which day it was.
+    weekdays = _canvas_kind(_session(session_id)) == "weekly"
+    where = f"{_day_label(day, weekdays=weekdays)} " if day else ""
     outcome = edit_service.process(
         session_id, f"swap {where}{meal_type} for {directive}".strip()
     )

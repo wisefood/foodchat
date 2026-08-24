@@ -285,3 +285,246 @@ class TestReadTools:
                 "plan_totals", {"session_id": planned, "plan_type": "monthly"}
             )
         assert "daily" in str(e.value) and "weekly" in str(e.value)
+
+
+# ── the day readers on the DAILY canvas ──────────────────────────────────
+#
+# `summarize_week` and `summarize_day` read `plan.entries` and nothing else, so
+# a member looking at a three-day plan asked for a summary and was told
+# "there's no weekly plan in this conversation yet". Multi-day plans live on the
+# daily canvas — that is what `plan_structured` produces — and these two exist
+# to summarise days.
+
+def _daily_plate(rid, title, role="main", kcal=500):
+    from models.session import MealCourse
+
+    return MealCourse(
+        recipe_id=rid, title=title, ingredients=f"{title} ingredients",
+        directions="cook", role=role, nutrition={"calories": kcal},
+        match_reasons=[{"kind": "diet", "label": "vegetarian"}],
+    )
+
+
+def _three_days():
+    """Three days; day 2's dinner is two plates, so a reader can drop one."""
+    from models.session import DayPlan, Meal, MealPlan
+
+    days = [
+        DayPlan(day=1, meals=[
+            Meal("breakfast", [_daily_plate("d1b", "Porridge")]),
+            Meal("dinner", [_daily_plate("d1d", "Bean stew")]),
+        ]),
+        DayPlan(day=2, meals=[
+            Meal("breakfast", [_daily_plate("d2b", "Toast")]),
+            Meal("dinner", [_daily_plate("d2d", "Moussaka"),
+                            _daily_plate("d2s", "Greek salad", role="side")]),
+        ]),
+        DayPlan(day=3, meals=[
+            Meal("dinner", [_daily_plate("d3d", "Curry")]),
+        ]),
+    ]
+    plan = MealPlan.from_days(days, "three days")
+    plan.constraints_applied = [{"constraint": "vegetarian", "status": "satisfied"}]
+    return plan
+
+
+class TestDayReadersOnTheDailyCanvas:
+    @pytest.fixture
+    def multiday(self, session_service, sample_profile):
+        import uuid
+
+        session = session_service.create_session(
+            f"member-{uuid.uuid4()}", sample_profile
+        )
+        session_service.add_prepared_meal_plan(session.session_id, _three_days())
+        return session.session_id
+
+    def test_summarize_week_reads_a_multi_day_daily_plan(self, multiday):
+        """The reported failure: this used to raise "no weekly plan"."""
+        out = tools.invoke("summarize_week", {"session_id": multiday})
+        assert out["plan_type"] == "daily"
+        assert [d["day"] for d in out["days"]] == [1, 2, 3]
+
+    def test_it_does_not_invent_weekdays(self, multiday):
+        """A daily plan starts when the member cooks it, not on Monday."""
+        out = tools.invoke("summarize_week", {"session_id": multiday})
+        names = [d["name"] for d in out["days"]]
+        assert names == ["Day 1", "Day 2", "Day 3"]
+        assert "Monday" not in str(out)
+
+    def test_every_plate_is_counted_and_named(self, multiday):
+        out = tools.invoke("summarize_week", {"session_id": multiday})
+        # 6 plates at 500 kcal — the side on day 2 included.
+        assert out["total"]["calories"] == 3000.0
+        assert out["daily_average_kcal"] == 1000.0
+        dinner = next(m for m in out["days"][1]["meals"] if m["meal_type"] == "dinner")
+        assert dinner["title"] == "Moussaka + Greek salad"
+        assert [p["role"] for p in dinner["plates"]] == ["main", "side"]
+
+    def test_it_carries_the_ledger_rather_than_dropping_it(self, multiday):
+        out = tools.invoke("summarize_week", {"session_id": multiday})
+        assert "vegetarian" in out["constraints_honored"]
+
+    def test_summarize_day_reads_one_day_of_it(self, multiday):
+        out = tools.invoke("summarize_day", {"session_id": multiday, "day": 2})
+        assert out["name"] == "Day 2"
+        assert [m["title"] for m in out["meals"]] == [
+            "Toast", "Moussaka", "Greek salad",
+        ]
+        assert out["totals"]["calories"] == 1500.0
+        assert all("why" in m for m in out["meals"])
+
+    def test_summarize_day_names_what_the_plan_does_cover(self, multiday):
+        with pytest.raises(tools.ToolError) as e:
+            tools.invoke("summarize_day", {"session_id": multiday, "day": 6})
+        msg = str(e.value)
+        assert "Day 6" in msg and "Day 3" in msg
+        assert "Saturday" not in msg
+
+    def test_asking_for_weekly_explicitly_still_says_there_is_none(self, multiday):
+        """The canvas the member is on decides; an explicit ask is honoured."""
+        with pytest.raises(tools.ToolError) as e:
+            tools.invoke(
+                "summarize_week", {"session_id": multiday, "plan_type": "weekly"}
+            )
+        assert "weekly plan" in str(e.value).lower()
+
+    def test_the_canvas_the_menu_was_opened_on_wins(self, session_service,
+                                                    sample_profile):
+        """A session with both canvases reads the one it is told to read."""
+        import uuid
+
+        session = session_service.create_session(
+            f"member-{uuid.uuid4()}", sample_profile
+        )
+        session_service.add_weekly_meal_plan(
+            session.session_id, _week(), day_summaries={},
+        )
+        session_service.add_prepared_meal_plan(session.session_id, _three_days())
+
+        daily = tools.invoke(
+            "summarize_week", {"session_id": session.session_id, "plan_type": "daily"}
+        )
+        weekly = tools.invoke(
+            "summarize_week", {"session_id": session.session_id, "plan_type": "weekly"}
+        )
+        assert len(daily["days"]) == 3 and daily["plan_type"] == "daily"
+        assert len(weekly["days"]) == 7
+
+    def test_plan_totals_splits_a_multi_day_plan_per_day(self, multiday):
+        """One number for three days reads as one enormous day."""
+        out = tools.invoke("plan_totals", {"session_id": multiday})
+        assert [d["day"] for d in out["per_day"]] == [1, 2, 3]
+        assert out["per_day"][1]["calories"] == 1500.0   # two plates at dinner
+        assert out["daily_average_kcal"] == 1000.0
+
+    def test_plan_totals_says_nothing_per_day_for_a_single_day(
+        self, session_service, sample_profile
+    ):
+        """A one-day plan has no per-day breakdown to give, so it claims none."""
+        import uuid
+
+        from models.session import DayPlan, Meal, MealPlan
+
+        session = session_service.create_session(
+            f"member-{uuid.uuid4()}", sample_profile
+        )
+        session_service.add_prepared_meal_plan(
+            session.session_id,
+            MealPlan.from_days([DayPlan(day=1, meals=[
+                Meal("dinner", [_daily_plate("x", "Soup")]),
+            ])], "one day"),
+        )
+        out = tools.invoke("plan_totals", {"session_id": session.session_id})
+        assert "per_day" not in out
+        assert out["total"]["calories"] == 500.0
+
+
+class TestWhichCanvasAToolRunsOn:
+    """A tool offered where it cannot run is the same broken promise as one
+    that does not exist. The registry declares it so the menu can ask."""
+
+    def test_replace_day_is_weekly_only(self):
+        assert tools.get("replace_day").canvases == ("weekly",)
+
+    def test_the_readers_work_on_either(self):
+        for name in ("summarize_week", "summarize_day", "plan_totals",
+                     "shopping_list", "swap_meal", "save_plan"):
+            assert set(tools.get(name).canvases) == {"daily", "weekly"}, name
+
+    def test_the_manifest_carries_it_so_the_ui_can_filter(self):
+        by_name = {t["name"]: t for t in tools.manifest()}
+        assert by_name["replace_day"]["canvases"] == ["weekly"]
+        assert by_name["summarize_week"]["canvases"] == ["daily", "weekly"]
+
+    def test_for_canvas_narrows_what_a_model_may_choose(self):
+        daily = {t.name for t in tools.for_canvas("daily")}
+        assert "replace_day" not in daily
+        assert "summarize_week" in daily
+        assert "replace_day" in {t.name for t in tools.for_canvas("weekly")}
+        # No canvas known → no filtering, rather than an empty tool surface.
+        assert tools.for_canvas(None) == tools.all_tools()
+
+    def test_the_prose_says_when_a_tool_is_restricted(self):
+        assert "weekly plans only" in tools.describe_tools("weekly")
+        assert "replace_day" not in tools.describe_tools("daily")
+
+
+class TestSwapMealNamesTheDayTheReaderCanRead:
+    """`swap_meal` built its message with a weekday name whatever the canvas.
+    On a multi-day daily plan `edit_service._named_day(weekdays=False)` reads
+    nothing but "day N", so the edit came back asking which day it was."""
+
+    def _capture(self, monkeypatch):
+        sent = {}
+
+        class _FakeEdit:
+            def __init__(self, _svc):
+                pass
+
+            def process(self, session_id, message):
+                sent["message"] = message
+                return type("O", (), {"text": "done", "changed_slots": [],
+                                      "unresolved": False})()
+
+        import services.edit_service as es
+
+        monkeypatch.setattr(es, "EditService", _FakeEdit)
+        return sent
+
+    def test_a_daily_canvas_gets_day_n(self, monkeypatch, session_service,
+                                       sample_profile):
+        import uuid
+
+        sent = self._capture(monkeypatch)
+        session = session_service.create_session(
+            f"member-{uuid.uuid4()}", sample_profile
+        )
+        session_service.add_prepared_meal_plan(session.session_id, _three_days())
+        tools.invoke("swap_meal", {
+            "session_id": session.session_id, "meal_type": "dinner",
+            "directive": "lighter", "day": 2,
+        })
+        assert "day 2" in sent["message"].lower()
+        assert "tuesday" not in sent["message"].lower()
+
+        from services.edit_service import _named_day
+        assert _named_day(sent["message"], weekdays=False) == 2
+
+    def test_a_weekly_canvas_still_gets_the_weekday(self, monkeypatch,
+                                                    session_service,
+                                                    sample_profile):
+        import uuid
+
+        sent = self._capture(monkeypatch)
+        session = session_service.create_session(
+            f"member-{uuid.uuid4()}", sample_profile
+        )
+        session_service.add_weekly_meal_plan(
+            session.session_id, _week(), day_summaries={},
+        )
+        tools.invoke("swap_meal", {
+            "session_id": session.session_id, "meal_type": "dinner",
+            "directive": "lighter", "day": 2,
+        })
+        assert "Tuesday" in sent["message"]

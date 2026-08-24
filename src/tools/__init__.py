@@ -63,6 +63,12 @@ class Tool:
     uses_model: bool = False
     # What the tool changes, if anything. A reader is always safe to retry.
     mutates: bool = False
+    # Which canvases the tool actually works on. The menu offers a tool per
+    # canvas, and "replace this day" on a daily canvas reached a handler that
+    # reads weekly entries and answered "there's no weekly plan" — a tool
+    # offered where it cannot run is the same broken promise as a tool that
+    # does not exist. Both by default: most tools read either canvas.
+    canvases: tuple[str, ...] = ("daily", "weekly")
     examples: tuple[str, ...] = field(default_factory=tuple)
 
     def as_manifest(self) -> dict:
@@ -73,6 +79,7 @@ class Tool:
             "parameters": self.parameters,
             "uses_model": self.uses_model,
             "mutates": self.mutates,
+            "canvases": list(self.canvases),
             "examples": list(self.examples),
         }
 
@@ -96,6 +103,7 @@ def tool(
     parameters: dict,
     uses_model: bool = False,
     mutates: bool = False,
+    canvases: tuple[str, ...] = ("daily", "weekly"),
     examples: tuple[str, ...] = (),
 ):
     """Decorator form: declare a function as a tool."""
@@ -104,7 +112,8 @@ def tool(
         register(Tool(
             name=name, summary=summary, description=description,
             parameters=parameters, handler=fn,
-            uses_model=uses_model, mutates=mutates, examples=examples,
+            uses_model=uses_model, mutates=mutates, canvases=canvases,
+            examples=examples,
         ))
         return fn
 
@@ -142,18 +151,32 @@ def manifest() -> list[dict]:
 MANIFEST = manifest
 
 
-def describe_tools() -> str:
+def for_canvas(plan_type: Optional[str]) -> list[Tool]:
+    """The tools that work on this canvas. Everything, when it isn't known."""
+    if not plan_type:
+        return all_tools()
+    return [t for t in all_tools() if plan_type in t.canvases]
+
+
+def describe_tools(plan_type: Optional[str] = None) -> str:
     """The manifest as prose, for a prompt.
 
     Mirrors `plan_client.describe_options`: a model reasons better about a
     paragraph naming what it can do than about a JSON schema dump.
+
+    `plan_type` narrows it to what the member's own canvas can serve. Listing
+    a weekly-only tool to a model looking at a daily plan is an invitation to
+    pick it, and the member gets "there's no weekly plan" for a message that
+    was perfectly routable.
     """
     lines = []
-    for t in all_tools():
+    for t in for_canvas(plan_type):
         args = ", ".join(sorted((t.parameters.get("properties") or {}).keys()))
         cost = " (spends a model call)" if t.uses_model else ""
         change = " (changes the plan)" if t.mutates else ""
-        lines.append(f"- {t.name}({args}): {t.summary}{cost}{change}")
+        only = ("" if len(t.canvases) > 1
+                else f" ({t.canvases[0]} plans only)")
+        lines.append(f"- {t.name}({args}): {t.summary}{cost}{change}{only}")
     return "\n".join(lines)
 
 

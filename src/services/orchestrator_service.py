@@ -477,12 +477,13 @@ class OrchestratorService:
         try:
             import tools
 
-            # Only what this canvas can actually serve. A day-scoped tool needs
-            # a day, and every tool needs a session — the registry enforces
-            # both, but offering an unusable capability invites the model to
-            # pick it and turns a routable message into a 400.
-            available = {t.name for t in tools.all_tools()}
-            manifest = tools.describe_tools()
+            # Only what this canvas can actually serve — which is what this
+            # comment always claimed and the line below did not do: every tool
+            # was offered on every canvas, so a member on a daily plan could
+            # have `replace_day` chosen for them and be told there is no weekly
+            # plan. The registry declares which canvases each tool works on.
+            available = {t.name for t in tools.for_canvas(plan_type)}
+            manifest = tools.describe_tools(plan_type)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Tool registry unavailable: %s", exc)
             return None
@@ -591,12 +592,22 @@ class OrchestratorService:
         turn = ChatTurn(role="assistant", content=answer, intent="chat")
         if spec is not None and spec.mutates:
             # The tool rewrote part of the plan. Reload the canvas so the
-            # response carries what the member is now looking at.
-            refreshed = session.get_current_weekly_plan()
-            if refreshed is not None:
-                turn.weekly_meal_plan = refreshed
-                turn.plan_version = refreshed.version
-                turn.plan_parent_id = refreshed.parent_id
+            # response carries what the member is now looking at — whichever
+            # canvas it was. Only the weekly one was reloaded, so a swap on a
+            # daily plan answered with prose and left the old plan attached.
+            canvas = session.active_canvas
+            if canvas is not None and canvas.plan_type == "daily":
+                refreshed = session.get_current_daily_plan()
+                if refreshed is not None:
+                    turn.meal_plan = refreshed
+                    turn.plan_version = refreshed.version
+                    turn.plan_parent_id = refreshed.parent_id
+            else:
+                refreshed = session.get_current_weekly_plan()
+                if refreshed is not None:
+                    turn.weekly_meal_plan = refreshed
+                    turn.plan_version = refreshed.version
+                    turn.plan_parent_id = refreshed.parent_id
         self.session_service.add_message(
             session_id, "assistant", answer, intent="chat",
         )
@@ -623,7 +634,10 @@ class OrchestratorService:
             )
             return f"{result['name']}: {dishes}." if dishes else f"Here's {result['name']}."
         if result.get("days"):
-            return f"Here's the week — {len(result['days'])} days on the plan."
+            days = len(result["days"])
+            if result.get("plan_type") == "daily":
+                return f"Here's the plan — {days} day(s) on it."
+            return f"Here's the week — {days} days on the plan."
         if result.get("items") and result.get("item_count") is not None:
             # A shopping list, and the sentence must not imply amounts: the
             # corpus stores ingredients as text, so the tool reports what each

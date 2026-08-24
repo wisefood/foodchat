@@ -445,3 +445,70 @@ class TestClarificationGate:
                                 "directive": "lighter"}
         out = es.continue_clarification(planned, "the dinner")
         assert out.unresolved
+
+
+# ── the reply names the day the plan actually has ────────────────────────
+#
+# A multi-day plan on the daily canvas carries no calendar: its day 1 is the
+# first day the member cooks, not Monday. `_named_day(weekdays=False)` has
+# always refused to READ weekdays here; the reply was still WRITING them, so a
+# swap on day 3 was reported as "Wednesday's dinner" on a plan with no
+# Wednesday in it — and the member has no way to check which day was changed.
+
+class TestTheReplyNamesTheRightDay:
+    def test_a_swap_on_a_multi_day_daily_plan_says_day_n(self, session_service,
+                                                         planned):
+        es = _service(session_service)
+        out = es._edit_daily(
+            es._get_session(planned), "dinner",
+            DirectivePredicate("lighter"), "day 2 dinner lighter", day=2,
+        )
+        assert "day 2's dinner" in out.text
+        assert "Tuesday" not in out.text
+
+    def test_a_failure_on_a_multi_day_daily_plan_still_names_the_day(
+        self, session_service, planned
+    ):
+        """It named no day at all, so "I looked for a replacement for the
+        dinner" was the answer to a question about one day of four."""
+        es = _service(session_service)
+        es._find_replacement = lambda *a, **k: (None, None, None, {})
+        out = es._edit_daily(
+            es._get_session(planned), "dinner",
+            DirectivePredicate("lighter"), "day 3 dinner lighter", day=3,
+        )
+        assert "day 3's dinner" in out.text
+        assert "Wednesday" not in out.text
+
+    def test_a_single_day_plan_names_no_day(self, session_service, sample_profile):
+        """Nothing to disambiguate, so the sentence stays as it was."""
+        session = session_service.create_session(
+            f"member-{uuid.uuid4()}", sample_profile
+        )
+        session_service.add_prepared_meal_plan(
+            session.session_id,
+            MealPlan.from_days([DayPlan(day=1, meals=[
+                Meal("dinner", [MealCourse(
+                    recipe_id="only", title="Stew", ingredients="x",
+                    directions="cook", nutrition={"calories": 700},
+                )]),
+            ])], "one day"),
+        )
+        es = _service(session_service)
+        out = es._edit_daily(
+            es._get_session(session.session_id), "dinner",
+            DirectivePredicate("lighter"), "dinner lighter", day=1,
+        )
+        assert "the dinner" in out.text
+        assert "day 1" not in out.text and "Monday" not in out.text
+
+    def test_the_weekly_canvas_still_says_the_weekday(self):
+        """A weekly plan IS calendar-anchored — day 3 there really is Wednesday."""
+        phrase = EditService._slot_phrase("dinner", 3, weekdays=True)
+        assert phrase == "Wednesday's dinner"
+
+    def test_the_phrase_helper_covers_both_and_neither(self):
+        assert EditService._slot_phrase("lunch", None, weekdays=True) == "the lunch"
+        assert EditService._slot_phrase("lunch", 2, weekdays=False) == "day 2's lunch"
+        # Beyond a week there is no weekday to name even on a weekly plan.
+        assert EditService._slot_phrase("lunch", 9, weekdays=True) == "day 9's lunch"

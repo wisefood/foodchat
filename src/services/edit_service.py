@@ -666,7 +666,10 @@ class EditService:
             in_plan + self._standing_exclusions(session),
         )
         if choice is None:
-            text = self._failure_text(meal_type, predicate, facts)
+            text = self._failure_text(
+                meal_type, predicate, facts,
+                day=target_day if len(days) > 1 else None, weekdays=False,
+            )
             self.session_service.add_message(session.session_id, "assistant", text)
             return EditOutcome(text=text, facts=facts)
 
@@ -705,15 +708,21 @@ class EditService:
             session.session_id, new_plan,
         )
 
+        # A day is reported only when the plan HAS days. On a single-day plan
+        # `target_day` is 1 by construction, and carrying it made the reply
+        # name a day the member never mentioned ("Monday's dinner" on a plan
+        # with one unnamed day) and made the UI look for a slot key of
+        # "1-dinner" where the single-day canvas renders "dinner" — so the
+        # before/after flash never fired either.
         changed = [self._changed_slot(
-            meal_type, target_day, old_course.title, old_rich,
-            choice.title, new_rich, predicate,
+            meal_type, target_day if len(days) > 1 else None,
+            old_course.title, old_rich, choice.title, new_rich, predicate,
         )]
         for key in ("named_dish", "named_miss"):
             if key in facts:
                 changed[0][key] = facts[key]
         facts.update({"changed": changed[0]})
-        text = self._success_text(changed[0], predicate)
+        text = self._success_text(changed[0], predicate, weekdays=False)
 
         self._record_edit(session, meal_type, old_course, choice, facts)
         self.session_service.add_message(session.session_id, "assistant", text)
@@ -841,8 +850,26 @@ class EditService:
         }
 
     @staticmethod
-    def _success_text(changed: dict, predicate) -> str:
-        where = f"{DAY_NAMES[changed['day'] - 1]}'s {changed['meal_type']}" if changed["day"] else f"the {changed['meal_type']}"
+    def _slot_phrase(meal_type: str, day: Optional[int], *, weekdays: bool) -> str:
+        """Name the slot the way the plan is entitled to name it.
+
+        A weekly plan's day 3 IS Wednesday. A multi-day plan on the daily
+        canvas has no weekdays at all — it starts when the member cooks it — so
+        "I swapped Wednesday's dinner" answered a swap on day 3 of a plan that
+        has no Wednesday in it. `_named_day` already refuses to READ weekdays
+        there for exactly this reason; the reply now agrees with it.
+        """
+        if not day:
+            return f"the {meal_type}"
+        if weekdays and 1 <= int(day) <= 7:
+            return f"{DAY_NAMES[int(day) - 1]}'s {meal_type}"
+        return f"day {int(day)}'s {meal_type}"
+
+    @staticmethod
+    def _success_text(changed: dict, predicate, *, weekdays: bool = True) -> str:
+        where = EditService._slot_phrase(
+            changed["meal_type"], changed["day"], weekdays=weekdays,
+        )
         text = f"Done — I swapped {where}: “{changed['old']['title']}” → “{changed['new']['title']}”."
         old_kcal, new_kcal = changed["old"]["kcal"], changed["new"]["kcal"]
         if predicate.kind == "lighter" and old_kcal and new_kcal:
@@ -865,8 +892,9 @@ class EditService:
         return text
 
     @staticmethod
-    def _failure_text(meal_type, predicate, facts, day=None) -> str:
-        where = f"{DAY_NAMES[day - 1]}'s {meal_type}" if day else f"the {meal_type}"
+    def _failure_text(meal_type, predicate, facts, day=None, *,
+                      weekdays: bool = True) -> str:
+        where = EditService._slot_phrase(meal_type, day, weekdays=weekdays)
         text = (f"I looked for a replacement for {where} that's provably "
                 f"“{predicate.directive}”, but nothing in the matching recipes passes the bar")
         nearest = facts.get("nearest_miss")
