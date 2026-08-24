@@ -1210,15 +1210,51 @@ PLAN_INTENT_EXTRACTOR_USER = _reg(
 )
 
 
+def _read_failure_means_missing(exc: BaseException) -> bool:
+    """Whether this failed existence check means the prompt is not there yet.
+
+    The distinction is the whole safety of `sync_prompts`. A 404 means seed it.
+    A timeout, a 5xx, an expired key or a DNS blip means **we do not know** —
+    and `create_prompt` on a name that already exists adds a VERSION and moves
+    the `production` label onto FoodChat's in-code text. That silently reverts
+    whatever a prompt engineer edited in the UI, which is the exact outcome
+    this module promises never happens.
+
+    So the read failure is classified, and anything unrecognised is treated as
+    "leave it alone". A prompt that genuinely was missing gets seeded on the
+    next boot; a prompt that was edited in the UI is never overwritten by a
+    network hiccup.
+
+    Matched on the exception's name and message rather than an imported type:
+    the SDK's error classes have moved between major versions, and an
+    ImportError here would turn the safe path into the unsafe one.
+    """
+    name = type(exc).__name__.lower()
+    text = str(exc).lower()
+    if "notfound" in name or "not_found" in name:
+        return True
+    return "404" in text or "not found" in text
+
+
 def sync_prompts(*, client=None, registry=None) -> dict:
     """Seed registry prompts into Langfuse, creating ONLY those missing.
 
     Idempotent and safe on every pod start: an existing prompt is left
     untouched because live text may be a deliberate UI edit — the UI is the
     source of truth and overwriting it would silently revert prompt-engineering
-    work. Returns ``{"created", "skipped", "failed"}`` counts.
+    work.
+
+    Returns ``{"created", "skipped", "unchecked", "failed"}`` counts plus
+    ``"names"``, the prompts it actually created. The names matter after a
+    deploy that adds some: the counts alone cannot tell you whether the twelve
+    you expected are the twelve that landed.
+
+    ``unchecked`` is the honest fourth state — prompts whose existence could
+    not be established, and which were therefore left alone rather than
+    risked. It used to be folded into "create it": every transient read error
+    became a write.
     """
-    counts = {"created": 0, "skipped": 0, "failed": 0}
+    counts = {"created": 0, "skipped": 0, "unchecked": 0, "failed": 0, "names": []}
     if client is None:
         client = get_langfuse_client()
     if client is None:
@@ -1230,8 +1266,16 @@ def sync_prompts(*, client=None, registry=None) -> dict:
         # WITHOUT the cache (ttl 0), so it isn't answered from stale state.
         try:
             existing = client.get_prompt(prompt.name, label=prompt.label, cache_ttl_seconds=0)
-        except Exception:
-            existing = None  # not found / transient error → treat as missing
+        except Exception as exc:  # noqa: BLE001
+            if not _read_failure_means_missing(exc):
+                _prompt_logger.warning(
+                    "Could not check whether %s exists (%s) — leaving it "
+                    "alone rather than risk overwriting a UI edit.",
+                    prompt.name, exc,
+                )
+                counts["unchecked"] += 1
+                continue
+            existing = None
         if existing is not None:
             counts["skipped"] += 1
             continue
@@ -1243,6 +1287,7 @@ def sync_prompts(*, client=None, registry=None) -> dict:
                 labels=[prompt.label],
             )
             counts["created"] += 1
+            counts["names"].append(prompt.name)
         except Exception as exc:
             _prompt_logger.warning("create_prompt(%s) failed: %s", prompt.name, exc)
             counts["failed"] += 1

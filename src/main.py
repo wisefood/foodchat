@@ -61,7 +61,22 @@ async def lifespan(app: FastAPI):
         try:
             from prompts import sync_prompts
             result = sync_prompts()
-            if any(result.values()):
+            # Always logged, and the created NAMES with it. A deploy that adds
+            # prompts needs one line saying which ones landed — the counts
+            # alone cannot tell you whether the twelve you expected are the
+            # twelve that arrived, and the alternative is opening the UI and
+            # comparing by eye.
+            if result.get("names"):
+                logger.info(
+                    "Langfuse prompt sync created %d: %s",
+                    result["created"], ", ".join(result["names"]),
+                )
+            if result.get("unchecked") or result.get("failed"):
+                logger.warning(
+                    "Langfuse prompt sync incomplete: %s — rerun happens on "
+                    "the next boot", result,
+                )
+            elif any(v for k, v in result.items() if k != "names"):
                 logger.info("Langfuse prompt sync: %s", result)
         except Exception as exc:  # observability must never break the app
             logger.warning("Langfuse prompt sync failed: %s", exc)

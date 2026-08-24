@@ -89,7 +89,10 @@ class DisabledPathTests(unittest.TestCase):
 
     def test_sync_prompts_noop_when_disabled(self):
         result = sync_prompts()
-        self.assertEqual(result, {"created": 0, "skipped": 0, "failed": 0})
+        self.assertEqual(
+            result,
+            {"created": 0, "skipped": 0, "unchecked": 0, "failed": 0, "names": []},
+        )
 
 
 class BuildTraceConfigTests(unittest.TestCase):
@@ -147,11 +150,15 @@ class SyncPromptsContractTests(unittest.TestCase):
         p = _Prompt("t", "hello {{who}}")
         result = sync_prompts(client=client, registry=[p])
         client.create_prompt.assert_not_called()   # UI wins — never overwrite
-        self.assertEqual(result, {"created": 0, "skipped": 1, "failed": 0})
+        self.assertEqual(result["skipped"], 1)
+        self.assertEqual(result["created"], 0)
+        self.assertEqual(result["names"], [])
 
     def test_creates_missing_prompts(self):
         client = MagicMock()
-        client.get_prompt.side_effect = Exception("not found")  # missing
+        # "not found" is the ONLY read failure that means "seed it". See
+        # `_read_failure_means_missing`.
+        client.get_prompt.side_effect = Exception("404 not found")
         p = _Prompt("t", "hello world")
         result = sync_prompts(client=client, registry=[p])
         client.create_prompt.assert_called_once()
@@ -160,7 +167,51 @@ class SyncPromptsContractTests(unittest.TestCase):
         self.assertEqual(kwargs["type"], "text")
         self.assertEqual(kwargs["prompt"], "hello world")
         self.assertEqual(kwargs["labels"], ["production"])
-        self.assertEqual(result, {"created": 1, "skipped": 0, "failed": 0})
+        self.assertEqual(result["created"], 1)
+        # The names, so a deploy log can say WHICH prompts landed rather than
+        # how many.
+        self.assertEqual(result["names"], ["foodchat/t"])
+
+    def test_a_transient_read_failure_never_becomes_a_write(self):
+        """The bug this classification exists for.
+
+        `create_prompt` on a name that already exists adds a VERSION and moves
+        the `production` label onto FoodChat's in-code text — so a timeout on
+        the existence check used to silently revert whatever a prompt engineer
+        had edited in the UI. That is the exact outcome this module promises
+        never happens, and it happened on any network hiccup.
+        """
+        for failure in (
+            TimeoutError("read timed out"),
+            Exception("503 service unavailable"),
+            Exception("401 unauthorized"),
+            Exception("connection reset by peer"),
+        ):
+            with self.subTest(failure=failure):
+                client = MagicMock()
+                client.get_prompt.side_effect = failure
+                result = sync_prompts(
+                    client=client, registry=[_Prompt("t", "in-code text")],
+                )
+                client.create_prompt.assert_not_called()
+                self.assertEqual(result["unchecked"], 1)
+                self.assertEqual(result["created"], 0)
+
+    def test_a_real_404_still_seeds(self):
+        """Being careful must not mean never seeding anything."""
+        for missing in (
+            Exception("404 Not Found"),
+            Exception("prompt not found"),
+            type("NotFoundError", (Exception,), {})("nope"),
+        ):
+            with self.subTest(missing=missing):
+                client = MagicMock()
+                client.get_prompt.side_effect = missing
+                result = sync_prompts(
+                    client=client, registry=[_Prompt("t", "x")],
+                )
+                client.create_prompt.assert_called_once()
+                self.assertEqual(result["created"], 1)
 
     def test_existence_check_uses_no_fallback_and_no_cache(self):
         client = MagicMock()
