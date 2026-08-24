@@ -48,6 +48,7 @@ from services.clarification import ClarificationManager, ClarificationState
 from services.feedback_service import FeedbackService
 from services.planning_pipeline import PlanningPipeline
 from services.seed_service import SeedService
+from services import transparency
 from services.transparency import apply_transparency, split_ledger
 from .session_service import SessionService
 
@@ -589,6 +590,19 @@ class ChatService:
             "constraints_honored": honored,
             "constraints_not_honored": not_honored,
         }
+        # Why this plan is worth eating, alongside what it was allowed to be.
+        #
+        # Without this the facts were five parts constraint bookkeeping to zero
+        # parts health, so every reply came out as a compliance result: what was
+        # permitted, what was swapped, what fell short. The measurements were
+        # already being taken and shown as a collapsed panel of scores out of
+        # five.
+        facts["plan_value"] = transparency.plan_value(
+            meal_plan, profile,
+            metrics=metrics if isinstance(metrics, dict) else None,
+            kcal_target=brief.kcal_target,
+            pantry_facts=pantry_facts,
+        )
         if pantry_facts:
             # The writer may only phrase what the matcher measured — used
             # AND unused items both reach the member.
@@ -803,6 +817,12 @@ class ChatService:
         honored, not_honored = split_ledger(meal_plan.constraints_applied)
         facts["constraints_honored"] = honored
         facts["constraints_not_honored"] = not_honored
+        facts["plan_value"] = transparency.plan_value(
+            meal_plan, profile,
+            metrics=structured_metrics if isinstance(structured_metrics, dict) else None,
+            kcal_target=brief.kcal_target,
+            pantry_facts=pantry_facts,
+        )
         # And the rating history, which this path dropped: the classic path
         # feeds it to the grader, and with no grader here it belongs in the
         # facts so the reply is at least written in light of it.

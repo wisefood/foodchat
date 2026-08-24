@@ -12,6 +12,8 @@ Reason kinds (shared contract with the UI):
     pinned | favorite | memory | profile | feedback | diner | guideline
 """
 
+from typing import Optional
+
 
 def match_reasons(
     course_recipe_id: str,
@@ -274,3 +276,135 @@ def apply_transparency(
                 )
     meal_plan.constraints_applied = constraints_ledger(profile, downvoted_count)
     meal_plan.personalization_summary = personalization_summary(profile, feedback_lines)
+
+# --------------------------------------------------------------------------- #
+# What is GOOD about this plan                                                  #
+# --------------------------------------------------------------------------- #
+#
+# The ledger above answers "was every constraint respected". That is a real
+# question and it has an honest answer, and it is not what a member came for.
+#
+# FoodChat is not a constraint solver. It is meant to help a household shape
+# meals that are better for them and to say WHY — and the facts handed to the
+# reply were five parts constraint bookkeeping (`constraints_honored`,
+# `constraints_not_honored`, `verified_problems`, `repair`, `pantry`) to zero
+# parts health. So every plan was explained as a compliance result: what was
+# permitted, what was swapped, what fell short. Meanwhile the system had
+# measured food variety, guideline adherence, meal diversity, Nutri-Score and
+# the day's calories, and handed the member a collapsed panel of scores out of
+# five instead of a sentence.
+#
+# This builds the other half. Every value here is MEASURED — a count, a total,
+# or a judge's own sentence — because a reply is only allowed to phrase what
+# the facts contain, and "healthy" is not a measurement.
+
+
+def plan_value(
+    meal_plan,
+    profile: dict,
+    metrics: Optional[dict] = None,
+    kcal_target: Optional[float] = None,
+    pantry_facts: Optional[dict] = None,
+) -> dict:
+    """The reasons this plan is worth eating, for the reply to draw on.
+
+    Empty keys are omitted rather than sent as zero: a reply that says "0
+    unique foods" or "no guidance" because a metric was skipped is worse than
+    one that talks about the food.
+    """
+    metrics = metrics or {}
+    value: dict = {}
+
+    diners = [str(d) for d in (profile.get("cooking_for_names") or []) if d]
+    if len(diners) > 1:
+        # Named, because a plan for a household is a different thing from a
+        # plan for one person, and the reply should sound like it knows.
+        value["cooking_for"] = diners
+
+    totals = _day_totals(meal_plan)
+    if totals:
+        nutrition = {
+            "kcal_per_day": round(totals["kcal"] / max(1, totals["days"])),
+            "protein_g_per_day": round(totals["protein"] / max(1, totals["days"])),
+        }
+        if not totals["complete"]:
+            # Said, so the reply cannot present a partial sum as the day.
+            nutrition["partial"] = "some dishes carry no nutrition data"
+        if kcal_target:
+            nutrition["kcal_target"] = int(kcal_target)
+        value["nutrition"] = nutrition
+
+    if metrics.get("fvs_count"):
+        # Food variety: distinct ingredients across the plan. A real number
+        # about a real thing — a varied plate is the least controversial
+        # nutrition advice there is.
+        value["distinct_foods"] = int(metrics["fvs_count"])
+
+    for key, name in (
+        ("guideline_adherence_reasoning", "guidance"),
+        ("diversity_llm_reasoning", "balance"),
+    ):
+        sentence = str(metrics.get(key) or "").strip()
+        if sentence:
+            # The judge's own sentence, not its score. "3 out of 5" is not
+            # something to tell someone about their dinner.
+            value[name] = sentence[:300]
+
+    grades = _nutri_grades(meal_plan)
+    if grades:
+        value["nutri_score"] = grades
+
+    if pantry_facts and pantry_facts.get("used"):
+        # The sustainability half, and the only one the member asked for
+        # directly: food they already had, now going into a meal instead of a
+        # bin.
+        value["using_up"] = list(pantry_facts["used"])
+
+    return value
+
+
+def _day_totals(meal_plan) -> Optional[dict]:
+    """Summed macros across every plate, and how many it could not see."""
+    kcal = protein = 0.0
+    counted = plates = 0
+    days = 0
+    for day in getattr(meal_plan, "day_plans", None) or []:
+        days += 1
+        for meal in getattr(day, "meals", None) or []:
+            for plate in getattr(meal, "plates", None) or []:
+                if not getattr(plate, "recipe_id", ""):
+                    continue
+                plates += 1
+                nutrition = getattr(plate, "nutrition", None) or {}
+                value = nutrition.get("kcal")
+                if not isinstance(value, (int, float)):
+                    continue
+                counted += 1
+                kcal += float(value)
+                protein += float(nutrition.get("protein_g") or 0)
+    if not counted:
+        return None
+    return {
+        "kcal": kcal, "protein": protein, "days": max(1, days),
+        "complete": counted == plates,
+    }
+
+
+def _nutri_grades(meal_plan) -> Optional[str]:
+    """"4 of 5 dishes are Nutri-Score A or B", or None when none are graded."""
+    good = graded = 0
+    for day in getattr(meal_plan, "day_plans", None) or []:
+        for meal in getattr(day, "meals", None) or []:
+            for plate in getattr(meal, "plates", None) or []:
+                label = str(
+                    (getattr(plate, "nutrition", None) or {}).get("nutri_score_label")
+                    or ""
+                ).strip().upper()
+                if not label:
+                    continue
+                graded += 1
+                if label[-1] in ("A", "B"):
+                    good += 1
+    if not graded:
+        return None
+    return f"{good} of {graded} dishes are Nutri-Score A or B"
