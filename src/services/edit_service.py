@@ -733,9 +733,16 @@ class EditService:
                 "Tell me which of those you meant and I'll swap it."
             )
         have = [m.meal_type for m in matching[0].meals]
+        # Offering to ADD it, not asking which existing meal to change.
+        #
+        # The old sentence sent the member in a circle: they asked for a meal
+        # the plan does not have, and were asked to pick one it does. Saying
+        # "ask me to add it" is the way out, and the shape reader upstream
+        # (`shape_intent`) is what makes "add breakfast" work when they do.
         return (
-            f"Day {day} doesn't have a {meal_type} in this plan — it has "
-            f"{', '.join(have) or 'no meals'}. Which of those should I change?"
+            f"This plan has no {meal_type} — it has "
+            f"{', '.join(have) or 'no meals'}. Say \"add {meal_type}\" and I "
+            f"will plan one in, or tell me which of those to change instead."
         )
 
     def _edit_weekly(self, session, day: int, meal_type: str, predicate, original_message: str) -> EditOutcome:

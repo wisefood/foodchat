@@ -60,6 +60,11 @@ _TURN: ContextVar[Optional[tuple[str, str, PlanningState]]] = ContextVar(
     "turn_intake", default=None
 )
 
+# What this turn added to the plan's SHAPE, if anything — "added breakfast",
+# "added a salad to lunch". Read by the router: a turn that grows the shape is a
+# re-plan, not a slot swap, whatever the intent classifier called it.
+_SHAPE: ContextVar[list] = ContextVar("turn_shape_additions", default=[])
+
 
 def _run(fns: list[Callable[[], PlanningStateDelta]]) -> list[PlanningStateDelta]:
     """Every extractor at once, each in a copy of this turn's context.
@@ -147,6 +152,25 @@ def intake(session_id: str, message: str, *,
         if not delta.is_empty:
             state = state.merge(delta)
 
+    # Shape ADDITIONS, before the facet retraction.
+    #
+    # "Add breakfast" and "a salad on the side" are changes to the plan's
+    # SHAPE, and nothing could act on them: an edit replaces the dish on a slot,
+    # so a request for a slot that does not exist got "this plan has lunch,
+    # dinner — which of those should I change?", and the member said "I don't
+    # have a breakfast" again. There was no way out of that loop.
+    #
+    # Additive against the standing spec rather than replacing it, which is the
+    # other half: the shape extractor answers with the meals the MESSAGE
+    # mentions, and `merge` takes a delta's spec wholesale — so "add a salad to
+    # lunch" would have set the day to lunch alone.
+    from services import shape_intent
+
+    grown, added = shape_intent.additions(message, state.spec)
+    _SHAPE.set(added)
+    if added:
+        state = state.merge(PlanningStateDelta(spec=grown))
+
     # Taking a facet back, last and against the merged state.
     #
     # Last because it can only remove something that is standing, and the thing
@@ -176,6 +200,17 @@ def intake(session_id: str, message: str, *,
 def forget() -> None:
     """Drop the memo. For tests, and for a caller replaying one session."""
     _TURN.set(None)
+    _SHAPE.set([])
+
+
+def added_shape() -> list:
+    """What this turn added to the plan's shape — `[]` when nothing.
+
+    The router reads this rather than re-deriving it: intake has already done
+    the work, and two places deciding what "add a salad" means is how they come
+    to disagree.
+    """
+    return list(_SHAPE.get() or [])
 
 
 def current(session_id: str, *, session_service=None) -> PlanningState:

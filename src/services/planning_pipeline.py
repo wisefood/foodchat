@@ -479,6 +479,7 @@ class PlanningPipeline:
         # week with a side at dinner is seven inside one turn budget.
         options: dict[str, list] = {}
         placement: dict[str, tuple[int, str]] = {}
+        unfilled: list[str] = []
         used: set = set()
         for day in sorted(pools_by_day):
             for slot in spec.meals:
@@ -493,7 +494,19 @@ class PlanningPipeline:
                     enrichment={},
                 )
                 if not composed:
-                    logger.info("day %s %s could not be filled", day, slot)
+                    # NOT a silent `continue`.
+                    #
+                    # It was, and a member asking to reuse ingredients got back
+                    # a plan containing only lunch: dinner's plates could not be
+                    # filled from what was left after the exclusions, so dinner
+                    # was dropped and the reply described the lunch as though
+                    # that were the day. A plan short a whole meal has to say so
+                    # — losing a meal is not a detail.
+                    logger.warning(
+                        "day %s %s could not be filled — reporting it, not "
+                        "dropping it", day, slot,
+                    )
+                    unfilled.append(slot)
                     continue
                 label = meal_composer.label_for(day, slot)
                 options[label] = composed
@@ -505,7 +518,21 @@ class PlanningPipeline:
                 # introduce a duplicate this reservation missed.
                 used.update(composed[0].recipe_ids)
 
-        chosen = meal_composer.judge(query, options)
+        # The food-waste setting, on the path where a multi-plate plan is
+        # built. It reached the classic grader's query and the weekly scorer,
+        # and nothing here — so a member who asked to reuse ingredients and had
+        # a shaped plan got the setting applied to nothing at all.
+        #
+        # It rides the judge's query, which is where a preference about how
+        # dishes go TOGETHER belongs: sharing a bunch of coriander is a property
+        # of the combination, not of any one dish.
+        waste = plan_parameters.waste_mode(profile.get("plan_parameters") or {})
+        judge_query = query
+        if waste != "off":
+            judge_query = f"{query}\n\n{_WASTE_PREFERENCE[waste]}"
+            logger.info("Food-waste preference reaching the meal judge: %s", waste)
+
+        chosen = meal_composer.judge(judge_query, options)
 
         # A judge that moves a meal off its measured winner can, in principle,
         # land on a dish another meal already took: the reservation above was
@@ -598,9 +625,21 @@ class PlanningPipeline:
         # trust to tell you when it fell short.
         parts = [f"Planned {spec.describe()} from your preferences"]
 
+        # A missing MEAL first, and in those words.
+        #
+        # "3 of 8 plates could not be filled" is technically the same fact and
+        # is not the same sentence: a member reads it as a plate short, not as
+        # "you have no dinner". Naming the meals is what makes it legible.
+        missing = sorted(set(unfilled))
+        if missing:
+            parts.append(
+                f"there is no {', no '.join(missing)} in this plan — nothing in "
+                "your collection could fill it under these requirements"
+            )
+
         expected = spec.total_plates
         produced = sum(len(m.plates) for d in days for m in d.meals)
-        if produced < expected:
+        if produced < expected and not missing:
             parts.append(
                 f"{expected - produced} of {expected} plates could not be "
                 "filled from the recipes that match your requirements"

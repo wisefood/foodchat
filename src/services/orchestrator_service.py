@@ -701,6 +701,33 @@ class OrchestratorService:
             return self._handle_plan(session_id, message, intent, is_refinement=True)
 
         if intent == "edit_plan_slot":
+            # A turn that GREW the shape is a re-plan, not a swap.
+            #
+            # "Add breakfast" and "add a salad as well there for side" classify
+            # as slot edits, and an edit can only replace the dish on a slot
+            # that exists. So the first got "this plan has lunch, dinner — which
+            # of those should I change?" in a loop, and the second had its swap
+            # executed and its addition heard by nobody: the member read a
+            # confident answer to half of what they asked.
+            #
+            # The shape reader has already updated the standing spec by the
+            # time this runs, so re-planning honours BOTH halves — the new plate
+            # and the "lighter" — where the edit path could only ever do one.
+            grew = turn_intake.added_shape()
+            if grew:
+                logger.info(
+                    "[%s] %s — re-planning rather than swapping a slot",
+                    session_id, "; ".join(grew),
+                )
+                canvas = session.active_canvas
+                if canvas is not None and canvas.plan_type == "weekly":
+                    return self._handle_weekly(
+                        session_id, message, "refine_plan", is_refinement=True,
+                    )
+                return self._handle_plan(
+                    session_id, message, "refine_plan", is_refinement=True,
+                    seeds=self.seed_service.extract_seeds(message),
+                )
             if session.active_canvas is None:
                 # "get me a side salad as well" with nothing on the canvas is
                 # not an error to bounce — it is a plan request wearing edit

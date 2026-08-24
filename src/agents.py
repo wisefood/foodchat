@@ -275,21 +275,38 @@ class DocumentGrader:
         # The top-of-ranking day is always graded; the rest of the batch is
         # sampled per slot so the judge sees variety across every slot rather
         # than across the last one only.
+        # Deduplicated by RECIPE ID, not by hashing the candidates.
+        #
+        # `CandidateRecipe` is a frozen dataclass, so it looks hashable — until
+        # one of its fields is the `nutrition` dict, and then `hash()` raises
+        # `TypeError: unhashable type: 'dict'`. Every candidate from
+        # `plan_meals` carries nutrition, so putting a combination in a set
+        # threw on EVERY real plan: the pipeline caught it, served the unranked
+        # pool, and told the member "not ranked — grader unavailable". Not
+        # flaky — every single time, and invisible here because the test
+        # fixtures build candidates with no macros at all.
         wanted = max(0, self.max_plans_to_score - 1)
         rest: list[tuple] = []
-        seen = {best_combo}
+
+        def combo_key(combo) -> tuple:
+            return tuple(str(c.recipe_id) for c in combo)
+
+        seen = {combo_key(best_combo)}
         for _ in range(wanted * 4):          # bounded attempts, not a while-true
             if len(rest) >= wanted:
                 break
             combo = tuple(random.choice(pool) for pool in pools)
-            if combo in seen:
+            key = combo_key(combo)
+            if key in seen:
                 continue
-            seen.add(combo)
+            seen.add(key)
             rest.append(combo)
         # A pool small enough to enumerate gets exhaustive coverage instead of
         # sampling, which is the old behaviour for three short slots.
         if len(head) <= self.max_plans_to_score:
-            rest = [c for c in head if c != best_combo][:wanted]
+            rest = [
+                c for c in head if combo_key(c) != combo_key(best_combo)
+            ][:wanted]
         sampled = [best_combo] + rest
 
         def course_text(slot: str, course) -> str:
