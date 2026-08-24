@@ -701,3 +701,43 @@ class TestTheVerifierReadsWhatThePlanCarries:
         )
         calories = next(c for c in report.checks if c.name == "calories")
         assert calories.status == "failed", "the live figure should have been used"
+
+
+class TestTheComposerJudgesAMainTheSameWay:
+    """The fetch and the judgement have to agree about what a main is.
+
+    The composer checked every main against `main-dish`, so the moment
+    breakfast started returning breakfasts, a correct one would have been
+    marked down for "not annotated as a main" — the same slot-blind assumption,
+    one step later, penalising the fix.
+    """
+
+    def test_a_breakfast_in_a_main_role_is_not_a_mismatch(self):
+        from models.recipe import RecipeEnrichment
+
+        pools = {("breakfast", "main"): [_c("b", "Porridge", "oats")]}
+        enrichment = {
+            "b": RecipeEnrichment("b", "Porridge", dish_types=["breakfast"]),
+        }
+        composed = meal_composer.compose(
+            "breakfast", ("main",), pools, enrichment=enrichment,
+        )[0]
+        assert not any("annotated" in f for f in composed.findings), (
+            composed.findings
+        )
+
+    def test_a_side_is_still_checked(self):
+        """Only `main` is slot-dependent; the rest keep their meaning."""
+        from models.recipe import RecipeEnrichment
+
+        pools = {
+            ("dinner", "main"): [_c("m", "Bean stew", "beans")],
+            ("dinner", "side"): [_c("s", "Chocolate cake", "cocoa")],
+        }
+        enrichment = {
+            "s": RecipeEnrichment("s", "Chocolate cake", dish_types=["dessert"]),
+        }
+        composed = meal_composer.compose(
+            "dinner", ("main", "side"), pools, enrichment=enrichment,
+        )[0]
+        assert any("not annotated as a side" in f for f in composed.findings)

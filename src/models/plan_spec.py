@@ -51,6 +51,7 @@ ROLES: tuple[str, ...] = ("main", "side", "salad", "soup", "dessert", "drink")
 # semantics here — unlike a *multi-course meal*, where each course needs its own
 # request because the courses must all be present.
 ROLE_COURSE_TYPES: dict[str, tuple[str, ...]] = {
+    # See `request_course_types` — a main is NOT asked for by this name.
     "main": ("main-dish",),
     # Broad on purpose: a generic side can be any of these, and asking for only
     # one would empty the plate on a corpus that annotated it as another.
@@ -61,6 +62,31 @@ ROLE_COURSE_TYPES: dict[str, tuple[str, ...]] = {
     "dessert": ("desserts",),
     "drink": ("beverages",),
 }
+
+def request_course_types(role: str) -> tuple[str, ...]:
+    """The course types to ASK RecipeWrangler for, for a plate in this role.
+
+    Empty for `main`, on purpose, and this is the whole point of the function.
+
+    "main" is FoodChat's word for *the principal plate of this slot*. It is not
+    the corpus's `main-dish`, and what a main IS depends on the slot: a
+    breakfast main is a breakfast, a snack main is a snack, a dessert main is a
+    dessert. RecipeWrangler owns that map — `SLOT_COURSE_TYPES` in its
+    `plan_meals` — and applies it to any slot whose request carries no
+    `course_types` override.
+
+    Sending `main-dish` for every main overrode that map on every shaped plan,
+    so breakfast was a literal request for a main dish and came back with
+    pasta. The classic single-plate path never had the bug because it sends no
+    override at all; only the path that knows about roles did.
+
+    Every other role means the same thing wherever it sits — a salad is a
+    salad at lunch and at dinner — so those keep their own course types.
+    """
+    if role == "main":
+        return ()
+    return ROLE_COURSE_TYPES.get(role, ())
+
 
 # How a meal's calorie budget divides across its plates — the honest-nutrition
 # rule from §4.2: "main + side ≈ one meal, not two".
@@ -292,7 +318,7 @@ class PlanSpec:
                     {
                         "slot": slot,
                         "count": wanted,
-                        "course_types": list(ROLE_COURSE_TYPES.get(role, ())),
+                        "course_types": list(request_course_types(role)),
                     }
                 )
         return out

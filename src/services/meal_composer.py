@@ -342,10 +342,13 @@ def _score(
         composition.findings.extend(misses)
 
     # 3. Does each plate look like the course it is filling?
-    from models.plan_spec import ROLE_COURSE_TYPES
+    from models.plan_spec import request_course_types
 
     for plate in plates:
-        wanted = set(ROLE_COURSE_TYPES.get(plate.role, ()))
+        # The same rule the fetch used: a main is whatever the slot's main
+        # course is, and checking it against `main-dish` would have penalised
+        # a correct breakfast for being annotated `breakfast`.
+        wanted = set(request_course_types(plate.role))
         rich = enrichment.get(plate.recipe_id)
         types = {str(t).lower() for t in (getattr(rich, "dish_types", None) or [])}
         if not wanted or not types:
