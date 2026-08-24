@@ -48,6 +48,46 @@ def _day_kcal_target(profile: dict) -> float | None:
     return PlanBrief.build(profile).kcal_target
 
 
+
+def _repeat_note(slots: list[str]) -> str:
+    """One clause naming the meals that had to reuse a recent dish, or ""."""
+    if not slots:
+        return ""
+    where = ", ".join(slots)
+    return (
+        f"Your collection had nothing new left for {where}, so that "
+        f"{'meal repeats' if len(slots) == 1 else 'those meals repeat'} "
+        "something you have had recently"
+    )
+
+
+def _with_note(plans: list[ScoredPlan], note: str) -> list[ScoredPlan]:
+    """The same plans, each carrying `note`. Unchanged when there is none."""
+    if not note or not plans:
+        return plans
+    return [
+        ScoredPlan(
+            score=plan.score,
+            reasoning=f"{plan.reasoning} {note}." if plan.reasoning else f"{note}.",
+            slots=dict(plan.slots),
+        )
+        for plan in plans
+    ]
+
+
+
+def _every_plate_has_a_candidate(pools_by_day: dict, spec) -> bool:
+    """Whether every requested plate of every day came back with something."""
+    if not pools_by_day:
+        return False
+    for pools in pools_by_day.values():
+        for slot in spec.meals:
+            for role in spec.roles_for(slot):
+                if not pools.get((slot, role)):
+                    return False
+    return True
+
+
 class PlanningPipeline:
     """Reconcile → fetch candidates → grade combinations → ranked plans."""
 
@@ -60,6 +100,7 @@ class PlanningPipeline:
         profile: dict,
         pinned: dict[str, "CandidateRecipe"] | None = None,
         exclude_recipe_ids: list[str] | None = None,
+        avoid_recent: list[str] | None = None,
         feedback_history: str = "",
     ) -> list[ScoredPlan]:
         """Produce ranked daily-plan combinations for the reformulated query.
@@ -79,6 +120,13 @@ class PlanningPipeline:
         recipes are folded into the pool coverage-first and the grader is told
         to prefer combinations that use them. A boost, never a filter — the
         pool stays constraint-correct and full-sized either way.
+
+        ``avoid_recent`` is what the member was just served. A SOFT exclusion,
+        and the difference matters: `exclude_recipe_ids` is a decision (a
+        downvote, "not that one") and is never relaxed, while this is only a
+        preference for something new. It is dropped the moment it would empty a
+        slot, because a member on a narrow diet must not be told no meals exist
+        for the crime of asking twice.
         """
         pinned = pinned or {}
         pantry = pantry_service.normalize_items(profile.pop("_pantry", None) or [])
@@ -116,16 +164,47 @@ class PlanningPipeline:
         # Asking for `CANDIDATE_LIMIT` per slot turns it into a candidate
         # source: the grader still ranks the combinations, it just ranks a pool
         # that already respects what the member asked for.
+        hard_exclusions = (
+            [r.recipe_id for r in pinned.values()] + list(exclude_recipe_ids or [])
+        )
+        # Recently served dishes are asked for last and given up first.
+        recent = [r for r in (avoid_recent or []) if r not in hard_exclusions]
         candidates = _fetch_candidate_pool(
             profile=profile,
             cuisines=cuisines,
             liked_ingredients=liked_ingredients,
             max_minutes=max_minutes,
-            exclude_recipe_ids=(
-                [r.recipe_id for r in pinned.values()] + list(exclude_recipe_ids or [])
-            ),
+            exclude_recipe_ids=hard_exclusions + recent,
             limit_per_slot=CANDIDATE_LIMIT,
         )
+        repeated_slots: list[str] = []
+        if recent:
+            # A slot the history emptied is refetched without it. Only that
+            # slot: the other slots keep their fresh dishes, so asking twice
+            # costs the repeat of one meal rather than of the whole day.
+            thin = [slot for slot, pool in (candidates or {}).items() if not pool]
+            if not candidates or thin:
+                refetched = _fetch_candidate_pool(
+                    profile=profile,
+                    cuisines=cuisines,
+                    liked_ingredients=liked_ingredients,
+                    max_minutes=max_minutes,
+                    exclude_recipe_ids=hard_exclusions,
+                    limit_per_slot=CANDIDATE_LIMIT,
+                )
+                if not candidates:
+                    candidates = refetched
+                    repeated_slots = sorted(refetched)
+                else:
+                    for slot in thin:
+                        if refetched.get(slot):
+                            candidates[slot] = refetched[slot]
+                            repeated_slots.append(slot)
+                if repeated_slots:
+                    logger.info(
+                        "Nothing new left for %s — reusing recent dishes there",
+                        ", ".join(repeated_slots),
+                    )
 
         # Pantry (food waste): fold in recipes that use the member's on-hand
         # ingredients, coverage-first. The per-item fan-out exists because
@@ -181,10 +260,16 @@ class PlanningPipeline:
         # Nutri-Score, so its top pick is a real plan — just not a ranked one.
         # An unranked plan the member receives beats a ranked one the gateway
         # cuts off before it arrives.
+        # A repeat the corpus forced is said, not hidden. The member asked for
+        # something new and is getting a dish they have just had; that is a fact
+        # about their collection, and finding out by recognising the photo is
+        # worse than being told.
+        note = _repeat_note(repeated_slots)
+
         if turn_budget.skip("plan grading", turn_budget.COST_GRADING):
-            return self._assemble_from_pool(
-                candidates, "not ranked — the plan was taking too long"
-            )
+            return _with_note(self._assemble_from_pool(
+                candidates, "not ranked — the plan was taking too long",
+            ), note)
 
         try:
             scored = self.grader.grade_daily_plans(
@@ -196,25 +281,29 @@ class PlanningPipeline:
             # ordered by planning tier and Nutri-Score, so serving its top pick
             # beats an apology.
             logger.error("Grader failed (%s) — serving the unranked pool", exc)
-            return self._assemble_from_pool(candidates, "not ranked — grader unavailable")
+            return _with_note(
+                self._assemble_from_pool(candidates, "not ranked — grader unavailable"),
+                note,
+            )
 
         if not scored:
             logger.warning("Grader returned no plans — serving the unranked pool")
             fallback = self._assemble_from_pool(candidates)
             if fallback:
-                return fallback
+                return _with_note(fallback, note)
 
         logger.info(
             "Pipeline produced %d scored plan(s); best score=%s",
             len(scored), scored[0].score if scored else "n/a",
         )
-        return scored
+        return _with_note(scored, note)
 
     def plan_structured(
         self,
         profile: dict,
         spec: "PlanSpec",
         exclude_recipe_ids: list[str] | None = None,
+        avoid_recent: list[str] | None = None,
         pinned: dict | None = None,
         query: str = "",
     ) -> "MealPlan | None":
@@ -292,12 +381,32 @@ class PlanningPipeline:
         multi_plate = any(len(spec.roles_for(slot)) > 1 for slot in spec.meals)
         per_plate = meal_composer.POOL_PER_PLATE if multi_plate else 1
 
+        # Recently served dishes are a SOFT exclusion here too: asked for, and
+        # given up the moment they would leave a plate unfillable. A shaped
+        # plan has more plates to fill than a plain day, so it runs out of new
+        # dishes sooner — and a member who asked twice must not be told their
+        # shape is impossible.
+        recent = [
+            r for r in (avoid_recent or [])
+            if r not in (exclude_recipe_ids or [])
+        ]
         pools_by_day, relaxations = meal_composer.role_pools(
             profile, spec,
-            exclude_recipe_ids=list(exclude_recipe_ids or []),
+            exclude_recipe_ids=list(exclude_recipe_ids or []) + recent,
             boost_ids=boost_ids,
             per_plate=per_plate,
         )
+        if recent and not _every_plate_has_a_candidate(pools_by_day, spec):
+            logger.info(
+                "Nothing new left to fill every plate — planning without the "
+                "recently-served exclusion"
+            )
+            pools_by_day, relaxations = meal_composer.role_pools(
+                profile, spec,
+                exclude_recipe_ids=list(exclude_recipe_ids or []),
+                boost_ids=boost_ids,
+                per_plate=per_plate,
+            )
         if not pools_by_day:
             return None
 

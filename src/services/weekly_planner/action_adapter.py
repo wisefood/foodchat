@@ -38,6 +38,7 @@ class RecipeActionSpace:
         additional_diet: List[str] = None,
         pantry: tuple = (),
         spec: Optional[object] = None,
+        avoid_recent: Optional[List[str]] = None,
     ):
         self.user_profile = user_profile
         self.allergens = user_profile.get("allergies", [])
@@ -79,6 +80,14 @@ class RecipeActionSpace:
         self._role_cache: Dict[int, Dict[tuple, list]] = {}
         # Recipes already committed to the plan — excluded from every fetch.
         self._selected_ids: List[str] = []
+        # What the member was served on their LAST few plans. A soft ask: it
+        # rides the same exclusion list, and is dropped for the whole plan if
+        # the first day cannot be filled with it. Without it, a second "plan my
+        # week" returned the same week — RecipeWrangler's order is
+        # deterministic and this loop has no model to vary the pick.
+        self._avoid_recent: List[str] = [
+            r for r in (avoid_recent or []) if r
+        ]
         # recipe_id -> RecipeEnrichment for every fetched pool (M6).
         self._enrichment: Dict[str, Any] = {}
 
@@ -121,9 +130,27 @@ class RecipeActionSpace:
                 # and diet is never relaxed.
                 diet=normalize_diet_tags(self.diet),
                 cuisines=cuisines,
-                exclude_recipe_ids=list(self._selected_ids),
+                exclude_recipe_ids=list(self._selected_ids) + self._avoid_recent,
                 limit_per_slot=DAILY_POOL_LIMIT,
             )
+            if self._avoid_recent and not all(pool.get(s) for s in self._slots()):
+                # Nothing new left for some slot. Give the history up for the
+                # whole plan rather than per slot: a week is 21 picks, and
+                # dropping it once keeps the pools consistent across days
+                # instead of a different exclusion set on every fetch.
+                logger.info(
+                    "Nothing new left for every slot — planning this week "
+                    "without the recently-served exclusion",
+                )
+                self._avoid_recent = []
+                pool = _fetch_candidate_pool(
+                    profile=self.user_profile,
+                    allergens=self.allergens,
+                    diet=normalize_diet_tags(self.diet),
+                    cuisines=cuisines,
+                    exclude_recipe_ids=list(self._selected_ids),
+                    limit_per_slot=DAILY_POOL_LIMIT,
+                )
             if self.pantry and pool:
                 # Same Tier-A fan-out as the daily pipeline: single-item hard
                 # includes, merged coverage-first, pool size unchanged. The
@@ -178,6 +205,12 @@ class RecipeActionSpace:
             actions.append(action)
         return actions
 
+    def _slots(self) -> List[str]:
+        """The meal slots this plan needs a pool for."""
+        return [
+            str(m).lower() for m in (getattr(self.spec, "meals", None) or ())
+        ] or ["breakfast", "lunch", "dinner"]
+
     def mark_selected(self, recipe_id: str) -> None:
         """Called by the environment after a recipe is committed to the plan."""
         if recipe_id and recipe_id not in self._selected_ids:
@@ -210,7 +243,7 @@ class RecipeActionSpace:
         if day not in self._role_cache:
             pools, notes = meal_composer.role_pools(
                 self.user_profile, self.spec,
-                exclude_recipe_ids=list(self._selected_ids),
+                exclude_recipe_ids=list(self._selected_ids) + self._avoid_recent,
                 boost_ids=(
                     list(self.user_profile.get("favorite_recipe_ids") or [])
                     if self.user_profile.get("use_favorites") is not False else []

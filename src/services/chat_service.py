@@ -35,6 +35,7 @@ from services.adapted_recipes import overlay_plan
 from services import (
     pantry_service,
     plan_parameters,
+    plan_history,
     plan_quality,
     plan_repair,
     plan_verifier,
@@ -462,6 +463,16 @@ class ChatService:
             final_query, profile, pinned=pinned,
             exclude_recipe_ids=list(signals.downvoted_recipe_ids or [])
             + list(profile.get("_excluded_recipe_ids") or []),
+            # What the member was just served. Only on a FRESH plan: a
+            # refinement is a request to change the plan on screen, so keeping
+            # its unchanged slots is the whole point, and a refinement that
+            # avoided its own dishes would replace everything every time.
+            avoid_recent=(
+                [] if is_refinement
+                else plan_history.recently_served(
+                    self.session_service.get_session(session_id)
+                )
+            ),
             feedback_history=signals.history_text,
         )
         if not plans:
@@ -643,6 +654,12 @@ class ChatService:
 
         meal_plan = self.pipeline.plan_structured(
             profile, spec, exclude_recipe_ids=excluded, pinned=pinned,
+            avoid_recent=(
+                [] if is_refinement
+                else plan_history.recently_served(
+                    self.session_service.get_session(session_id)
+                )
+            ),
             # The member's words. This path had no query parameter at all, so
             # the shape was honoured and the request was not — and the reply
             # was then phrased around something that reached nothing.

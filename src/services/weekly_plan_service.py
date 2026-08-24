@@ -192,7 +192,9 @@ class WeeklyPlanService:
         # "a high-protein week" was heard, stored, and dropped. Intake puts the
         # claim on `claim_tags`, which every fetch site reads, and adds the two
         # extractions weekly never had: facets ("a Thai week") and shape.
-        from services import pantry_service, plan_parameters, turn_intake
+        from services import (
+            pantry_service, plan_history, plan_parameters, turn_intake,
+        )
 
         state = turn_intake.intake(
             session_id, content, session_service=self.session_service,
@@ -254,6 +256,13 @@ class WeeklyPlanService:
             # action space had no notion of a plate and every refinement
             # flattened a multi-plate week back to single dishes.
             spec=state.spec,
+            # What the member was served on their last few plans, so a second
+            # "plan my week" is a different week. Fresh plans only: a
+            # refinement is a request to change the week on screen.
+            avoid_recent=(
+                [] if is_refinement
+                else plan_history.recently_served(session)
+            ),
         )
         # Anchored recipes must never repeat elsewhere in the week.
         for entry in pinned.values():

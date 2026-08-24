@@ -133,12 +133,44 @@ class TestThePipelineTakesTheQuery:
         assert "query" in params, "the member's message must reach planning"
 
     def test_the_caller_passes_it(self):
+        """Read from the AST, not by slicing to the first `)`.
+
+        The text version broke the moment another keyword argument's value
+        contained a bracketed expression — which says nothing about whether the
+        query reaches planning, only about where a paren happens to fall.
+        """
+        import ast
+
         from services.chat_service import ChatService
 
-        src = inspect.getsource(ChatService._generate_structured)
-        call = src[src.find("self.pipeline.plan_structured("):]
-        call = call[:call.find(")\n")]
-        assert "query=" in call
+        tree = ast.parse(inspect.getsource(ChatService._generate_structured).lstrip())
+        passed = {
+            kw.arg
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and getattr(node.func, "attr", None) == "plan_structured"
+            for kw in node.keywords
+        }
+        assert "query" in passed, "the member's message must reach planning"
+
+    def test_the_caller_asks_for_something_new(self):
+        """Same call, and the reason the assertion above needed rewriting: a
+        fresh plan must exclude what the member was just served, or asking
+        twice returns the same plan — RecipeWrangler's order is deterministic
+        and the grader runs at temperature 0."""
+        import ast
+
+        from services.chat_service import ChatService
+
+        tree = ast.parse(inspect.getsource(ChatService._generate_structured).lstrip())
+        passed = {
+            kw.arg
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and getattr(node.func, "attr", None) == "plan_structured"
+            for kw in node.keywords
+        }
+        assert "avoid_recent" in passed
 
     def test_real_favourites_are_boosted_not_just_pantry_ids(self):
         from services.planning_pipeline import PlanningPipeline
