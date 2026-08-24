@@ -12,3 +12,9 @@ RECSYS26_PLAN.md
 # dev run or a test that forgets its tmpdir drops one next to the code.
 *.db
 foodchat.db
+
+# conftest builds its test database in `tempfile.mkdtemp(prefix="foodchat-tests-")`.
+# That normally lands in /tmp, but it follows TMPDIR — and with TMPDIR pointing
+# here it drops a 300KB directory of throwaway sessions next to the source,
+# where it shows up as untracked and makes a clean tree look dirty.
+foodchat-tests-*/
