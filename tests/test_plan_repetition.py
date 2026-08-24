@@ -278,44 +278,85 @@ class TestReadingTheHistory:
         assert plan_history.recently_served(None) == []
 
 
-class TestARefinementDoesNotAvoidItsOwnPlan:
-    """A refinement is a request to change the plan on screen. Keeping its
-    unchanged slots is the whole point, so a refinement that avoided its own
-    dishes would replace everything every time."""
+class TestARefinementAvoidsThePlanItIsRefining:
+    """This started out the other way round, on the reasoning that "keeping its
+    unchanged slots is the whole point". That is true of a single-slot swap —
+    which `edit_service` handles — and false of this path, which regenerates
+    every slot. So "make it lighter" refetched the same pool, took the same
+    head of it, and handed back the same three dishes."""
 
-    def test_the_daily_path_passes_nothing_on_a_refinement(self):
+    @staticmethod
+    def _avoid_kwarg(method: str, call_name: str) -> str:
         import ast
         import inspect
 
         from services.chat_service import ChatService
 
-        src = inspect.getsource(ChatService._generate_and_store).lstrip()
-        tree = ast.parse(src)
+        tree = ast.parse(inspect.getsource(getattr(ChatService, method)).lstrip())
         call = next(
             node for node in ast.walk(tree)
             if isinstance(node, ast.Call)
-            and getattr(node.func, "attr", None) == "generate"
+            and getattr(node.func, "attr", None) == call_name
         )
-        avoid = next(kw for kw in call.keywords if kw.arg == "avoid_recent")
-        assert "is_refinement" in ast.unparse(avoid.value)
+        return ast.unparse(
+            next(kw for kw in call.keywords if kw.arg == "avoid_recent").value
+        )
 
-    def test_the_structured_path_does_the_same(self):
-        import ast
-        import inspect
+    def test_both_daily_paths_go_through_one_decision(self):
+        """Two call sites deciding this separately is how they drift."""
+        assert self._avoid_kwarg("_generate_and_store", "generate") == \
+            self._avoid_kwarg("_generate_structured", "plan_structured")
 
+    def test_the_decision_takes_the_refinement_flag(self):
+        assert "is_refinement" in self._avoid_kwarg("_generate_and_store", "generate")
+
+    def test_a_refinement_avoids_the_plan_on_screen(self, session_service, sample_profile):
+        from conftest import make_candidates
         from services.chat_service import ChatService
 
-        src = inspect.getsource(ChatService._generate_structured).lstrip()
-        tree = ast.parse(src)
-        call = next(
-            node for node in ast.walk(tree)
-            if isinstance(node, ast.Call)
-            and getattr(node.func, "attr", None) == "plan_structured"
+        session = session_service.create_session(
+            f"member-{uuid.uuid4()}", sample_profile,
         )
-        avoid = next(kw for kw in call.keywords if kw.arg == "avoid_recent")
-        assert "is_refinement" in ast.unparse(avoid.value)
+        session_service.add_meal_plan(
+            session.session_id, make_candidates("cur"), "r", {},
+        )
+        svc = ChatService.__new__(ChatService)
+        svc.session_service = session_service
 
-    def test_weekly_does_the_same(self):
+        avoided = svc._avoid_for(session.session_id, is_refinement=True)
+        assert set(avoided) == {"cur-b", "cur-l", "cur-d"}
+
+    def test_a_fresh_plan_avoids_the_session_history(self, session_service, sample_profile):
+        from conftest import make_candidates
+        from services.chat_service import ChatService
+
+        session = session_service.create_session(
+            f"member-{uuid.uuid4()}", sample_profile,
+        )
+        for n in range(2):
+            session_service.add_meal_plan(
+                session.session_id, make_candidates(f"p{n}"), "r", {},
+            )
+        svc = ChatService.__new__(ChatService)
+        svc.session_service = session_service
+
+        avoided = svc._avoid_for(session.session_id, is_refinement=False)
+        assert any("p0" in r for r in avoided) and any("p1" in r for r in avoided)
+
+    def test_no_plan_yet_means_nothing_to_avoid(self, session_service, sample_profile):
+        from services.chat_service import ChatService
+
+        session = session_service.create_session(
+            f"member-{uuid.uuid4()}", sample_profile,
+        )
+        svc = ChatService.__new__(ChatService)
+        svc.session_service = session_service
+        assert svc._avoid_for(session.session_id, is_refinement=True) == []
+
+    def test_weekly_still_only_avoids_on_a_fresh_week(self):
+        """A weekly refinement re-runs a 21-slot walk that already excludes
+        within itself; avoiding the previous week as well would empty pools on
+        a narrow diet before the week was half planned."""
         import inspect
 
         from services.weekly_plan_service import WeeklyPlanService

@@ -404,6 +404,34 @@ class ChatService:
             }
         return pinned
 
+    def _avoid_for(self, session_id: str, is_refinement: bool) -> list[str]:
+        """Dishes this plan should not serve, because they were just served.
+
+        A soft preference the fetch gives up rather than empty a slot — see
+        `PlanningPipeline.generate`.
+
+        The two cases differ in WHICH plan to avoid, not in whether to:
+
+        * **Fresh plan** — the last few plans of the session. Without it, "plan
+          my day" twice returns the same day: RecipeWrangler's order is
+          deterministic and the grader runs at temperature 0.
+        * **Refinement** — the plan being refined. This used to pass nothing,
+          on the reasoning that "a refinement is a request to change the plan
+          on screen, so keeping its unchanged slots is the whole point". That
+          reasoning was wrong about this path: it regenerates every slot, and
+          slot preservation belongs to `edit_service`, which handles a
+          single-slot swap. So "make it lighter" refetched the same pool, took
+          the same head of it, and handed back the same three dishes.
+
+        Anchors need no special case. A pinned slot's pool is replaced by its
+        anchor outright, so excluding the anchor from the fetch cannot lose it.
+        """
+        session = self.session_service.get_session(session_id)
+        if not is_refinement:
+            return plan_history.recently_served(session)
+        current = session.get_current_daily_plan() if session else None
+        return plan_history.plan_recipe_ids(current) if current else []
+
     def _generate_and_store(
         self,
         session_id: str,
@@ -464,16 +492,9 @@ class ChatService:
             final_query, profile, pinned=pinned,
             exclude_recipe_ids=list(signals.downvoted_recipe_ids or [])
             + list(profile.get("_excluded_recipe_ids") or []),
-            # What the member was just served. Only on a FRESH plan: a
-            # refinement is a request to change the plan on screen, so keeping
-            # its unchanged slots is the whole point, and a refinement that
-            # avoided its own dishes would replace everything every time.
-            avoid_recent=(
-                [] if is_refinement
-                else plan_history.recently_served(
-                    self.session_service.get_session(session_id)
-                )
-            ),
+            # What the member was just served — the session's recent plans on a
+            # fresh request, the plan on screen on a refinement.
+            avoid_recent=self._avoid_for(session_id, is_refinement),
             feedback_history=signals.history_text,
         )
         if not plans:
@@ -668,12 +689,7 @@ class ChatService:
 
         meal_plan = self.pipeline.plan_structured(
             profile, spec, exclude_recipe_ids=excluded, pinned=pinned,
-            avoid_recent=(
-                [] if is_refinement
-                else plan_history.recently_served(
-                    self.session_service.get_session(session_id)
-                )
-            ),
+            avoid_recent=self._avoid_for(session_id, is_refinement),
             # The member's words. This path had no query parameter at all, so
             # the shape was honoured and the request was not — and the reply
             # was then phrased around something that reached nothing.

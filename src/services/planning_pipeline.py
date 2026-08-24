@@ -23,7 +23,9 @@ from agents import DocumentGrader
 from models.plan_spec import PlanSpec
 from models.recipe import CandidateRecipe, ScoredPlan
 from models.session import MealPlan
-from services import intent_facets, meal_composer, pantry_service, plan_parameters
+from services import (
+    intent_facets, meal_composer, pantry_service, plan_parameters, plate_critic,
+)
 from services.candidates_client import CANDIDATES, effective_diet, screening_allergens
 from services import turn_budget
 
@@ -261,6 +263,25 @@ class PlanningPipeline:
             )
             return []
 
+        # Reason about the picks BEFORE anything selects one.
+        #
+        # `plan_meals` returns a deterministic order — planning tier, then
+        # Nutri-Score, then curated source. That is a good tiebreak and a poor
+        # decision, and taking its head had two consequences a member saw: an
+        # 11%-of-the-day breakfast beside a 45% lunch, every constraint
+        # honoured; and the same three dishes every time, because a fixed order
+        # plus "take the first" is a function with one output.
+        #
+        # Reordering here rather than overriding a pick later means the grader
+        # ranks a pool whose head already fits the slot, and the unranked
+        # fallback's "first" is a reasoned first. Nothing is dropped: a pool
+        # this emptied would turn a quality opinion into "no meals exist".
+        candidates, critic_findings = plate_critic.rank_pool(
+            candidates, kcal_target=_day_kcal_target(profile),
+        )
+        if critic_findings:
+            logger.info("Plate critic: %s", "; ".join(critic_findings[:4]))
+
         # The grader hears about the pantry as a preference in the query text;
         # every user-facing coverage CLAIM still comes from the deterministic
         # matcher (pantry_service), never from the model.
@@ -301,10 +322,14 @@ class PlanningPipeline:
         # about their collection, and finding out by recognising the photo is
         # worse than being told.
         note = _repeat_note(repeated_slots)
+        # When the grader cannot run, this ordering IS the reasoning — so what
+        # it moved out of the way is what the member is owed.
+        critique_note = "; ".join(critic_findings[:2])
 
         if turn_budget.skip("plan grading", turn_budget.COST_GRADING):
             return _with_note(self._assemble_from_pool(
                 candidates, "not ranked — the plan was taking too long",
+                critique=critique_note,
             ), note)
 
         try:
@@ -318,7 +343,10 @@ class PlanningPipeline:
             # beats an apology.
             logger.error("Grader failed (%s) — serving the unranked pool", exc)
             return _with_note(
-                self._assemble_from_pool(candidates, "not ranked — grader unavailable"),
+                self._assemble_from_pool(
+                    candidates, "not ranked — grader unavailable",
+                    critique=critique_note,
+                ),
                 note,
             )
 
@@ -596,15 +624,18 @@ class PlanningPipeline:
 
     @staticmethod
     def _assemble_from_pool(
-        candidates: dict, note: str = ""
+        candidates: dict, note: str = "", critique: str = ""
     ) -> list[ScoredPlan]:
-        """Take the top candidate per slot, unranked.
+        """Take the top candidate per slot — now a REASONED top.
 
         Used when the grader cannot rank — it raised, or returned nothing. The
         pool it would have ranked is already there and already respects every
         constraint, so there is nothing to re-fetch: the deterministic order
         `plan_meals` returned (planning tier, then Nutri-Score, then curated
-        source) is a perfectly reasonable plan on its own.
+        source) is a reasonable tiebreak — but it is not a decision, which is
+        why `plate_critic` has already reordered the pool by then. "First" here
+        means the best-fitting candidate for the slot, not the first one the
+        service happened to return.
 
         This used to make a second call to `plan_meals` for exactly the pool it
         already had in hand.
@@ -621,6 +652,11 @@ class PlanningPipeline:
         reasoning = "Assembled directly from your constraints"
         if note:
             reasoning += f" ({note})"
+        if critique:
+            # What the plate critic moved out of the way. With no grader this
+            # is the only reasoning that happened, so it is the only reasoning
+            # there is to report.
+            reasoning += f". Preferred these over the first matches — {critique}"
         return [
             ScoredPlan(
                 breakfast=candidates["breakfast"][0],
