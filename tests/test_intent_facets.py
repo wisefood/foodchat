@@ -369,18 +369,22 @@ class TestSlidersThatUsedToDoNothing:
                      "healthy_and_nutritious"],
         }
 
-    def test_easy_maps_onto_proxies_that_exist(self):
+    def test_simple_maps_onto_the_one_proxy_that_exists(self):
         """RecipeWrangler has no difficulty field at all — grep returns nothing.
-        `easy` does have honest proxies in the corpus."""
+        `5_ingredients_or_less` is a real, checkable form of "keep it simple".
+
+        Deliberately NOT `30_minutes_or_less` as well: duration is its own
+        control, and two controls writing the same filter is how they end up
+        disagreeing about what the member asked for."""
         self._vocab()
         got = F.facet_kwargs({"plan_parameters": {"difficulty": "easy"},
                               "food_likes": []})
-        assert set(got["tags"]) == {"30_minutes_or_less", "5_ingredients_or_less"}
+        assert set(got["tags"]) == {"5_ingredients_or_less"}
 
     @pytest.mark.parametrize("level", ["medium", "hard"])
     def test_levels_with_no_signal_apply_nothing(self, level):
-        """There is no "elaborate" annotation to ask for, and inventing one
-        would empty every slot. Applying nothing is the honest outcome."""
+        """"Any" is the honest middle, and "hard" no longer exists as an
+        option — a stored value from before the change must still be harmless."""
         self._vocab()
         got = F.facet_kwargs({"plan_parameters": {"difficulty": level},
                               "food_likes": []})
@@ -393,8 +397,7 @@ class TestSlidersThatUsedToDoNothing:
             "food_likes": [],
         })
         assert set(got["tags"]) == {
-            "high_protein", "high_fibre", "30_minutes_or_less",
-            "5_ingredients_or_less",
+            "high_protein", "high_fibre", "5_ingredients_or_less",
         }
 
 

@@ -74,22 +74,24 @@ GOAL_CLAIM_TAGS: dict[str, list[str]] = {
     "energy": ["high_protein", "high_fibre"],
 }
 
-# Difficulty, mapped onto the only signals that exist for it.
+# Effort — what "difficulty" turned into once it had to be true.
 #
-# RecipeWrangler has NO difficulty field — `grep -ri difficulty` across its
-# source returns nothing. So the slider was a pure no-op: prose to a grader that
-# two of the three planning paths never run. `easy` does have honest proxies in
-# the corpus (`5_ingredients_or_less` 563 recipes, `30_minutes_or_less` 2809),
-# so it becomes real here.
+# RecipeWrangler has NO difficulty field: `grep -ri difficulty` across its
+# source returns nothing. There is no tag, no vocabulary, nothing to ask for.
+# So Easy/Medium/Elaborate was a control where two of the three options changed
+# the plan in no way at all, which is the question a member eventually asks out
+# loud: why is this here?
 #
-# `medium` and `hard` map to nothing, and that is deliberate rather than an
-# omission: there is no "elaborate" annotation to ask for, and inventing one
-# would empty every slot. They stay selectable — removing an option is a UI
-# contract change — but they now apply nothing instead of pretending.
+# What the corpus does carry is `5_ingredients_or_less` (563 recipes), which is
+# a real, checkable form of "keep it simple". So the control is now that, and
+# "Elaborate" is gone rather than kept as decoration.
 DIFFICULTY_CLAIM_TAGS: dict[str, list[str]] = {
-    "easy": ["30_minutes_or_less", "5_ingredients_or_less"],
+    # `5_ingredients_or_less` only, not `30_minutes_or_less` as well: cooking
+    # time is its own control, and two controls writing the same filter is how
+    # they end up disagreeing about what the member asked for.
+    "easy": ["5_ingredients_or_less"],
+    # "Any" — the default, and an honest answer rather than a dead option.
     "medium": [],
-    "hard": [],
 }
 
 # The nutrition claims a member states directly, as opposed to via the slider.

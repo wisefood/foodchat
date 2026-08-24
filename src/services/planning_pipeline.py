@@ -49,6 +49,23 @@ def _day_kcal_target(profile: dict) -> float | None:
 
 
 
+# What each food-waste setting asks the grader for. Deliberately phrased as a
+# trade rather than a rule: reuse pulls against variety, and the member chose
+# which side of that they want.
+_WASTE_PREFERENCE = {
+    "reuse": (
+        "The user wants to reduce food waste. Prefer combinations whose meals "
+        "share fresh ingredients with each other, so fewer things are bought "
+        "and left to spoil — but not at the cost of the day being repetitive."
+    ),
+    "strict": (
+        "The user wants the smallest possible shopping list. Strongly prefer "
+        "combinations whose meals share ingredients, even where that makes the "
+        "day less varied. They have asked for this trade explicitly."
+    ),
+}
+
+
 def _repeat_note(slots: list[str]) -> str:
     """One clause naming the meals that had to reuse a recent dish, or ""."""
     if not slots:
@@ -254,6 +271,25 @@ class PlanningPipeline:
                 f"(reduce food waste): {', '.join(pantry)}. Prefer combinations "
                 "that together use as many of them as possible."
             )
+        # The food-waste setting, on the path where it did nothing.
+        #
+        # `waste_mode` had exactly one reader — the weekly planner's scorer —
+        # and its own docstring said the daily path "hears the same setting as
+        # prose via describe". It does not: `describe` builds the canonical
+        # message for a slider APPLY, so a member with reuse standing got it
+        # once, on the turn they set it, and never again. Every later "plan my
+        # day" ignored it.
+        #
+        # It belongs in the grader's query rather than in a filter, because it
+        # is a property of a COMBINATION — whether three meals share a bunch of
+        # coriander — and the grader is the only thing here that sees all three
+        # at once. No recipe is excluded for it.
+        waste = plan_parameters.waste_mode(profile.get("plan_parameters") or {})
+        if waste != "off":
+            grader_query += (
+                "\n\n" + _WASTE_PREFERENCE[waste]
+            )
+            logger.info("Food-waste preference reaching the grader: %s", waste)
 
         # Running late? Take the same exit a failed grader takes. The pool is
         # already constraint-correct and ordered by planning tier and

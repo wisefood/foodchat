@@ -40,13 +40,29 @@ PARAMETER_DEFS: list[dict] = [
         "default": 30,
     },
     {
+        # Was "Difficulty", with Easy / Medium / Elaborate — and two of those
+        # three filtered nothing. `grep -ri difficulty` across RecipeWrangler
+        # returns nothing: there is no difficulty field, no tag and no
+        # vocabulary, so "Elaborate" was a control that changed the plan in no
+        # way whatsoever and said nothing about it.
+        #
+        # What the corpus CAN express is simplicity: `5_ingredients_or_less`
+        # (563 recipes). So the parameter is now that, under a name that says
+        # it, with the option that meant nothing removed. Deliberately NOT
+        # `30_minutes_or_less` as well — duration is the control right above
+        # this one, and two controls setting the same filter is how they end up
+        # disagreeing.
+        #
+        # `ordered` marks a scale the UI can render as a draggable toggle
+        # rather than a row of pills: simple → any is a direction, unlike the
+        # goals below, which are alternatives.
         "key": "difficulty",
-        "label": "Difficulty",
+        "label": "Effort",
         "kind": "choice",
+        "ordered": True,
         "options": [
-            {"value": "easy", "label": "Easy"},
-            {"value": "medium", "label": "Medium"},
-            {"value": "hard", "label": "Elaborate"},
+            {"value": "easy", "label": "Simple"},
+            {"value": "medium", "label": "Any"},
         ],
         "default": "medium",
     },
@@ -76,6 +92,7 @@ PARAMETER_DEFS: list[dict] = [
         "key": "food_waste",
         "label": "Food waste",
         "kind": "choice",
+        "ordered": True,
         "options": [
             {"value": "off", "label": "Off"},
             # Reuse fresh ingredients across the plan; pantry staples (oil,
@@ -114,9 +131,18 @@ _PHRASES = {
 def waste_mode(values: dict) -> str:
     """The applied food-waste setting: 'off', 'reuse' or 'strict'.
 
-    Read by the weekly planner's scorer, which selects without an LLM — a
-    preference that never becomes a number there is a preference that does
-    not exist. The daily path hears the same setting as prose via `describe`.
+    Two readers, because the two paths choose differently. The weekly planner
+    selects without an LLM, so there it becomes a number in the preference
+    scorer — a preference that never becomes a number there does not exist. The
+    daily path ranks combinations with a grader, so there it becomes a line in
+    the grader's query: whether three meals share a bunch of coriander is a
+    property of the COMBINATION, and the grader is the only thing that sees all
+    three at once.
+
+    It used to say the daily path heard this "as prose via `describe`". It did
+    not: `describe` builds the canonical message for a slider APPLY, so a
+    member with reuse standing got it once, on the turn they set it, and every
+    later "plan my day" ignored it.
     """
     value = values.get("food_waste")
     return value if value in ("reuse", "strict") else "off"
