@@ -290,11 +290,16 @@ class TestWhatMustBeJudged:
         chosen = meal_composer.judge("something rich", {"dinner": options}, agent=judge)
         assert chosen["dinner"] is options[other]
 
-    def test_the_reason_is_recorded_as_a_judgement_not_a_measurement(self):
+    def test_the_reason_is_kept_apart_from_the_measurements(self):
+        """It is the one thing here worth SAYING — "the slaw cuts the rich
+        pork" is about the food. It used to be appended to `findings`, which
+        put the marker this code invented for its own bookkeeping straight onto
+        the member's plan: "day 1 lunch: chosen for the table: …"."""
         options = _two_options()
         judge = _Judge({"dinner": (1, "the slaw cuts the rich pork")})
         chosen = meal_composer.judge("rich", {"dinner": options}, agent=judge)
-        assert any("chosen for the table" in f for f in chosen["dinner"].findings)
+        assert chosen["dinner"].pairing == "the slaw cuts the rich pork"
+        assert not any("chosen for the table" in f for f in chosen["dinner"].findings)
 
     def test_it_is_one_call_for_the_whole_plan(self):
         """A week with a side at dinner is seven judgements. Seven round trips

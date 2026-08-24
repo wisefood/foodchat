@@ -322,14 +322,10 @@ class PlanningPipeline:
         # about their collection, and finding out by recognising the photo is
         # worse than being told.
         note = _repeat_note(repeated_slots)
-        # When the grader cannot run, this ordering IS the reasoning — so what
-        # it moved out of the way is what the member is owed.
-        critique_note = "; ".join(critic_findings[:2])
 
         if turn_budget.skip("plan grading", turn_budget.COST_GRADING):
             return _with_note(self._assemble_from_pool(
                 candidates, "not ranked — the plan was taking too long",
-                critique=critique_note,
             ), note)
 
         try:
@@ -343,10 +339,7 @@ class PlanningPipeline:
             # beats an apology.
             logger.error("Grader failed (%s) — serving the unranked pool", exc)
             return _with_note(
-                self._assemble_from_pool(
-                    candidates, "not ranked — grader unavailable",
-                    critique=critique_note,
-                ),
+                self._assemble_from_pool(candidates, "not ranked — grader unavailable"),
                 note,
             )
 
@@ -608,23 +601,43 @@ class PlanningPipeline:
             )
         if relaxations:
             parts.append("; ".join(relaxations))
-        if findings:
-            # Measured, and said. A plate that runs to twice its share of the
-            # meal, or two plates leaning on the same vegetable, is exactly the
-            # thing a member would spot themselves and wonder why nobody
-            # mentioned. Capped so the reasoning stays a sentence.
-            parts.append("; ".join(findings[:3]))
+        # Composition findings deliberately do NOT go in here.
+        #
+        # They did, and the member read this on their plan:
+        #
+        #   "day 1 dinner: chosen for the table: The hearty burgers are
+        #    balanced by the bright ginger-dressed beans; day 1 lunch: side is
+        #    52 kcal against a 300 kcal share"
+        #
+        # "chosen for the table" is a marker this code invented for its own
+        # bookkeeping, "against a 300 kcal share" is internal accounting, and
+        # "day 1" is noise on a one-day plan. All of it is true and none of it
+        # is a sentence anybody wants about their dinner.
+        #
+        # The findings stay where they belong: the log, and `plan_value` for the
+        # response writer, which phrases them. This field is the plan's own
+        # short factual account — shape, relaxations, plates that could not be
+        # filled — and it is rendered verbatim on the canvas.
 
         concerns = spec.concerns()
         reasoning = ". ".join(parts) + "."
         if concerns:
             reasoning += " " + " ".join(concerns)
 
-        return MealPlan.from_days(days, reasoning=reasoning)
+        plan = MealPlan.from_days(days, reasoning=reasoning)
+        # Why the dishes of each meal go together, for the reply to phrase.
+        # Attached rather than folded into `reasoning`, which is rendered
+        # verbatim on the canvas — the same reason the metrics are attached.
+        plan.pairings = [
+            f"{label.replace('day 1 ', '')}: {composition.pairing}"
+            for label, composition in sorted(chosen.items())
+            if composition.pairing
+        ]
+        return plan
 
     @staticmethod
     def _assemble_from_pool(
-        candidates: dict, note: str = "", critique: str = ""
+        candidates: dict, note: str = ""
     ) -> list[ScoredPlan]:
         """Take the top candidate per slot — now a REASONED top.
 
@@ -652,11 +665,11 @@ class PlanningPipeline:
         reasoning = "Assembled directly from your constraints"
         if note:
             reasoning += f" ({note})"
-        if critique:
-            # What the plate critic moved out of the way. With no grader this
-            # is the only reasoning that happened, so it is the only reasoning
-            # there is to report.
-            reasoning += f". Preferred these over the first matches — {critique}"
+        # The critic's arithmetic is NOT appended here. It is real and it is
+        # internal: "226 kcal is 54% under what breakfast should carry" belongs
+        # in the log, where someone debugging a pick will look for it, and not
+        # on a member's plan. What they are owed is already in `note` — that
+        # this plan was not ranked.
         return [
             ScoredPlan(
                 breakfast=candidates["breakfast"][0],

@@ -210,3 +210,63 @@ class TestTheVoiceIsNotAComplianceReport:
         assert any(
             p.name.endswith("response_writer_system_v2") for p in prompts.ALL_PROMPTS
         )
+
+
+class TestWhyTheDishesGoTogether:
+    """The one part of composition worth saying out loud.
+
+    It used to be appended to the composition's `findings` and then joined into
+    the plan's `reasoning`, which is rendered verbatim on the canvas. A member
+    read this on their own plan:
+
+        "day 1 dinner: chosen for the table: The hearty burgers are balanced by
+         the bright ginger-dressed beans and peas; day 1 lunch: side is 52 kcal
+         against a 300 kcal share"
+
+    "chosen for the table" is a marker this code invented for its own
+    bookkeeping, "against a 300 kcal share" is internal accounting, and "day 1"
+    is noise on a one-day plan. All true; none of it a sentence anybody wants
+    about their dinner.
+    """
+
+    def test_a_pairing_reaches_the_reply_as_a_fact(self):
+        plan = _plan(_plate("a", "Pork belly", kcal=600))
+        plan.pairings = ["dinner: the pickled slaw cuts the rich pork"]
+        value = transparency.plan_value(plan, {})
+        assert value["pairings"] == ["dinner: the pickled slaw cuts the rich pork"]
+
+    def test_no_pairing_means_no_key(self):
+        plan = _plan(_plate("a", "Stew", kcal=600))
+        assert "pairings" not in transparency.plan_value(plan, {})
+
+    def test_the_internal_marker_is_not_produced_any_more(self):
+        """Checked against the module's string LITERALS, not its text — the
+        comment explaining why it went would match a plain substring search,
+        and then the test would pass on the explanation instead of the code."""
+        import ast
+        import pathlib as _pathlib
+
+        source = (_pathlib.Path("src") / "services" / "meal_composer.py").read_text()
+        literals = [
+            node.value for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        ]
+        offenders = [
+            text for text in literals
+            if "chosen for the table" in text and not text.lstrip().startswith('"""')
+            and "\n" not in text  # docstrings are prose, not output
+        ]
+        assert not offenders, offenders
+
+    def test_composition_findings_do_not_reach_the_canvas_reasoning(self):
+        """`reasoning` is rendered verbatim, so it is the plan's own short
+        factual account — shape, relaxations, plates that could not be
+        filled — and nothing else."""
+        import inspect
+
+        from services.planning_pipeline import PlanningPipeline
+
+        src = inspect.getsource(PlanningPipeline.plan_structured)
+        # The reasoning is assembled from `parts`; findings must not be in it.
+        assert 'parts.append("; ".join(findings' not in src
+        assert "plan.pairings" in src

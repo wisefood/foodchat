@@ -191,13 +191,18 @@ class TestItRunsBeforeAnythingSelects:
         assert critic_at != -1, "the pool is never critiqued"
         assert critic_at < grade_at, "the grader ranks the raw order"
 
-    def test_the_unranked_fallback_reports_what_it_preferred(self):
-        """With no grader this ordering IS the reasoning, so it is the only
-        reasoning there is to report."""
+    def test_the_arithmetic_is_logged_and_never_rendered(self):
+        """"226 kcal is 54% under what breakfast should carry" is real, and it
+        is internal. It belongs where someone debugging a pick will look for
+        it, not on a member's plan — the member is owed the fact that this plan
+        was not ranked, which `note` already carries."""
         import inspect
 
         from services.planning_pipeline import PlanningPipeline
 
-        src = inspect.getsource(PlanningPipeline._assemble_from_pool)
-        assert "critique" in src
-        assert "Preferred these over the first matches" in src
+        generate = inspect.getsource(PlanningPipeline.generate)
+        assert 'logger.info("Plate critic' in generate
+
+        assemble = inspect.getsource(PlanningPipeline._assemble_from_pool)
+        assert "critic_findings" not in assemble
+        assert "reasoning +=" in assemble  # the note still reaches the member

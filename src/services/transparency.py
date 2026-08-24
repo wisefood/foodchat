@@ -354,6 +354,14 @@ def plan_value(
     if grades:
         value["nutri_score"] = grades
 
+    pairings = [str(x) for x in (getattr(meal_plan, "pairings", None) or []) if x]
+    if pairings:
+        # Why the dishes of a meal go together, in the judge's own words. The
+        # one part of composition worth saying out loud — and it reaches the
+        # reply as a fact to phrase rather than as a string rendered on the
+        # canvas, which is how "chosen for the table:" ended up on a plan.
+        value["pairings"] = pairings[:3]
+
     if pantry_facts and pantry_facts.get("used"):
         # The sustainability half, and the only one the member asked for
         # directly: food they already had, now going into a meal instead of a

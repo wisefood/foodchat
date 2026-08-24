@@ -121,9 +121,16 @@ class Composition:
     slot: str
     plates: list[Plate]
     score: float = 0.0
-    # Measured, not asserted: what the arithmetic actually found. Rendered into
-    # the ledger, so it has to describe the plan that exists.
+    # Measured, not asserted: what the arithmetic actually found. For the log
+    # and the ledger — NOT for the member's reply. "side is 52 kcal against a
+    # 300 kcal share" is true, internal, and not a sentence anybody wants about
+    # their dinner.
     findings: list[str] = field(default_factory=list)
+    # Why these dishes go together, in the judge's own words. Kept apart from
+    # `findings` because it is the one thing here worth SAYING: "the fresh
+    # sautéed peppers cut the richness of the herby onion rice" is about the
+    # food, and the response writer can phrase it.
+    pairing: str = ""
 
     @property
     def recipe_ids(self) -> list[str]:
@@ -458,9 +465,10 @@ def judge(
             continue
         picked = entries[index]
         if reason:
-            # Recorded on the composition, so the ledger can say a model chose
-            # this and why — rather than presenting a judgement as a measurement.
-            picked.findings.append(f"chosen for the table: {reason}")
+            # Its own field, not a finding. Appending it to `findings` put
+            # "chosen for the table: …" — a marker this code invented for its
+            # own bookkeeping — straight onto the member's plan.
+            picked.pairing = reason
         chosen[label] = picked
     return chosen
 
