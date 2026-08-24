@@ -504,7 +504,7 @@ class ProfileService:
         likes = list(primary.get("food_likes") or [])
         for other in others:
             for like in other.get("food_likes") or []:
-                if str(like).lower() not in [str(l).lower() for l in likes]:
+                if str(like).lower() not in [str(seen).lower() for seen in likes]:
                     likes.append(like)
         merged["food_likes"] = likes
 

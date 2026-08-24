@@ -19,14 +19,6 @@ import uuid
 from datetime import datetime as dt, timezone as _tz
 from typing import Dict, List, Optional
 
-
-def _aware(value):
-    """Coerce pre-M5 naive timestamps (assumed UTC) to aware — mixing naive
-    and aware datetimes in sort keys raises TypeError."""
-    if value is not None and value.tzinfo is None:
-        return value.replace(tzinfo=_tz.utc)
-    return value
-
 from db import (
     db_update_session_title,
     db_set_plan_saved,
@@ -60,6 +52,15 @@ from models.session import (
     WeeklyMealPlan,
     MAX_MESSAGES_PER_SESSION,
 )
+
+
+def _aware(value):
+    """Coerce pre-M5 naive timestamps (assumed UTC) to aware — mixing naive
+    and aware datetimes in sort keys raises TypeError."""
+    if value is not None and value.tzinfo is None:
+        return value.replace(tzinfo=_tz.utc)
+    return value
+
 
 logger = logging.getLogger(__name__)
 

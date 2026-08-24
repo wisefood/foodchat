@@ -1,7 +1,6 @@
 """WiseFood Client connection pool for efficient client instance management."""
 import os
 import logging
-from typing import Optional
 from threading import Lock
 from contextlib import contextmanager
 

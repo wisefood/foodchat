@@ -23,12 +23,12 @@ from dotenv import load_dotenv
 # Load .env before any module reads os.getenv at import time (agents, backends).
 load_dotenv()
 
-from fastapi import FastAPI
+from fastapi import FastAPI  # noqa: E402 — must follow load_dotenv()
 
-import auth
-from db import init_db
-from routers import foodchat_router
-from services import (
+import auth  # noqa: E402
+from db import init_db  # noqa: E402
+from routers import foodchat_router  # noqa: E402
+from services import (  # noqa: E402
     init_chat_service,
     init_weekly_plan_service,
     init_memory_service,

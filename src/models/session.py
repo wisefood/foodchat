@@ -18,12 +18,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Literal, Optional
 
+from models.recipe import CandidateRecipe
+
 
 def _utcnow() -> datetime:
     """Aware UTC now — every timestamp in the domain model carries tzinfo."""
     return datetime.now(timezone.utc)
-
-from models.recipe import CandidateRecipe
 
 MAX_MESSAGES_PER_SESSION = int(os.getenv("SESSION_MAX_MESSAGES", "200"))
 

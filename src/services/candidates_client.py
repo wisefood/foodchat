@@ -23,7 +23,7 @@ from typing import Optional
 
 import httpx
 
-from models.recipe import CandidateRecipe, CandidatesBySlot, RecipeEnrichment, ResolvedRecipe
+from models.recipe import CandidateRecipe, RecipeEnrichment, ResolvedRecipe
 
 logger = logging.getLogger(__name__)
 

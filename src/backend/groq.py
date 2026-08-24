@@ -5,7 +5,6 @@ import hashlib
 import json
 from typing import Optional, Dict, Any, Union
 from threading import Lock
-from pydantic import BaseModel
 from langchain_groq import ChatGroq
 
 from backend.model_profiles import apply_profile

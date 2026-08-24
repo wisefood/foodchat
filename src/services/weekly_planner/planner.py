@@ -93,7 +93,7 @@ def build_preference_scorer(
     asked for it in words.
     """
     favorites = {str(f) for f in (user_profile.get("favorite_recipe_ids") or [])}
-    likes = [str(l).lower() for l in (user_profile.get("food_likes") or [])]
+    likes = [str(like).lower() for like in (user_profile.get("food_likes") or [])]
 
     from services import plan_parameters  # local import; avoids a cycle at module load
     from services.pantry_service import matched_items, normalize_items

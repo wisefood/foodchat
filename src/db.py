@@ -19,7 +19,6 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import (
-    Boolean,
     Column,
     DateTime,
     ForeignKey,

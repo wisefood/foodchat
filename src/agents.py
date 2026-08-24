@@ -26,13 +26,16 @@ import json
 import logging
 import os
 import random
-from typing import Optional, Sequence
+from typing import TYPE_CHECKING, Optional, Sequence
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from backend.groq import GROQ_CHAT
 from backend.observability import build_trace_config
 from models.recipe import CandidatesBySlot, ScoredPlan, slot_sort_key
+if TYPE_CHECKING:  # import-time cycle: models.plan_spec reaches back here
+    from models.plan_spec import PlanSpec
+
 from prompts import (
     PLAN_GRADER_SYSTEM,
     TOOL_SELECTOR_SYSTEM,
@@ -461,7 +464,7 @@ class QueryReconciler:
         known_facts = "; ".join(filter(None, [
             ", ".join(user_profile.get("preferences") or []),
             user_profile.get("history") or "",
-            ", ".join(f"likes {l}" for l in (user_profile.get("food_likes") or [])[:5]),
+            ", ".join(f"likes {like}" for like in (user_profile.get("food_likes") or [])[:5]),
         ])) or "(nothing on file)"
 
         result = self.query_reconciler.invoke(as_json_messages([
