@@ -263,3 +263,66 @@ class TestItReachesTheTurnAndTheRouter:
         text = EditService._structured_miss_text(days, 1, "breakfast")
         assert "add breakfast" in text
         assert "Which of those should I change?" not in text
+
+
+class TestPhrasingsFoundByProbing:
+    """The gaps a written-down list of cases does not find.
+
+    Each of these came from running plausible member phrasings through the
+    reader and looking at what it did — which is how the "should have" and the
+    plural came to light, both of them silently doing nothing.
+    """
+
+    @pytest.mark.parametrize("message,expected", [
+        ("can you add a breakfast", "added breakfast"),
+        ("i'd like a snack too", "added snack"),
+        ("lunch should have a soup as well", "added a soup to lunch"),
+        ("dinner needs a salad", "added a salad to dinner"),
+        ("also a drink with dinner", "added a drink to dinner"),
+        ("throw in a dessert after dinner", "added a dessert to dinner"),
+    ])
+    def test_phrasings_that_mean_add(self, message, expected):
+        assert add(message)[1] == [expected]
+
+    def test_a_plural_is_the_same_request(self):
+        """"Add two sides to dinner" matched nothing at all, because the reader
+        looked for `side` and the member wrote `sides`."""
+        bare = PlanSpec(meals=("lunch", "dinner"))
+        spec, changed = shape_intent.additions("add two sides to dinner", bare)
+        assert changed == ["added a side to dinner"]
+        assert spec.roles_for("dinner") == ("main", "side")
+
+    @pytest.mark.parametrize("message,focus", [
+        ("what's for breakfast?", None),
+        ("the breakfast is too heavy", None),
+        ("i had breakfast already", None),
+        ("replace breakfast", None),
+        ("just breakfast today", None),
+        ("only lunch and dinner", None),
+        ("less salad please", "lunch"),
+        ("swap the salad for something else", "lunch"),
+    ])
+    def test_phrasings_that_do_not(self, message, focus):
+        """A question about a meal, a complaint about one, a memory of one and a
+        request to REPLACE one all mention a slot and none of them is an
+        addition. "Only" and "just" are narrowings, which the shape extractor
+        owns — this reader deliberately stays out of them."""
+        assert add(message, focus=focus)[1] == []
+
+
+class TestWhatThisReaderDoesNotDo:
+    """Written down because the alternative is someone assuming it does."""
+
+    def test_it_cannot_remove_a_meal(self):
+        """"Instead of" is a replacement, and this reader only adds — so
+        "give me a brunch instead of lunch" adds the brunch and leaves the
+        lunch. Half the request, and the half it can express."""
+        spec, changed = add("give me a brunch instead of lunch")
+        assert changed == ["added brunch"]
+        assert "lunch" in spec.meals
+
+    def test_a_bare_slot_name_is_not_a_request(self):
+        """"Breakfast please" is plausibly one. So is "what's for breakfast?",
+        and nothing in the words separates them — so neither fires, and the
+        dead-end sentence tells the member the phrasing that does."""
+        assert add("breakfast please")[1] == []

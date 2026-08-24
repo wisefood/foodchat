@@ -46,7 +46,11 @@ logger = logging.getLogger(__name__)
 # a meal.
 _ADD = (
     r"(?:add|include|throw in|chuck in|put in|put|give me|i want|"
-    r"i'd like|also|as well as|plus|with|and)"
+    r"i'd like|i would like|"
+    # "lunch should have a soup as well" is an addition phrased as a
+    # requirement rather than a command, and it was reaching nothing.
+    r"should (?:have|get|come with)|needs?|wants?|have|"
+    r"also|as well as|plus|with|and)"
 )
 
 # Words that mean "not that" — so "no dessert" and "without a salad" are never
@@ -167,7 +171,9 @@ def _mentioned_as_addition(text: str, word: str) -> bool:
     simply be listed ("lunch with a salad"). What disqualifies it is a negation
     anywhere in the same clause — "no dessert" must never grow a dessert.
     """
-    pattern = re.compile(rf"\b{re.escape(word)}\b", re.IGNORECASE)
+    # An optional plural, because "add two sides to dinner" is the same request
+    # as "add a side" and matched nothing at all.
+    pattern = re.compile(rf"\b{re.escape(word)}(?:e?s)?\b", re.IGNORECASE)
     for match in pattern.finditer(text):
         clause = _clause_around(text, match.start())
         # Where the target sits inside its own clause, so "not" is only a
@@ -175,7 +181,9 @@ def _mentioned_as_addition(text: str, word: str) -> bool:
         local = clause.lower().rfind(word.lower())
         if local != -1 and _NEGATED_BEFORE.search(clause[:local]):
             continue
-        if re.search(rf"{_ADD}\b[^.;]*\b{re.escape(word)}\b", clause, re.IGNORECASE):
+        if re.search(
+            rf"{_ADD}\b[^.;]*\b{re.escape(word)}(?:e?s)?\b", clause, re.IGNORECASE,
+        ):
             return True
     return _stated_missing(text, word)
 
@@ -213,7 +221,7 @@ def _named_slot(text: str, spec) -> Optional[str]:
 
     named = [
         slot for slot in KNOWN_SLOTS
-        if re.search(rf"\b{slot}\b", text, re.IGNORECASE)
+        if re.search(rf"\b{slot}(?:e?s)?\b", text, re.IGNORECASE)
     ]
     # A word that is also a ROLE is not the naming of a meal.
     #
