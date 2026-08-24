@@ -82,6 +82,28 @@ class PlanClient:
     def vocabularies(self) -> dict:
         return self.manifest().get("vocabularies") or {}
 
+    def accepts(self, tool: str, field: str) -> bool:
+        """Whether the live service takes this request field on this tool.
+
+        The planning surface rejects unknown fields with a 422 rather than
+        ignoring them — deliberately, so a misremembered name is reported
+        instead of silently widening a query. The consequence for a caller is
+        that there is no safe way to try an optional parameter and see: it
+        either knows the field exists or it must not send it.
+
+        So the manifest says. Each tool entry carries `accepts`, generated from
+        its own request model, and FoodChat asks here before sending anything
+        newer than the oldest deployment it might be talking to.
+
+        Absent `accepts` — an older RecipeWrangler — is a NO. Guessing yes
+        would turn every plan request into a 422 the moment the two services
+        drifted, which is the outage this method exists to prevent.
+        """
+        for entry in self.manifest().get("tools") or []:
+            if entry.get("name") == tool:
+                return field in (entry.get("accepts") or [])
+        return False
+
     def planning_options(self) -> dict[str, Any]:
         """What a user can actually ask for, from the live service.
 
@@ -157,6 +179,10 @@ class PlanClient:
         # one. A single-plate meal has nothing to compose, so a deeper pool for
         # it is recipes fetched and ranked to arrive at the first one anyway.
         deepen_multiplate_only: bool = False,
+        # Where each slot's window starts. The ranking is deterministic, so
+        # every request without this draws from the same top of the same list —
+        # which is why asking for a second plan returned the first one.
+        offset: int = 0,
         spec: Optional["PlanSpec"] = None,
         allergens: Optional[list[str]] = None,
         diet: Optional[list[str]] = None,
@@ -242,6 +268,19 @@ class PlanClient:
             payload["max_minutes"] = int(max_minutes)
         if min_nutri_score:
             payload["min_nutri_score"] = str(min_nutri_score).upper()
+        # Gated on the manifest, like `tags`, and for the same reason: the
+        # request model rejects unknown fields with a 422, so sending this to a
+        # RecipeWrangler that predates it would break every plan rather than
+        # degrade. Without it the pool is page one, every time.
+        if offset > 0:
+            if self.accepts("plan_meals", "offset"):
+                payload["offset"] = int(offset)
+            else:
+                logger.info(
+                    "Not sending offset=%d — this RecipeWrangler does not "
+                    "advertise it, so every plan draws from the same window",
+                    offset,
+                )
 
         logger.info(
             "plan_meals days=%d slots=%s cuisines=%s max_minutes=%s",

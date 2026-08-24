@@ -102,3 +102,52 @@ def recently_served(session, *, plans: int = RECENT_PLANS,
             len(recent),
         )
     return recent
+
+
+# How far the window moves for each plan this session has already produced.
+#
+# Not a page size. `plan_meals` over-fetches and then picks a diverse subset,
+# so the pool a slot draws from is already several times the count asked for —
+# stepping by the count would land inside the window it just used. Stepping by
+# this walks clear of it while staying well inside the corpus.
+WINDOW_STEP = 8
+
+# Where the walk turns around. RecipeWrangler's own bound is 100 candidates
+# per slot; past a few hundred a narrow diet has nothing left, and the honest
+# behaviour is to start again at the best matches rather than to page into an
+# empty tail.
+MAX_OFFSET = 120
+
+
+def window_offset(session, *, step: int = WINDOW_STEP, cap: int = MAX_OFFSET) -> int:
+    """How far into each slot's ranking this plan should start.
+
+    RecipeWrangler ranks deterministically and returns page one unless asked
+    otherwise, so a caller that never sends an offset gets the same window
+    every time — and, after `select_diverse` has picked from it, the same plan.
+    Exclusion narrows that window; an offset MOVES it, which is what keeps the
+    pool full rather than shrinking it toward empty.
+
+    Derived from how many plans this session has already made, so it is stable
+    for a given plan and different for the next one. Not random: the same
+    request must produce the same plan, or a member cannot tell a regeneration
+    from a bug.
+
+    Wraps at `cap`. Paging forever walks off the end of what the member's
+    constraints admit, and starting again from the best matches is a better
+    answer than an empty slot.
+    """
+    if session is None:
+        return 0
+    made = len(getattr(session, "meal_plans", None) or []) + len(
+        getattr(session, "weekly_meal_plans", None) or []
+    )
+    if made <= 0:
+        return 0
+    offset = (made * step) % (cap + step)
+    if offset:
+        logger.info(
+            "Plan %d of this session — starting %d into each slot's ranking",
+            made + 1, offset,
+        )
+    return offset

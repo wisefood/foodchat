@@ -150,6 +150,7 @@ def role_pools(
     exclude_recipe_ids: Optional[list[str]] = None,
     boost_ids: Optional[list[str]] = None,
     per_plate: int = POOL_PER_PLATE,
+    offset: int = 0,
     days: Optional[int] = None,
 ) -> tuple[dict[int, dict[tuple[str, str], list]], list[str]]:
     """`({day: {(slot, role): [CandidateRecipe]}}, relaxation notes)`.
@@ -188,6 +189,9 @@ def role_pools(
             # would be fetched, enriched and ranked to arrive at the one
             # RecipeWrangler put first anyway.
             deepen_multiplate_only=True,
+            # Move the window rather than only narrowing it — see
+            # `plan_history.window_offset`.
+            offset=offset,
             allergens=screening_allergens(profile),
             diet=effective_diet(profile),
             **intent_facets.facet_kwargs(profile, cuisines),

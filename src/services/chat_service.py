@@ -495,6 +495,12 @@ class ChatService:
             # What the member was just served — the session's recent plans on a
             # fresh request, the plan on screen on a refinement.
             avoid_recent=self._avoid_for(session_id, is_refinement),
+            # Recipes come back in pages. Exclusion narrows the window; this
+            # MOVES it, which is what keeps the pool full instead of shrinking
+            # it toward empty as a session goes on.
+            window_offset=plan_history.window_offset(
+                self.session_service.get_session(session_id)
+            ),
             feedback_history=signals.history_text,
         )
         if not plans:
@@ -690,6 +696,11 @@ class ChatService:
         meal_plan = self.pipeline.plan_structured(
             profile, spec, exclude_recipe_ids=excluded, pinned=pinned,
             avoid_recent=self._avoid_for(session_id, is_refinement),
+            # Same page walk as the classic path. A shaped plan has more plates
+            # to fill, so it exhausts a window sooner, not later.
+            window_offset=plan_history.window_offset(
+                self.session_service.get_session(session_id)
+            ),
             # The member's words. This path had no query parameter at all, so
             # the shape was honoured and the request was not — and the reply
             # was then phrased around something that reached nothing.

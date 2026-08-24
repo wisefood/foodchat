@@ -120,6 +120,7 @@ class PlanningPipeline:
         pinned: dict[str, "CandidateRecipe"] | None = None,
         exclude_recipe_ids: list[str] | None = None,
         avoid_recent: list[str] | None = None,
+        window_offset: int = 0,
         feedback_history: str = "",
     ) -> list[ScoredPlan]:
         """Produce ranked daily-plan combinations for the reformulated query.
@@ -195,6 +196,7 @@ class PlanningPipeline:
             max_minutes=max_minutes,
             exclude_recipe_ids=hard_exclusions + recent,
             limit_per_slot=CANDIDATE_LIMIT,
+            offset=window_offset,
         )
         repeated_slots: list[str] = []
         if recent:
@@ -210,6 +212,7 @@ class PlanningPipeline:
                     max_minutes=max_minutes,
                     exclude_recipe_ids=hard_exclusions,
                     limit_per_slot=CANDIDATE_LIMIT,
+                    offset=window_offset,
                 )
                 if not candidates:
                     candidates = refetched
@@ -361,6 +364,7 @@ class PlanningPipeline:
         spec: "PlanSpec",
         exclude_recipe_ids: list[str] | None = None,
         avoid_recent: list[str] | None = None,
+        window_offset: int = 0,
         pinned: dict | None = None,
         query: str = "",
     ) -> "MealPlan | None":
@@ -452,6 +456,7 @@ class PlanningPipeline:
             exclude_recipe_ids=list(exclude_recipe_ids or []) + recent,
             boost_ids=boost_ids,
             per_plate=per_plate,
+            offset=window_offset,
         )
         if recent and not _every_plate_has_a_candidate(pools_by_day, spec):
             logger.info(
@@ -463,6 +468,7 @@ class PlanningPipeline:
                 exclude_recipe_ids=list(exclude_recipe_ids or []),
                 boost_ids=boost_ids,
                 per_plate=per_plate,
+                offset=window_offset,
             )
         if not pools_by_day:
             return None
@@ -687,6 +693,7 @@ def _fetch_candidate_pool(
     cuisines: list[str],
     liked_ingredients: list[str],
     max_minutes: int | None,
+    offset: int = 0,
     exclude_recipe_ids: list[str],
     favorite_recipe_ids: list[str] | None = None,
     limit_per_slot: int,
@@ -728,6 +735,9 @@ def _fetch_candidate_pool(
             ),
             max_minutes=max_minutes,
             min_nutri_score=profile.get("min_nutri_score"),
+            # Where each slot's window starts. Recipes come back in pages, and
+            # without this every request is page one.
+            offset=offset,
         )
     except Exception as exc:  # noqa: BLE001
         logger.error("plan_meals candidate fetch failed: %s", exc)
