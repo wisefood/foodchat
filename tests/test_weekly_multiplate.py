@@ -300,3 +300,82 @@ class TestItReachesWhatIsStored:
         legacy = {"day": 1, "meal_idx": 0, "meal_type": "breakfast",
                   "recipe": {"recipe_id": "r"}, "reward": 0.0}
         assert WeeklyMealPlanEntryResponse(**legacy).role == "main"
+
+
+# ── the pool is fetched for the slots the plan actually has ────────────────
+#
+# The environment honours a spec's meals — `self.meal_types = slots` — so a
+# week with a snack steps through a snack slot. The single-dish pool fetch
+# asked for breakfast, lunch and dinner and nothing else, so that slot's pool
+# had never been requested: `get_candidate_actions` returned nothing and the
+# planner raised `PlanGenerationError("snack")`. The member asked for a week
+# with a snack and was told the week could not be built.
+
+class TestThePoolCoversThePlansOwnSlots:
+    def _capture(self, monkeypatch):
+        """Record what the pool fetch asks RecipeWrangler for."""
+        asked = {}
+
+        class _FakePlanner:
+            def plan_meals(self, **kwargs):
+                asked.update(kwargs)
+                return {"days": []}
+
+            def to_candidates(self, envelope, **kwargs):
+                return {
+                    slot: [CandidateRecipe(f"{slot}-1", f"A {slot}", "i", "d")]
+                    for slot in asked.get("slots", ())
+                }
+
+        import services.plan_client as pc
+
+        monkeypatch.setattr(pc, "PLANNER", _FakePlanner())
+        monkeypatch.setattr(
+            "services.candidates_client.CANDIDATES.fetch_details",
+            lambda ids: {},
+        )
+        return asked
+
+    def test_a_snack_week_asks_for_snacks(self, monkeypatch):
+        from services.weekly_planner.action_adapter import RecipeActionSpace
+
+        asked = self._capture(monkeypatch)
+        spec = PlanSpec(num_days=7, meals=("breakfast", "lunch", "dinner", "snack"))
+        space = RecipeActionSpace({"diet": []}, spec=spec)
+
+        actions = space.get_candidate_actions("snack", {"day": 1})
+
+        assert "snack" in asked["slots"], asked["slots"]
+        assert actions, "the snack slot came back with nothing to choose from"
+
+    def test_it_sends_no_course_types_so_the_slot_decides(self, monkeypatch):
+        """A snack asked for as a main dish is the fettuccine-at-breakfast bug
+        in a different slot. RecipeWrangler maps snack → snacks itself."""
+        from services.weekly_planner.action_adapter import RecipeActionSpace
+
+        asked = self._capture(monkeypatch)
+        spec = PlanSpec(num_days=2, meals=("breakfast", "snack"))
+        RecipeActionSpace({"diet": []}, spec=spec).get_candidate_actions(
+            "breakfast", {"day": 1},
+        )
+        assert "course_types" not in asked
+        assert asked["slots"] == ("breakfast", "snack")
+
+    def test_no_spec_still_asks_for_the_default_three(self, monkeypatch):
+        from services.weekly_planner.action_adapter import RecipeActionSpace
+
+        asked = self._capture(monkeypatch)
+        RecipeActionSpace({"diet": []}).get_candidate_actions("lunch", {"day": 1})
+        assert asked["slots"] == ("breakfast", "lunch", "dinner")
+
+    def test_an_int_slot_indexes_the_plans_own_slots(self, monkeypatch):
+        """The literal map here was the default three, so index 3 of a
+        four-meal day answered "lunch" — a wrong answer where the shape is
+        known."""
+        from services.weekly_planner.action_adapter import RecipeActionSpace
+
+        self._capture(monkeypatch)
+        spec = PlanSpec(num_days=1, meals=("breakfast", "lunch", "dinner", "snack"))
+        space = RecipeActionSpace({"diet": []}, spec=spec)
+        actions = space.get_candidate_actions(3, {"day": 1})
+        assert [a["recipe_title"] for a in actions] == ["A snack"]

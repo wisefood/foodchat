@@ -133,6 +133,58 @@ def _day_plan(session_id: str, plan_type: Optional[str] = None):
     )
 
 
+def _spec_of(plan) -> "object":
+    """The shape a stored weekly plan actually has, read from the plan itself.
+
+    `replace_day` built its planner with no spec at all, so the walk fell back
+    to its default — seven days of breakfast/lunch/dinner — whatever the plan
+    in front of it was:
+
+    * replacing a day of a THREE-day week generated the four days it did not
+      have, because every unpinned slot gets filled;
+    * a week with a snack lost the snack, since the rebuilt day had no such
+      slot and the pool was never asked for one;
+    * a multi-plate dinner flattened back to one dish, on the one operation
+      whose entire promise is that everything else survives byte for byte.
+
+    The plan is the source of truth for its own shape — the same rule
+    `_edit_daily` follows for a daily plan with days — so the shape is read
+    from the entries rather than from the member's standing spec, which may
+    have moved on since this plan was made.
+    """
+    from models.plan_spec import DEFAULT_MEALS, PlanSpec
+    from models.recipe import slot_sort_key
+
+    days = sorted({int(e.get("day") or 0) for e in plan.entries if e.get("day")})
+
+    # slot -> the roles it is served with, in the order they appear. Read from
+    # day 1 alone would miss a side that only Thursday has, so every day
+    # contributes and the widest reading of each slot wins.
+    roles_by_slot: dict[str, list[str]] = {}
+    for entry in plan.entries:
+        slot = str(entry.get("meal_type") or "").strip().lower()
+        if not slot:
+            continue
+        role = str(entry.get("role") or "main").strip().lower() or "main"
+        roles = roles_by_slot.setdefault(slot, [])
+        if role not in roles:
+            roles.append(role)
+
+    meals = tuple(sorted(roles_by_slot, key=slot_sort_key))
+    plates = {
+        slot: tuple(roles)
+        for slot, roles in roles_by_slot.items()
+        if len(roles) > 1
+    }
+    return PlanSpec(
+        num_days=max(len(days), 1),
+        # An empty plan cannot describe itself; the default shape is the only
+        # honest fallback, and it is the shape this code always assumed anyway.
+        meals=meals or DEFAULT_MEALS,
+        plates=plates,
+    )
+
+
 def _sum_nutrition(pairs: list[tuple[str, dict]]) -> dict:
     """Total a list of (title, nutrition) pairs, saying what it could not see.
 
@@ -621,10 +673,13 @@ def replace_day(session_id: str, day: int, note: str = "") -> dict:
 
     state = svc.session_service.get_planning_state(session_id)
     profile = session.user_profile
+    spec = _spec_of(plan)
     action_space = RecipeActionSpace(
         profile,
         additional_diet=list(state.diet_tags),
         pantry=state.pantry,
+        # The shape of the plan being edited, not the default seven-by-three.
+        spec=spec,
     )
     # Nothing already in the week may come back, so the new day is genuinely
     # new rather than a reshuffle of what the member has just seen.
@@ -656,6 +711,7 @@ def replace_day(session_id: str, day: int, note: str = "") -> dict:
         reward_calculator=RewardCalculator(),
         user_query=query,
         stated_diet=list(state.diet_tags),
+        spec=spec,
     )
     try:
         entries = WeeklyPlanner(env).generate_full_plan(

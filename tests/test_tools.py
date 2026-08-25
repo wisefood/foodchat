@@ -528,3 +528,56 @@ class TestSwapMealNamesTheDayTheReaderCanRead:
             "directive": "lighter", "day": 2,
         })
         assert "Tuesday" in sent["message"]
+
+
+class TestReplaceDayKeepsThePlansShape:
+    """`replace_day` built its planner with no spec, so the walk used its
+    default — seven days of breakfast/lunch/dinner — whatever the plan was.
+    Its entire promise is that everything outside the target day survives."""
+
+    def _spec_of(self, entries):
+        from tools.plan_tools import _spec_of
+
+        return _spec_of(type("P", (), {"entries": entries})())
+
+    def test_it_reads_the_number_of_days_from_the_plan(self):
+        """A three-day week regenerated as seven is four days the member never
+        asked for — every unpinned slot gets filled."""
+        entries = [e for e in _week() if e["day"] <= 3]
+        assert self._spec_of(entries).num_days == 3
+
+    def test_it_keeps_a_slot_the_default_shape_does_not_have(self):
+        entries = _week() + [_entry(1, 3, "snack", "s1", "Oatcakes")]
+        spec = self._spec_of(entries)
+        assert "snack" in spec.meals
+
+    def test_the_slots_are_in_eating_order(self):
+        """`KNOWN_SLOTS` lists snack after dinner; the plan is read in the order
+        people eat, which is the order every other surface uses."""
+        entries = _week() + [_entry(1, 3, "snack", "s1", "Oatcakes")]
+        # `slot_sort_key` puts a snack between lunch and dinner — the
+        # afternoon — not after dinner where KNOWN_SLOTS lists it.
+        assert self._spec_of(entries).meals == (
+            "breakfast", "lunch", "snack", "dinner",
+        )
+
+    def test_a_multi_plate_meal_stays_multi_plate(self):
+        """Flattening it here undoes the shape on the one operation that
+        promises not to touch anything else."""
+        entries = _week() + [
+            dict(_entry(3, 2, "dinner", "d-side", "Greek salad"), role="side"),
+        ]
+        spec = self._spec_of(entries)
+        assert spec.roles_for("dinner") == ("main", "side")
+
+    def test_a_side_only_one_day_has_still_counts(self):
+        """Reading day 1 alone would miss it."""
+        entries = [e for e in _week() if e["day"] == 1] + [
+            dict(_entry(1, 2, "dinner", "x", "Slaw"), role="side"),
+        ]
+        assert self._spec_of(entries).roles_for("dinner") == ("main", "side")
+
+    def test_an_empty_plan_falls_back_to_the_default_shape(self):
+        spec = self._spec_of([])
+        assert spec.meals == ("breakfast", "lunch", "dinner")
+        assert spec.num_days == 1

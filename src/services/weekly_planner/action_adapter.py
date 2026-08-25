@@ -18,7 +18,7 @@ import logging
 from typing import Any, Dict, List, Optional, Union
 
 from services import intent_facets
-from services.candidates_client import CANDIDATES, normalize_diet_tags
+from services.candidates_client import CANDIDATES, MEAL_SLOTS, normalize_diet_tags
 
 # The failure path below logs; without this the except clause itself raised
 # NameError, turning a degradable fetch failure into a crashed plan.
@@ -132,6 +132,7 @@ class RecipeActionSpace:
                 cuisines=cuisines,
                 exclude_recipe_ids=list(self._selected_ids) + self._avoid_recent,
                 limit_per_slot=DAILY_POOL_LIMIT,
+                slots=tuple(self._slots()),
             )
             if self._avoid_recent and not all(pool.get(s) for s in self._slots()):
                 # Nothing new left for some slot. Give the history up for the
@@ -150,6 +151,7 @@ class RecipeActionSpace:
                     cuisines=cuisines,
                     exclude_recipe_ids=list(self._selected_ids),
                     limit_per_slot=DAILY_POOL_LIMIT,
+                    slots=tuple(self._slots()),
                 )
             if self.pantry and pool:
                 # Same Tier-A fan-out as the daily pipeline: single-item hard
@@ -184,7 +186,12 @@ class RecipeActionSpace:
             self._enrichment.update(CANDIDATES.fetch_details(day_ids))
 
         if isinstance(meal_type, int):
-            meal_type = {0: "breakfast", 1: "lunch", 2: "dinner"}.get(meal_type, "lunch")
+            # Indexed into the plan's OWN slots. The literal map here was the
+            # default three, so on a four-meal day index 3 answered "lunch".
+            slots = self._slots()
+            meal_type = (
+                slots[meal_type] if 0 <= meal_type < len(slots) else slots[0]
+            )
 
         candidates = self._day_cache[current_day].get(str(meal_type).lower(), [])
         actions = []
@@ -378,8 +385,16 @@ def _fetch_candidate_pool(
     cuisines: list,
     exclude_recipe_ids: list,
     limit_per_slot: int,
+    slots: tuple = MEAL_SLOTS,
 ) -> dict:
     """A per-slot candidate pool from the planning endpoint.
+
+    `slots` is the plan's own shape, and it used to be absent — so this always
+    fetched breakfast, lunch and dinner. The environment honours a spec's meals
+    (`self.meal_types = slots`), so a week with a snack stepped through a snack
+    slot whose pool had never been asked for: `get_candidate_actions` returned
+    nothing and the planner raised `PlanGenerationError("snack")`. The member
+    asked for a week with a snack and got told the week could not be built.
 
     Shares the daily pipeline's reasoning: `plan_meals` asked for N recipes per
     slot is a candidate source whose pool already respects the member's
@@ -398,6 +413,10 @@ def _fetch_candidate_pool(
     try:
         envelope = PLANNER.plan_meals(
             days=1,
+            # No `course_types` override: RecipeWrangler maps each slot to its
+            # own courses (snack → snacks, dessert → desserts), which is what
+            # keeps a snack slot from filling with main dishes.
+            slots=tuple(slots) or MEAL_SLOTS,
             count_per_slot=limit_per_slot,
             allergens=allergens,
             diet=normalize_diet_tags(diet),
