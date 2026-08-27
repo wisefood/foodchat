@@ -98,13 +98,53 @@ class TestMeasurement:
 
         assert shared_ingredient_facts(entries)["meals"] == 0
 
-    def test_a_nameable_share_alongside_noise_names_only_the_real_one(self):
+    def test_the_whole_phrase_is_the_name(self):
+        """"green capsicum", not "capsicum" and certainly not "green"."""
         entries = [
             _entry(1, "lunch", "A", "green capsicum, bay leaf"),
             _entry(3, "dinner", "B", "green capsicum, bay leaf"),
         ]
 
-        assert shared_ingredient_facts(entries)["entries"][1] == [("capsicum", 1)]
+        assert shared_ingredient_facts(entries)["entries"][1] == [("green capsicum", 1)]
+
+    def test_one_ingredient_is_one_item_not_one_per_word(self):
+        """Observed: *"also uses Thursday's raising and Thursday's self"* —
+        one bag of flour, reported as two ingredients."""
+        entries = [
+            _entry(4, "breakfast", "A", "self raising flour, banana, nutmeg"),
+            _entry(6, "breakfast", "B", "self raising flour, banana, cocoa"),
+        ]
+
+        shared = shared_ingredient_facts(entries)["entries"][1]
+
+        assert [name for name, _ in shared] == ["banana"]
+
+    def test_a_phrase_that_names_a_staple_is_not_a_saving(self):
+        """"self raising flour" IS flour; "brown sugar" IS sugar. Sharing a
+        staple has never counted, and it is exactly those phrases whose
+        modifiers survive tokenising and impersonate ingredients."""
+        entries = [
+            _entry(1, "breakfast", "A", "self raising flour, brown sugar, thyme leaf"),
+            _entry(3, "breakfast", "B", "self raising flour, brown sugar, thyme leaf"),
+        ]
+
+        assert shared_ingredient_facts(entries)["meals"] == 0
+
+    def test_a_run_together_blob_is_not_named(self):
+        entries = [
+            _entry(1, "lunch", "A", "brown sugar light brown cane sugar"),
+            _entry(3, "lunch", "B", "brown sugar light brown cane sugar"),
+        ]
+
+        assert shared_ingredient_facts(entries)["meals"] == 0
+
+    def test_measurements_and_counting_words_are_dropped_from_the_name(self):
+        entries = [
+            _entry(1, "dinner", "A", "half a cabbage"),
+            _entry(3, "lunch", "B", "2 cups chopped cabbage"),
+        ]
+
+        assert shared_ingredient_facts(entries)["entries"][1] == [("cabbage", 1)]
 
     def test_an_ingredient_nobody_repeats_is_not_reported(self):
         entries = [
@@ -151,6 +191,18 @@ class TestTheTwoChipsStayApart:
 
         assert "pantry" in _kinds(entries[2])
         assert SHARED_INGREDIENT_KIND not in _kinds(entries[2])
+
+    def test_a_phrase_touching_the_pantry_is_dropped_whole(self):
+        """"eggplant aubergine" anchors on a word the member never said, but
+        showing it to someone who told us about their eggplants credits the
+        plan for their fridge."""
+        entries = [
+            _entry(1, "dinner", "A", "eggplant aubergine, walnuts"),
+            _entry(3, "dinner", "B", "eggplant aubergine, apple"),
+        ]
+
+        assert shared_ingredient_facts(entries, ("eggplants",))["meals"] == 0
+        assert shared_ingredient_facts(entries, ())["meals"] == 1
 
     def test_an_ingredient_nobody_mentioned_gets_the_cross_day_chip(self):
         entries, _ = self._annotated()

@@ -2,6 +2,43 @@
 
 ---
 
+# Cross-day reuse names the whole ingredient
+
+> **Date:** 2026-08-27
+> **Branch:** main
+> No API change. Chip labels and the `"the plan"` ledger row change wording;
+> `kind: "shared_ingredient"` and the row's shape are unchanged.
+
+Follow-up to *"Weekly plans reuse ingredients without repeating them"*,
+from reading its output on a live plan. The chips were naming tokens, and
+a token is not an ingredient:
+
+> *"also uses Thursday's raising and Thursday's self"*
+
+That is one bag of self raising flour, reported as two ingredients, neither
+of which is a thing you can buy. Same shape as the ones the previous change
+caught (*"Monday's green"*, *"Wednesday's brown"*, *"Monday's leaf"*) — the
+stoplist was treating symptoms, since whitespace tokenising will keep
+producing new ones.
+
+| What | Detail |
+|---|---|
+| A share is **found** by token and **named** by phrase | The overlap detection was never the problem — token matching is what makes "tomatoes"/"tomato" meet. Naming now uses the comma-separated phrase the token came from, as the *earlier* day wrote it, which is the day the label credits. |
+| Several tokens from one phrase collapse into one item | "self" and "raising" both resolve to "self raising flour", so a chip names one ingredient instead of two fragments. This is what actually fixes the class of bug rather than the instances. |
+| A phrase that names a staple is not a saving | "self raising flour" *is* flour, "brown sugar" *is* sugar, "macadamia nut oil" *is* oil, "thyme leaf" *is* thyme. `_PANTRY_STAPLES` already said sharing those saves nothing; per-token filtering dropped the staple and kept its modifiers, which is precisely how the modifiers ended up impersonating ingredients. |
+| A phrase touching the member's pantry is dropped **whole** | "eggplant aubergine" anchors on a word the member never said, so it survived the per-stem filter — and would have been shown to a member who had just told us about their eggplants, crediting the plan for their own fridge. |
+| Measurements, counting words and blobs | `_UNITS` and a new `_QUANTITY_WORDS` are stripped from the display ("half a cabbage" → "cabbage", "2 cups chopped cabbage" → "cabbage"), and a phrase over four words is a run-together blob ("brown sugar light brown cane sugar"), not a name — not reported. |
+
+Replayed over three stored plans, every label now names something real:
+*Tuesday's broccoli floret*, *Wednesday's old fashioned rolled oat*,
+*Monday's bean pinto*, *Wednesday's mixed beans*, *Thursday's avocado*,
+*Monday's capsicum*. Nothing reads as a fragment.
+
+`tests/test_shared_ingredients.py` grows to 21 tests, including the flour
+case and the pantry-phrase case verbatim. 504 passing.
+
+---
+
 # Weekly reuse gets a clock
 
 > **Date:** 2026-08-27

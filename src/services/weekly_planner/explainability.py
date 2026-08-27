@@ -129,18 +129,28 @@ SHARED_BADGE_FOODWASTE = "reducing food waste"
 # Items named in one chip before it stops being readable.
 _SHARED_ITEMS_PER_CHIP = 2
 
-# Words that survive `perishable_tokens` but cannot be shown to a member as
-# the name of an ingredient. The tokeniser splits on whitespace, so an
-# ingredient line like "green beans, brown rice, bay leaf, balsamic vinegar"
-# yields "green", "brown", "leaf" and "balsamic" alongside the real nouns.
-# That noise is harmless in the scorer — two meals sharing "green" really are
-# a little more alike, and the averaging absorbs it — but a chip reading
-# *"also uses Monday's green"* is not something a member can act on.
+# Naming is held to a stricter standard than ranking, and the unit of a
+# *name* is the ingredient phrase, not the token.
 #
-# So naming is held to a stricter standard than ranking, and a share whose
-# only overlap is unnameable is not counted at all. Under-reporting is the
-# safe direction here, the same posture the pantry matcher takes: a missed
-# match says less than it could, it never invents a saving.
+# `perishable_tokens` splits on whitespace, which is right for scoring —
+# two meals sharing "green" really are a little more alike, and averaging
+# absorbs the noise. It is wrong for a chip. Tokenising "self raising flour"
+# drops the staple and leaves the modifiers, so the first version of this
+# told a member she was reusing *"Thursday's self"* and *"Thursday's
+# raising"*, from one bag of flour. Others: "Monday's green" (green beans),
+# "Wednesday's brown" (brown rice), "Monday's leaf" (bay leaf).
+#
+# So a share is *found* by token — that part works — and then *named* by
+# the phrase the token came from on the day it first appeared. Several
+# tokens from one phrase collapse into one item, which is what makes "self"
+# and "raising" a single "self raising flour" rather than two ingredients.
+#
+# A share the phrase rules cannot name is not counted at all. Under-
+# reporting is the safe direction here, the same posture the pantry matcher
+# takes: a missed match says less than it could, it never invents a saving.
+
+# A token must anchor on one of these to be worth naming at all — a phrase
+# of pure adjectives ("whole, raw") names nothing.
 _UNNAMEABLE: frozenset = frozenset({
     # colours
     "green", "brown", "white", "black", "yellow", "purple", "golden", "dark",
@@ -158,6 +168,26 @@ _UNNAMEABLE: frozenset = frozenset({
     # condiment modifiers whose noun is a staple and gets dropped
     "balsamic", "wine", "cider", "malt", "sesame", "sunflower", "rapeseed",
 })
+
+# Quantity words to drop from a displayed phrase. `_UNITS` already covers
+# measurements; these are the counting words that survive it ("half a
+# cabbage" should read "cabbage").
+_QUANTITY_WORDS: frozenset = frozenset({
+    "half", "quarter", "third", "few", "some", "handful", "pinch", "dash",
+    "splash", "piece", "pieces", "packet", "packets", "pouch", "pouches",
+    "tin", "tins", "can", "cans", "jar", "jars", "bunch", "sprig", "sprigs",
+    "stick", "sticks", "tub", "block", "each", "about", "approx",
+})
+
+# Longer than this and the "phrase" is a run-together blob rather than an
+# ingredient name ("brown sugar light brown cane sugar"). Not named.
+_MAX_PHRASE_WORDS = 4
+
+
+def _unnameable_stems() -> frozenset:
+    from services.pantry_service import singular
+
+    return frozenset(singular(w) for w in _UNNAMEABLE)
 
 
 def _pantry_stems(pantry: Any) -> set:
@@ -177,6 +207,43 @@ def _pantry_stems(pantry: Any) -> set:
     }
 
 
+def _nameable_phrases(ingredients_text: Any, pantry_stems: set) -> List[tuple]:
+    """``[(display_name, {stems})]`` for the phrases worth naming to a member.
+
+    A phrase is dropped when it names a staple — "self raising flour" *is*
+    flour, "brown sugar" *is* sugar, "macadamia nut oil" *is* oil — because
+    sharing a staple has never been a saving, and it is exactly those phrases
+    whose modifiers survive tokenising and end up impersonating ingredients.
+
+    A phrase touching the member's own pantry is dropped **whole**, not just
+    filtered down to its other words. "eggplant aubergine" anchored on
+    "aubergine" would otherwise be shown to a member who told us about their
+    eggplants, crediting the plan for their fridge.
+    """
+    from .planner import _PANTRY_STAPLES, _UNITS, _singular, perishable_tokens
+
+    out: List[tuple] = []
+    for part in re.split(r"[\n,;•]+", str(ingredients_text or "")):
+        words = re.sub(r"[^a-z\s]", " ", part.lower()).split()
+        if not words or len(words) > _MAX_PHRASE_WORDS:
+            continue
+        if any(w in _PANTRY_STAPLES for w in words):
+            continue
+        all_stems = {_singular(t) for t in perishable_tokens(" ".join(words))}
+        if all_stems & pantry_stems:
+            continue
+        stems = {s for s in all_stems if s not in _unnameable_stems()}
+        if not stems:
+            continue
+        display = " ".join(
+            w for w in words
+            if len(w) > 2 and w not in _UNITS and w not in _QUANTITY_WORDS
+        )
+        if display:
+            out.append((display, stems))
+    return out
+
+
 def shared_ingredient_facts(plan_entries: List[dict], pantry: Any = ()) -> dict:
     """Which meals reuse an ingredient the plan itself introduced.
 
@@ -186,41 +253,42 @@ def shared_ingredient_facts(plan_entries: List[dict], pantry: Any = ()) -> dict:
     *earlier* day — the first appearance introduced the ingredient and has
     nothing to point back to — so nothing is double-counted.
 
-    Returns ``{"entries": {index: [(item, day)]}, "meals": n, "items": [...]}``.
+    Returns ``{"entries": {index: [(name, day)]}, "meals": n, "items": [...]}``
+    where ``name`` is the whole ingredient phrase as the earlier day wrote it.
     """
-    from .planner import _singular, perishable_tokens
-
-    skip = _pantry_stems(pantry) | {_singular(w) for w in _UNNAMEABLE}
-    # stem -> earliest day it appears on, and the surface word to show.
-    first_day: Dict[str, int] = {}
-    surface: Dict[str, str] = {}
-    for entry in plan_entries:
-        day = entry.get("day")
-        if not isinstance(day, int):
-            continue
-        for token in perishable_tokens(_ingredients(_recipe(entry))):
-            stem = _singular(token)
-            if stem in skip:
-                continue
-            if stem not in first_day or day < first_day[stem]:
-                first_day[stem] = day
-                surface[stem] = token
+    pantry_stems = _pantry_stems(pantry)
+    phrases = [
+        _nameable_phrases(_ingredients(_recipe(e)), pantry_stems)
+        if isinstance(e.get("day"), int) else []
+        for e in plan_entries
+    ]
+    # stem -> (earliest day it appears on, how that day named it)
+    origin: Dict[str, tuple] = {}
+    for entry, entry_phrases in zip(plan_entries, phrases):
+        day = entry["day"]
+        for display, stems in entry_phrases:
+            for stem in stems:
+                if stem not in origin or day < origin[stem][0]:
+                    origin[stem] = (day, display)
 
     per_entry: Dict[int, List[tuple]] = {}
     items: List[str] = []
-    for index, entry in enumerate(plan_entries):
-        day = entry.get("day")
-        if not isinstance(day, int):
+    for index, (entry, entry_phrases) in enumerate(zip(plan_entries, phrases)):
+        if not entry_phrases:
             continue
-        shared = []
-        for token in sorted(perishable_tokens(_ingredients(_recipe(entry)))):
-            stem = _singular(token)
-            origin = first_day.get(stem)
-            if stem in skip or origin is None or origin >= day:
-                continue
-            shared.append((surface.get(stem, token), origin))
-            if surface.get(stem, token) not in items:
-                items.append(surface.get(stem, token))
+        day = entry["day"]
+        shared: List[tuple] = []
+        for _display, stems in entry_phrases:
+            for stem in sorted(stems):
+                origin_day, origin_name = origin.get(stem, (day, ""))
+                if origin_day >= day:
+                    continue
+                # Keyed by the earlier day's phrase, so several tokens out of
+                # one ingredient ("self", "raising") collapse into one item.
+                if (origin_name, origin_day) not in shared:
+                    shared.append((origin_name, origin_day))
+                if origin_name not in items:
+                    items.append(origin_name)
         if shared:
             per_entry[index] = shared
     return {"entries": per_entry, "meals": len(per_entry), "items": items}
