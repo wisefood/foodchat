@@ -8,7 +8,10 @@ from .weekly_planner.action_adapter import RecipeActionSpace
 from .weekly_planner.reward_logic import RewardCalculator
 from .weekly_planner.environment import WeeklyMealPlanEnv
 from .weekly_planner.day_summary import build_day_summaries
-from .weekly_planner.explainability import build_weekly_explainability
+from .weekly_planner.explainability import (
+    annotate_shared_ingredients,
+    build_weekly_explainability,
+)
 from .transparency import split_ledger
 from .weekly_planner.planner import (
     PlanGenerationError,
@@ -232,6 +235,15 @@ class WeeklyPlanService:
         )
         pantry_note = pantry_service.describe_coverage(pantry_facts)
 
+        # Cross-day reuse the PLAN introduced, chipped separately from the
+        # member's own pantry and worded so the two cannot be confused
+        # ("also uses Monday's cabbage" vs "uses your tomatoes"). Runs last,
+        # and runs whether or not a pantry was stated — the member said
+        # nothing about these ingredients, which is the point.
+        shared_facts = annotate_shared_ingredients(
+            plan_entries, pantry, explainability=explainability,
+        )
+
         if is_refinement:
             weekly_plan = self.session_service.refine_weekly_meal_plan(
                 session_id, plan_entries, day_summaries=day_summaries,
@@ -286,6 +298,13 @@ class WeeklyPlanService:
                 "used": pantry_facts["used"],
                 "unused": pantry_facts["unused"],
                 "note": pantry_note,
+            }
+        if shared_facts["meals"]:
+            # Kept separate from `pantry` so the writer cannot present the
+            # plan's own reuse as something the member asked for.
+            facts["shared_ingredients"] = {
+                "meals": shared_facts["meals"],
+                "items": shared_facts["items"][:6],
             }
         fallback_extras = " ".join(p for p in (seed_note, pantry_note) if p)
         response_text = self.response_writer.write(

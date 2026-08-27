@@ -113,6 +113,168 @@ def attach_match_reasons(plan_entries: List[dict], profile: dict) -> None:
 
 
 # --------------------------------------------------------------------- #
+# Cross-day ingredient reuse (M8)                                         #
+#                                                                         #
+# Distinct from the pantry chip, and deliberately worded so a member can  #
+# tell which is which. "uses your tomatoes" means the member said they    #
+# had tomatoes; "also uses Monday's cabbage" means nothing was said about #
+# cabbage and the plan bought it once for two meals. Conflating them      #
+# would credit the member for an inference, or credit the planner for the #
+# member's own statement.                                                 #
+# --------------------------------------------------------------------- #
+
+SHARED_INGREDIENT_KIND = "shared_ingredient"
+SHARED_BADGE_FOODWASTE = "reducing food waste"
+
+# Items named in one chip before it stops being readable.
+_SHARED_ITEMS_PER_CHIP = 2
+
+# Words that survive `perishable_tokens` but cannot be shown to a member as
+# the name of an ingredient. The tokeniser splits on whitespace, so an
+# ingredient line like "green beans, brown rice, bay leaf, balsamic vinegar"
+# yields "green", "brown", "leaf" and "balsamic" alongside the real nouns.
+# That noise is harmless in the scorer — two meals sharing "green" really are
+# a little more alike, and the averaging absorbs it — but a chip reading
+# *"also uses Monday's green"* is not something a member can act on.
+#
+# So naming is held to a stricter standard than ranking, and a share whose
+# only overlap is unnameable is not counted at all. Under-reporting is the
+# safe direction here, the same posture the pantry matcher takes: a missed
+# match says less than it could, it never invents a saving.
+_UNNAMEABLE: frozenset = frozenset({
+    # colours
+    "green", "brown", "white", "black", "yellow", "purple", "golden", "dark",
+    "light", "wholemeal", "wholegrain",
+    # generic categories
+    "vegetable", "vegetables", "veggie", "veggies", "fruit", "fruits",
+    "leaf", "leaves", "dressing", "seasoning", "spice", "spices", "herb",
+    "herbs", "mix", "mixed", "blend", "topping", "filling", "garnish",
+    "flakes", "powder", "paste", "puree", "concentrate", "granules",
+    # preparation / provenance adjectives
+    "raw", "whole", "cooked", "frozen", "canned", "tinned", "smoked",
+    "roasted", "toasted", "boneless", "skinless", "seedless", "unsalted",
+    "salted", "standard", "plain", "instant", "ready", "free", "style",
+    "organic", "natural", "baby", "wild", "sweet", "sour", "spicy",
+    # condiment modifiers whose noun is a staple and gets dropped
+    "balsamic", "wine", "cider", "malt", "sesame", "sunflower", "rapeseed",
+})
+
+
+def _pantry_stems(pantry: Any) -> set:
+    """Stems of every word the member named, so their items are not re-labelled.
+
+    An ingredient the member told us about already carries the pantry chip.
+    Adding "also uses Monday's tomatoes" beside "uses your tomatoes" would
+    blur exactly the distinction these two chips exist to draw.
+    """
+    from services.pantry_service import normalize_items, singular
+
+    return {
+        singular(word)
+        for item in normalize_items(pantry or ())
+        for word in str(item).split()
+        if word
+    }
+
+
+def shared_ingredient_facts(plan_entries: List[dict], pantry: Any = ()) -> dict:
+    """Which meals reuse an ingredient the plan itself introduced.
+
+    Measured over the finished week, not over what the scorer intended: the
+    claim is "these two meals share cabbage", which is either true of the
+    plan on the page or it is not. A meal is credited only against an
+    *earlier* day — the first appearance introduced the ingredient and has
+    nothing to point back to — so nothing is double-counted.
+
+    Returns ``{"entries": {index: [(item, day)]}, "meals": n, "items": [...]}``.
+    """
+    from .planner import _singular, perishable_tokens
+
+    skip = _pantry_stems(pantry) | {_singular(w) for w in _UNNAMEABLE}
+    # stem -> earliest day it appears on, and the surface word to show.
+    first_day: Dict[str, int] = {}
+    surface: Dict[str, str] = {}
+    for entry in plan_entries:
+        day = entry.get("day")
+        if not isinstance(day, int):
+            continue
+        for token in perishable_tokens(_ingredients(_recipe(entry))):
+            stem = _singular(token)
+            if stem in skip:
+                continue
+            if stem not in first_day or day < first_day[stem]:
+                first_day[stem] = day
+                surface[stem] = token
+
+    per_entry: Dict[int, List[tuple]] = {}
+    items: List[str] = []
+    for index, entry in enumerate(plan_entries):
+        day = entry.get("day")
+        if not isinstance(day, int):
+            continue
+        shared = []
+        for token in sorted(perishable_tokens(_ingredients(_recipe(entry)))):
+            stem = _singular(token)
+            origin = first_day.get(stem)
+            if stem in skip or origin is None or origin >= day:
+                continue
+            shared.append((surface.get(stem, token), origin))
+            if surface.get(stem, token) not in items:
+                items.append(surface.get(stem, token))
+        if shared:
+            per_entry[index] = shared
+    return {"entries": per_entry, "meals": len(per_entry), "items": items}
+
+
+def _shared_reason(shared: List[tuple]) -> dict:
+    """One chip naming what the matcher found, and which day it came from."""
+    named = shared[:_SHARED_ITEMS_PER_CHIP]
+    parts = [f"{_day_name(day)}'s {item}" for item, day in named]
+    return {
+        "kind": SHARED_INGREDIENT_KIND,
+        "label": "also uses " + " and ".join(parts) + f" — {SHARED_BADGE_FOODWASTE}",
+    }
+
+
+def annotate_shared_ingredients(
+    plan_entries: List[dict],
+    pantry: Any = (),
+    explainability: Optional[dict] = None,
+) -> dict:
+    """Attach the cross-day reuse chip in place, and a ledger row.
+
+    Runs AFTER ``build_weekly_explainability`` and after the pantry
+    annotation, so it appends to the chips those built rather than
+    replacing them. Unlike the pantry annotation it runs even when the
+    member stated no pantry — this reuse is the plan's own doing, so there
+    is nothing for the member to have said first.
+    """
+    facts = shared_ingredient_facts(plan_entries, pantry)
+    for index, shared in facts["entries"].items():
+        recipe = _recipe(plan_entries[index])
+        if not recipe:
+            continue
+        reasons = list(recipe.get("match_reasons") or [])
+        reasons.append(_shared_reason(shared))
+        recipe["match_reasons"] = reasons
+
+    if explainability is not None and facts["meals"]:
+        ledger = list(explainability.get("constraints_applied") or [])
+        ledger.append({
+            "constraint": (
+                f"{facts['meals']} meal(s) reuse an ingredient from an earlier "
+                f"day — {SHARED_BADGE_FOODWASTE}"
+            ),
+            "type": "soft",
+            "status": "satisfied",
+            "source": "the plan",
+            "detail": "shares " + ", ".join(facts["items"][:6]),
+        })
+        explainability["constraints_applied"] = ledger
+    return facts
+
+
+# --------------------------------------------------------------------- #
 # Weekly metrics (deterministic — no LLM)                                 #
 # --------------------------------------------------------------------- #
 

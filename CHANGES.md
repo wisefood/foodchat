@@ -2,6 +2,81 @@
 
 ---
 
+# Weekly reuse gets a clock
+
+> **Date:** 2026-08-27
+> **Branch:** main
+> No API change, no schema change, no new network calls. Weekly plans pick
+> differently — see the note on `off` below, which now means slightly less
+> than it used to. `pantry_service._singular` is now public as `singular`;
+> nothing outside that module called it before.
+
+Stage 1 of *"Weekly plans that look like how people actually cook"*
+(`IDEAS.md`): sharing ingredients across days, without the sharing turning
+into the same dinner four nights running.
+
+The food-waste axis already rewarded a candidate for overlapping with what
+the plan had already bought. It did it from a flat `set` of ingredient
+tokens, which knows *whether* an ingredient has been used and nothing about
+*when* — so reusing Monday's cabbage on Wednesday and reusing it at Monday's
+dinner scored identically, and the set only ever grew. By day five almost
+everything was in it, every candidate matched, and the signal meant to
+separate reuse from repetition separated nothing.
+
+No shelf life is modelled, here or anywhere else in the service: nothing
+records when an ingredient was bought or when it spoils. The spacing below
+is about the week being worth eating, and makes no claim about freshness.
+
+| What | Detail |
+|---|---|
+| `weekly_planner/planner.py` — new `IngredientBasket` | Replaces the flat `set` the planner carried. Records each committed meal's ingredients against the **day** it lands on, so the scorer can ask how long ago one was eaten and how many times. Pinned slots go in too: a member's anchor puts food in the basket like any other meal. |
+| `weekly_planner/planner.py` — new `_reuse_and_monotony()` | Returns reuse and monotony as **two** numbers, because they answer to different masters. Per shared ingredient: same day −1.0, the next day −0.5, two or more days later rewarded at the slider's weight. That is the whole rule — there is no upper gap, because a five-day gap saves the same shopping-list line a two-day gap does. |
+| An ingredient is worth rewarding twice | Buy it once, cook it twice. A third appearance is not reuse, it is a theme — so it scores as monotony instead, however well spaced. Reuse should shorten the shopping list, not pick the week's flavour. |
+| Monotony is **not** gated on the food-waste slider | `off` has always meant "sharing ingredients earns nothing", and it still does. It never meant "serve the same vegetable three days running" — the flat basket simply had no way to notice that it had. This is the one behaviour change for members who never touched the control. |
+| The penalty is capped at −3.0, separately from the reuse cap | Uncapped, the scorer would quietly prefer recipes with short ingredient lists: they have less to collide with. That is a bias about recipe-writing style, not about food. Capped below the favourites bonus (+5) on purpose — same ordering rule the reuse bonus already followed: it nudges, it does not veto. |
+| A stated pantry is spaced like any other reuse | Found by running it: a member who said *"I already have tomatoes, pasta, cabbage, eggplants"* got tomatoes in **15 of 21 meals, on all seven days**. The pantry boost is +3 per item, up to +6 — it outranks the −3.0 monotony cap on its own, so the spacing never got to bite. `_pantry_item_wanted()` now applies the same two rules the reuse bonus follows: not on an adjacent day, and not once the item has had two meals. "I have tomatoes" is a request to use them up, not to eat them daily. |
+| The basket is number-symmetric | `perishable_tokens` does no stemming, so the same plan stored `tomatoes` (days 1–2) and `tomato` (days 1–7) as **two different ingredients** — and the monotony penalty compared each against only half its own history. Now keyed by `pantry_service.singular()`, the stem the pantry matcher already uses, which is the same asymmetry commit `7c3159f` fixed one module over. `tokens()` still returns the unstemmed set, so a pre-M8 scorer matches on exactly what it used to. |
+| Cross-day reuse is a **different chip** from the pantry | `explainability.annotate_shared_ingredients()` adds `kind: "shared_ingredient"` — *"also uses Monday's cabbage — reducing food waste"* — beside the existing `kind: "pantry"` chip *"uses your tomatoes"*. A member can act on those differently: the first is the planner's doing about an ingredient nobody mentioned, the second is theirs and they can go check the fridge. An item the member named never carries the cross-day chip, so neither claim takes the other's ground. |
+| Two ledger rows, attributed apart | `source: "your pantry"` keeps *"using N of M on-hand ingredient(s)"*; the new `source: "the plan"` row reports *"N meal(s) reuse an ingredient from an earlier day"* with the items in `detail`. The cross-day row appears whether or not a pantry was stated — the member said nothing about these ingredients, which is the whole point. |
+| Naming is held to a stricter standard than ranking | `perishable_tokens` splits on whitespace, so "green beans, bay leaf, balsamic vinegar" yields `green`, `leaf`, `balsamic`. Harmless in the scorer — two meals sharing "green" really are a bit more alike, and averaging absorbs it — but the first run of this produced chips reading *"also uses Monday's green"*, *"Wednesday's brown"*, *"Monday's leaf"*. `_UNNAMEABLE` now drops colours, generic categories and preparation adjectives, and a share whose only overlap is unnameable **is not counted at all**. Under-reporting is the safe direction, the same posture the pantry matcher takes. |
+| `WeeklyPlanner.generate_full_plan` dispatches on scorer arity | The scorer grew a fourth argument (the day being planned). Each arity is now called with exactly what it accepts — 4 gets the basket and the day, 3 gets `basket.tokens()` and behaves exactly as it did before this change, 2 is untouched. Adding the day could otherwise have broken a 3-argument scorer silently, which is what the old `>= 3` check would have done. |
+
+The pre-M8 flat-basket contract still works if you pass a plain set: reward on
+overlap, no spacing, no penalty. That path is tested, not merely left in.
+
+`tests/test_food_waste.py` gains 19 tests. Verified as regressions rather
+than decoration: zeroing the same-day and adjacent-day weights fails 6, and
+the end-to-end spacing test then reports the shared ingredient landing on
+days `[1, 2, 3, 4, 5, 6, 7]` — the exact failure the change exists to
+prevent. With the weights in place it lands on `[1, 3]`: reused once,
+spaced, then done. Removing the pantry gate fails 3 more, and un-stemming
+the basket fails 5. `tests/test_shared_ingredients.py` is new (16 tests) and
+covers the separation itself: a member-stated item must never carry the
+cross-day chip, and vice versa. 499 passing (457 + 42).
+
+Simulated against a tomato-heavy Italian pool (7 of 10 candidates carry the
+stated item, as they did in the plan that exposed this): **21 of 21 slots
+before, 2 of 21 after, on days 1 and 3**. What the scorer cannot fix is a
+pool where nearly every candidate carries the ingredient anyway — Italian
+cuisine and tomatoes — which is the sourcing half's problem, not this one's.
+
+**Deliberately not in this change**, both recorded in `IDEAS.md`:
+
+- *The sourcing half of stage 1.* Feeding a committed day's ingredients back
+  through `pantry_service.fetch_pantry_candidates` would make reuse stronger
+  by putting matching recipes in the pool rather than hoping they are there.
+  It also fires a per-item HTTP fan-out on **every** weekly plan, where today
+  that fan-out only runs when the member actually stated a pantry — a
+  latency regression for every user, to strengthen an axis most of them
+  leave `off`. Worth doing behind the slider, not worth doing blind.
+Replayed over the plan that exposed the pantry bug, the two now read apart:
+9 pantry chips naming tomatoes/pasta/cabbage/eggplants, and 8 cross-day
+chips naming bread, capsicum, zucchini, courgette, carrots, celery,
+aubergine, beans and almond — with `13 meal(s)` dropping to `8` once the
+unnameable shares stopped counting.
+
+---
+
 # Pantry review follow-ups
 
 > **Date:** 2026-08-20

@@ -198,11 +198,24 @@ correctly after a process restart or on a different replica.
   |      diet-aware, relaxes with a warning if it would empty the pool;
   |      prunes/relaxations recorded on env.selection_events at decision
   |      time), then preference score + soft calorie-budget score pick the
-  |      recipe; the tracker accumulates real kcal/macros as slots commit
+  |      recipe; the tracker accumulates real kcal/macros as slots commit.
+  |      An IngredientBasket carries each committed meal's ingredients WITH
+  |      the day they land on, so the scorer judges overlap by when the
+  |      ingredient was last eaten: same day -1.0 / next day -0.5
+  |      (monotony, applied at every food-waste setting), two or more days
+  |      later rewarded at the slider's weight, and only twice per
+  |      ingredient. No shelf life is modelled — nothing records expiry
   +--> batch enrichment on the final 21 entries (nutrition, image, tags)
   |      + adapted-recipe overlay
   +--> build_day_summaries(entries) -> {day: "dinner with fish" headline}
   +--> build_weekly_explainability(entries, profile, selection_events, ...)
+  |      then annotate_weekly_entries (pantry chips, "uses your tomatoes",
+  |      ledger source "your pantry") and annotate_shared_ingredients
+  |      (cross-day chips, "also uses Monday's cabbage", ledger source
+  |      "the plan"). Two kinds, never merged: the first is what the member
+  |      told us they had, the second is reuse the plan introduced on its
+  |      own. A member-stated item never carries the cross-day chip, and a
+  |      share the tokeniser cannot name is not counted at all
   |      LLM-free: attaches per-entry recipe.match_reasons chips, builds
   |      the MEASURED constraint ledger (meat count / calorie budget with
   |      status satisfied | relaxed | violated), personalization counts,

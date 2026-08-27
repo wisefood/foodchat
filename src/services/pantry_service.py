@@ -75,7 +75,7 @@ def normalize_items(raw: Iterable) -> tuple[str, ...]:
     return tuple(seen)
 
 
-def _singular(word: str) -> str:
+def singular(word: str) -> str:
     """A crude singular stem, enough for ingredient names.
 
     "tomatoes" → "tomato", "berries" → "berri" (which still matches "berries"
@@ -101,7 +101,7 @@ def _item_pattern(term: str) -> str:
     """
     words = [w for w in term.split() if w]
     return r"\b" + r"\s+".join(
-        re.escape(_singular(w)) + r"(?:e?s)?" for w in words
+        re.escape(singular(w)) + r"(?:e?s)?" for w in words
     ) + r"\b"
 
 
