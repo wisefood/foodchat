@@ -2,6 +2,218 @@
 
 ---
 
+# Three things a real week got wrong
+
+> **Date:** 2026-09-04
+> **Branch:** main
+> No API change. `metrics.selection_events` gains `repeat_offered`. Weekly
+> plans pick differently (breakfast repeats can now actually happen), the
+> pantry extractor now fires on phrasings it used to miss, and fewer meals
+> count toward the weekly meat limit.
+
+Follow-up to *"Weekly plans go looking for what they already buy, and
+breakfast may come back"*, from running it and reading the output. Nothing
+here was visible from the tests; all three were visible in one generated week.
+
+## The repeat could never fire
+
+`planned_repeats: 0`, seven distinct breakfasts. Not a wiring fault — the
+number was wrong.
+
+`_REPEAT_PENALTY` shipped at 1.0, justified as "enough that a repeat does not
+win a coin flip". That assumed candidates are spread over a range of scores.
+They are not. The member had no favourites, and both their `food_likes` were
+cuisines — which `split_cuisines` removes before the scorer sees them — so the
+liked-ingredient boost had nothing to match and **almost every candidate scored
+exactly 0.0**. Against a flat field, −1.0 is not a tiebreak, it is a veto: the
+repeat lost to every fresh candidate that existed.
+
+| What | Detail |
+|---|---|
+| `_REPEAT_PENALTY` → 0.0 | A legal repeat joins the tie pool and takes a proportional share of slots. It was never the real control: the cooldown decides *whether* a repeat is legal and the cap decides *how often*, and both still hold. The constant stays as the dial to turn if repeats get too frequent. |
+| The branch still matters at zero | Sitting out the ingredient axis is the load-bearing half — without it a repeat collects the full reuse bonus for overlapping with its own earlier serving, and at `strict` repeating becomes the cheapest way to score. |
+| Measured | 40 simulated weeks, 10 candidates/slot/day, bare profile, food waste off: **~1.2 repeats per week** (over two 40-week samples: 0 in 4–7 weeks, 1 in 20–22, 2 in 13–14). Lunch/dinner uniqueness, the 2-day gap and the 2-serving cap held on every run. |
+
+## "The week repeated nothing" and "nothing was offered" looked identical
+
+Two causes with opposite fixes — one in the scorer, one at RecipeWrangler —
+and no way to tell them apart from a stored plan.
+
+| What | Detail |
+|---|---|
+| New `repeat_offered` selection event | `{"type", "day", "meal_type", "count", "recipe_ids"}`, recorded when a slot's pool contains a legal repeat, whether or not one is chosen. Once per slot. |
+
+## The member's pantry was silently ignored
+
+The query was *"…and I already have avocado, tomatoes and pasta"*. No pantry
+chips, no `"your pantry"` ledger row, and the pantry never reached the planner.
+
+| What | Detail |
+|---|---|
+| The hint gate required subject and verb adjacent | `\bi\s+have\b` cannot span "already" — about the most natural way anyone says this. "still", "just", "only", "also" and "now" failed the same way. Subject and verb may now be up to two words apart. |
+| The trade was always in this direction | The gate's own comment says a false positive costs one abstaining LLM call. A miss costs the whole feature — and worse than silently: the `ResponseWriter` still wrote *"using your avocado, tomatoes and pasta"* with no `facts["pantry"]` to support it. |
+
+## A chickpea burger was a red-meat meal
+
+Not just a wording problem. It spent one of three weekly meat allowances,
+pruned meat from every later candidate pool, forced a `meat_limit_relaxed`
+event at 4-of-3, and had the reply apologise that Thursday's dinner "required
+red meat to fit the cuisine mix".
+
+| What | Detail |
+|---|---|
+| `vegetarian_or_vegan` added to `VEG_TAGS` | RecipeWrangler's most-used veg tag spelling was not listed, so the authoritative signal was being ignored on exactly the recipes that need it. The module docstring already says tags are authoritative; this is one more spelling of the same tag, not a new policy. |
+| It classifies as `vegetarian`, not `vegan` | The tag cannot say which. Calling a vegan dish vegetarian understates it; the reverse would be a claim about a recipe nobody made. |
+| New `meat_text` — qualified uses stripped before matching | A keyword match cannot read a qualifier. "chickpea burger", "veggie burger", "meat-free chilli", "vegan sausage", "lentil meatballs" are no longer meat. One vocabulary, stripped once, rather than a growing exception list inside each caller. |
+| Two kinds of qualifier, with different reach | An outright one ("vegan", "mock", "tofu") may qualify any meat word. A vegetable ("chickpea", "mushroom") may only qualify a word describing a *shape* — burger, sausage, meatball. A vegetable beside an animal is a dish containing the animal, so "mushroom chicken" stays poultry. Under-counting meat is the worse error when the point is a meat limit. |
+| A qualifier covers the same word named again | RecipeWrangler ingredient strings repeat the noun bare — the chickpea burger's read *"Burger patties burger patty"*. Every occurrence of a qualified word goes; only that word, so "Beef burger with a veggie sausage" still counts on "beef". |
+| The food database's hen's egg is not poultry | *"eggs, chicken, whole, raw"* is how the composition database writes an egg. Read literally it made every shakshuka a poultry meal. The pattern only fires when "chicken" is a bare comma-delimited fragment, so "2 eggs, chicken breast, flour" is still poultry. |
+
+Replayed over the exact week that prompted this: meat meals **4 → 3** (at the
+limit, so no relaxation and no apology), and Thursday's headline goes from
+*"dinner with red meat"* to *"light vegetarian day"*. The other six days and
+all three fish/poultry detections are unchanged.
+
+## Verification
+
+Eleven further mutations, each neutering one of the changes above — the penalty,
+the ingredient-axis exemption, both halves of the offer recording, the gate in
+each direction, the veg tag, the qualifier scope, the egg patterns, and
+`meat_text` itself. All eleven are caught, and the previous change's sweep still passes — one of
+its 25 became moot when the penalty went to zero, so it runs 24 now.
+One mutation found dead code: the qualified-phrase substitution was redundant
+once the qualifier-scope loop existed, and is gone.
+
+Repeats make selection less deterministic, so the suite was run 20 times
+rather than once. That found a flaky test of my own: the end-to-end sourcing
+test asserted that *Sunday* still had an ingredient worth reusing, which
+depends on which recipes happened to land where — by day 7 every ingredient
+in the fixture may have had its two meals, which is the cap working, not the
+offer failing. It now asserts that some day was offered something.
+
+`tests/test_day_summary.py` grows to 38, `tests/test_pantry.py` and
+`tests/test_repeat_policy.py` gain the gate and offer cases. **600 passing**,
+20 runs in a row; ruff unchanged at its pre-existing 19.
+
+## Not fixed here
+
+The `ResponseWriter` still writes claims the facts do not carry — the run that
+prompted this said *"using your avocado, tomatoes and pasta"* with no pantry in
+`facts`, and *"14 kcal weekly budget"*. Widening the pantry gate removes the
+occasion for the first one but not the ability. Separately, the reuse sentence
+now in `explainability["reasoning"]` reaches the plan payload but not the chat
+message, because the writer composes its own prose.
+
+---
+
+# Weekly plans go looking for what they already buy, and breakfast may come back
+
+> **Date:** 2026-09-04
+> **Branch:** main
+> No breaking API change. Additive on the weekly payload: entries may carry
+> `recipe.repeat_of_day` / `recipe.repeat_source`, `match_reasons` gains
+> `kind: "repeat"` (with a `source` field), `metrics.variety` gains
+> `planned_repeats` / `repeats_by_source` / `unexplained_repeats`,
+> `metrics.repeats` is new, and `metrics.selection_events` gains three event
+> types. **A 7-day plan can now contain the same breakfast twice** — the
+> "21 distinct recipes" guarantee is retired for that one slot.
+> Extra RecipeWrangler calls only when the food-waste slider is at `strict`.
+
+Components 1 (sourcing half) and 2 of *"Weekly plans that look like how
+people actually cook"* (`IDEAS.md`). Two mechanisms, one theme: a generated
+week was 21 independently chosen recipes, and read like 21 shopping lists.
+
+## The sourcing half of cross-day reuse
+
+The scoring half shipped in *"Weekly reuse gets a clock"* and could only
+reorder the pool it was handed. A day's pool is fetched knowing nothing
+about what the week has already bought, so reuse happened when a shared
+ingredient turned up by luck.
+
+| What | Detail |
+|---|---|
+| The planner offers, the action space decides | Before each new day's pool is fetched, `WeeklyPlanner` calls `offer_derived_pantry` with the ingredients `IngredientBasket.reusable_items` says are still worth another meal. Duck-typed, so the fakes in the tests and the edit path's action space never receive the offer. |
+| Sourcing asks for exactly what scoring rewards | `reusable_items` applies the same two rules the reuse bonus scores by — a gap of ≥ 2 days, at most 2 meals per ingredient. Sourcing something the scorer then penalises would buy latency and a worse week. |
+| Gated on `strict` | One `plan_meals` request per ingredient per day. Capped at three ingredients. On by default it would be a latency cost paid by everyone to strengthen an axis most members leave `off`. |
+| The member's items are left to their own fan-out | Anything matching the stated pantry is dropped from the derived list — it is already being searched for, and searching twice buys only latency. |
+| The member's pantry still ranks the pool | Both merges sort coverage-first, so whichever runs last decides the top of the day's pool. The derived merge runs **first**, deliberately: what the member told us they have must outrank what the plan inferred. |
+| Ingredients had to be named before they could be searched | `perishable_tokens` splits on whitespace, and "self" is no more a search term than it is a chip. `nameable_phrases` moved out of `explainability` into `planner` and now serves both — two definitions of "an ingredient" would have drifted apart within a release. |
+| Both outcomes are recorded | `derived_pantry_sourced` per day that searched (with what it searched for), or `derived_pantry_skipped` once with the setting that skipped it. "This week reused nothing" and "this week never looked" are different answers. |
+
+The ledger reports the search (`"look for recipes using ingredients the week
+already buys"`, source `"food-waste setting"`) separately from the reuse,
+which is still measured over the finished week by `shared_ingredient_facts`.
+A search that found nothing usable is not a saving.
+
+## Breakfast may come back
+
+`RecipeActionSpace` excluded every committed id from every later fetch, so a
+repeat was impossible at the *source*. Nobody eats seven different
+breakfasts.
+
+| What | Detail |
+|---|---|
+| A slot-scoped cooldown, breakfast only | A breakfast may return after ≥ 2 days, at most twice in the week, never in another slot. Lunch and dinner keep the original rule exactly. `mark_selected` still means never — pinned anchors and downvoted dishes have no way back. |
+| It costs no extra requests | The fetch is per *day* and serves all three slots, so it uses the loosest exclusion any slot needs and the per-slot rule is applied at selection time. A test asserts one pool fetch per day, so a regression to per-slot fetching (3× the calls) cannot pass silently. |
+| `mark_selected` split from `mark_committed` | The first means "never, at all" and is what the service calls for anchors and downvotes. The second carries the day and the slot, which is what a cooldown needs — without them a commitment can only mean "never again". |
+| The variety penalty had to stop fighting the cooldown | −2 per shared title token, against an exact repeat, scales with how many words the recipe happens to be called — always enough to beat the cooldown. A sanctioned repeat is exempt from its **own** earlier title and from nothing else, and pays a flat `_REPEAT_PENALTY = 1.0` instead, so it loses to an equally good new dish. |
+| A repeat earns no reuse bonus from its own ingredients | It shares everything with its earlier serving, so at `strict` the ingredient axis made repeating the cheapest way to score. Observed before the fix: a strict week repeated a breakfast at the first legal opportunity, every time. A repeat now sits out that axis entirely. |
+| A thin pool repeats instead of failing | Four breakfasts across seven days used to raise `PlanGenerationError` on day 5. The cooldown strictly improves fillability — it only ever loosens an exclusion. |
+
+## Which repeats were asked for, and which were not
+
+The failure mode is not "too few repeats". It is a thin candidate pool
+quietly producing a repetitive week that the plan then describes as a
+feature. So every repeat carries the authority it repeated under, set at the
+only point that can justify it and carried through unchanged.
+
+| What | Detail |
+|---|---|
+| `repeat_source` on the candidate | `"member_request"` when the recipe is one the member starred, `"plan"` otherwise. Set in `get_candidate_actions`, and rides on the candidate onto the stored entry — the scorer, the environment and the explainability layer all read the same flag. |
+| Two different chips | `"back from Monday, a favorite of yours"` vs `"the same breakfast as Tuesday"`, both `kind: "repeat"`, both carrying `source` for machine consumers. |
+| A repeat is not also billed as ingredient reuse | A meal that IS an earlier meal shares every ingredient with it; showing "the same breakfast as Monday" beside "also uses Monday's rolled oats" says one thing twice and inflates the reuse count by the repeat count. |
+| `variety_metrics` learned the difference | `planned_repeats` and `repeats_by_source` are reported apart from `unexplained_repeats` — a duplicate with no recorded reason (a pinned dish, a slot edit) is never folded into the sanctioned count and gets its own `violated` ledger row. |
+| Measured against the policy, not asserted from it | The ledger row's status comes from the gap and appearance counts observed in the finished week, so a duplicate that reached the plate without passing the cooldown is reported as out of policy rather than described as intended. |
+| The prose says it too | `_compose_reasoning` names the count and the split ("*2 meal(s) repeat earlier in the week … 1 you'd starred and 1 the plan's own choice, never closer together than 2 day(s)*"), and the response writer gets the same split in `facts["repeats"]` rather than a total. |
+
+`annotate_shared_ingredients` now also **appends** its sentence to
+`explainability["reasoning"]`. It runs last so its chips are additive, which
+meant the whole-week justification was composed before anyone had measured
+the reuse — so the one axis a member is most likely to ask about was the one
+the prose never mentioned.
+
+## Fixed on the way
+
+| What | Detail |
+|---|---|
+| A counting word could impersonate an ingredient | `half` clears the length filter in `perishable_tokens`, and was stripped from a chip's *display* but not from its *stems*. "half a cabbage" and "half a pumpkin" therefore shared an ingredient, and the later meal was credited with reusing the cabbage. Measurements and counting words are now dropped before the stems are taken. |
+| `env.reset()` orphaned the event list | The action space holds a reference to the same `selection_events` list, so rebinding it on reset would have silently dropped every sourcing event it recorded afterwards. Cleared in place. |
+| `planner.py` had no module docstring | Contrary to the standing rule in `CLAUDE.md`. Added, covering the loop, the basket, the naming, and the scorer. |
+| A repeat flag could outlive its partner | `edit_service` replaces a slot with a freshly built recipe dict, which clears the flag on the slot it edits and leaves the *other* serving still claiming to repeat a day that no longer has it. `repeat_facts` now checks each flag against the days that recipe is actually on, so a stale flag cannot become a ledger row. |
+| A `strict` member could be recorded as having skipped the search | The skip branch was reached by falling through the sourcing condition, which also fails when the day pool comes back empty. The setting is now re-checked rather than inferred. |
+| `metrics.repeats` carried list indices as keys | The payload is stored as JSON, so they would return as strings on the next read. Only the counts are stored; which meal is a repeat is already on the entry as `recipe.repeat_of_day`. |
+
+## Verification
+
+Every mechanism above was checked by neutering it and confirming a test
+fails — 25 mutations (the cooldown's slot, gap and cap; the exclusion
+loosening; the repeat labelling; the scorer's two exemptions and its penalty;
+the sourcing gate, cap and de-duplication; the recording of both outcomes;
+the stale-flag guard; each ledger row; the variety split; the prose). All 25
+are caught. The first sweep found three that were not, including a test whose
+fixture was derived from the constant it was testing — so raising the cap to
+99 moved its goalposts with it and the assertion still held.
+
+`tests/test_repeat_policy.py` (36) and `tests/test_reuse_sourcing.py` (22)
+are new; `tests/test_shared_ingredients.py` grows from 21 to 24. Repeat
+behaviour is asserted against the real `RecipeActionSpace` with only its
+network edges stubbed, including a source that ignores `exclude_recipe_ids`
+entirely — that is a request to RecipeWrangler, not a guarantee, and the
+per-slot rule is the only thing between a downvoted recipe and the member's
+plate. **565 passing**; ruff unchanged at its pre-existing 19.
+
+---
+
 # Cross-day reuse names the whole ingredient
 
 > **Date:** 2026-08-27

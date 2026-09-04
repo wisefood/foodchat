@@ -43,8 +43,13 @@ class WeeklyMealPlanEnv:
         self.done = False
         self.plan = [] # To store the generated plan details
         # Selection events recorded while picking (M7 explainability) —
-        # meat-pool prunes and limit relaxations, appended by the planner.
+        # meat-pool prunes and limit relaxations appended by the planner,
+        # sanctioned repeats appended below, and the action space's own
+        # sourcing decisions (M9). One ledger, so `metrics.selection_events`
+        # carries the whole selection story in the order it happened.
         self.selection_events: List[Dict[str, Any]] = []
+        if hasattr(action_space, "selection_events"):
+            action_space.selection_events = self.selection_events
 
     def reset(self, user_query: Optional[str] = None) -> Dict[str, Any]:
         """
@@ -58,7 +63,10 @@ class WeeklyMealPlanEnv:
         self.current_meal_idx = 0
         self.done = False
         self.plan = []
-        self.selection_events = []
+        # Cleared in place: the action space holds a reference to this same
+        # list (see __init__), and rebinding it here would silently orphan
+        # every event it records after a reset.
+        self.selection_events.clear()
         if user_query is not None:
             self.user_query = user_query
         return self._get_state()
@@ -115,8 +123,32 @@ class WeeklyMealPlanEnv:
             user_query=self.user_query
         )
         
-        # Register selected recipe so future fetches exclude it
-        self.action_space.mark_selected(str(chosen_recipe.get("recipe_id", "")))
+        # Register the commitment so later fetches know what the week has
+        # already served. `mark_committed` carries the day and the slot, which
+        # is what the repeat policy needs; an action space that predates it
+        # (the fakes in the tests) falls back to the old never-again call and
+        # behaves exactly as before.
+        recipe_id = str(chosen_recipe.get("recipe_id", ""))
+        commit = getattr(self.action_space, "mark_committed", None)
+        if callable(commit):
+            commit(recipe_id, self.current_day, self.meal_types[self.current_meal_idx])
+        else:
+            self.action_space.mark_selected(recipe_id)
+
+        # A repeat is a decision, so it is recorded where the other selection
+        # decisions are, at the moment it is taken. `source` is the whole point:
+        # a second serving the member starred and one the planner chose are
+        # different claims, and only this event knows which happened.
+        if chosen_recipe.get("repeat_of_day"):
+            self.selection_events.append({
+                "type": "repeat_allowed",
+                "day": self.current_day,
+                "meal_type": self.meal_types[self.current_meal_idx],
+                "recipe_id": recipe_id,
+                "recipe_title": chosen_recipe.get("recipe_title", ""),
+                "repeat_of_day": chosen_recipe["repeat_of_day"],
+                "source": chosen_recipe.get("repeat_source", "plan"),
+            })
 
         # Store step in the plan list
         self.plan.append({

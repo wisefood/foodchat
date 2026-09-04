@@ -19,6 +19,19 @@ entry point: it attaches per-entry ``match_reasons`` in place (mirroring
 Ledger ``status`` values: ``satisfied`` | ``relaxed`` | ``violated``.
 Daily rows only ever say "satisfied" — the two new values are additive;
 UI consumers should treat unknown statuses as informational.
+
+M9 adds two more things a week can now do, and the labels that keep them
+apart from each other and from the member's own requests:
+
+- a recipe may **repeat** (breakfast only — see ``action_adapter``). Every
+  repeat carries the day it repeats and whether it was the member's doing
+  (a starred recipe) or the plan's own, through to the chip, the ledger row,
+  the variety metric and the prose. A duplicate that carries neither reason
+  is reported as ``unexplained``, never folded into the sanctioned count.
+- the plan may **search later days for ingredients it has already bought**.
+  What it searched for is a ledger row; what it actually reused is measured
+  separately over the finished week by ``shared_ingredient_facts``, because a
+  search that found nothing usable is not a saving.
 """
 
 import re
@@ -29,6 +42,7 @@ from services.adapted_recipes import ADAPTED_REASON
 from services.transparency import constraints_ledger, match_reasons, personalization_summary
 
 from .day_summary import classify_meal, is_meat_meal
+from .planner import nameable_phrases
 from .reward_logic import candidate_kcal
 from .state_tracking import WeeklyNutritionalTracker
 
@@ -113,6 +127,113 @@ def attach_match_reasons(plan_entries: List[dict], profile: dict) -> None:
 
 
 # --------------------------------------------------------------------- #
+# Sanctioned repeats (M9)                                                 #
+#                                                                         #
+# A recipe may now appear twice in a week — breakfast only, spaced, and   #
+# capped (`action_adapter`'s repeat policy). Two very different things    #
+# can produce that, and the week must never present one as the other:     #
+# a breakfast the member starred coming back on Thursday is the plan      #
+# doing what they asked, while the planner choosing a second serving on   #
+# its own is a mechanism they never opted into. Every repeat therefore    #
+# carries the day it repeats and the authority it repeated under, from    #
+# the candidate that was picked all the way to the chip on the card.      #
+# --------------------------------------------------------------------- #
+
+REPEAT_KIND = "repeat"
+
+# Mirrors `action_adapter.REPEAT_MEMBER_REQUEST` / `REPEAT_PLAN`. Duplicated
+# as a presentation constant rather than imported, so the label vocabulary the
+# UI depends on cannot change as a side effect of a planning-side edit.
+REPEAT_BY_MEMBER = "member_request"
+REPEAT_BY_PLAN = "plan"
+
+
+def repeat_facts(plan_entries: List[dict]) -> dict:
+    """Which meals repeat an earlier one, and on whose authority.
+
+    Measured over the finished week, from the flag the action space set on
+    the candidate it allowed back — not from the policy constants. If a
+    repeat reached the plate some other way (a pinned dish, a slot edit) it
+    shows up here as ``unexplained``, which is the honest reading: nobody
+    recorded a reason for it, so nobody may claim one.
+
+    Returns ``{"entries": {index: {"of_day", "source"}}, "count": n,
+    "by_source": {...}, "min_gap_days": g|None, "max_appearances": n,
+    "unexplained": n}``.
+    """
+    per_entry: Dict[int, dict] = {}
+    by_source: Dict[str, int] = {}
+    gaps: List[int] = []
+    appearances: Counter = Counter()
+    # recipe_id -> the days it is actually on, so a flag can be checked
+    # against the plan rather than believed. `edit_service` replaces a slot
+    # with a freshly built recipe dict, which clears the flag on the slot it
+    # edits and leaves the OTHER serving still claiming to repeat a day that
+    # no longer has it. A stale flag must not become a ledger row.
+    served_on: Dict[str, set] = {}
+    for entry in plan_entries:
+        recipe_id = str(_recipe(entry).get("recipe_id") or "")
+        if recipe_id:
+            appearances[recipe_id] += 1
+            if isinstance(entry.get("day"), int):
+                served_on.setdefault(recipe_id, set()).add(entry["day"])
+
+    for index, entry in enumerate(plan_entries):
+        recipe = _recipe(entry)
+        of_day = recipe.get("repeat_of_day")
+        if not of_day:
+            continue
+        recipe_id = str(recipe.get("recipe_id") or "")
+        day = entry.get("day")
+        if int(of_day) not in served_on.get(recipe_id, set()):
+            continue
+        if isinstance(day, int) and int(of_day) >= day:
+            continue
+        source = str(recipe.get("repeat_source") or REPEAT_BY_PLAN)
+        per_entry[index] = {"of_day": int(of_day), "source": source}
+        by_source[source] = by_source.get(source, 0) + 1
+        if isinstance(day, int):
+            gaps.append(day - int(of_day))
+
+    duplicates = max(sum(appearances.values()) - len(appearances), 0)
+    return {
+        "entries": per_entry,
+        "count": len(per_entry),
+        "by_source": by_source,
+        "min_gap_days": min(gaps) if gaps else None,
+        "max_appearances": max(appearances.values()) if appearances else 0,
+        "unexplained": max(duplicates - len(per_entry), 0),
+    }
+
+
+def _repeat_reason(entry: dict, fact: dict) -> dict:
+    """One chip saying what came back, from when, and who wanted it."""
+    meal = str(entry.get("meal_type") or "meal").lower()
+    origin = _day_name(fact["of_day"])
+    if fact["source"] == REPEAT_BY_MEMBER:
+        label = f"back from {origin}, a favorite of yours"
+    else:
+        label = f"the same {meal} as {origin}"
+    return {"kind": REPEAT_KIND, "label": label, "source": fact["source"]}
+
+
+def attach_repeat_reasons(plan_entries: List[dict], repeats: dict) -> None:
+    """Append the repeat chip to every entry the planner allowed back.
+
+    Appends rather than replaces: a repeated favourite still carries its
+    "one of your favourites" chip from `attach_match_reasons`, and dropping
+    that to make room would lose the reason it was eligible at all.
+    """
+    for index, fact in repeats["entries"].items():
+        recipe = _recipe(plan_entries[index])
+        if not recipe:
+            continue
+        reasons = list(recipe.get("match_reasons") or [])
+        reasons.append(_repeat_reason(plan_entries[index], fact))
+        recipe["match_reasons"] = reasons
+
+
+# --------------------------------------------------------------------- #
 # Cross-day ingredient reuse (M8)                                         #
 #                                                                         #
 # Distinct from the pantry chip, and deliberately worded so a member can  #
@@ -129,65 +250,15 @@ SHARED_BADGE_FOODWASTE = "reducing food waste"
 # Items named in one chip before it stops being readable.
 _SHARED_ITEMS_PER_CHIP = 2
 
-# Naming is held to a stricter standard than ranking, and the unit of a
-# *name* is the ingredient phrase, not the token.
-#
-# `perishable_tokens` splits on whitespace, which is right for scoring —
-# two meals sharing "green" really are a little more alike, and averaging
-# absorbs the noise. It is wrong for a chip. Tokenising "self raising flour"
-# drops the staple and leaves the modifiers, so the first version of this
-# told a member she was reusing *"Thursday's self"* and *"Thursday's
-# raising"*, from one bag of flour. Others: "Monday's green" (green beans),
-# "Wednesday's brown" (brown rice), "Monday's leaf" (bay leaf).
-#
-# So a share is *found* by token — that part works — and then *named* by
-# the phrase the token came from on the day it first appeared. Several
-# tokens from one phrase collapse into one item, which is what makes "self"
-# and "raising" a single "self raising flour" rather than two ingredients.
-#
-# A share the phrase rules cannot name is not counted at all. Under-
-# reporting is the safe direction here, the same posture the pantry matcher
-# takes: a missed match says less than it could, it never invents a saving.
-
-# A token must anchor on one of these to be worth naming at all — a phrase
-# of pure adjectives ("whole, raw") names nothing.
-_UNNAMEABLE: frozenset = frozenset({
-    # colours
-    "green", "brown", "white", "black", "yellow", "purple", "golden", "dark",
-    "light", "wholemeal", "wholegrain",
-    # generic categories
-    "vegetable", "vegetables", "veggie", "veggies", "fruit", "fruits",
-    "leaf", "leaves", "dressing", "seasoning", "spice", "spices", "herb",
-    "herbs", "mix", "mixed", "blend", "topping", "filling", "garnish",
-    "flakes", "powder", "paste", "puree", "concentrate", "granules",
-    # preparation / provenance adjectives
-    "raw", "whole", "cooked", "frozen", "canned", "tinned", "smoked",
-    "roasted", "toasted", "boneless", "skinless", "seedless", "unsalted",
-    "salted", "standard", "plain", "instant", "ready", "free", "style",
-    "organic", "natural", "baby", "wild", "sweet", "sour", "spicy",
-    # condiment modifiers whose noun is a staple and gets dropped
-    "balsamic", "wine", "cider", "malt", "sesame", "sunflower", "rapeseed",
-})
-
-# Quantity words to drop from a displayed phrase. `_UNITS` already covers
-# measurements; these are the counting words that survive it ("half a
-# cabbage" should read "cabbage").
-_QUANTITY_WORDS: frozenset = frozenset({
-    "half", "quarter", "third", "few", "some", "handful", "pinch", "dash",
-    "splash", "piece", "pieces", "packet", "packets", "pouch", "pouches",
-    "tin", "tins", "can", "cans", "jar", "jars", "bunch", "sprig", "sprigs",
-    "stick", "sticks", "tub", "block", "each", "about", "approx",
-})
-
-# Longer than this and the "phrase" is a run-together blob rather than an
-# ingredient name ("brown sugar light brown cane sugar"). Not named.
-_MAX_PHRASE_WORDS = 4
-
-
-def _unnameable_stems() -> frozenset:
-    from services.pantry_service import singular
-
-    return frozenset(singular(w) for w in _UNNAMEABLE)
+# A share is *found* by token and *named* by the phrase the token came from:
+# tokenising "self raising flour" once told a member she was reusing
+# "Thursday's self" and "Thursday's raising", from one bag of flour. That
+# rule now lives in `planner.nameable_phrases`, because the sourcing half of
+# this axis needs the same names — an ingredient worth naming to a member is
+# exactly an ingredient worth searching RecipeWrangler for, and two
+# definitions of "an ingredient" would drift apart within a release. A share
+# the phrase rules cannot name is not counted at all: under-reporting is the
+# safe direction, the same posture the pantry matcher takes.
 
 
 def _pantry_stems(pantry: Any) -> set:
@@ -207,43 +278,6 @@ def _pantry_stems(pantry: Any) -> set:
     }
 
 
-def _nameable_phrases(ingredients_text: Any, pantry_stems: set) -> List[tuple]:
-    """``[(display_name, {stems})]`` for the phrases worth naming to a member.
-
-    A phrase is dropped when it names a staple — "self raising flour" *is*
-    flour, "brown sugar" *is* sugar, "macadamia nut oil" *is* oil — because
-    sharing a staple has never been a saving, and it is exactly those phrases
-    whose modifiers survive tokenising and end up impersonating ingredients.
-
-    A phrase touching the member's own pantry is dropped **whole**, not just
-    filtered down to its other words. "eggplant aubergine" anchored on
-    "aubergine" would otherwise be shown to a member who told us about their
-    eggplants, crediting the plan for their fridge.
-    """
-    from .planner import _PANTRY_STAPLES, _UNITS, _singular, perishable_tokens
-
-    out: List[tuple] = []
-    for part in re.split(r"[\n,;•]+", str(ingredients_text or "")):
-        words = re.sub(r"[^a-z\s]", " ", part.lower()).split()
-        if not words or len(words) > _MAX_PHRASE_WORDS:
-            continue
-        if any(w in _PANTRY_STAPLES for w in words):
-            continue
-        all_stems = {_singular(t) for t in perishable_tokens(" ".join(words))}
-        if all_stems & pantry_stems:
-            continue
-        stems = {s for s in all_stems if s not in _unnameable_stems()}
-        if not stems:
-            continue
-        display = " ".join(
-            w for w in words
-            if len(w) > 2 and w not in _UNITS and w not in _QUANTITY_WORDS
-        )
-        if display:
-            out.append((display, stems))
-    return out
-
-
 def shared_ingredient_facts(plan_entries: List[dict], pantry: Any = ()) -> dict:
     """Which meals reuse an ingredient the plan itself introduced.
 
@@ -258,10 +292,18 @@ def shared_ingredient_facts(plan_entries: List[dict], pantry: Any = ()) -> dict:
     """
     pantry_stems = _pantry_stems(pantry)
     phrases = [
-        _nameable_phrases(_ingredients(_recipe(e)), pantry_stems)
+        nameable_phrases(_ingredients(_recipe(e)), pantry_stems)
         if isinstance(e.get("day"), int) else []
         for e in plan_entries
     ]
+    # A meal that IS an earlier meal is not news about ingredients. Telling a
+    # member "the same breakfast as Monday" and "also uses Monday's tomatoes"
+    # on one card says the same thing twice, and counting it would inflate the
+    # reuse figure with the repeat count. The repeat chip covers it.
+    repeated = {
+        index for index, entry in enumerate(plan_entries)
+        if _recipe(entry).get("repeat_of_day")
+    }
     # stem -> (earliest day it appears on, how that day named it)
     origin: Dict[str, tuple] = {}
     for entry, entry_phrases in zip(plan_entries, phrases):
@@ -274,7 +316,7 @@ def shared_ingredient_facts(plan_entries: List[dict], pantry: Any = ()) -> dict:
     per_entry: Dict[int, List[tuple]] = {}
     items: List[str] = []
     for index, (entry, entry_phrases) in enumerate(zip(plan_entries, phrases)):
-        if not entry_phrases:
+        if not entry_phrases or index in repeated:
             continue
         day = entry["day"]
         shared: List[tuple] = []
@@ -316,6 +358,12 @@ def annotate_shared_ingredients(
     replacing them. Unlike the pantry annotation it runs even when the
     member stated no pantry — this reuse is the plan's own doing, so there
     is nothing for the member to have said first.
+
+    Also appends a sentence to ``explainability["reasoning"]``. Running last
+    is what makes the chips additive, but it also meant the whole-week
+    justification was composed before anyone had measured the reuse, so the
+    one axis a member is most likely to ask about ("why is Wednesday's slaw
+    here?") was the one the prose never mentioned.
     """
     facts = shared_ingredient_facts(plan_entries, pantry)
     for index, shared in facts["entries"].items():
@@ -339,6 +387,18 @@ def annotate_shared_ingredients(
             "detail": "shares " + ", ".join(facts["items"][:6]),
         })
         explainability["constraints_applied"] = ledger
+
+        named = ", ".join(facts["items"][:3])
+        sentence = (
+            f"{facts['meals']} meal(s) reuse an ingredient introduced earlier "
+            f"in the week ({named}), so the week buys fewer separate things "
+            "than 21 unrelated recipes would."
+        )
+        # Appended, never assigned: `_compose_reasoning` has already written
+        # the meat, calorie and anchor sentences, and replacing that string
+        # would drop them.
+        existing = str(explainability.get("reasoning") or "").strip()
+        explainability["reasoning"] = f"{existing} {sentence}".strip()
     return facts
 
 
@@ -346,8 +406,20 @@ def annotate_shared_ingredients(
 # Weekly metrics (deterministic — no LLM)                                 #
 # --------------------------------------------------------------------- #
 
-def variety_metrics(plan_entries: List[dict]) -> dict:
-    """Distinct recipes, unique ingredients, and category distribution."""
+def variety_metrics(plan_entries: List[dict], repeats: Optional[dict] = None) -> dict:
+    """Distinct recipes, planned repeats, unique ingredients, categories.
+
+    A repeat is not automatically a failure of variety. Nobody eats seven
+    different breakfasts, and one the member starred coming back on Thursday
+    is the week working as intended — so it is counted separately and the
+    prose does not treat it as a shortfall.
+
+    A duplicate that nobody sanctioned is a different matter, and stays
+    visible as ``unexplained_repeats``: reporting both as one "21 minus
+    distinct" number is exactly how a thin candidate pool ends up presented
+    as if the member had asked for it.
+    """
+    facts = repeats if repeats is not None else repeat_facts(plan_entries)
     recipes = [_recipe(e) for e in plan_entries]
     distinct = len({
         str(r.get("recipe_id") or "") for r in recipes if r.get("recipe_id")
@@ -357,13 +429,26 @@ def variety_metrics(plan_entries: List[dict]) -> dict:
         items.update(_ingredient_names(_ingredients(r)))
     categories = Counter(classify_meal(r) for r in recipes if r)
     total = len(plan_entries)
+    planned_repeats = facts["count"]
+    unexplained = facts["unexplained"]
     if distinct == total:
         headline = f"All {total} meals are distinct recipes"
+    elif planned_repeats and not unexplained:
+        headline = (
+            f"{distinct} recipes across {total} meals, "
+            f"with {planned_repeats} planned repeat(s)"
+        )
     else:
         headline = f"{distinct} distinct recipes across {total} meals"
     return {
         "distinct_recipes": distinct,
         "total_meals": total,
+        # Repeats the planner allowed and recorded a reason for, split by that
+        # reason. `unexplained_repeats` is the honest remainder: a duplicate
+        # with nothing behind it, which is monotony and reads as one.
+        "planned_repeats": planned_repeats,
+        "repeats_by_source": dict(facts["by_source"]),
+        "unexplained_repeats": unexplained,
         "unique_ingredients": len(items),
         "category_distribution": dict(categories),
         "reasoning": (
@@ -502,6 +587,7 @@ def weekly_constraints_ledger(
     selection_events: List[dict],
     downvoted_count: int,
     nutrition: dict,
+    repeats: Optional[dict] = None,
 ) -> List[dict]:
     """Profile rows (same as daily) + measured weekly rows.
 
@@ -512,7 +598,87 @@ def weekly_constraints_ledger(
     the final week breaks the limit anyway (e.g. pinned dishes bypass
     constraints).
     """
+    from .action_adapter import (  # local import; keeps the policy single-sourced
+        MAX_APPEARANCES,
+        REPEAT_MIN_GAP_DAYS,
+    )
+
     ledger = constraints_ledger(profile, downvoted_count)
+
+    repeats = repeats or {}
+    if repeats.get("count"):
+        by_source = repeats.get("by_source") or {}
+        who = []
+        if by_source.get(REPEAT_BY_MEMBER):
+            who.append(f"{by_source[REPEAT_BY_MEMBER]} you starred")
+        if by_source.get(REPEAT_BY_PLAN):
+            who.append(f"{by_source[REPEAT_BY_PLAN]} the plan's own")
+        gap = repeats.get("min_gap_days")
+        served = int(repeats.get("max_appearances") or 0)
+        detail = f"{repeats['count']} meal(s) repeat an earlier day"
+        if who:
+            detail += " (" + ", ".join(who) + ")"
+        if gap is not None:
+            detail += f"; closest repeat {gap} day(s) apart"
+        detail += f"; no recipe served more than {served} time(s)"
+        # Measured against the policy, not asserted from it: a pinned dish or
+        # a slot edit can put a duplicate on the plate without ever passing
+        # through the cooldown, and the row has to be able to say so.
+        within_policy = (
+            (gap is None or gap >= REPEAT_MIN_GAP_DAYS)
+            and served <= MAX_APPEARANCES
+        )
+        if by_source.get(REPEAT_BY_MEMBER) and by_source.get(REPEAT_BY_PLAN):
+            source = "your favourites and the plan"
+        elif by_source.get(REPEAT_BY_MEMBER):
+            source = "your favourites"
+        else:
+            source = "the plan"
+        ledger.append({
+            "constraint": "repeat meals stay spaced and capped",
+            "type": "soft",
+            "status": "satisfied" if within_policy else "violated",
+            "source": source,
+            "detail": detail,
+        })
+    if repeats.get("unexplained"):
+        # A duplicate nobody recorded a reason for. Reported rather than
+        # quietly folded into the repeat count above, because the whole point
+        # of labelling repeats is that an unexplained one is not a feature.
+        ledger.append({
+            "constraint": "every repeat has a recorded reason",
+            "type": "soft",
+            "status": "violated",
+            "source": "the plan",
+            "detail": (
+                f"{repeats['unexplained']} duplicate meal(s) carry no reason — "
+                "not the repeat policy's doing"
+            ),
+        })
+
+    # Cross-day reuse, sourcing half: the days that spent extra RecipeWrangler
+    # calls looking for the week's own ingredients. Only the days that actually
+    # searched get a row — when the food-waste setting skips it, nothing was
+    # applied, so there is no constraint to report; the `derived_pantry_skipped`
+    # event in `metrics.selection_events` is where that trace lives instead.
+    sourced = [e for e in selection_events if e.get("type") == "derived_pantry_sourced"]
+    if sourced:
+        searched: List[str] = []
+        for event in sourced:
+            for item in event.get("items") or []:
+                if item not in searched:
+                    searched.append(item)
+        ledger.append({
+            "constraint": "look for recipes using ingredients the week already buys",
+            "type": "soft",
+            "status": "satisfied",
+            "source": "food-waste setting",
+            "detail": (
+                f"{len(sourced)} day(s) also searched for "
+                + ", ".join(searched[:6])
+                + " — what the plan then reused is measured separately"
+            ),
+        })
 
     meat_limit = int(targets.get("meat_limit") or 0)
     if meat_limit > 0 or meat_count > 0:
@@ -570,6 +736,7 @@ def _compose_reasoning(
     nutrition: dict,
     pinned_count: int,
     adapted_count: int,
+    repeats: Optional[dict] = None,
 ) -> str:
     parts = []
     total = variety["total_meals"]
@@ -607,6 +774,30 @@ def _compose_reasoning(
             sentence += f" ({nutrition['note']})"
         parts.append(sentence + ".")
 
+    repeats = repeats or {}
+    if repeats.get("count"):
+        by_source = repeats.get("by_source") or {}
+        who = []
+        if by_source.get(REPEAT_BY_MEMBER):
+            who.append(f"{by_source[REPEAT_BY_MEMBER]} you'd starred")
+        if by_source.get(REPEAT_BY_PLAN):
+            who.append(f"{by_source[REPEAT_BY_PLAN]} the plan's own choice")
+        sentence = (
+            f"{repeats['count']} meal(s) repeat earlier in the week rather than "
+            "filling every slot with something new"
+        )
+        if who:
+            sentence += " — " + " and ".join(who)
+        gap = repeats.get("min_gap_days")
+        if gap is not None:
+            sentence += f", never closer together than {gap} day(s)"
+        parts.append(sentence + ".")
+    if repeats.get("unexplained"):
+        parts.append(
+            f"{repeats['unexplained']} further duplicate meal(s) appear with no "
+            "reason recorded for them."
+        )
+
     if pinned_count:
         parts.append(f"{pinned_count} dish(es) anchored at your request.")
     if adapted_count:
@@ -641,8 +832,13 @@ def build_weekly_explainability(
     targets = tracker.targets
 
     attach_match_reasons(plan_entries, profile)
+    # Repeats are read off the entries themselves (the flag the action space
+    # set on the candidate it allowed back), so this works for patched plans
+    # and restored plans exactly as it does for freshly generated ones.
+    repeats = repeat_facts(plan_entries)
+    attach_repeat_reasons(plan_entries, repeats)
 
-    variety = variety_metrics(plan_entries)
+    variety = variety_metrics(plan_entries, repeats)
     checklist = guideline_checklist(variety["category_distribution"], variety["total_meals"])
     nutrition = nutrition_metrics(plan_entries, targets)
     days = day_breakdown(plan_entries, day_summaries or {})
@@ -657,6 +853,7 @@ def build_weekly_explainability(
     )
     ledger = weekly_constraints_ledger(
         profile, meat_count, targets, events, downvoted_count, nutrition,
+        repeats=repeats,
     )
 
     relaxed = [e for e in events if e.get("type") == "meat_limit_relaxed"]
@@ -670,6 +867,7 @@ def build_weekly_explainability(
         nutrition,
         pinned_count,
         adapted_count,
+        repeats=repeats,
     )
 
     return {
@@ -680,6 +878,11 @@ def build_weekly_explainability(
             "guideline_checklist": checklist,
             "nutrition": nutrition,
             "days": days,
+            # Counts only. `entries` is keyed by list index, and this payload
+            # is stored as JSON — the keys would come back as strings on the
+            # next read. Nothing needs it there anyway: which meal is a repeat
+            # is already on the entry itself, as `recipe.repeat_of_day`.
+            "repeats": {k: v for k, v in repeats.items() if k != "entries"},
             "selection_events": events,
         },
         "reasoning": reasoning,

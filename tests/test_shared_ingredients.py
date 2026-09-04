@@ -146,6 +146,18 @@ class TestMeasurement:
 
         assert shared_ingredient_facts(entries)["entries"][1] == [("cabbage", 1)]
 
+    def test_a_counting_word_is_not_an_ingredient_two_meals_can_share(self):
+        """"half" clears the length filter `perishable_tokens` applies, so
+        dropping it from the displayed name but not from the stems made two
+        unrelated halves share an ingredient — and the later meal was then
+        credited with reusing the cabbage."""
+        entries = [
+            _entry(1, "dinner", "A", "half a cabbage, walnuts"),
+            _entry(3, "lunch", "B", "half a pumpkin, apple"),
+        ]
+
+        assert shared_ingredient_facts(entries)["meals"] == 0
+
     def test_an_ingredient_nobody_repeats_is_not_reported(self):
         entries = [
             _entry(1, "lunch", "A", "lentils, spinach"),
@@ -255,6 +267,32 @@ class TestAnnotationIsAdditive:
         annotate_shared_ingredients(entries)
 
         assert _kinds(entries[1]) == ["profile", SHARED_INGREDIENT_KIND]
+
+    def test_the_justification_the_member_reads_mentions_the_reuse(self):
+        """This pass runs after the whole-week prose is composed, so without
+        an explicit append the one axis a member is most likely to ask about
+        ("why is Wednesday's slaw here?") is the one it never mentioned."""
+        entries = [
+            _entry(1, "dinner", "Braise", "cabbage, walnuts"),
+            _entry(3, "lunch", "Slaw", "cabbage, apple"),
+        ]
+        explainability = {"constraints_applied": [], "reasoning": "Existing prose."}
+
+        annotate_shared_ingredients(entries, (), explainability=explainability)
+
+        assert explainability["reasoning"].startswith("Existing prose.")
+        assert "1 meal(s) reuse an ingredient introduced earlier" in (
+            explainability["reasoning"]
+        )
+        assert "cabbage" in explainability["reasoning"]
+
+    def test_a_plan_with_no_reuse_leaves_the_justification_alone(self):
+        entries = [_entry(1, "lunch", "A", "lentils"), _entry(3, "lunch", "B", "quinoa")]
+        explainability = {"constraints_applied": [], "reasoning": "Existing prose."}
+
+        annotate_shared_ingredients(entries, (), explainability=explainability)
+
+        assert explainability["reasoning"] == "Existing prose."
 
     def test_a_plan_with_no_reuse_adds_no_ledger_row(self):
         entries = [_entry(1, "lunch", "A", "lentils"), _entry(3, "lunch", "B", "quinoa")]

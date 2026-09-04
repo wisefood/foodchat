@@ -56,8 +56,18 @@ BADGE_FOODWASTE = "reducing food waste"
 # Cheap gate for the LLM extraction: most turns say nothing about a pantry,
 # and an extractor call per turn would price the feature into every message.
 # Broad on purpose — a false positive costs one abstaining LLM call.
+#
+# The subject and the verb are allowed up to two words apart. The original
+# pattern required them adjacent, so "I **already** have avocado, tomatoes and
+# pasta" — about the most natural way anyone says this — never reached the
+# extractor at all, and the plan silently ignored the member's fridge while
+# the reply still thanked them for it. "still", "just", "only", "also" and
+# "now" fail the same way. The stated trade is explicitly in this direction:
+# a miss costs the whole feature, a false positive costs one LLM call that
+# abstains.
 _PANTRY_HINT_RE = re.compile(
-    r"\b(i\s+have|i've\s+got|i\s+got|we\s+have|there(?:'s| is| are))\b"
+    r"\b(?:i|we)(?:'ve)?\s+(?:\w+\s+){0,2}(?:have|got)\b"
+    r"|\bthere(?:'s| is| are)\b"
     r"|\b(fridge|freezer|pantry|cupboard|leftover|left\s*over|left-over"
     r"|scraps?|use\s+up|using\s+up|lying\s+around|going\s+(?:bad|off)"
     r"|about\s+to\s+(?:spoil|expire)|food\s*waste|used\s+up|finished\s+the)\b",

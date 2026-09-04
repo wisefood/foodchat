@@ -7,6 +7,8 @@ annotation on both plan shapes, the weekly scorer boost, the extraction gate,
 and the `uses_ingredient` edit predicate. No network, no LLM (per conftest).
 """
 
+import pytest
+
 from models.planning_state import PlanningState, PlanningStateDelta
 from models.recipe import CandidateRecipe
 from services import pantry_service
@@ -275,6 +277,50 @@ class TestExtractionGate:
         )
         assert fake.calls == 1
         assert delta.pantry_add == ("zucchini", "spinach")
+
+    def test_an_adverb_between_subject_and_verb_still_reaches_it(self):
+        """"I already have avocado, tomatoes and pasta" — about the most
+        natural way anyone says this — missed the gate entirely, because the
+        pattern required "I" and "have" adjacent. The plan then ignored the
+        member's fridge while the reply still thanked them for it.
+        """
+        fake = _FakeExtractor({"have": ["avocado", "tomatoes", "pasta"], "used_up": []})
+        delta = extract_pantry_delta(
+            "Give me a weekly plan, I like Italian and Asian cuisine, and I "
+            "already have avocado, tomatoes and pasta.",
+            extractor=fake,
+        )
+
+        assert fake.calls == 1
+        assert delta.pantry_add == ("avocado", "tomatoes", "pasta")
+
+    @pytest.mark.parametrize("message", [
+        "I already have avocado",
+        "we still have some spinach",
+        "I just got a big bag of carrots",
+        "we have leeks",
+        "I've got zucchini",
+        "I only have pasta left",
+    ])
+    def test_the_ways_people_actually_say_it(self, message):
+        fake = _FakeExtractor({"have": ["x"], "used_up": []})
+        extract_pantry_delta(message, extractor=fake)
+
+        assert fake.calls == 1, message
+
+    @pytest.mark.parametrize("message", [
+        "plan me a healthy week",
+        "I like Italian food",
+        "what should I cook on Tuesday",
+        "make Wednesday lighter",
+    ])
+    def test_ordinary_turns_still_cost_no_llm_call(self, message):
+        """The gate exists to keep the extractor off every message. Widening
+        it must not widen it into everything."""
+        fake = _FakeExtractor({"have": ["x"], "used_up": []})
+        extract_pantry_delta(message, extractor=fake)
+
+        assert fake.calls == 0, message
 
     def test_used_up_becomes_removal(self):
         fake = _FakeExtractor({"have": [], "used_up": ["zucchini"]})

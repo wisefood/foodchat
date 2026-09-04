@@ -67,7 +67,9 @@ Client (wisefood-api gateway)
   |      + pantry_service.extract_pantry_delta(RAW message)
   |        (regex-gated PantryExtractor: "I have zucchini and spinach" ->
   |         state.pantry; "used up the zucchini" removes it; persisted on
-  |         the session, rides the profile snapshot as profile["_pantry"])
+  |         the session, rides the profile snapshot as profile["_pantry"].
+  |         The gate allows up to two words between subject and verb, so
+  |         "I already have ..." reaches the extractor)
   |
   +--> ClarificationManager.start(effective_message, session.user_profile, origin_intent)
          |
@@ -187,11 +189,35 @@ correctly after a process restart or on a different replica.
   |      standing PlanningState (same state the daily flow reads — whichever
   |      horizon hears about the zucchini, both honour it)
   +--> RecipeActionSpace(profile, extra diet tags, pantry) -> per-day pools
-  |      (RecipeWrangler fetch once per day, selected ids excluded -> no
-  |       repeats; each day's pool enriched with one batch details call ->
+  |      (RecipeWrangler fetch ONCE PER DAY, serving all three of that day's
+  |       slots; each day's pool enriched with one batch details call ->
   |       candidates carry nutrition + diet tags during selection; a stated
   |       pantry folds per-item matches into every day's pool coverage-first,
   |       and build_preference_scorer adds +3 per matched item, capped at 2)
+  |
+  |      Repeats: lunch and dinner exclude every committed id, as before.
+  |      BREAKFAST has a slot-scoped cooldown -- a breakfast may return
+  |      after >= 2 days, at most twice in the week, never in another slot,
+  |      and never if it was pinned or downvoted (mark_selected still means
+  |      never). The day's fetch uses the loosest exclusion any of its three
+  |      slots needs and the per-slot rule is applied afterwards, so this
+  |      costs no extra requests. A candidate allowed back carries
+  |      repeat_of_day + repeat_source ("member_request" for a starred
+  |      recipe, "plan" otherwise) from the pool to the stored entry.
+  |      A repeat_offered event records what a slot COULD have repeated,
+  |      taken or not -- "the week repeated nothing" and "the source never
+  |      offered anything" have opposite fixes and look identical without it.
+  |
+  |      Sourcing (food waste = strict only): before each new day is
+  |      fetched the planner offers the ingredients the week has already
+  |      bought (IngredientBasket.reusable_items -- >= 2 days old, used
+  |      once, named as whole phrases, capped at 3, the member's own items
+  |      left to their own fan-out). Those get the same per-item plan_meals
+  |      fan-out a stated pantry gets, merged BEFORE the member's pantry so
+  |      the member's coverage ranking still decides the top of the pool.
+  |      Recorded either way on selection_events: derived_pantry_sourced
+  |      per day, or derived_pantry_skipped once with the setting that
+  |      skipped it.
   +--> WeeklyMealPlanEnv + WeeklyPlanner.generate_full_plan
   |      21 steps (7 days x 3 meals), fully LLM-free:
   |      apply_hard_constraints prunes the pool (weekly meat limit —
@@ -204,7 +230,11 @@ correctly after a process restart or on a different replica.
   |      ingredient was last eaten: same day -1.0 / next day -0.5
   |      (monotony, applied at every food-waste setting), two or more days
   |      later rewarded at the slider's weight, and only twice per
-  |      ingredient. No shelf life is modelled — nothing records expiry
+  |      ingredient. No shelf life is modelled — nothing records expiry.
+  |      A sanctioned repeat sits out that axis entirely (it shares its
+  |      ingredients with itself) and is not charged the variety penalty for
+  |      its own earlier title, so it competes on equal terms with a new
+  |      dish; the cooldown and the cap are what govern it
   +--> batch enrichment on the final 21 entries (nutrition, image, tags)
   |      + adapted-recipe overlay
   +--> build_day_summaries(entries) -> {day: "dinner with fish" headline}
@@ -215,7 +245,15 @@ correctly after a process restart or on a different replica.
   |      "the plan"). Two kinds, never merged: the first is what the member
   |      told us they had, the second is reuse the plan introduced on its
   |      own. A member-stated item never carries the cross-day chip, and a
-  |      share the tokeniser cannot name is not counted at all
+  |      share the tokeniser cannot name is not counted at all.
+  |      A THIRD kind rides alongside: the repeat chip (kind "repeat", with
+  |      a `source` field) -- "back from Monday, a favorite of yours" vs
+  |      "the same breakfast as Tuesday". A repeated meal gets no cross-day
+  |      reuse chip: it shares its ingredients with itself, so the two would
+  |      say the same thing twice and inflate the reuse count.
+  |      annotate_shared_ingredients also APPENDS its sentence to
+  |      explainability["reasoning"], because it runs after the prose is
+  |      composed
   |      LLM-free: attaches per-entry recipe.match_reasons chips, builds
   |      the MEASURED constraint ledger (meat count / calorie budget with
   |      status satisfied | relaxed | violated), personalization counts,
@@ -242,8 +280,11 @@ ChatTurnResponse {
                            day_summaries{day -> headline},
                            constraints_applied[{constraint, type, status,
                            source, detail?}], personalization_summary,
-                           metrics{variety, guideline_checklist, nutrition,
-                           days, selection_events}, reasoning,
+                           metrics{variety (distinct_recipes,
+                           planned_repeats, repeats_by_source,
+                           unexplained_repeats, ...), guideline_checklist,
+                           nutrition, days, repeats, selection_events},
+                           reasoning,
                            version, parent_id),
   at_message_limit,
   plan_version, plan_parent_id

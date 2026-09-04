@@ -39,7 +39,14 @@ FISH_KEYWORDS = (
 )
 MEAT_KEYWORDS = RED_MEAT_KEYWORDS | POULTRY_KEYWORDS | FISH_KEYWORDS
 
-VEG_TAGS = {"vegetarian", "vegan"}
+# Tag spellings RecipeWrangler uses to assert a recipe contains no meat.
+# `vegetarian_or_vegan` is the one it sets most often and was not listed here,
+# so the authoritative signal was being ignored on exactly the recipes that
+# need it: "Chickpea and egg burgers" carried it, hit the "burger" keyword,
+# and was counted as a red-meat meal — which spent a meat allowance, forced a
+# `meat_limit_relaxed` event, and had the reply apologise that Thursday's
+# dinner "required red meat". It is chickpeas and egg.
+VEG_TAGS = {"vegetarian", "vegan", "vegetarian_or_vegan"}
 
 # kcal thresholds for the light/hearty day qualifier (whole-day estimate).
 LIGHT_DAY_KCAL = 1400.0
@@ -50,6 +57,77 @@ def _matches(text: str, keywords: set[str]) -> bool:
     return any(
         re.search(r"\b" + re.escape(k) + r"s?\b", text) for k in keywords
     )
+
+
+# Keyword matching cannot tell "beef burger" from "chickpea burger", and the
+# recipe tag that could is not always present. Two kinds of qualifier, with
+# deliberately different reach.
+
+# Says outright that the thing is not meat, so it may qualify ANY meat word:
+# "vegan bacon", "mock duck", "tofu sausage".
+_VEG_QUALIFIERS = (
+    r"vegan|vegetarian|veggie|plant[-\s]?based|meat[-\s]?free|meatless|"
+    r"mock|faux|imitation|soya?|tofu|tempeh|quorn|seitan"
+)
+
+# Names an ingredient, and may only qualify a word describing a SHAPE. A
+# vegetable next to a form word is a vegetarian version of that form
+# ("chickpea burger", "lentil meatballs"); a vegetable next to an animal is a
+# dish containing that animal, and "mushroom chicken" must stay poultry.
+_INGREDIENT_QUALIFIERS = (
+    r"lentil|bean|chickpea|falafel|mushroom|nut|quinoa|aubergine|eggplant|"
+    r"cauliflower|jackfruit"
+)
+_FORM_WORDS = sorted(
+    {"burger", "hamburger", "sausage", "meatball", "meatloaf"} & MEAT_KEYWORDS
+)
+
+_ANY_MEAT = "|".join(re.escape(k) for k in sorted(MEAT_KEYWORDS))
+_QUALIFIED_NOT_MEAT = re.compile(
+    r"\b(?:(?:" + _VEG_QUALIFIERS + r")s?[-\s]+(?P<word>" + _ANY_MEAT + r")"
+    r"|(?:" + _INGREDIENT_QUALIFIERS + r")s?[-\s]+(?P<form>"
+    + "|".join(re.escape(k) for k in _FORM_WORDS) + r"))s?\b"
+)
+# "meat-free" on its own, where there is no following meat word to swallow.
+_MEAT_FREE = re.compile(r"\bmeat[-\s]?free\b")
+
+# Food-composition-database wording for a hen's egg: "eggs, chicken, whole,
+# raw" and "chicken egg". Read literally it makes every shakshuka a poultry
+# meal. The first pattern only fires when "chicken" is a bare comma-delimited
+# fragment, so "2 eggs, chicken breast, flour" is still poultry.
+_EGG_NOT_POULTRY = (
+    re.compile(r"\beggs?\s*,\s*chicken\s*(?=,|$)"),
+    re.compile(r"\bchicken\s+eggs?\b"),
+)
+
+
+def meat_text(title: str, ingredients: str) -> str:
+    """Lowercased recipe text with the non-meat uses of meat words removed.
+
+    Every claim this module makes about meat is a keyword match, and a keyword
+    match cannot read a qualifier. Stripping the qualified uses before matching
+    keeps one vocabulary rather than growing a second list of exceptions inside
+    each caller.
+    """
+    text = f"{title} {ingredients}".lower()
+    for pattern in _EGG_NOT_POULTRY:
+        text = pattern.sub(" ", text)
+
+    # A word qualified once is qualified throughout the recipe: "Veggie
+    # burger" with "burger, bun" in the ingredients is one burger, described
+    # twice. RecipeWrangler's ingredient strings are full of that shape — the
+    # chickpea burger's read "Burger patties burger patty".
+    #
+    # So every occurrence of the qualified word goes, not just the qualified
+    # one. Only that word: "Beef burger with a veggie sausage" loses "burger"
+    # and "sausage" and still counts, on "beef".
+    qualified = {
+        match.group("word") or match.group("form")
+        for match in _QUALIFIED_NOT_MEAT.finditer(text)
+    }
+    for word in qualified:
+        text = re.sub(r"\b" + re.escape(word) + r"s?\b", " ", text)
+    return _MEAT_FREE.sub(" ", text)
 
 
 def is_meat_meal(
@@ -63,11 +141,15 @@ def is_meat_meal(
     A vegetarian/vegan RecipeWrangler tag overrides keyword hits (tags are
     authoritative); ``count_fish=False`` exempts fish/seafood — used for
     pescatarian profiles, whose meals would otherwise all count as meat.
+
+    Keyword hits are taken from ``meat_text``, not the raw string, so a
+    qualified use ("chickpea burger", "meat-free chilli", the food-composition
+    database's "eggs, chicken, whole, raw") does not spend a meat allowance.
     """
     if tags and VEG_TAGS & {str(t).lower() for t in tags}:
         return False
     keywords = MEAT_KEYWORDS if count_fish else (RED_MEAT_KEYWORDS | POULTRY_KEYWORDS)
-    return _matches(f"{title} {ingredients}".lower(), keywords)
+    return _matches(meat_text(title, ingredients), keywords)
 
 
 def classify_meal(recipe: dict) -> str:
@@ -83,13 +165,16 @@ def classify_meal(recipe: dict) -> str:
     tags = {str(t).lower() for t in (recipe.get("tags") or [])}
     if "vegan" in tags:
         return "vegan"
-    if "vegetarian" in tags:
+    if tags & VEG_TAGS:
+        # `vegetarian_or_vegan` cannot say which, so it says the weaker of the
+        # two. Calling a vegan dish vegetarian understates it; the reverse
+        # would be a claim about a recipe nobody made.
         return "vegetarian"
 
-    text = " ".join(
-        str(recipe.get(k) or "")
-        for k in ("recipe_title", "title", "recipe_ingredients", "ingredients")
-    ).lower()
+    text = meat_text(
+        " ".join(str(recipe.get(k) or "") for k in ("recipe_title", "title")),
+        " ".join(str(recipe.get(k) or "") for k in ("recipe_ingredients", "ingredients")),
+    )
     if _matches(text, FISH_KEYWORDS):
         return "fish"
     if _matches(text, RED_MEAT_KEYWORDS):

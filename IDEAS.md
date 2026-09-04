@@ -535,9 +535,10 @@ redo). Options, roughly in order of appeal:
 
 # Weekly plans that look like how people actually cook
 
-**Status: open (recorded 2026-08-27; reconstructed from a design
-conversation that was never written down — treat the staging as a
-proposal, not a decision).**
+**Status: components 1 and 2 shipped 2026-09-04; component 3 open.**
+(Recorded 2026-08-27, reconstructed from a design conversation that was
+never written down. The staging below was a proposal; components 1 and 2
+have since been built and the entries say what actually happened.)
 
 A generated week is 21 independently chosen recipes, and that is exactly
 what it reads like: 21 shopping lists, 21 things to cook, no dish ever
@@ -563,34 +564,47 @@ for two meals. Three changes, in increasing order of structural cost.
 
 ## 1. Share ingredients across days
 
-**Status: scoring half shipped 2026-08-27** (see the CHANGES.md entry
-"Weekly plans reuse ingredients without repeating them"). The flat token
-set became a day-aware `IngredientBasket`; reuse is rewarded at a gap of
-two days or more, penalised on the same or the next day, and capped at two
-meals per ingredient. The monotony half applies at every food-waste
-setting. No shelf life is modelled — nothing records expiry, so no gap is
-ever "too old to count". Cross-day reuse is surfaced as its own chip kind
-(`shared_ingredient`, "also uses Monday's cabbage") and its own ledger row
-(`source: "the plan"`), kept apart from the member's stated pantry
-("uses your tomatoes", `source: "your pantry"`). **The sourcing half below
-is still open.**
+**Status: DONE.** Scoring half shipped 2026-08-27, sourcing half
+2026-09-04 (CHANGES.md: "Weekly plans reuse ingredients without repeating
+them" and "Weekly plans go looking for what they already buy, and
+breakfast may come back").
+
+The flat token set became a day-aware `IngredientBasket`; reuse is
+rewarded at a gap of two days or more, penalised on the same or the next
+day, and capped at two meals per ingredient. The monotony half applies at
+every food-waste setting. No shelf life is modelled — nothing records
+expiry, so no gap is ever "too old to count". Cross-day reuse is surfaced
+as its own chip kind (`shared_ingredient`, "also uses Monday's cabbage")
+and its own ledger row (`source: "the plan"`), kept apart from the
+member's stated pantry ("uses your tomatoes", `source: "your pantry"`).
+
+The sourcing half went in behind `strict`, as predicted below: before each
+new day is fetched, `IngredientBasket.reusable_items` offers up to three
+ingredients (gap and cap identical to the scorer's, so sourcing asks for
+exactly what scoring would reward) and they get the pantry fan-out. The
+member's own items are excluded from it — they have their own fan-out —
+and the member's merge runs last so their coverage ranking still decides
+the top of the pool. Both outcomes are recorded on `selection_events`
+(`derived_pantry_sourced` per day, `derived_pantry_skipped` once), so
+"why did this week reuse nothing" is answerable from the stored plan.
 
 **The ask:** buying a bunch of dill for one Tuesday recipe is waste; the
 week should route it through two or three meals.
 
-**Mechanism (sourcing half, still open):** after a slot commits, feed its
-recipe's perishable ingredients back as a *derived* pantry for subsequent
-days — the same fan-out that a member-stated pantry gets, sourced from the
-plan instead of from the member. `PerishableBasket` already holds exactly
-this list; `mark_selected` is the natural hook.
+**What shipped:** the offer is made by the planner
+(`offer_derived_pantry`) before each new day's pool is fetched, and the
+action space decides whether to spend the requests. Gated on `strict`
+exactly as predicted — the fan-out is one HTTP request per item per day,
+and making it fire on every weekly plan would be a latency cost paid by
+everyone to strengthen an axis most members leave `off`.
 
-The reason it did not ship with the scoring half: that fan-out is one
-HTTP request per item per day, and today it only fires when the member
-actually stated a pantry. Making it fire on every weekly plan is a
-latency cost paid by everyone to strengthen an axis most members leave
-`off`. It belongs behind the slider — `strict`, probably — not on by
-default. Scoring can only reorder the pool it is given; sourcing is what
-would put the second dill recipe in it.
+One thing the plan did not anticipate: the ingredients had to be *named*
+before they could be searched for. `perishable_tokens` splits on
+whitespace, and "self" is not a search term any more than it is a chip.
+So `nameable_phrases` moved out of `explainability` into `planner` and now
+serves both — an ingredient worth naming to a member is exactly an
+ingredient worth searching RecipeWrangler for, and two definitions of "an
+ingredient" would have drifted apart within a release.
 
 **What makes this honest rather than a lie:**
 
@@ -609,10 +623,15 @@ would put the second dill recipe in it.
   perishability tier would be a separate piece of work with a real data
   source behind it.
 
-**Cost:** low. Scorer weight + a derived-pantry source. The fan-out
-already exists.
+**Cost (actual):** low, as estimated. The fan-out already existed; the
+work was in the naming and in keeping the two merges in the right order.
 
 ## 2. Repeat favourites and breakfasts on non-adjacent days
+
+**Status: DONE for breakfast, 2026-09-04** (CHANGES.md: "Weekly plans go
+looking for what they already buy, and breakfast may come back"). Lunch
+and dinner keep the original never-repeat rule; extending the cooldown to
+them was not attempted, and dinner-twice-a-week remains open.
 
 **The ask:** nobody eats seven different breakfasts. A favourite dinner
 twice a week is a feature, not a failure.
@@ -630,28 +649,67 @@ twice a week is a feature, not a failure.
   and the prose says "All 21 meals are distinct recipes" as praise. An
   intentional repeat would render as a *degraded* week.
 
-**Mechanism:** replace the global exclusion with a **slot-scoped
-cooldown** — exclude ids selected within the last K days rather than all
-of them, with K per slot (breakfast K≈1, so every-other-day is legal;
-dinner K≈3). Favourites (`favorite_recipe_ids`, +5 in the scorer) are
-the natural candidates to permit back in first.
+**What shipped:** a slot-scoped cooldown, breakfast only — a breakfast
+may return after ≥ 2 days, at most twice in a week, never in another slot,
+and never if it was pinned or downvoted (`mark_selected` still means
+never).
 
-**Open questions that need a decision, not code:**
+The blocker turned out to be softer than this section assumed. A per-slot
+cooldown looked like it needed per-slot fetches (3× the RecipeWrangler
+calls), but the fetch is per *day* and serves all three slots: fetch with
+the loosest exclusion any slot needs, apply the per-slot rule at selection
+time. No extra requests at all, and there is a test asserting one fetch
+per day so a regression to per-slot fetching cannot pass silently.
 
-- Is a repeat *earned* (a favourite, a member-stated liked dish) or
-  merely *allowed* (a thin pool)? Those must be distinguishable in the
-  ledger, or a week that repeated because RecipeWrangler returned six
-  candidates will be presented as if the member had asked for it.
-- `variety_metrics` must learn the difference between an intentional
-  repeat and monotony before the prose is allowed to comment on either.
-  Simplest honest version: report distinct recipes *and* intentional
-  repeats as two numbers, and say which is which.
-- The no-repeat contract is documented as a guarantee. Changing it is a
-  doc change across `action_adapter.py`, `CHAT_ENDPOINT_PIPELINE.md`,
-  and any test asserting it — per the standing rule, in the same change.
+Two things had to be added that this section did not foresee:
 
-**Cost:** medium. The selection change is small; the metric and prose
-changes are where the work is.
+- **The variety penalty had to stop fighting the cooldown.** −2 per shared
+  title token, against an exact repeat, scales with how many words the
+  recipe happens to be called — always enough to beat the cooldown. A
+  sanctioned repeat is now exempt from its own earlier title, and from
+  nothing else.
+- **And the flat repeat penalty that replaced it had to go to zero.** It
+  shipped at −1.0 to stop a repeat winning a coin flip. On a real profile
+  there is no coin flip: with no favourites and no liked *ingredients*,
+  almost every candidate scores exactly 0.0, so any penalty at all is a
+  veto and the cooldown never fires. First live week: seven distinct
+  breakfasts. At zero it measures ~1.25 repeats per week. The lesson
+  generalises — this scorer's numbers only mean something
+  relative to a spread, and a bare profile has none.
+- **A repeat had to stop collecting the reuse bonus.** It shares every
+  ingredient with its own earlier serving, so at `strict` the ingredient
+  axis made repeating the cheapest possible way to score — observed: a
+  strict week repeated a breakfast at the first legal opportunity, every
+  time. A repeat now sits out that axis entirely.
+
+**How the open questions were answered:**
+
+- *Earned or merely allowed?* Both happen, and both are labelled.
+  `repeat_source` is `member_request` when the recipe is one the member
+  starred and `plan` otherwise, set at the only point that can justify it
+  and carried through the chip, the ledger row, the variety metric, the
+  prose and the response-writer facts. A week that repeated because the
+  pool was thin says so.
+- *`variety_metrics` and monotony.* It now reports `planned_repeats` and
+  `repeats_by_source` separately from `unexplained_repeats` — a duplicate
+  with no recorded reason (a pinned dish, a slot edit) is never folded
+  into the sanctioned count, and gets its own `violated` ledger row.
+  Repeats are also measured against the policy rather than asserted from
+  it, so a repeat that reached the plate some other way is reported as
+  out of policy.
+- *The documented guarantee.* Retired in the same change:
+  `action_adapter.py`'s docstring, `CHAT_ENDPOINT_PIPELINE.md`, and this
+  file.
+
+**Cost (actual):** medium, as estimated, but the work landed in a
+different place than expected — the metric and prose changes were
+straightforward, and the scorer interactions above were where the time
+went.
+
+**Still open here:** dinner and lunch repeats, which need a view on how
+often a *dinner* may recur before a week reads as lazy rather than
+familiar; and a repeat earned by something other than a star (a
+member-stated liked dish is not currently a repeat authority).
 
 ## 3. Day N's dinner becomes day N+1's lunch
 
@@ -690,11 +748,13 @@ UI moving in the same release.
 
 ## Suggested staging
 
-1. **Component 1** — pure scorer/sourcing work behind the existing waste
-   slider, no contract changes, no UI change. Ships alone.
-2. **Component 2** — needs the no-repeat contract retired and the
-   variety metric taught the difference. Ships once the ledger can say
-   *why* a repeat happened.
+1. ~~**Component 1**~~ — done (scoring 2026-08-27, sourcing 2026-09-04).
+2. ~~**Component 2**~~ — done for breakfast 2026-09-04. Lunch and dinner
+   repeats remain open, and are a preference question rather than a
+   mechanism one: the cooldown generalises to any slot by adding it to
+   `REPEATABLE_SLOTS`.
 3. **Component 3** — needs a plan-shape decision first (is a leftover an
    entry kind or a flag on an ordinary entry?), then moves across
-   service, gateway and UI together. Not before the other two.
+   service, gateway and UI together. Unchanged, and still last: it is the
+   only one of the three that needs portion arithmetic, which is the
+   quantity claim the pantry work deliberately refused to make.

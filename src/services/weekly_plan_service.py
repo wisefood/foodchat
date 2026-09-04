@@ -306,6 +306,18 @@ class WeeklyPlanService:
                 "meals": shared_facts["meals"],
                 "items": shared_facts["items"][:6],
             }
+        # Repeats, split by whose doing they were. Same principle as the two
+        # pantry keys above: the writer is given the distinction rather than a
+        # total, so it cannot describe the planner's own second serving as a
+        # dish the member asked to see again.
+        repeats = (explainability.get("metrics") or {}).get("repeats") or {}
+        if repeats.get("count"):
+            facts["repeats"] = {
+                "meals": repeats["count"],
+                "you_starred": repeats["by_source"].get("member_request", 0),
+                "plans_own_choice": repeats["by_source"].get("plan", 0),
+                "min_gap_days": repeats.get("min_gap_days"),
+            }
         fallback_extras = " ".join(p for p in (seed_note, pantry_note) if p)
         response_text = self.response_writer.write(
             facts, content,
