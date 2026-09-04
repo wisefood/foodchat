@@ -184,11 +184,24 @@ def classify_meal(recipe: dict) -> str:
     return "vegetarian"
 
 
-def _recipe_kcal(recipe: dict) -> Optional[float]:
-    nutrition = recipe.get("nutrition") or {}
+def recipe_kcal(source: dict) -> Optional[float]:
+    """Per-serving kcal from a recipe or candidate dict, None when unknown.
+
+    **Zero is unknown, not a zero-calorie meal.** RecipeWrangler returns
+    ``kcal: 0`` for recipes it has no composition data for, and every caller
+    here read that as a real measurement: a week containing two of them
+    reported ``meals_with_data: 21 of 21``, suppressed the "based on N meals"
+    note, and put the missing calories into the weekly total as if the member
+    would eat nothing. No recipe is 0 kcal.
+
+    The canonical reader for the whole weekly planner —
+    ``reward_logic.candidate_kcal`` delegates here — so the rule is stated
+    once rather than in each place that happens to divide by it.
+    """
+    nutrition = source.get("nutrition") or {}
     for key in ("kcal", "calories"):
         value = nutrition.get(key)
-        if isinstance(value, (int, float)):
+        if isinstance(value, (int, float)) and value > 0:
             return float(value)
     return None
 
@@ -208,7 +221,7 @@ def summarize_day(day_entries: list[dict]) -> str:
     ordered = sorted(day_entries, key=lambda e: e.get("meal_idx", 0))
     labelled = [
         (str(e.get("meal_type", "meal")), classify_meal(e.get("recipe") or {}),
-         _recipe_kcal(e.get("recipe") or {}))
+         recipe_kcal(e.get("recipe") or {}))
         for e in ordered
     ]
 

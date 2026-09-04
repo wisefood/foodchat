@@ -50,6 +50,13 @@ DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
 
 # Soft calorie budget counts as satisfied up to this share of the target.
 CALORIE_TOLERANCE = 1.05
+# ...and down to this share of it. A ceiling on its own is not a budget check:
+# a week planned at 47% of target — 933 kcal a day — passed as "satisfied",
+# because nothing ever asked whether the member would be fed. Looser than the
+# ceiling on purpose: per-serving figures from a recipe database are
+# approximate and real weeks vary, so this is set to catch a week that is
+# wrong rather than one that is merely light.
+CALORIE_FLOOR = 0.85
 
 
 # --------------------------------------------------------------------- #
@@ -492,6 +499,32 @@ def guideline_checklist(category_counts: Dict[str, int], total_meals: int) -> Li
     ]
 
 
+def calorie_budget_status(
+    planned: float, target_kcal: float, covered: int, total_meals: int
+) -> Optional[str]:
+    """``"over"`` | ``"under"`` | ``"on_track"``, or None when nothing is known.
+
+    Both directions, decided in one place so the metric, the ledger row and
+    the prose cannot drift apart. The ledger used to check only the ceiling,
+    which is not a budget check: a week planned at 47% of target — 933 kcal a
+    day — was reported as satisfied and handed to the reply as an honoured
+    request, because nothing ever asked whether the member would be fed.
+
+    The floor is measured against the meals we actually have data for, not
+    against the whole week. Judging a 19-of-21 week by the full target would
+    report "short of target" for two missing data points — a claim about our
+    coverage, dressed up as a claim about the member's food.
+    """
+    if target_kcal <= 0 or not covered:
+        return None
+    expected = target_kcal * (covered / total_meals if total_meals else 1.0)
+    if planned > target_kcal * CALORIE_TOLERANCE:
+        return "over"
+    if expected > 0 and planned < expected * CALORIE_FLOOR:
+        return "under"
+    return "on_track"
+
+
 def nutrition_metrics(plan_entries: List[dict], targets: Dict[str, float]) -> dict:
     """Weekly totals + daily average vs target, with honest coverage.
 
@@ -534,11 +567,18 @@ def nutrition_metrics(plan_entries: List[dict], targets: Dict[str, float]) -> di
         f"based on {covered} of {total_meals} meals with nutrition data"
         if 0 < covered < total_meals else ""
     )
+
+    budget_status = calorie_budget_status(
+        totals["kcal"], target_kcal, covered, total_meals,
+    )
+
     return {
         "weekly_totals": {name: round(value, 1) for name, value in totals.items()},
         "daily_average_kcal": round(totals["kcal"] / 7.0, 1) if covered else None,
         "weekly_targets": weekly_targets,
         "budget_used_pct": budget_used_pct,
+        # "over" | "under" | "on_track" | None (no target, or nothing measured)
+        "budget_status": budget_status,
         "coverage": {"meals_with_data": covered, "total_meals": total_meals},
         "note": note,
     }
@@ -713,10 +753,26 @@ def weekly_constraints_ledger(
         detail = f"{planned:,.0f} of {target_kcal:,.0f} kcal planned ({pct}%)"
         if nutrition.get("note"):
             detail += f", {nutrition['note']}"
+        # A budget has two sides. The row used to check only the ceiling, so a
+        # week that fed the member half of what they need was reported as
+        # honoured — and `split_ledger` then handed it to the reply as an
+        # honoured request.
+        #
+        # Derived here when the caller's payload predates the field, rather
+        # than read as absent: a missing measurement must not turn into a
+        # violation, which is the same mistake in the other direction.
+        budget_status = nutrition.get("budget_status") or calorie_budget_status(
+            planned, target_kcal, covered,
+            int((nutrition.get("coverage") or {}).get("total_meals") or 0),
+        )
+        if budget_status == "under":
+            detail += "; short of your target for the meals we have data for"
+        elif budget_status == "over":
+            detail += "; over your target"
         ledger.append({
-            "constraint": "weekly calorie budget",
+            "constraint": "weekly calorie target",
             "type": "soft",
-            "status": "satisfied" if planned <= target_kcal * CALORIE_TOLERANCE else "violated",
+            "status": "satisfied" if budget_status == "on_track" else "violated",
             "source": "calorie target",
             "detail": detail,
         })
@@ -772,6 +828,10 @@ def _compose_reasoning(
         )
         if nutrition.get("note"):
             sentence += f" ({nutrition['note']})"
+        if nutrition.get("budget_status") == "under":
+            sentence += " — noticeably short of what you asked for"
+        elif nutrition.get("budget_status") == "over":
+            sentence += " — over what you asked for"
         parts.append(sentence + ".")
 
     repeats = repeats or {}

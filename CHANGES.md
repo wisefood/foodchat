@@ -2,6 +2,76 @@
 
 ---
 
+# A calorie budget with only a ceiling is not a budget check
+
+> **Date:** 2026-09-04
+> **Branch:** main
+> No API change. `metrics.nutrition` gains `budget_status`; the ledger row is
+> renamed `weekly calorie budget` → `weekly calorie target` and can now be
+> `violated` from below. `coverage.meals_with_data` will read lower on plans
+> containing recipes RecipeWrangler has no composition data for — that is the
+> fix, not a regression. New `day_summary.recipe_kcal`;
+> `reward_logic.candidate_kcal` keeps its name and delegates to it.
+
+Two bugs with one root, both visible in a single generated week: a plan that
+fed the member **933 kcal a day** and reported the calorie constraint as
+*satisfied*, alongside `meals_with_data: 21 of 21` for a week where two
+recipes had no nutrition data at all.
+
+## A reported zero is missing data, not a zero-calorie meal
+
+RecipeWrangler returns `kcal: 0` for recipes it has no composition data for.
+Every reader treated that as a measurement.
+
+| What | Detail |
+|---|---|
+| One canonical reader | `day_summary.recipe_kcal` returns `None` for a missing *or zero* value. `reward_logic.candidate_kcal` delegates to it, so "unknown" means the same thing to the calorie constraint, the day headline and the weekly metrics. The rule is stated once instead of in each place that divides by it. |
+| Coverage stops overstating itself | The week that prompted this goes from `21 of 21` to `19 of 21`, and the *"based on N meals with nutrition data"* note — which had been suppressed precisely when it was most needed — now fires. |
+| Day headlines stop averaging in a number nobody measured | `summarize_day` scales the known meals up to the day's meal count. Counting a zero as known dragged the estimate down and could label a hearty day light. |
+
+No recipe is 0 kcal, so the guard is `value > 0`.
+
+## The budget had no floor
+
+`status = "satisfied" if planned <= target * 1.05 else "violated"` — nothing
+ever asked whether the member would be fed. `split_ledger` then handed the row
+to the response writer under `constraints_honored`, so a half-fed week was
+described to the member as an honoured request.
+
+| What | Detail |
+|---|---|
+| New `calorie_budget_status` | Returns `"over"` / `"under"` / `"on_track"`, or `None` when there is no target or nothing measured. One function, called by `nutrition_metrics`, so the metric, the ledger row and the prose cannot drift apart — each reads the result instead of re-deriving it. |
+| `CALORIE_FLOOR = 0.85` | Looser than the 1.05 ceiling on purpose: per-serving figures from a recipe database are approximate and real weeks vary, so this catches a week that is *wrong*, not one that is merely light. |
+| The floor is measured against the meals we have data for | Judging a 19-of-21 week by the full weekly target would report "short of target" for two missing data points — a claim about our coverage, dressed up as a claim about the member's food. A week whose 11 known meals are on target reads `on_track` even though its total is half the weekly figure. |
+| A missing status is not a violation | Stored plans from before this change, and hand-built payloads, carry no `budget_status`; the ledger derives it rather than reading its absence as a failure. That would be the same mistake in the other direction, and a test pins it. |
+| The row says which way it went | Renamed to "weekly calorie target" — "budget" reads as a ceiling, and it is now checked both ways — with `; short of your target for the meals we have data for` or `; over your target` in the detail, and a matching clause in the week's justification. |
+
+## On the week that prompted this
+
+```
+coverage      : 21/21    -> 19/21
+budget status : (absent) -> "under"
+note          : ""       -> "based on 19 of 21 meals with nutrition data"
+ledger        : [satisfied] weekly calorie budget
+             -> [violated]  weekly calorie target
+                6,531 of 14,000 kcal planned (47%), based on 19 of 21 meals
+                with nutrition data; short of your target for the meals we
+                have data for
+```
+
+## Verification
+
+Eight mutations, each neutering one part — the zero guard, the day
+qualifier's use of it, `candidate_kcal`'s delegation, the floor, the
+coverage-relative expectation, the ledger's use of the status, the
+missing-status fallback, and the prose clause. All eight caught.
+
+`tests/test_weekly_explainability.py` grows from 21 to 33, including the
+property that keeps the floor honest: a week short only because of missing
+data is *not* flagged. **612 passing**; ruff unchanged at its pre-existing 19.
+
+---
+
 # Three things a real week got wrong
 
 > **Date:** 2026-09-04

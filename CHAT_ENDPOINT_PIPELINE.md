@@ -255,8 +255,11 @@ correctly after a process restart or on a different replica.
   |      explainability["reasoning"], because it runs after the prose is
   |      composed
   |      LLM-free: attaches per-entry recipe.match_reasons chips, builds
-  |      the MEASURED constraint ledger (meat count / calorie budget with
-  |      status satisfied | relaxed | violated), personalization counts,
+  |      the MEASURED constraint ledger (meat count / calorie target with
+  |      status satisfied | relaxed | violated -- the calorie row is checked
+  |      in BOTH directions, and its floor is measured against the meals that
+  |      have nutrition data, so a coverage gap never reads as an underfed
+  |      week; a reported kcal of 0 is missing data, not a free meal), personalization counts,
   |      weekly metrics (variety + category distribution, deterministic
   |      guideline frequency checklist, nutrition trackers with coverage,
   |      per-day breakdown) and the whole-week justification prose

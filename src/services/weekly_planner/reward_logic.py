@@ -24,7 +24,7 @@ populated — it is now simply the negative constraint penalty at that step.
 import logging
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
-from .day_summary import is_meat_meal
+from .day_summary import is_meat_meal, recipe_kcal
 
 if TYPE_CHECKING:
     from .state_tracking import WeeklyNutritionalTracker
@@ -38,13 +38,13 @@ CALORIE_OVERAGE_WEIGHT = 0.01
 
 
 def candidate_kcal(candidate: Dict[str, Any]) -> Optional[float]:
-    """Per-serving kcal from an enriched candidate dict, None when unknown."""
-    nutrition = candidate.get("nutrition") or {}
-    for key in ("kcal", "calories"):
-        value = nutrition.get(key)
-        if isinstance(value, (int, float)):
-            return float(value)
-    return None
+    """Per-serving kcal from an enriched candidate dict, None when unknown.
+
+    Delegates to ``day_summary.recipe_kcal`` so "unknown" means the same thing
+    to the calorie constraint, the day headline and the weekly metrics — in
+    particular that a reported ``kcal: 0`` is missing data, not a free meal.
+    """
+    return recipe_kcal(candidate)
 
 
 def is_meat_candidate(candidate: Dict[str, Any], count_fish: bool = True) -> bool:
