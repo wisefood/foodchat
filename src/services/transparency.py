@@ -82,12 +82,7 @@ def constraints_ledger(profile: dict, downvoted_count: int = 0) -> list[dict]:
             "members": members_for("allergies", allergen),
         })
     for diet in profile.get("diet") or []:
-        ledger.append({
-            "constraint": str(diet),
-            "type": "hard", "status": "satisfied",
-            "source": "dietary group",
-            "members": members_for("diet", diet),
-        })
+        ledger.append(_diet_row(diet, members_for("diet", diet)))
     for dislike in (profile.get("food_dislikes") or [])[:5]:
         ledger.append({
             "constraint": f"avoiding {dislike}",
@@ -106,6 +101,56 @@ def constraints_ledger(profile: dict, downvoted_count: int = 0) -> list[dict]:
             "members": [],
         })
     return ledger
+
+
+def _diet_row(diet, members: list[str]) -> dict:
+    """One row per diet value, saying what actually happened to it.
+
+    Every value used to render as ``hard`` / ``satisfied``, which is only true
+    of the ones RecipeWrangler has a filter for. A profile saying
+    ``flexitarian`` — a word this service does not know, and which reaches
+    neither the recipe query nor the weekly meat limit — was reported as a
+    satisfied hard constraint. The row was the only place a member could have
+    learned otherwise, and it said the opposite.
+
+    Three outcomes, because there are three things that can happen:
+
+    - forwarded as a filter — the original claim, and now only made when true;
+    - a non-restrictive label ("omnivore", "mediterranean"): nothing was
+      excluded and nothing was meant to be, so it is reported as the soft
+      description it is rather than as an enforced rule;
+    - unknown: ``relaxed``, which puts it in ``constraints_not_honored`` and
+      obliges the reply to say so. Dropping the row instead would trade a
+      false claim for a silent one — the failure this module exists to
+      prevent, in its other direction.
+    """
+    from services.candidates_client import (  # local import; avoids a cycle
+        DIET_FILTER,
+        DIET_NOT_RESTRICTIVE,
+        diet_tag_status,
+    )
+
+    status, _tag = diet_tag_status(diet)
+    if status == DIET_FILTER:
+        return {
+            "constraint": str(diet), "type": "hard", "status": "satisfied",
+            "source": "dietary group", "members": members,
+        }
+    if status == DIET_NOT_RESTRICTIVE:
+        return {
+            "constraint": str(diet), "type": "soft", "status": "satisfied",
+            "source": "dietary group",
+            "detail": "a description of how you eat, not a recipe filter — "
+                      "no dishes were excluded for it",
+            "members": members,
+        }
+    return {
+        "constraint": str(diet), "type": "hard", "status": "relaxed",
+        "source": "dietary group",
+        "detail": "the recipe service has no filter for this, so no dishes "
+                  "were excluded for it",
+        "members": members,
+    }
 
 
 def _goal_rows(profile: dict, household: bool) -> list[dict]:

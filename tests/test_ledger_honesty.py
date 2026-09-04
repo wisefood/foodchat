@@ -56,6 +56,105 @@ def _household_profile(**over) -> dict:
     return profile
 
 
+class TestADietRowSaysWhatHappenedToIt:
+    """The ledger reported every diet value as an applied hard constraint.
+
+    RecipeWrangler treats diet tags as hard filters and `normalize_diet_tags`
+    forwards only the ones it knows, so a member whose profile said
+    `flexitarian` — a word that appears nowhere in this service, and which
+    reaches neither the recipe query nor the weekly meat limit — was told the
+    constraint had been satisfied. The row was the only place they could have
+    learned otherwise, and it said the opposite.
+    """
+
+    @staticmethod
+    def _row(value):
+        rows = constraints_ledger({"diet": [value], "preferences": []})
+        return next(r for r in rows if r["constraint"] == value)
+
+    def test_a_diet_the_recipe_service_filters_on_is_satisfied(self):
+        row = self._row("vegetarian")
+
+        assert row["type"] == "hard" and row["status"] == "satisfied"
+
+    def test_a_diet_it_has_never_heard_of_is_relaxed(self):
+        row = self._row("flexitarian")
+
+        assert row["type"] == "hard" and row["status"] == "relaxed"
+        assert "no dishes were excluded for it" in row["detail"]
+
+    def test_and_that_reaches_the_reply(self):
+        """`relaxed` puts it in constraints_not_honored, so the writer has to
+        say so instead of listing it as an honoured request."""
+        honored, not_honored = split_ledger(
+            constraints_ledger({"diet": ["flexitarian"], "preferences": []})
+        )
+
+        assert not_honored == ["flexitarian"]
+        assert "flexitarian" not in honored
+
+    def test_a_non_restrictive_label_is_reported_as_the_label_it_is(self):
+        """"mediterranean" is deliberately not forwarded — as a hard filter it
+        would empty every slot. Nothing was excluded and nothing was meant to
+        be, so it is a soft description rather than an enforced rule."""
+        row = self._row("mediterranean")
+
+        assert row["type"] == "soft" and row["status"] == "satisfied"
+        assert "not a recipe filter" in row["detail"]
+
+    def test_an_unknown_diet_still_gets_a_row(self):
+        """Dropping it would trade a false claim for a silent one — the same
+        failure this module exists to prevent, in its other direction."""
+        rows = constraints_ledger({"diet": ["flexitarian"], "preferences": []})
+
+        assert [r["constraint"] for r in rows] == ["flexitarian"]
+
+    def test_no_value_is_claimed_as_applied_unless_it_was_forwarded(self):
+        """The invariant that keeps the ledger and the query from drifting:
+        a row may only say hard+satisfied for a value that actually became a
+        RecipeWrangler filter."""
+        from services.candidates_client import normalize_diet_tags
+
+        diets = ["vegetarian", "flexitarian", "mediterranean", "gluten_free",
+                 "omnivore", "pescatarian", "carnivore", "low-carb"]
+        forwarded = set(normalize_diet_tags(diets))
+        rows = {r["constraint"]: r for r in
+                constraints_ledger({"diet": diets, "preferences": []})}
+
+        assert set(rows) == set(diets), "every value keeps a row"
+        for value, row in rows.items():
+            applied = row["type"] == "hard" and row["status"] == "satisfied"
+            actually_filtered = bool(set(normalize_diet_tags([value])) & forwarded)
+            assert applied == actually_filtered, value
+
+
+class TestDietTagStatus:
+    def test_the_three_outcomes(self):
+        from services.candidates_client import (
+            DIET_FILTER,
+            DIET_NOT_RESTRICTIVE,
+            DIET_UNKNOWN,
+            diet_tag_status,
+        )
+
+        assert diet_tag_status("vegetarian") == (DIET_FILTER, "vegetarian")
+        assert diet_tag_status("gluten-free") == (DIET_FILTER, "gluten_free")
+        assert diet_tag_status("mediterranean") == (DIET_NOT_RESTRICTIVE, None)
+        assert diet_tag_status("flexitarian") == (DIET_UNKNOWN, None)
+
+    def test_it_is_case_and_space_tolerant(self):
+        from services.candidates_client import DIET_FILTER, diet_tag_status
+
+        assert diet_tag_status("  Vegetarian ") == (DIET_FILTER, "vegetarian")
+
+    def test_normalize_still_forwards_exactly_the_filters(self):
+        from services.candidates_client import normalize_diet_tags
+
+        assert normalize_diet_tags(
+            ["vegetarian", "flexitarian", "mediterranean", "gluten-free"]
+        ) == ["vegetarian", "gluten_free"]
+
+
 class TestSplitLedger:
     def test_relaxed_is_never_honored(self):
         honored, not_honored = split_ledger([

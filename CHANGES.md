@@ -2,6 +2,60 @@
 
 ---
 
+# The ledger stops claiming diets it never applied
+
+> **Date:** 2026-09-04
+> **Branch:** main
+> No API change. A diet row can now be `relaxed` (and carry a `detail`), and a
+> non-restrictive label renders as `soft` rather than `hard`. New
+> `candidates_client.diet_tag_status`; `normalize_diet_tags` is unchanged in
+> behaviour and now delegates to it.
+
+`constraints_ledger` emitted `{"type": "hard", "status": "satisfied"}` for
+every value in `profile["diet"]`, unconditionally. `normalize_diet_tags`
+forwards only the values RecipeWrangler has a filter for — everything else is
+dropped, with a log line nobody reads.
+
+So a profile saying **flexitarian** produced a satisfied hard constraint for a
+word that appears nowhere in this service: not in `DIET_TAG_MAP`, not in
+`VALID_RW_DIET_TAGS`, and not in `state_tracking`'s diet-aware meat limit,
+which special-cases only vegetarian, vegan and pescatarian. Nothing was
+excluded for it and nothing counted it. The ledger row was the one place a
+member could have found that out, and it said the opposite.
+
+| What | Detail |
+|---|---|
+| New `diet_tag_status(value)` | Returns `("filter", tag)`, `("not_restrictive", None)` or `("unknown", None)` — the classification already inside `normalize_diet_tags`, minus its log line, so the ledger can report which of the three happened instead of assuming the first. `normalize_diet_tags` now delegates to it, so the query and the ledger cannot drift. |
+| Forwarded → unchanged | `hard` / `satisfied`, as before, and now only when true. |
+| Unknown → `relaxed` | With a detail saying the recipe service has no filter for it, so no dishes were excluded. `relaxed` puts it in `constraints_not_honored`, which obliges the reply to say so rather than list it as an honoured request. |
+| Non-restrictive label → `soft` | "omnivore", "mediterranean" and friends are deliberately not forwarded — as hard filters they would empty every slot. Nothing was excluded and nothing was meant to be, so they render as the description they are, with a detail saying so. |
+| The row is never dropped | Deleting an unknown value's row would trade a false claim for a silent one — the failure this module exists to prevent, in its other direction. A test pins it. |
+
+The load-bearing test is the invariant rather than the examples: for an
+arbitrary diet list, a row may say `hard` + `satisfied` **only** for a value
+that `normalize_diet_tags` actually forwarded. That is what stops the two
+sides drifting the next time the tag vocabulary changes.
+
+## Verification
+
+Six mutations — collapsing the three outcomes back to one, dropping the row,
+reporting unknown as satisfied, reporting a label as an enforced rule, and
+both halves of the classifier. All six caught; the last two by the existing
+`test_candidates_client.py` tests, which is the check that
+`normalize_diet_tags` still behaves exactly as it did.
+
+`tests/test_ledger_honesty.py` grows from 11 to 20. **621 passing**; ruff
+unchanged at its pre-existing 19.
+
+## Not fixed here
+
+`flexitarian` still *does* nothing — it is reported honestly now, but the
+plan does not act on it. Honouring it would mean a diet-aware meat limit in
+`state_tracking` (which already does this for vegetarian/vegan), and the
+number is a product decision, not a code one.
+
+---
+
 # A calorie budget with only a ceiling is not a budget check
 
 > **Date:** 2026-09-04

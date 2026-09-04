@@ -115,6 +115,31 @@ def allergen_conflict(text: str, allergies: list[str]) -> Optional[str]:
     return None
 
 
+# What `normalize_diet_tags` does with one value.
+DIET_FILTER = "filter"                    # forwarded to RW as a hard filter
+DIET_NOT_RESTRICTIVE = "not_restrictive"  # a label, deliberately not forwarded
+DIET_UNKNOWN = "unknown"                  # RW has no filter for it; dropped
+
+
+def diet_tag_status(value) -> tuple[str, str | None]:
+    """``(status, rw_tag)`` for one profile diet value — the classification
+    behind ``normalize_diet_tags``, without its log line.
+
+    Split out so the transparency ledger can say which of the three happened
+    to each value instead of assuming the first. It reported every diet value
+    as an applied hard constraint, so a member whose profile said
+    ``flexitarian`` — a word that appears nowhere in this service — was told
+    it had been satisfied while RecipeWrangler was never asked for it.
+    """
+    key = str(value).lower().strip()
+    if key in DIET_TAG_MAP:
+        mapped = DIET_TAG_MAP[key]
+        return (DIET_FILTER, mapped) if mapped is not None else (DIET_NOT_RESTRICTIVE, None)
+    if key in VALID_RW_DIET_TAGS:
+        return DIET_FILTER, key
+    return DIET_UNKNOWN, None
+
+
 def normalize_diet_tags(diet) -> list[str]:
     """Convert user-profile diet values to valid RecipeWrangler diet tags.
 
@@ -125,14 +150,10 @@ def normalize_diet_tags(diet) -> list[str]:
     raw = diet if isinstance(diet, list) else ([diet] if diet else [])
     tags: list[str] = []
     for d in raw:
-        key = str(d).lower().strip()
-        if key in DIET_TAG_MAP:
-            mapped = DIET_TAG_MAP[key]
-            if mapped is not None:
-                tags.append(mapped)
-        elif key in VALID_RW_DIET_TAGS:
-            tags.append(key)
-        else:
+        status, tag = diet_tag_status(d)
+        if status == DIET_FILTER:
+            tags.append(tag)
+        elif status == DIET_UNKNOWN:
             logger.warning("Dropping unrecognized diet tag %r — not in RecipeWrangler schema", d)
     return tags
 
