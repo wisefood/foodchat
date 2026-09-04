@@ -11,7 +11,9 @@ langchain-groq>=1.0.0
 sqlalchemy>=2.0.0
 
 # WiseFood platform client (member profiles)
-wisefood
+# Pinned: unpinned, a rebuild silently takes whatever is newest on PyPI, and
+# this package is one this team publishes.
+wisefood==0.0.25
 
 # HTTP client (RecipeWrangler, FoodScholar)
 httpx>=0.27.0

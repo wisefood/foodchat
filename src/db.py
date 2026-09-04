@@ -554,6 +554,56 @@ def db_get_feedback(db: DBSession, message_id: int) -> list[FeedbackRow]:
     return db.query(FeedbackRow).filter(FeedbackRow.message_id == message_id).all()
 
 
+def db_list_feedback(
+    db: DBSession,
+    *,
+    limit: int = 50,
+    offset: int = 0,
+    member_id: str | None = None,
+    rating: str | None = None,
+) -> tuple[int, list[dict]]:
+    """A page of feedback with the message it rates, newest first.
+
+    The table has been written since it was added and read only by the
+    personalisation loop — there was no listing, no export and no endpoint, so
+    a thumbs-down was invisible to anyone without a database shell. Returns
+    ``(total, rows)`` so a console can page without a second count query.
+    """
+    query = (
+        db.query(FeedbackRow, MessageRow)
+        .outerjoin(MessageRow, FeedbackRow.message_id == MessageRow.id)
+    )
+    if member_id:
+        query = query.filter(FeedbackRow.member_id == member_id)
+    if rating in ("up", "down"):
+        query = query.filter(FeedbackRow.rating == rating)
+
+    total = query.count()
+    rows = (
+        query.order_by(FeedbackRow.created_at.desc())
+        .limit(max(1, min(int(limit or 50), 200)))
+        .offset(max(0, int(offset or 0)))
+        .all()
+    )
+    return total, [
+        {
+            "message_id": fb.message_id,
+            "session_id": fb.session_id,
+            "member_id": fb.member_id,
+            "rating": fb.rating,
+            "comment": fb.comment,
+            "created_at": fb.created_at,
+            "intent": getattr(msg, "intent", None),
+            "plan_id": getattr(msg, "plan_id", None),
+            # Enough of the rated message to recognise it, not the whole thing.
+            "message_preview": (
+                " ".join((getattr(msg, "content", "") or "").split())[:240] or None
+            ),
+        }
+        for fb, msg in rows
+    ]
+
+
 def db_get_member_feedback_with_plans(db: DBSession, member_id: str, limit: int = 100) -> list[dict]:
     """A member's feedback joined to the plans it rated, newest first.
 

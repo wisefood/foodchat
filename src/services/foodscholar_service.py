@@ -28,6 +28,8 @@ from urllib.parse import quote
 
 import httpx
 
+import obs_context
+
 from models.attribution import Attribution, Citation
 from .session_service import SessionService
 
@@ -87,8 +89,18 @@ class FoodScholarClient:
                 "free_text": clarification_answer,
             }
 
+        # The correlation id goes with the question. FoodChat receives a signed
+        # member assertion, not a Keycloak subject, so it cannot tell FoodScholar
+        # *who* is asking — but the gateway can, and its activity record for this
+        # same id carries the user. That join is how a nutrition question asked
+        # inside a chat turn gets attributed, without giving this service an
+        # identity it has no business holding.
         with httpx.Client(timeout=FOODSCHOLAR_TIMEOUT) as client:
-            response = client.post(f"{self.base_url}/api/v1/qa/ask", json=payload)
+            response = client.post(
+                f"{self.base_url}/api/v1/qa/ask",
+                json=payload,
+                headers=obs_context.outbound_headers(),
+            )
             response.raise_for_status()
             return response.json()
 

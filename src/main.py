@@ -14,6 +14,9 @@ No data files, vector stores, or embedding models are required to boot.
 """
 
 import logging
+
+import obs_context
+import wf_telemetry
 import os
 import threading
 from contextlib import asynccontextmanager
@@ -27,7 +30,7 @@ from fastapi import FastAPI  # noqa: E402 — must follow load_dotenv()
 
 import auth  # noqa: E402
 from db import init_db  # noqa: E402
-from routers import foodchat_router  # noqa: E402
+from routers import foodchat_router, review_router  # noqa: E402
 from services import (  # noqa: E402
     init_chat_service,
     init_weekly_plan_service,
@@ -41,10 +44,32 @@ from services import (  # noqa: E402
 # back to INFO, because a typo'd log level must not stop the pod from booting.
 _LOG_LEVELS = {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"}
 _LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+# `force=True` because basicConfig is a no-op once the root logger has
+# handlers — which it does under pytest and under uvicorn's own log config, so
+# without this the level and format silently did not apply there.
 logging.basicConfig(
     level=_LOG_LEVEL if _LOG_LEVEL in _LOG_LEVELS else "INFO",
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    format="%(asctime)s [%(levelname)s] %(name)s: [%(request_id)s] %(message)s",
+    force=True,
 )
+# Every line carries the correlation id of the request that caused it — the same
+# id the gateway assigned and forwarded — so one user action can be followed
+# across services. LOG_FORMAT=json additionally preserves `extra={...}` fields,
+# which the text formatter silently drops.
+_LOG_JSON = (os.getenv("LOG_FORMAT", "text") or "text").strip().lower() == "json"
+for _handler in logging.getLogger().handlers:
+    _handler.setFormatter(
+        obs_context.JsonFormatter()
+        if _LOG_JSON
+        else obs_context.ContextTextFormatter(
+            "%(asctime)s [%(levelname)s] %(name)s: [%(request_id)s] %(message)s"
+        )
+    )
+obs_context.install_log_filter()
+# Report turns and model spend back to the gateway, which owns the
+# analytics store. No-op unless ANALYTICS_ENABLED and an ingest secret
+# are both set.
+wf_telemetry.TELEMETRY.start(app="foodchat")
 logger = logging.getLogger(__name__)
 
 
@@ -114,6 +139,11 @@ logger.info("Services initialized (chat, weekly, memory, orchestrator).")
 # auth.py for why the gateway is the only party that can make this assertion.
 app.middleware("http")(auth.assertion_middleware)
 
+# Adopt the gateway's X-Request-Id (or mint one for a direct caller). Added
+# after the assertion middleware, so it sits outermost: the id exists before
+# anything else can log, including an assertion rejection.
+app.add_middleware(obs_context.RequestContextMiddleware)
+
 if auth.enforcing():
     logger.info("Member assertions ENFORCED (FOODCHAT_ASSERTION_SECRET is set).")
 else:
@@ -124,6 +154,9 @@ else:
     )
 
 app.include_router(foodchat_router.router)
+# Review-scoped reads, gated at the gateway on an admin or expert token. Kept
+# out of the member-scoped router so its ownership guarantee stays absolute.
+app.include_router(review_router.router)
 
 
 @app.get("/")

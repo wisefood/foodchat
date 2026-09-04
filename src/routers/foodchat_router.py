@@ -40,7 +40,12 @@ from pydantic import BaseModel, Field
 
 import auth
 import services
-from db import SessionLocal, db_upsert_feedback, db_get_message_by_id
+from db import (
+    SessionLocal,
+    db_upsert_feedback,
+    db_get_message_by_id,
+    db_list_feedback,
+)
 from models.session import MealCourse
 from services import plan_parameters
 from services.candidates_client import MEAL_SLOTS
@@ -448,6 +453,27 @@ class FeedbackResponse(BaseModel):
     message_id: int
     rating: str
     comment: Optional[str] = None
+
+
+class FeedbackEntry(BaseModel):
+    """One rating, with enough of the message to know what was rated."""
+
+    message_id: int
+    session_id: str
+    member_id: str
+    rating: str
+    comment: Optional[str] = None
+    created_at: datetime
+    intent: Optional[str] = None
+    plan_id: Optional[str] = None
+    message_preview: Optional[str] = None
+
+
+class FeedbackListResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    items: List[FeedbackEntry] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -1080,7 +1106,56 @@ def submit_feedback(session_id: str, message_id: int, request: FeedbackRequest):
             rating=request.rating,
             comment=request.comment,
         )
+        # Mirrored to the gateway's shared inbox. The row above stays: it is
+        # what feeds personalisation, and that must not depend on a network
+        # call to another service succeeding.
+        try:
+            import activity
+
+            activity.report_feedback(
+                message_id=str(message_id),
+                rating=request.rating,
+                comment=request.comment,
+                member_id=request.member_id,
+            )
+        except Exception:  # pragma: no cover - never fail the write
+            logger.debug("Feedback mirroring failed", exc_info=True)
         return FeedbackResponse(message_id=fb.message_id, rating=fb.rating, comment=fb.comment)
+    finally:
+        db.close()
+
+
+@router.get("/members/{member_id}/feedback", response_model=FeedbackListResponse)
+def get_member_feedback(
+    member_id: str,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    rating: Optional[str] = Query(None, pattern="^(up|down)$"),
+):
+    """One member's ratings, newest first, with the message each one rates.
+
+    The read side of a table that has been filling since it was added and read
+    only by the personalisation loop — a thumbs-down was previously invisible
+    without a database shell.
+
+    Deliberately member-scoped, like every other route that names a member: the
+    id in the path IS the thing being authorized, and the assertion is the only
+    check there is. An unscoped "all feedback" listing was the obvious thing to
+    write here and would have handed every member's comments to anything that
+    can reach this port, since FoodChat authenticates nobody. Experts get the
+    cross-member view from the gateway's feedback inbox instead, which is fed
+    by the mirror in `submit_feedback` and carries FoodScholar's and the
+    platform widget's feedback alongside this.
+    """
+    _require_member(member_id)
+    db = SessionLocal()
+    try:
+        total, items = db_list_feedback(
+            db, limit=limit, offset=offset, member_id=member_id, rating=rating
+        )
+        return FeedbackListResponse(
+            total=total, limit=limit, offset=offset, items=items
+        )
     finally:
         db.close()
 

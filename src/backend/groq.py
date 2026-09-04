@@ -201,6 +201,22 @@ class GroqConnectionPool:
                     callbacks.append(handler)
                     final_kwargs["callbacks"] = callbacks
 
+                # Token accounting, attached at the pool for the same reason:
+                # a turn is a dozen agent calls, and costing them one call site
+                # at a time guarantees the thirteenth is missed. Langfuse holds
+                # the traces; this holds the per-member numbers, which the
+                # Langfuse metrics API cannot group by user.
+                try:
+                    import activity
+
+                    usage = activity.usage_callback("foodchat_llm")
+                    if usage is not None:
+                        callbacks = list(final_kwargs.get("callbacks") or [])
+                        callbacks.append(usage)
+                        final_kwargs["callbacks"] = callbacks
+                except Exception:  # never block client construction
+                    logger.debug("Usage callback unavailable", exc_info=True)
+
                 # A caller may override either, but neither may be absent:
                 # `ChatGroq` defaults `request_timeout` to None, which is what
                 # let a hung call hold a worker for as long as the socket

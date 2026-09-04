@@ -34,6 +34,7 @@ preference stated while answering a question is never silently dropped.
 Returns a unified ChatTurn so the router needs one response model.
 """
 
+import contextvars
 import json
 import logging
 import re
@@ -55,6 +56,14 @@ from .seed_service import SeedService
 from .session_service import SessionService
 
 logger = logging.getLogger(__name__)
+
+#: What a turn handler learned, for the guard to attach when it reports. A
+#: ContextVar rather than an attribute: two turns on two sessions run
+#: concurrently in the same process, and an attribute would let one describe
+#: the other.
+_turn_detail: contextvars.ContextVar = contextvars.ContextVar(
+    "foodchat_turn_detail", default=None
+)
 
 # Words that count as accepting the favorites offer. Kept deliberately simple
 # for M2 — anything else is treated as a decline and the original request
@@ -199,10 +208,21 @@ class OrchestratorService:
             # check and the claim still happen together under the lock, so this
             # is not check-then-act.
             yield not busy
+            outcome = "ok" if not busy else "busy"
+        except BaseException:
+            outcome = "error"
+            raise
         finally:
             if not busy:
                 with self._turn_lock:
                     self._turns_in_flight.pop(session_id, None)
+            # Reported here, not at the four entry points, because this is the
+            # one thing all four share — and because it is the only place that
+            # also sees a refused turn, a turn that hit the message cap, and a
+            # turn that raised. An earlier version reported from `process()`
+            # alone, so three of the four entry points and every failed turn
+            # were missing from the record.
+            self._report_turn(session_id, outcome, now)
 
     @staticmethod
     def _busy_turn() -> ChatTurn:
@@ -325,7 +345,38 @@ class OrchestratorService:
             result = self._attach_memory_suggestions(session, turn, message)
             if opening_turn:
                 self._autotitle_session(session_id, member_id, message)
+            # What only this path knows. The turn itself is reported by the
+            # guard above, which also catches the paths that never get here.
+            _turn_detail.set({
+                "intent": getattr(result, "intent", None),
+                "plan_id": getattr(result, "plan_id", None),
+                "opening_turn": bool(opening_turn),
+                "has_attribution": bool(getattr(result, "attribution", None)),
+            })
             return result
+
+    @staticmethod
+    def _report_turn(session_id: str, outcome: str, started: float) -> None:
+        """Report one turn. Never raises: analytics must not cost an answer."""
+        try:
+            import activity
+
+            detail = _turn_detail.get() or {}
+            activity.report_turn(
+                session_id=session_id,
+                intent=detail.get("intent"),
+                plan_id=detail.get("plan_id"),
+                latency_ms=(time.monotonic() - started) * 1000.0,
+                extra={
+                    "outcome": outcome,
+                    "opening_turn": bool(detail.get("opening_turn")),
+                    "has_attribution": bool(detail.get("has_attribution")),
+                },
+            )
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("Turn reporting failed", exc_info=True)
+        finally:
+            _turn_detail.set(None)
 
     def _autotitle_session(self, session_id: str, member_id: str, message: str) -> None:
         """Name a session from its opening message. Best-effort, never fatal.

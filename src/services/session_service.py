@@ -65,6 +65,79 @@ def _aware(value):
 logger = logging.getLogger(__name__)
 
 
+def _report_plan_generated(
+    session_id: str,
+    plan_id: str,
+    plan_type: str,
+    version: int,
+    parent_id: Optional[str],
+    item_count: Optional[int] = None,
+) -> None:
+    """Report that a plan came out of a turn. Never raises, never blocks.
+
+    The console counts generated plans against saved ones — how many of the
+    plans FoodChat produces a member actually keeps is the one number that says
+    whether planning is working — and that tile read zero because nothing ever
+    emitted the event. Reported here rather than at the pipeline, because six
+    entry points (daily, weekly, structured, and a refinement of each) converge
+    on these methods and reporting from the pipeline missed the other five.
+
+    Ids, counts and a version number only. The plan's reasoning, its titles and
+    the constraints behind it are the member's own dietary situation and stay
+    out of analytics.
+    """
+    try:
+        import activity
+
+        activity.report_event(
+            "chat.plan_generated",
+            props={
+                "session_id": session_id,
+                "plan_id": plan_id,
+                "plan_type": plan_type,
+                "version": version,
+                # A refinement, not a first plan. Derived rather than reported
+                # as a version test, because a structured plan can arrive
+                # already versioned.
+                "refinement": bool(parent_id),
+                "item_count": item_count,
+            },
+        )
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("Plan reporting failed", exc_info=True)
+
+
+def _report_plan_saved(session_id: str, plan_id: str) -> None:
+    """Report that a member kept a plan. Never raises, never blocks.
+
+    "Saved" is the member's explicit act of keeping a plan past its
+    conversation, not the row write that every generated plan already gets —
+    reporting the latter would make the saved count identical to the generated
+    one and tell nobody anything.
+    """
+    try:
+        import activity
+
+        activity.report_event(
+            "chat.plan_saved",
+            props={"session_id": session_id, "plan_id": plan_id},
+        )
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("Plan reporting failed", exc_info=True)
+
+
+def _daily_plan_size(meal_plan) -> Optional[int]:
+    """How many plates a daily plan holds, across every day it covers."""
+    try:
+        return sum(
+            len(getattr(meal, "plates", None) or [])
+            for day in meal_plan.day_plans
+            for meal in getattr(day, "meals", None) or []
+        )
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+
 class SessionService:
     """Hybrid session store: metadata + messages → SQLite; plan objects → in-memory + SQLite."""
 
@@ -207,9 +280,16 @@ class SessionService:
             return False
         db = SessionLocal()
         try:
-            return db_set_plan_saved(db, session_id, plan_id, saved, title)
+            updated = db_set_plan_saved(db, session_id, plan_id, saved, title)
         finally:
             db.close()
+        if updated and saved:
+            # Only the keeping, not the unkeeping: the console tile compares
+            # plans generated with plans kept, and counting an unsave as a save
+            # would make a member who changed their mind look twice as
+            # satisfied. The title the member typed is never reported.
+            _report_plan_saved(session_id, plan_id)
+        return updated
 
     def get_member_saved_plans(self, member_id: str) -> list[dict]:
         """Saved plans across the member's sessions, newest saved first.
@@ -414,6 +494,10 @@ class SessionService:
         )
         self._persist_canvases(session_id, session)
 
+        _report_plan_generated(
+            session_id, meal_plan.id, "daily", 1, None,
+            _daily_plan_size(meal_plan),
+        )
         return meal_plan
 
     def add_prepared_meal_plan(self, session_id: str, meal_plan: MealPlan) -> MealPlan:
@@ -446,6 +530,11 @@ class SessionService:
             root_id=meal_plan.id,
         )
         self._persist_canvases(session_id, session)
+        _report_plan_generated(
+            session_id, meal_plan.id, "daily",
+            meal_plan.version, meal_plan.parent_id,
+            _daily_plan_size(meal_plan),
+        )
         return meal_plan
 
     def refine_prepared_meal_plan(
@@ -493,6 +582,11 @@ class SessionService:
             root_id=canvas.root_id,
         )
         self._persist_canvases(session_id, session)
+        _report_plan_generated(
+            session_id, meal_plan.id, "daily",
+            meal_plan.version, meal_plan.parent_id,
+            _daily_plan_size(meal_plan),
+        )
         return meal_plan
 
     def refine_meal_plan(
@@ -539,6 +633,10 @@ class SessionService:
         )
         self._persist_canvases(session_id, session)
 
+        _report_plan_generated(
+            session_id, meal_plan.id, "daily", next_version, parent_id,
+            _daily_plan_size(meal_plan),
+        )
         return meal_plan
 
     def add_weekly_meal_plan(
@@ -583,6 +681,9 @@ class SessionService:
         )
         self._persist_canvases(session_id, session)
 
+        _report_plan_generated(
+            session_id, weekly_plan.id, "weekly", 1, None, len(plan_entries or []),
+        )
         return weekly_plan
 
     def refine_weekly_meal_plan(
@@ -637,6 +738,10 @@ class SessionService:
         )
         self._persist_canvases(session_id, session)
 
+        _report_plan_generated(
+            session_id, weekly_plan.id, "weekly", next_version, parent_id,
+            len(plan_entries or []),
+        )
         return weekly_plan
 
     # ------------------------------------------------------------------ #

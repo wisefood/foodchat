@@ -151,6 +151,9 @@ def _routes(session_id: str):
             "request": api.SavePlanRequest(member_id=m, saved=True),
         }),
         "get_member_saved_plans": lambda m: (api.get_member_saved_plans, {"member_id": m}),
+        # Someone's ratings and the comments they wrote, from their id alone —
+        # exactly the shape of route this audit exists for.
+        "get_member_feedback": lambda m: (api.get_member_feedback, {"member_id": m}),
         "get_member_sessions": lambda m: (api.get_member_sessions, {"member_id": m}),
         "get_member_current_plans": lambda m: (api.get_member_current_plans, {"member_id": m}),
         "unified_chat": lambda m: (api.unified_chat, {
