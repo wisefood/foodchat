@@ -23,15 +23,32 @@ UI consumers should treat unknown statuses as informational.
 M9 adds two more things a week can now do, and the labels that keep them
 apart from each other and from the member's own requests:
 
-- a recipe may **repeat** (breakfast only — see ``action_adapter``). Every
-  repeat carries the day it repeats and whether it was the member's doing
-  (a starred recipe) or the plan's own, through to the chip, the ledger row,
-  the variety metric and the prose. A duplicate that carries neither reason
-  is reported as ``unexplained``, never folded into the sanctioned count.
+- a recipe may **repeat** (which slots, is the member's `repeat_meals`
+  setting — see ``action_adapter``). Every repeat carries the day it repeats
+  and whether it was the member's doing (a starred recipe) or the plan's own,
+  through to the chip, the ledger row, the variety metric and the prose. A
+  duplicate that carries neither reason is reported as ``unexplained``, never
+  folded into the sanctioned count.
 - the plan may **search later days for ingredients it has already bought**.
   What it searched for is a ledger row; what it actually reused is measured
   separately over the finished week by ``shared_ingredient_facts``, because a
   search that found nothing usable is not a saving.
+
+M10 adds a third authority to that list — a **leftover**: day N's dinner
+served as day N+1's lunch, because the member set ``repeat_meals`` to "cook
+once, eat twice". It is a repeat with a slot transition, so it rides every
+rule above and adds exactly two things:
+
+- it names the slot it was cooked in (``of_meal``), and is verified against
+  that slot rather than merely against the day. "Monday's dinner again" is a
+  checkable claim, and one the member checks by looking at Monday;
+- it stays out of ``min_gap_days``, because it is one day after its source by
+  definition — averaging it in would report the week's repeats as tighter than
+  the repeat policy allows and turn a satisfied ledger row into a violated one.
+
+What is never said: anything about portions. Nothing in this service records
+quantities, so the wording is "again", never "the rest of it", and the ledger
+row says outright that the plan does not track portions.
 """
 
 import re
@@ -153,6 +170,18 @@ REPEAT_KIND = "repeat"
 # UI depends on cannot change as a side effect of a planning-side edit.
 REPEAT_BY_MEMBER = "member_request"
 REPEAT_BY_PLAN = "plan"
+# M10: a repeat with a slot transition — day N's dinner served as day N+1's
+# lunch, because the member asked for "cook once, eat twice". A third
+# authority, not a flavour of the plan's own: the member turned a control to
+# get it, but did not name the dish, so neither existing label fits.
+REPEAT_BY_LEFTOVER = "leftover"
+
+# What a leftover chip may and may not say. Nothing in this service records
+# quantities or when anything was cooked, so the wording is "the same dish
+# again", never "the rest of it" and never "a double portion" — the plan can
+# see that Monday's dinner is on Tuesday's lunch card, and that is the whole
+# of what it can see.
+LEFTOVER_BADGE = "cook once, eat twice"
 
 
 def repeat_facts(plan_entries: List[dict]) -> dict:
@@ -164,9 +193,15 @@ def repeat_facts(plan_entries: List[dict]) -> dict:
     shows up here as ``unexplained``, which is the honest reading: nobody
     recorded a reason for it, so nobody may claim one.
 
-    Returns ``{"entries": {index: {"of_day", "source"}}, "count": n,
-    "by_source": {...}, "min_gap_days": g|None, "max_appearances": n,
-    "unexplained": n}``.
+    Returns ``{"entries": {index: {"of_day", "source", "of_meal"?}}, "count":
+    n, "by_source": {...}, "min_gap_days": g|None, "max_appearances": n,
+    "unexplained": n, "leftovers": n}``.
+
+    A leftover (M10) carries ``of_meal`` — the slot it was cooked in — and is
+    verified against that slot, not merely against the day. "Monday's dinner
+    again" has to be checkable, and a flag that survived an edit to Monday's
+    *lunch* would otherwise pass a day-only check and put a false sentence in
+    front of the member.
     """
     per_entry: Dict[int, dict] = {}
     by_source: Dict[str, int] = {}
@@ -178,12 +213,18 @@ def repeat_facts(plan_entries: List[dict]) -> dict:
     # edits and leaves the OTHER serving still claiming to repeat a day that
     # no longer has it. A stale flag must not become a ledger row.
     served_on: Dict[str, set] = {}
+    # ...and the (day, slot) pairs, for the leftover check, which is a claim
+    # about a slot ("Monday's dinner") rather than about a day.
+    served_at: Dict[str, set] = {}
     for entry in plan_entries:
         recipe_id = str(_recipe(entry).get("recipe_id") or "")
         if recipe_id:
             appearances[recipe_id] += 1
             if isinstance(entry.get("day"), int):
                 served_on.setdefault(recipe_id, set()).add(entry["day"])
+                served_at.setdefault(recipe_id, set()).add(
+                    (entry["day"], str(entry.get("meal_type") or "").lower())
+                )
 
     for index, entry in enumerate(plan_entries):
         recipe = _recipe(entry)
@@ -197,9 +238,24 @@ def repeat_facts(plan_entries: List[dict]) -> dict:
         if isinstance(day, int) and int(of_day) >= day:
             continue
         source = str(recipe.get("repeat_source") or REPEAT_BY_PLAN)
-        per_entry[index] = {"of_day": int(of_day), "source": source}
+        fact = {"of_day": int(of_day), "source": source}
+        leftover = recipe.get("leftover_of")
+        if isinstance(leftover, dict) and leftover.get("meal_type"):
+            of_meal = str(leftover["meal_type"]).lower()
+            if (int(of_day), of_meal) not in served_at.get(recipe_id, set()):
+                # The slot it claims to come from no longer holds it. Dropped
+                # whole rather than downgraded to an ordinary repeat: the only
+                # reason this entry is here is a sentence about that slot.
+                continue
+            fact["of_meal"] = of_meal
+            source = REPEAT_BY_LEFTOVER
+            fact["source"] = source
+        per_entry[index] = fact
         by_source[source] = by_source.get(source, 0) + 1
-        if isinstance(day, int):
+        if isinstance(day, int) and source != REPEAT_BY_LEFTOVER:
+            # Leftovers are excluded here, not filtered later: a gap list and
+            # a facts dict built in different loops drift apart the moment one
+            # of them gains a condition the other does not.
             gaps.append(day - int(of_day))
 
     duplicates = max(sum(appearances.values()) - len(appearances), 0)
@@ -207,6 +263,14 @@ def repeat_facts(plan_entries: List[dict]) -> dict:
         "entries": per_entry,
         "count": len(per_entry),
         "by_source": by_source,
+        # Counted apart as well as inside `by_source`, so a consumer that
+        # only wants "how many meals were cooked once and eaten twice" does
+        # not have to know the authority vocabulary to ask.
+        "leftovers": by_source.get(REPEAT_BY_LEFTOVER, 0),
+        # Leftovers are not in `gaps`: one is exactly one day after its
+        # source by definition, so counting it would report the week's
+        # repeats as closer together than the repeat policy actually allows,
+        # and the ledger would then read that as a violation.
         "min_gap_days": min(gaps) if gaps else None,
         "max_appearances": max(appearances.values()) if appearances else 0,
         "unexplained": max(duplicates - len(per_entry), 0),
@@ -217,7 +281,17 @@ def _repeat_reason(entry: dict, fact: dict) -> dict:
     """One chip saying what came back, from when, and who wanted it."""
     meal = str(entry.get("meal_type") or "meal").lower()
     origin = _day_name(fact["of_day"])
-    if fact["source"] == REPEAT_BY_MEMBER:
+    if fact["source"] == REPEAT_BY_LEFTOVER:
+        # Names the slot it was COOKED in, which is the entire difference
+        # between this and an ordinary repeat. "The same lunch as Monday"
+        # about a dish Monday ate for dinner is a small lie that the member
+        # can check against their own plan in one glance.
+        #
+        # "again" and not "the rest of" — see `LEFTOVER_BADGE`. The plan knows
+        # the dish is served twice; it does not know, and must not imply, that
+        # anything was portioned, saved or stretched.
+        label = f"{origin}'s {fact.get('of_meal', 'dinner')} again — {LEFTOVER_BADGE}"
+    elif fact["source"] == REPEAT_BY_MEMBER:
         label = f"back from {origin}, a favorite of yours"
     else:
         label = f"the same {meal} as {origin}"
@@ -455,6 +529,11 @@ def variety_metrics(plan_entries: List[dict], repeats: Optional[dict] = None) ->
         # with nothing behind it, which is monotony and reads as one.
         "planned_repeats": planned_repeats,
         "repeats_by_source": dict(facts["by_source"]),
+        # Broken out of `repeats_by_source` so a consumer can ask "how many
+        # meals were cooked once and eaten twice" without knowing the
+        # authority vocabulary. Included in `planned_repeats`, never instead
+        # of it: a leftover is a second serving and is counted as one.
+        "leftover_meals": int(facts.get("leftovers") or 0),
         "unexplained_repeats": unexplained,
         "unique_ingredients": len(items),
         "category_distribution": dict(categories),
@@ -640,6 +719,7 @@ def weekly_constraints_ledger(
     """
     from .action_adapter import (  # local import; keeps the policy single-sourced
         MAX_APPEARANCES,
+        MAX_LEFTOVER_MEALS,
         REPEAT_MIN_GAP_DAYS,
     )
 
@@ -653,6 +733,10 @@ def weekly_constraints_ledger(
             who.append(f"{by_source[REPEAT_BY_MEMBER]} you starred")
         if by_source.get(REPEAT_BY_PLAN):
             who.append(f"{by_source[REPEAT_BY_PLAN]} the plan's own")
+        if by_source.get(REPEAT_BY_LEFTOVER):
+            who.append(
+                f"{by_source[REPEAT_BY_LEFTOVER]} eaten the day after they were cooked"
+            )
         gap = repeats.get("min_gap_days")
         served = int(repeats.get("max_appearances") or 0)
         detail = f"{repeats['count']} meal(s) repeat an earlier day"
@@ -667,13 +751,16 @@ def weekly_constraints_ledger(
         within_policy = (
             (gap is None or gap >= REPEAT_MIN_GAP_DAYS)
             and served <= MAX_APPEARANCES
+            and int(repeats.get("leftovers") or 0) <= MAX_LEFTOVER_MEALS
         )
-        if by_source.get(REPEAT_BY_MEMBER) and by_source.get(REPEAT_BY_PLAN):
-            source = "your favourites and the plan"
-        elif by_source.get(REPEAT_BY_MEMBER):
-            source = "your favourites"
-        else:
-            source = "the plan"
+        sources = []
+        if by_source.get(REPEAT_BY_MEMBER):
+            sources.append("your favourites")
+        if by_source.get(REPEAT_BY_LEFTOVER):
+            sources.append("your cook-once setting")
+        if by_source.get(REPEAT_BY_PLAN) or not sources:
+            sources.append("the plan")
+        source = " and ".join(sources)
         ledger.append({
             "constraint": "repeat meals stay spaced and capped",
             "type": "soft",
@@ -681,6 +768,25 @@ def weekly_constraints_ledger(
             "source": source,
             "detail": detail,
         })
+    if repeats.get("leftovers"):
+        # Its own row, because it is its own setting. A member who turned
+        # `repeat_meals` to "cook once, eat twice" is entitled to see whether
+        # it happened without having to read the repeat row's parenthesis —
+        # and the row is where the claim is bounded, in both directions: how
+        # many meals, and what the plan does NOT know about them.
+        count = int(repeats["leftovers"])
+        ledger.append({
+            "constraint": "cook once, eat twice",
+            "type": "soft",
+            "status": "satisfied",
+            "source": "your repeat-meals setting",
+            "detail": (
+                f"{count} lunch(es) serve the previous evening's dinner again, "
+                f"at most {MAX_LEFTOVER_MEALS} a week — the plan doesn't track "
+                "portions, so cook enough for two meals if you want this"
+            ),
+        })
+
     if repeats.get("unexplained"):
         # A duplicate nobody recorded a reason for. Reported rather than
         # quietly folded into the repeat count above, because the whole point
@@ -842,6 +948,11 @@ def _compose_reasoning(
             who.append(f"{by_source[REPEAT_BY_MEMBER]} you'd starred")
         if by_source.get(REPEAT_BY_PLAN):
             who.append(f"{by_source[REPEAT_BY_PLAN]} the plan's own choice")
+        if by_source.get(REPEAT_BY_LEFTOVER):
+            who.append(
+                f"{by_source[REPEAT_BY_LEFTOVER]} the evening before's dinner, "
+                "eaten again at lunch"
+            )
         sentence = (
             f"{repeats['count']} meal(s) repeat earlier in the week rather than "
             "filling every slot with something new"

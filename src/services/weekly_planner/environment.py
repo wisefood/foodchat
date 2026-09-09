@@ -50,6 +50,22 @@ class WeeklyMealPlanEnv:
         self.selection_events: List[Dict[str, Any]] = []
         if hasattr(action_space, "selection_events"):
             action_space.selection_events = self.selection_events
+        # Whether the action space can be handed the committed candidate, not
+        # just its id (M10 leftovers). Measured once here, the same way the
+        # planner measures a scorer's arity and for the same reason: a
+        # try/except around the call would also swallow a TypeError raised
+        # inside `mark_committed` itself, and retrying after that would commit
+        # the slot twice.
+        self._commit_takes_action = False
+        commit = getattr(action_space, "mark_committed", None)
+        if callable(commit):
+            import inspect
+            try:
+                self._commit_takes_action = (
+                    "action" in inspect.signature(commit).parameters
+                )
+            except (TypeError, ValueError):  # builtins, C callables, odd wrappers
+                self._commit_takes_action = False
 
     def reset(self, user_query: Optional[str] = None) -> Dict[str, Any]:
         """
@@ -131,7 +147,21 @@ class WeeklyMealPlanEnv:
         recipe_id = str(chosen_recipe.get("recipe_id", ""))
         commit = getattr(self.action_space, "mark_committed", None)
         if callable(commit):
-            commit(recipe_id, self.current_day, self.meal_types[self.current_meal_idx])
+            # The chosen action goes too, so tomorrow's lunch can be built from
+            # the dinner actually served (M10 leftovers). An action space that
+            # predates it takes three arguments, and is called with three —
+            # decided once at construction, not per call.
+            if self._commit_takes_action:
+                commit(
+                    recipe_id, self.current_day,
+                    self.meal_types[self.current_meal_idx],
+                    action=chosen_recipe,
+                )
+            else:
+                commit(
+                    recipe_id, self.current_day,
+                    self.meal_types[self.current_meal_idx],
+                )
         else:
             self.action_space.mark_selected(recipe_id)
 
@@ -140,7 +170,7 @@ class WeeklyMealPlanEnv:
         # a second serving the member starred and one the planner chose are
         # different claims, and only this event knows which happened.
         if chosen_recipe.get("repeat_of_day"):
-            self.selection_events.append({
+            event = {
                 "type": "repeat_allowed",
                 "day": self.current_day,
                 "meal_type": self.meal_types[self.current_meal_idx],
@@ -148,7 +178,14 @@ class WeeklyMealPlanEnv:
                 "recipe_title": chosen_recipe.get("recipe_title", ""),
                 "repeat_of_day": chosen_recipe["repeat_of_day"],
                 "source": chosen_recipe.get("repeat_source", "plan"),
-            })
+            }
+            leftover = chosen_recipe.get("leftover_of")
+            if leftover:
+                # The slot it came FROM, which is the only part a leftover
+                # adds to the story a repeat already tells. Without it the
+                # event says "the same lunch as Monday" about a dinner.
+                event["leftover_of"] = dict(leftover)
+            self.selection_events.append(event)
 
         # Store step in the plan list
         self.plan.append({

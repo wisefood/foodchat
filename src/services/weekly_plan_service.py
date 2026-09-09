@@ -318,6 +318,17 @@ class WeeklyPlanService:
                 "plans_own_choice": repeats["by_source"].get("plan", 0),
                 "min_gap_days": repeats.get("min_gap_days"),
             }
+            if repeats.get("leftovers"):
+                # A third key rather than a bigger number, for the same reason
+                # the other two are separate: the writer may only say what the
+                # facts distinguish, and "you asked to cook once and eat twice"
+                # is a different sentence from "the plan served this again".
+                #
+                # `portions_not_tracked` is carried as a fact because the
+                # writer can only decline to claim what it is told it does not
+                # know — the reply must not promise a double portion.
+                facts["repeats"]["leftover_lunches"] = repeats["leftovers"]
+                facts["repeats"]["portions_not_tracked"] = True
         fallback_extras = " ".join(p for p in (seed_note, pantry_note) if p)
         response_text = self.response_writer.write(
             facts, content,

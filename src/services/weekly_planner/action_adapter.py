@@ -5,14 +5,38 @@ Fetches a fresh candidate pool from RecipeWrangler once per plan day
 (``services.candidates_client``), excluding recipes already committed to the
 plan.
 
-M9 retires the absolute no-repeat contract for ONE slot. A 7-day plan used to
+M9 retired the absolute no-repeat contract for ONE slot. A 7-day plan used to
 exclude every committed id from every later fetch, so repeats were impossible
 at the source rather than merely disfavoured — and nobody eats seven different
-breakfasts. Breakfast now has a **slot-scoped cooldown** (see the repeat policy
-below) while lunch and dinner keep the old rule exactly. A repeat is always
-labelled with the day it repeats and *why* it was allowed, so a week that
-repeated because the pool was thin can never be presented as one the member
-asked for.
+breakfasts. Breakfast got a **slot-scoped cooldown** (see the repeat policy
+below). A repeat is always labelled with the day it repeats and *why* it was
+allowed, so a week that repeated because the pool was thin can never be
+presented as one the member asked for.
+
+M10 makes the SCOPE of that cooldown the member's to set, and adds the
+cross-slot case M9 explicitly excluded:
+
+- ``plan_parameters.repeat_meals`` — one ordered control, ``off`` (21 distinct
+  recipes, the pre-M9 rule) → ``breakfast`` (M9's behaviour, and still the
+  default) → ``all`` (lunch and dinner too) → ``leftovers``. How often a
+  *dinner* may recur before a week reads as lazy rather than familiar is a
+  household question, not one this file can answer, so it is asked rather than
+  guessed. The gap and the cap stay here: they are what keeps a thin pool from
+  cashing the member's setting in for monotony.
+- **Leftovers** — at ``leftovers``, day N's dinner may be served as day N+1's
+  lunch. It is a *repeat with a slot transition*, not a new mechanism: the same
+  commitments, the same cap, the same labelling, and one extra rule (yesterday
+  only, at most ``MAX_LEFTOVER_MEALS`` a week). The candidate is rebuilt from
+  what was actually committed rather than re-fetched, so it costs no request
+  and cannot drift from the dish on the plate.
+
+  A leftover entry holds the **whole recipe**, not a reference to another slot:
+  the member really does eat that dish, so its nutrition, ingredients and card
+  are the dish's own. What it does NOT do is buy anything — the ingredient
+  basket, and everything downstream that measures the shopping list, skip it.
+  No portion arithmetic is claimed anywhere: nothing in this service records
+  quantities, so the honest reading of this feature is "eat the same dinner
+  again tomorrow at noon", and that is what the wording says.
 
 M9 also adds the sourcing half of cross-day ingredient reuse: `WeeklyPlanner`
 offers this action space the ingredients the week has already bought
@@ -54,10 +78,15 @@ DAILY_POOL_LIMIT = 10
 # that the UI then describes as a feature. So: one slot, a real gap, a hard cap,
 # and a recorded reason for every repeat that happens.
 
-# Slots where a recipe may come back at all. Lunch and dinner keep the original
-# never-repeat rule; component 3 of the natural-planning plan (day N's dinner
-# becoming day N+1's lunch) is a different mechanism and is not this.
+# Slots where a recipe may come back at all, at the DEFAULT setting. Kept as a
+# named constant because it is the M9 contract other modules (and their tests)
+# read the policy from; `plan_parameters.repeat_meals` is what widens it, and
+# `_slot_repeats_allowed` is the one place that resolves the two.
 REPEATABLE_SLOTS: frozenset = frozenset({"breakfast"})
+
+# Every slot the loosest setting opens up. Not a free-for-all list: a slot
+# absent from here can never repeat however the control is set.
+ALL_REPEATABLE_SLOTS: frozenset = frozenset({"breakfast", "lunch", "dinner"})
 
 # Days between two servings of the same recipe. The same gap the ingredient
 # spacing in ``planner`` uses, for the same reason: back-to-back is repetition,
@@ -74,6 +103,64 @@ MAX_APPEARANCES = 2
 # thin pool is the single thing this labelling exists to prevent.
 REPEAT_MEMBER_REQUEST = "member_request"  # the member starred this recipe
 REPEAT_PLAN = "plan"                      # the planner's own doing
+REPEAT_LEFTOVER = "leftover"              # yesterday's dinner, eaten at lunch
+
+
+# --- Leftovers (M10) --------------------------------------------------------
+#
+# "Cook once, eat twice" — the most common real-world weekly pattern, and the
+# one the planner could not express at all.
+#
+# Deliberately the narrowest possible version. Yesterday's dinner, today's
+# lunch, nothing else: not the day before yesterday (that is a fridge claim,
+# and nothing here records when anything was cooked or how long it keeps), not
+# dinner-to-dinner (that is an ordinary repeat and already has a rule), and not
+# breakfast (nobody saves half a dinner for tomorrow's breakfast).
+
+# {slot being filled: slot it may take yesterday's dish from}. A dict rather
+# than a pair, so the transition is stated in one direction only — lunch may
+# take from dinner; dinner may never take from lunch.
+LEFTOVER_FROM_SLOT: dict = {"lunch": "dinner"}
+
+# Exactly one day, not "at least one". Two days later is not a leftover, it is
+# a repeat, and it has its own rule and its own honest wording.
+LEFTOVER_GAP_DAYS = 1
+
+# Leftover lunches in a week. Six would mean lunch is never cooked, which is a
+# different product; three is "about half the week", and is the number to turn
+# if members ask for more.
+MAX_LEFTOVER_MEALS = 3
+
+
+# --- Offering a repeat rather than waiting for one (M10) --------------------
+#
+# The cooldown decides whether a recipe MAY come back. Until now, whether one
+# ever got the chance was RecipeWrangler's: a day's pool is a fresh fetch, and
+# an eligible earlier dish only reappeared if the source happened to rank it
+# into the day's top `DAILY_POOL_LIMIT`. On a real week it usually did not.
+# Observed on a live plan with the control set to "cook once, eat twice": the
+# policy allowed a repeat at all four remaining breakfast slots and the source
+# offered one at none of them, so a member who had asked for repeated
+# breakfasts got exactly one, for a reason nothing in the plan could name.
+#
+# So an eligible dish is now PUT in the pool, rebuilt from what was committed
+# — the same trick the leftover uses, for the same price of zero requests.
+#
+# Only when the member set the control themselves (`repeat_mode_is_explicit`).
+# The default must keep waiting for the source: injecting on a default would
+# change every existing member's week to satisfy a preference none of them
+# expressed, which is the difference between honouring a request and inventing
+# one.
+#
+# Injected candidates stay COUNTED SEPARATELY in the `repeat_offered` event.
+# That event exists to distinguish "the week repeated nothing" from "the
+# source never offered anything to repeat", and injecting would erase exactly
+# that signal if the two were merged.
+
+# Eligible earlier dishes added to one slot's pool. Everything eligible would
+# be legal, but a slot whose pool is a third old dishes is a repetitive week
+# arriving by the back door rather than by the member's setting.
+INJECTED_REPEATS_PER_SLOT = 2
 
 # Ingredients from earlier days forwarded to per-item candidate search. Each
 # one is an extra `plan_meals` round-trip per day, so this is the whole latency
@@ -114,6 +201,14 @@ class RecipeActionSpace:
         # A commitment is not automatically an exclusion any more; whether it
         # is depends on the slot, the gap and the cap. See `_repeatable_from`.
         self._commitments: Dict[str, List[tuple]] = {}
+        # (day, meal_type) -> the action dict actually committed there (M10).
+        # A leftover is rebuilt from this rather than re-fetched: the dish it
+        # claims to be is the dish on the plate, by construction, and it costs
+        # no request. Only what a leftover needs is kept — the whole action, so
+        # the copy carries the same nutrition and tags the source card shows.
+        self._served: Dict[tuple, Dict[str, Any]] = {}
+        # Leftover lunches taken so far, against `MAX_LEFTOVER_MEALS`.
+        self._leftovers_taken = 0
         self._favorites = {
             str(f) for f in (user_profile.get("favorite_recipe_ids") or [])
         }
@@ -138,6 +233,18 @@ class RecipeActionSpace:
         from services import plan_parameters  # local import; avoids a cycle
 
         self.waste_mode = plan_parameters.waste_mode(
+            user_profile.get("plan_parameters") or {}
+        )
+        # The member's repeat setting, resolved once. Read through
+        # `plan_parameters` so an unrecognised stored value degrades to the
+        # default rather than to "no repeats at all" (M10).
+        self.repeat_mode = plan_parameters.repeat_mode(
+            user_profile.get("plan_parameters") or {}
+        )
+        # Whether the member SET that, or merely inherited it. Only an
+        # explicit setting earns an injected repeat — see the policy note
+        # above `INJECTED_REPEATS_PER_SLOT`.
+        self.repeats_explicit = plan_parameters.repeat_mode_is_explicit(
             user_profile.get("plan_parameters") or {}
         )
 
@@ -306,15 +413,44 @@ class RecipeActionSpace:
                 action["dish_types"] = rich.dish_types or []
             actions.append(action)
 
+        # Eligible earlier dishes the source did not return, put in the pool
+        # rather than waited for (M10). Only on an explicit setting, and only
+        # after the fetched pool has been read, so a dish the source DID
+        # return is never added twice.
+        injected = self._injected_repeats(
+            current_day, meal_type, {a["recipe_id"] for a in actions}
+        )
+        for action in injected:
+            actions.append(action)
+            offered.append(action["recipe_id"])
+
+        leftover = self._leftover_action(current_day, meal_type)
+        if leftover is not None:
+            # Appended, never substituted. The member asked that leftovers be
+            # POSSIBLE, not that lunch stop being planned: the scorer weighs
+            # this against the day's real candidates, hard constraints still
+            # prune it (a leftover that would break the meat limit is dropped
+            # like any other meat dish), and if it loses, nothing is lost.
+            actions.append(leftover)
+            offered.append(leftover["recipe_id"])
+
         if offered and (current_day, meal_type) not in self._repeat_offers_noted:
             self._repeat_offers_noted.add((current_day, meal_type))
-            self.selection_events.append({
+            event = {
                 "type": "repeat_offered",
                 "day": current_day,
                 "meal_type": meal_type,
                 "count": len(offered),
                 "recipe_ids": offered,
-            })
+            }
+            if injected:
+                # Kept apart from `count`, never folded into it. This event's
+                # whole job is to separate "the week repeated nothing" from
+                # "the source never offered anything to repeat", and once the
+                # plan puts dishes in the pool itself, that question can only
+                # be answered by a number that says how many it put there.
+                event["injected"] = len(injected)
+            self.selection_events.append(event)
         return actions
 
     def mark_selected(self, recipe_id: str) -> None:
@@ -328,17 +464,164 @@ class RecipeActionSpace:
         if recipe_id and recipe_id not in self._selected_ids:
             self._selected_ids.append(recipe_id)
 
-    def mark_committed(self, recipe_id: str, day: int, meal_type: str) -> None:
+    def mark_committed(
+        self,
+        recipe_id: str,
+        day: int,
+        meal_type: str,
+        action: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """Record that the plan served this recipe, on this day, in this slot.
 
         Called by the environment as each slot commits. The day and slot are
         what the repeat policy needs — without them a commitment can only mean
         "never again", which is the rule M9 exists to loosen.
+
+        ``action`` is the committed candidate itself, kept so a leftover lunch
+        can be built from the dinner that was actually served (M10). Optional,
+        and the whole feature simply does not fire without it: an environment
+        that predates this passes three arguments and gets M9's behaviour.
         """
         if not recipe_id:
             return
-        self._commitments.setdefault(str(recipe_id), []).append(
-            (int(day), str(meal_type).lower())
+        slot = str(meal_type).lower()
+        self._commitments.setdefault(str(recipe_id), []).append((int(day), slot))
+        if action is not None:
+            self._served[(int(day), slot)] = dict(action)
+            if action.get("leftover_of"):
+                self._leftovers_taken += 1
+
+    def _second_serving(
+        self,
+        served: Dict[str, Any],
+        source_day: int,
+        source_slot: str,
+        source: str,
+    ) -> Dict[str, Any]:
+        """A committed dish, rebuilt as a candidate for a second serving.
+
+        Shared by the two ways one can come back — an injected repeat and a
+        leftover — so the pair cannot drift in what they carry or, more
+        importantly, in what they drop. The source's own labels describe the
+        source's slot, and `pinned` would credit the member for a dish the
+        plan chose to serve again.
+        """
+        action = {
+            key: value for key, value in served.items()
+            if key not in ("repeat_of_day", "repeat_source", "leftover_of",
+                           "pinned", "match_reasons")
+        }
+        action["repeat_of_day"] = int(source_day)
+        action["repeat_source"] = source
+        if source == REPEAT_LEFTOVER:
+            action["leftover_of"] = {
+                "day": int(source_day), "meal_type": str(source_slot),
+            }
+        return action
+
+    def _injected_repeats(
+        self, day: int, meal_type: str, already: set
+    ) -> List[Dict[str, Any]]:
+        """Eligible earlier dishes for this slot that the pool did not contain.
+
+        The cooldown says a recipe may come back; without this, whether it ever
+        got the chance was RecipeWrangler's ranking. Rebuilt from `_served`, so
+        this costs no request and offers the dish that was actually eaten.
+
+        Gated on an EXPLICIT setting: a member who never touched the card keeps
+        waiting for the source, exactly as before. Every other rule is the
+        ordinary one — `_repeatable_from` decides eligibility, so the slot, the
+        gap, the cap and `mark_selected` all still apply, and a dish the source
+        already returned is skipped rather than duplicated.
+
+        Ordered by how recently the dish was eaten, newest first: a routine is
+        built out of what the week is already in the habit of.
+        """
+        if not self.repeats_explicit or not self._served:
+            return []
+        slot = str(meal_type).lower()
+        if not self._slot_repeats_allowed(slot):
+            return []
+
+        eligible: List[tuple] = []
+        for (served_day, served_slot), served in self._served.items():
+            if served_slot != slot:
+                continue
+            recipe_id = str(served.get("recipe_id") or "")
+            if not recipe_id or recipe_id in already:
+                continue
+            if served.get("leftover_of"):
+                # A leftover is a dish already on its second serving; the cap
+                # below catches it, but skipping here says why.
+                continue
+            if self._repeatable_from(recipe_id, day, slot) is None:
+                continue
+            eligible.append((-served_day, recipe_id, served, served_slot))
+
+        eligible.sort(key=lambda row: (row[0], row[1]))
+        out: List[Dict[str, Any]] = []
+        seen: set = set()
+        for _order, recipe_id, served, served_slot in eligible:
+            if recipe_id in seen:
+                continue
+            seen.add(recipe_id)
+            out.append(
+                self._second_serving(served, -_order, served_slot, REPEAT_PLAN)
+            )
+            if len(out) >= INJECTED_REPEATS_PER_SLOT:
+                break
+        return out
+
+    def _leftover_action(
+        self, day: int, meal_type: str
+    ) -> Optional[Dict[str, Any]]:
+        """Yesterday's dinner, offered as today's lunch — or ``None``.
+
+        Built from ``_served``, so the candidate IS the committed dish rather
+        than a fresh search that resembles it. Every gate that stops an
+        ordinary repeat stops this too, plus two of its own:
+
+        - ``MAX_LEFTOVER_MEALS`` — six leftover lunches is a week where lunch
+          is never cooked, which is a different product from the one asked for;
+        - a pinned or downvoted dish stays barred. ``mark_selected`` means
+          "no way back" and a leftover is a way back; a member's anchor turning
+          up twice is the thing that call exists to prevent, and honouring the
+          contract matters more than the extra leftover it costs.
+
+        Returns a candidate carrying BOTH ``repeat_of_day`` and
+        ``leftover_of``. The first is deliberate: a leftover is a sanctioned
+        second serving, so every rule M9 already wrote for one — the scorer's
+        own-title exemption, the ingredient-axis exclusion, the cap, the
+        measured ledger row — applies without a parallel code path. The second
+        is what lets the chip, the ledger and the prose say *dinner at lunch*
+        instead of "the same lunch as Monday", which would be false.
+        """
+        from services import plan_parameters  # local import; avoids a cycle
+
+        slot = str(meal_type).lower()
+        source_slot = LEFTOVER_FROM_SLOT.get(slot)
+        if source_slot is None:
+            return None
+        if not plan_parameters.leftovers_allowed(
+            self.user_profile.get("plan_parameters") or {}
+        ):
+            return None
+        if self._leftovers_taken >= MAX_LEFTOVER_MEALS:
+            return None
+        source_day = int(day) - LEFTOVER_GAP_DAYS
+        if source_day < 1:
+            return None
+        served = self._served.get((source_day, source_slot))
+        if not served or served.get("leftover_of"):
+            return None
+        recipe_id = str(served.get("recipe_id") or "")
+        if not recipe_id or recipe_id in self._selected_ids:
+            return None
+        if len(self._commitments.get(recipe_id) or []) >= MAX_APPEARANCES:
+            return None
+
+        return self._second_serving(
+            served, source_day, source_slot, REPEAT_LEFTOVER
         )
 
     def offer_derived_pantry(self, items: List[str], day: int) -> None:
@@ -369,6 +652,27 @@ class RecipeActionSpace:
             items = [item for item in items if not matched_items(item, self.pantry)]
         return items[:DERIVED_PANTRY_ITEMS]
 
+    def _slot_repeats_allowed(self, meal_type: Optional[str]) -> bool:
+        """Whether the member's setting lets ``meal_type`` serve a dish twice.
+
+        ``None`` asks the per-day question a fetch needs: may ANY slot repeat?
+        Resolved here rather than at each call site so the control and the
+        hard list stay in one place — a slot outside `ALL_REPEATABLE_SLOTS`
+        can never repeat, whatever the setting says.
+        """
+        from services import plan_parameters  # local import; avoids a cycle
+
+        values = self.user_profile.get("plan_parameters") or {}
+        if meal_type is None:
+            return any(
+                plan_parameters.repeats_allowed(values, slot)
+                for slot in ALL_REPEATABLE_SLOTS
+            )
+        slot = str(meal_type).lower()
+        if slot not in ALL_REPEATABLE_SLOTS:
+            return False
+        return plan_parameters.repeats_allowed(values, slot)
+
     def _repeatable_from(
         self, recipe_id: str, day: int, meal_type: Optional[str] = None
     ) -> Optional[int]:
@@ -385,12 +689,20 @@ class RecipeActionSpace:
         if not uses or len(uses) >= MAX_APPEARANCES:
             return None
         slots = {slot for _day, slot in uses}
-        if not slots & REPEATABLE_SLOTS:
+        # Which slots may repeat is the member's setting (M10); which slots
+        # *could* is the hard list. A dish only qualifies through the slot it
+        # was actually served in — a breakfast the member allowed to repeat is
+        # a repeatable breakfast, not a repeatable recipe.
+        if not any(self._slot_repeats_allowed(slot) for slot in slots):
             return None
-        if meal_type is not None and str(meal_type).lower() not in slots:
+        if meal_type is not None:
+            slot = str(meal_type).lower()
             # A breakfast may come back as breakfast. Moving it to dinner is a
-            # different feature and a different claim.
-            return None
+            # different feature and a different claim — the one cross-slot move
+            # this planner makes is the leftover, which has its own rule,
+            # its own gap and its own label (`_leftover_action`).
+            if slot not in slots or not self._slot_repeats_allowed(slot):
+                return None
         last = max(used_day for used_day, _slot in uses)
         if int(day) - last < REPEAT_MIN_GAP_DAYS:
             return None

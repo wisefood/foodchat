@@ -258,6 +258,56 @@ _MONOTONY_CAP = 3.0
 # top of it — see below.
 _REPEAT_PENALTY = 0.0
 
+# What a repeat is worth once the member has ASKED for repeats — i.e. set
+# `repeat_meals` themselves rather than inheriting its default.
+#
+# `_REPEAT_PENALTY` above is zero so that a repeat the planner merely allowed
+# competes on equal terms. That is the right price for a default. It is the
+# wrong price for a request: a bare profile leaves nearly every candidate at
+# exactly 0.0, so "equal terms" in a pool of ten means a one-in-eleven share,
+# and a member who turned the control to "Repeat breakfasts" got one repeated
+# breakfast in a week — indistinguishable from not having set it.
+#
+# So an explicitly requested repeat is paid, on the same principle as the
+# stated-pantry boost and `_LEFTOVER_BONUS`: what the member asked for in
+# words (or by moving a control) outranks what the planner inferred.
+#
+# Sized below everything that should still win its slot — a favourite (+5), a
+# stated pantry item (+3), a leftover (+2.0, a stronger request: it removes a
+# cooking session rather than a shopping line) — and at parity with a single
+# liked ingredient (+1.0), so a fresh dish the member has a reason to like
+# still ties rather than losing. At `strict` food waste a fresh candidate that
+# genuinely reuses one ingredient scores 1.6 and beats it, which keeps the
+# waste axis meaning what it says.
+#
+# Unpaid on a default setting, always: `MAX_APPEARANCES` and the cooldown
+# bound how often this can fire, but nothing should make it fire for a member
+# who never asked.
+_REPEAT_BONUS = 1.0
+
+# What a leftover lunch (M10) is worth against an equally good fresh dish.
+#
+# Unlike `_REPEAT_PENALTY` this is a *positive* weight, and it is spent only
+# when the member has set `repeat_meals` to `leftovers` — the same standing as
+# the stated-pantry boost, which is also always on precisely because the member
+# asked for it in words. A repeat is something the planner is *allowed* to do;
+# a leftover is something the member *asked* for, and those deserve different
+# numbers.
+#
+# Sized against the scale the rest of this scorer is written on: below the
+# favourites bonus (+5), so a dish the member starred still wins its slot, and
+# below the stated-pantry boost (+3 per item), so "use up my tomatoes" still
+# outranks "reuse last night's dinner". Above zero by enough to actually win a
+# tie, because a bare profile leaves nearly every candidate at exactly 0.0 —
+# the lesson `_REPEAT_PENALTY` was reduced to zero for, read in the other
+# direction.
+#
+# It is not a licence to fill the week: `MAX_LEFTOVER_MEALS` in
+# `action_adapter` caps how many leftover lunches exist at all, and this weight
+# decides only whether the ones on offer are taken. Winning every time it is
+# offered is the intended behaviour of a control the member set deliberately.
+_LEFTOVER_BONUS = 2.0
+
 
 class IngredientBasket:
     """What the plan has already put in the basket, and the days it lands on.
@@ -484,15 +534,44 @@ def build_preference_scorer(
     not this scorer's. A favourite (+5) still wins its slot outright, and at
     `strict` a fresh candidate that genuinely reuses an ingredient outscores a
     repeat, because only the fresh one collects the reuse bonus.
+
+    **Leftovers (M10).** A candidate carrying ``leftover_of`` is yesterday's
+    dinner offered as today's lunch. It is a sanctioned repeat and takes every
+    rule above, plus ``_LEFTOVER_BONUS`` — positive, unlike the repeat penalty,
+    because the member turned a control to ask for it. It still loses to a
+    favourite and to a stated-pantry match, and it still pays the variety
+    penalty in full for resembling any dish other than itself.
+
+    **Asked-for repeats (M10).** When the member SET ``repeat_meals`` rather
+    than inheriting its default, every sanctioned repeat also earns
+    ``_REPEAT_BONUS``. Zero was the right price for a repeat the planner merely
+    allowed; it is the wrong price for one the member requested, because a bare
+    profile makes "equal terms" mean a one-in-eleven share of the slot. On a
+    default setting the weight is 0.0 and nothing about the week changes.
     """
     favorites = {str(f) for f in (user_profile.get("favorite_recipe_ids") or [])}
     likes = [str(l).lower() for l in (user_profile.get("food_likes") or [])]
 
     from services import plan_parameters  # local import; avoids a cycle at module load
     from services.pantry_service import matched_items, normalize_items
-    waste = plan_parameters.waste_mode(user_profile.get("plan_parameters") or {})
+    parameters = user_profile.get("plan_parameters") or {}
+    waste = plan_parameters.waste_mode(parameters)
     waste_weight = {"off": 0.0, "reuse": 0.8, "strict": 1.6}[waste]
     pantry_items = list(normalize_items(pantry))
+    # Whether a leftover is worth anything here at all. The action space will
+    # not offer one unless the member set the control, so this is belt and
+    # braces — but a bonus that could be paid to a candidate the member never
+    # asked for is exactly how a preference turns into a default.
+    leftover_weight = (
+        _LEFTOVER_BONUS if plan_parameters.leftovers_allowed(parameters) else 0.0
+    )
+    # Paid only to a repeat the member asked for. `repeat_mode` cannot tell a
+    # chosen "breakfast" from an inherited one; this can, and the difference
+    # is the whole gate.
+    repeat_weight = (
+        _REPEAT_BONUS
+        if plan_parameters.repeat_mode_is_explicit(parameters) else 0.0
+    )
 
     def scorer(
         candidate: Dict[str, Any],
@@ -558,6 +637,21 @@ def build_preference_scorer(
         # score.
         if sanctioned_repeat:
             score -= _REPEAT_PENALTY
+            # One request, one payment. A leftover takes the leftover weight
+            # INSTEAD of the repeat weight, never on top: both exist because
+            # the member moved the same single control, and stacking them
+            # would price one setting twice — enough, as it happens, to put a
+            # leftover level with a stated pantry item, which the ladder
+            # documented above says must still win its slot.
+            if candidate.get("leftover_of"):
+                # Cook once, eat twice — asked for, so paid for. Inside the
+                # repeat branch on purpose: a leftover shares every ingredient
+                # with the dinner it came from, so the reuse axis would be
+                # measuring the dish against itself here exactly as it would
+                # for any other second serving.
+                score += leftover_weight
+            else:
+                score += repeat_weight
         elif isinstance(basket, IngredientBasket):
             reuse_hits, monotony = _reuse_and_monotony(
                 ingredients, basket, current_day
@@ -706,7 +800,18 @@ class WeeklyPlanner:
             # Recorded against the day it is eaten, before the environment
             # advances the clock — pinned slots included, since a member's
             # anchor puts food in the basket like any other meal.
-            basket.add(chosen_recipe.get("recipe_ingredients", ""), state["day"])
+            #
+            # A leftover (M10) is the exception, and it is the one place the
+            # "eaten twice, bought once" distinction has to be made: this
+            # basket is the shopping list, not the menu. Adding it again would
+            # spend the ingredient's `_MAX_REWARDED_USES` allowance on a
+            # portion nobody bought, so a genuine later meal using it would be
+            # scored as overuse — and every dish on the following day would be
+            # charged monotony for sharing ingredients with a meal the member
+            # deliberately asked to eat twice. The source dinner already put
+            # all of it in the basket on its own day.
+            if not chosen_recipe.get("leftover_of"):
+                basket.add(chosen_recipe.get("recipe_ingredients", ""), state["day"])
             # Advance the environment (updates tracker, computes reward).
             state, reward, done, info = self.env.step(chosen_recipe)
 

@@ -76,7 +76,56 @@ PARAMETER_DEFS: list[dict] = [
         ],
         "default": "off",
     },
+    {
+        # How much of the week may be the same food twice. Like `food_waste`
+        # this is a *dimension of the plan*, not of any one recipe, and it
+        # pulls against variety — so it is a control rather than an inference:
+        # nothing in "plan my week" says whether repeating Tuesday's dinner on
+        # Wednesday reads as familiar or as lazy, and that answer differs by
+        # household rather than by request.
+        #
+        # One ordered scale, each stop a superset of the one before it, for
+        # the reason the food-waste comment gives: two knobs that can
+        # contradict each other ("repeats: off, leftovers: on") is a settings
+        # bug shipped as a feature.
+        #
+        # `breakfast` is the default because it is what the planner already
+        # did before this control existed (M9). A member who never touches
+        # this card gets exactly the week they got yesterday.
+        "key": "repeat_meals",
+        "label": "Repeat meals",
+        # Weekly only. "The same breakfast may come back later in the week" is
+        # not a setting a one-day plan can honour or even parse, and a control
+        # that visibly does nothing teaches members that none of them work.
+        # `sanitize` still accepts the key from any card: the value is the
+        # member's standing preference, stored on the profile, and the weekly
+        # planner is simply the only thing that reads it.
+        "plan_types": ("weekly",),
+        "kind": "choice",
+        "options": [
+            # 21 slots, 21 recipes — the pre-M9 rule, still what some people
+            # want from a plan.
+            {"value": "off", "label": "All different"},
+            # A breakfast may come back after a gap. Nobody eats seven
+            # different breakfasts.
+            {"value": "breakfast", "label": "Repeat breakfasts"},
+            # ...and so may a lunch or a dinner, under the same cooldown and
+            # the same cap.
+            {"value": "all", "label": "Repeat any meal"},
+            # Plus the cross-slot one: yesterday's dinner may be today's
+            # lunch. Deliberately the last stop — it is the only setting that
+            # removes a cooking session rather than a shopping line.
+            {"value": "leftovers", "label": "Cook once, eat twice"},
+        ],
+        "default": "breakfast",
+    },
 ]
+
+# The ordered stops of `repeat_meals`, loosest last. Index comparisons here
+# are what make each stop a superset of the one before it, so a new stop is
+# added to this tuple and nowhere else.
+REPEAT_MODES: tuple = ("off", "breakfast", "all", "leftovers")
+REPEAT_MODE_DEFAULT = "breakfast"
 
 # How each applied value reads in the canonical refinement query.
 _PHRASES = {
@@ -97,6 +146,12 @@ _PHRASES = {
         "reuse": "favour meals that reuse each other's fresh ingredients to reduce food waste",
         "strict": "keep the overall shopping list small — strongly favour meals sharing ingredients, even at some cost to variety",
     },
+    "repeat_meals": {
+        "off": "give every meal a different recipe",
+        "breakfast": "the same breakfast may come back later in the week",
+        "all": "any meal may come back later in the week, well spaced",
+        "leftovers": "any meal may come back later in the week, and yesterday's dinner may be today's lunch — cook once, eat twice",
+    },
 }
 
 
@@ -111,6 +166,64 @@ def waste_mode(values: dict) -> str:
     return value if value in ("reuse", "strict") else "off"
 
 
+def repeat_mode(values: dict) -> str:
+    """The applied repeat setting: 'off', 'breakfast', 'all' or 'leftovers'.
+
+    Read by ``weekly_planner.action_adapter``, which decides whether a recipe
+    may come back at all, and by the weekly scorer, which decides whether one
+    is actually chosen. Both read it through this function rather than off the
+    dict, so an unrecognised stored value degrades to the default instead of
+    disabling the policy — a profile written by an older release must not
+    silently become "all different".
+
+    The default is what the planner did before the control existed, so an
+    untouched card changes nothing.
+    """
+    value = values.get("repeat_meals")
+    return value if value in REPEAT_MODES else REPEAT_MODE_DEFAULT
+
+
+def repeat_mode_is_explicit(values: dict) -> bool:
+    """Whether the member actually SET the repeat control.
+
+    ``repeat_mode`` cannot answer this: it returns ``"breakfast"`` both for a
+    member who chose "Repeat breakfasts" and for one who has never seen the
+    card. Those deserve different planning, so the difference has to survive.
+
+    The distinction is what gates the two things that make a repeat likely
+    rather than merely legal — injecting an eligible earlier dish into the
+    day's pool (``action_adapter``) and paying it a bonus
+    (``planner._REPEAT_BONUS``). Both are a member's request being honoured;
+    neither may fire on a default, because a default is not a request. So a
+    week planned for someone who never touched this card is byte-for-byte the
+    week they got before the control existed.
+
+    An unrecognised stored value is NOT explicit. `repeat_mode` degrades it to
+    the default, and acting on a value we could not read would be inventing a
+    request rather than honouring one.
+    """
+    return values.get("repeat_meals") in REPEAT_MODES
+
+
+def repeats_allowed(values: dict, meal_type: str) -> bool:
+    """Whether a recipe already served may return to ``meal_type``.
+
+    The slot question only — the gap and the cap are the action space's, and
+    live next to the constants that state them.
+    """
+    mode = repeat_mode(values)
+    if mode == "off":
+        return False
+    if mode == "breakfast":
+        return str(meal_type).lower() == "breakfast"
+    return True
+
+
+def leftovers_allowed(values: dict) -> bool:
+    """Whether yesterday's dinner may be served as today's lunch."""
+    return repeat_mode(values) == "leftovers"
+
+
 def build_card(profile: dict, plan_type: str = "daily") -> dict:
     """The card payload for a turn: definitions plus current applied values.
 
@@ -121,7 +234,12 @@ def build_card(profile: dict, plan_type: str = "daily") -> dict:
     applied = profile.get("plan_parameters") or {}
     parameters = []
     for definition in PARAMETER_DEFS:
-        param = dict(definition)
+        # A definition may declare which plans it applies to; most apply to
+        # both and say nothing.
+        applies_to = definition.get("plan_types")
+        if applies_to and plan_type not in applies_to:
+            continue
+        param = {k: v for k, v in definition.items() if k != "plan_types"}
         param["value"] = applied.get(definition["key"])
         parameters.append(param)
     return {"parameters": parameters, "plan_type": plan_type}

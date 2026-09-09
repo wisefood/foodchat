@@ -195,18 +195,48 @@ correctly after a process restart or on a different replica.
   |       pantry folds per-item matches into every day's pool coverage-first,
   |       and build_preference_scorer adds +3 per matched item, capped at 2)
   |
-  |      Repeats: lunch and dinner exclude every committed id, as before.
-  |      BREAKFAST has a slot-scoped cooldown -- a breakfast may return
-  |      after >= 2 days, at most twice in the week, never in another slot,
-  |      and never if it was pinned or downvoted (mark_selected still means
-  |      never). The day's fetch uses the loosest exclusion any of its three
-  |      slots needs and the per-slot rule is applied afterwards, so this
-  |      costs no extra requests. A candidate allowed back carries
-  |      repeat_of_day + repeat_source ("member_request" for a starred
-  |      recipe, "plan" otherwise) from the pool to the stored entry.
+  |      Repeats: a slot-scoped cooldown -- a recipe may return after >= 2
+  |      days, at most twice in the week, never in another slot, and never
+  |      if it was pinned or downvoted (mark_selected still means never).
+  |      WHICH slots may repeat is the member's plan_parameters.repeat_meals
+  |      setting: off (21 distinct recipes) -> breakfast (the default) ->
+  |      all -> leftovers, each stop a superset of the one before it. The
+  |      day's fetch uses the loosest exclusion any of its three slots needs
+  |      and the per-slot rule is applied afterwards, so this costs no extra
+  |      requests. A candidate allowed back carries repeat_of_day +
+  |      repeat_source ("member_request" for a starred recipe, "plan"
+  |      otherwise) from the pool to the stored entry.
   |      A repeat_offered event records what a slot COULD have repeated,
   |      taken or not -- "the week repeated nothing" and "the source never
   |      offered anything" have opposite fixes and look identical without it.
+  |
+  |      Offering vs waiting: when the member SET repeat_meals themselves
+  |      (plan_parameters.repeat_mode_is_explicit -- a chosen "breakfast",
+  |      not an inherited one), an eligible earlier dish the pool does not
+  |      contain is REBUILT from what was committed and added to it, up to
+  |      INJECTED_REPEATS_PER_SLOT (2), newest first. Costs no request. Every
+  |      ordinary rule still decides eligibility (slot, gap, cap,
+  |      mark_selected), and a dish the source did return is never added
+  |      twice. On a DEFAULT setting nothing is injected: the week keeps
+  |      waiting for the source, exactly as before, because a default is not
+  |      a request. The repeat_offered event gains `injected: N` so the
+  |      diagnostic above still separates the plan's own additions from the
+  |      source's.
+  |
+  |      Leftovers (repeat_meals = "leftovers" only): day N's dinner is
+  |      offered as day N+1's lunch, REBUILT from the committed action
+  |      rather than re-fetched, so it costs no request and is the dish on
+  |      the plate by construction. It is a repeat with a slot transition,
+  |      not a new entry kind: the entry holds the whole recipe (the member
+  |      eats that dish, so its nutrition and card are the dish's own) and
+  |      carries repeat_of_day + repeat_source "leftover" + leftover_of
+  |      {day, meal_type}. Yesterday only, lunch only, never from a pinned
+  |      or downvoted dish, at most MAX_LEFTOVER_MEALS (3) a week, and it
+  |      still counts toward MAX_APPEARANCES. Appended to the day's pool,
+  |      never substituted for it -- the lunch is still planned, and the
+  |      leftover only wins if it scores.
+  |      No portion arithmetic anywhere: nothing records quantities, so the
+  |      claim is "Monday's dinner again", never "the rest of it".
   |
   |      Sourcing (food waste = strict only): before each new day is
   |      fetched the planner offers the ingredients the week has already
@@ -234,7 +264,17 @@ correctly after a process restart or on a different replica.
   |      A sanctioned repeat sits out that axis entirely (it shares its
   |      ingredients with itself) and is not charged the variety penalty for
   |      its own earlier title, so it competes on equal terms with a new
-  |      dish; the cooldown and the cap are what govern it
+  |      dish; the cooldown and the cap are what govern it. A repeat the
+  |      member ASKED for (explicit repeat_meals) earns +1.0 instead of 0.0 --
+  |      on a bare profile nearly every candidate scores exactly 0.0, so
+  |      "equal terms" in a pool of ten is a one-in-eleven share, and a
+  |      member who set "Repeat breakfasts" got one. It ties with a liked
+  |      ingredient and still loses to a favourite (+5) and a stated pantry
+  |      (+3). A LEFTOVER earns +2.0 INSTEAD (never on top -- one control,
+  |      one payment) and, uniquely, is NOT
+  |      added to the IngredientBasket: the basket is the shopping list and
+  |      a leftover buys nothing. That is the one place "eaten twice" and
+  |      "bought once" have to be different numbers
   +--> batch enrichment on the final 21 entries (nutrition, image, tags)
   |      + adapted-recipe overlay
   +--> build_day_summaries(entries) -> {day: "dinner with fish" headline}
@@ -248,9 +288,15 @@ correctly after a process restart or on a different replica.
   |      share the tokeniser cannot name is not counted at all.
   |      A THIRD kind rides alongside: the repeat chip (kind "repeat", with
   |      a `source` field) -- "back from Monday, a favorite of yours" vs
-  |      "the same breakfast as Tuesday". A repeated meal gets no cross-day
-  |      reuse chip: it shares its ingredients with itself, so the two would
-  |      say the same thing twice and inflate the reuse count.
+  |      "the same breakfast as Tuesday" vs, for a leftover, "Monday's
+  |      dinner again -- cook once, eat twice" (it names the slot it was
+  |      COOKED in; "the same lunch as Monday" would be false). A repeated
+  |      meal gets no cross-day reuse chip: it shares its ingredients with
+  |      itself, so the two would say the same thing twice and inflate the
+  |      reuse count. A leftover is verified against its (day, slot), not
+  |      just the day, and is kept out of min_gap_days -- it is one day
+  |      after its source by definition, and averaging it in would report
+  |      the week's repeats as tighter than the cooldown allows.
   |      annotate_shared_ingredients also APPENDS its sentence to
   |      explainability["reasoning"], because it runs after the prose is
   |      composed
@@ -279,13 +325,15 @@ ChatTurnResponse {
   meal_plan?              (id, courses, reasoning, 4 quality metrics,
                            version, parent_id),
   weekly_meal_plan?       (id, entries[day, meal_type, recipe{...,
-                           match_reasons}, reward],
+                           match_reasons, repeat_of_day?, repeat_source?,
+                           leftover_of?{day, meal_type}}, reward],
                            day_summaries{day -> headline},
                            constraints_applied[{constraint, type, status,
                            source, detail?}], personalization_summary,
                            metrics{variety (distinct_recipes,
                            planned_repeats, repeats_by_source,
-                           unexplained_repeats, ...), guideline_checklist,
+                           leftover_meals, unexplained_repeats, ...),
+                           guideline_checklist,
                            nutrition, days, repeats, selection_events},
                            reasoning,
                            version, parent_id),
