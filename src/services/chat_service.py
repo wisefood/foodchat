@@ -225,6 +225,11 @@ class ChatService:
             session_id, message, session_service=self.session_service,
         )
 
+        # A fresh daily request is one day unless this turn said otherwise —
+        # a standing seven-day horizon from "plan my week" is not a request
+        # for seven days. The rule and its reasons live with the intake.
+        state = turn_intake.plan_horizon(state, is_refinement=is_refinement)
+
         if seeds:
             resolutions = self.seed_service.resolve_seeds(seeds, profile)
             pinned, dropped = self.seed_service.place_daily(resolutions)

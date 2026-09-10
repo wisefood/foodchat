@@ -64,6 +64,10 @@ _TURN: ContextVar[Optional[tuple[str, str, PlanningState]]] = ContextVar(
 # "added a salad to lunch". Read by the router: a turn that grows the shape is a
 # re-plan, not a slot swap, whatever the intent classifier called it.
 _SHAPE: ContextVar[list] = ContextVar("turn_shape_additions", default=[])
+# Whether the shape extractor spoke THIS turn — as opposed to the standing
+# spec merely carrying what an earlier turn said. The router needs the
+# difference: a standing seven-day horizon is not a request for seven days.
+_NAMED: ContextVar[bool] = ContextVar("turn_shape_named", default=False)
 
 
 def _run(fns: list[Callable[[], PlanningStateDelta]]) -> list[PlanningStateDelta]:
@@ -148,7 +152,9 @@ def intake(session_id: str, message: str, *,
 
     state = session_service.get_planning_state(session_id)
     before = state
-    for delta in extract(message):
+    deltas = extract(message)
+    _NAMED.set(any(d.spec is not None for d in deltas))
+    for delta in deltas:
         if not delta.is_empty:
             state = state.merge(delta)
 
@@ -201,6 +207,41 @@ def forget() -> None:
     """Drop the memo. For tests, and for a caller replaying one session."""
     _TURN.set(None)
     _SHAPE.set([])
+    _NAMED.set(False)
+
+
+def plan_horizon(state: PlanningState, *, is_refinement: bool) -> PlanningState:
+    """The state a FRESH daily request should plan against: one day, unless
+    this turn said otherwise.
+
+    The horizon follows the request; the shape is standing. "Plan my week"
+    writes `num_days=7` into the standing spec, where it sits for the rest of
+    the session. A later "plan for today" says nothing the shape extractor can
+    read, so it abstains, the standing spec is left alone — and the day the
+    member asked for comes out as seven days on the daily canvas. That is the
+    "daily plans are still weekly plans, just with another layout" report: a
+    fresh session has no standing week and gets the three recipes it asked
+    for; a session that ever planned a week never does again.
+
+    Meals and plates are left exactly as they stand — "salads on the side" is
+    a preference and survives. A refinement keeps its days too: "make day 2
+    lighter" on a three-day plan is about that plan. And a turn that named a
+    horizon itself ("three days, please") already merged it, so it is kept.
+    """
+    if is_refinement or state.spec.num_days <= 1 or named_shape():
+        return state
+    return state.merge(PlanningStateDelta(spec=state.spec.with_days(1)))
+
+
+def named_shape() -> bool:
+    """Whether this turn's message itself described the plan's shape.
+
+    False means the extractor abstained and everything on `state.spec` is
+    standing — carried from an earlier turn. The distinction matters for the
+    horizon: the standing spec keeps `num_days=7` after "plan my week", and a
+    later "plan for today" that says nothing about days must not inherit it.
+    """
+    return bool(_NAMED.get())
 
 
 def added_shape() -> list:

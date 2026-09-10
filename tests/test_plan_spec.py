@@ -288,3 +288,20 @@ class TestAMainIsWhateverTheSlotServes:
         assert request_course_types("side") == ("side", "salad", "soup")
         # An unknown role asks for nothing rather than guessing.
         assert request_course_types("garnish") == ()
+
+
+class TestWithDays:
+    def test_it_moves_only_the_horizon(self):
+        spec = PlanSpec(num_days=7, meals=("lunch", "dinner"),
+                        plates={"dinner": ("main", "salad")})
+        day = spec.with_days(1)
+        assert day.num_days == 1
+        assert day.meals == spec.meals and day.plates == spec.plates
+
+    def test_it_clamps_to_what_a_plan_can_be(self):
+        assert PlanSpec().with_days(0).num_days == 1
+        assert PlanSpec().with_days(99).num_days == MAX_DAYS
+
+    def test_unchanged_is_the_same_object(self):
+        spec = PlanSpec(num_days=3)
+        assert spec.with_days(3) is spec

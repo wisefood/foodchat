@@ -272,3 +272,74 @@ class TestEveryKindOfTurnHearsIt:
         orch._classify_and_route(session, session.session_id,
                                  "food scholar: is gluten free ok for kids?")
         assert session_service.get_planning_state(session.session_id).diet_tags == ("gluten_free",)
+
+
+# ── the horizon follows the request; the shape is standing ───────────────
+#
+# Reported from the live demo: "daily plans are still weekly plans, just with
+# another layout — locally I get 3 recipes." Locally is a fresh session. On the
+# demo the member had planned a week earlier in the session, `num_days=7` sat
+# on the standing spec, and "plan for today" said nothing the shape extractor
+# could read — so the standing seven days went straight into a daily plan.
+
+class TestAFreshDailyRequestIsOneDay:
+    def _standing_week(self, session_service, session, monkeypatch):
+        """A session whose standing spec carries a week, then a turn that
+        says nothing about shape."""
+        import services.planning_delta as planning_delta
+
+        session_service.set_planning_state(
+            session.session_id,
+            session_service.get_planning_state(session.session_id).merge(
+                PlanningStateDelta(spec=PlanSpec(
+                    num_days=7, plates={"dinner": ("main", "salad")},
+                ))
+            ),
+        )
+        # The extractor abstains — exactly what "plan for today" produces.
+        monkeypatch.setattr(planning_delta, "extract_state_delta",
+                            lambda *a, **k: PlanningStateDelta())
+        return _intake(session_service, session.session_id, "plan for today")
+
+    def test_the_standing_week_does_not_become_the_day(self, session_service, session, monkeypatch):
+        state = self._standing_week(session_service, session, monkeypatch)
+        assert state.spec.num_days == 7, "precondition: the week is standing"
+        assert turn_intake.named_shape() is False
+
+        planned = turn_intake.plan_horizon(state, is_refinement=False)
+        assert planned.spec.num_days == 1
+
+    def test_the_shape_itself_survives(self, session_service, session, monkeypatch):
+        """Only the horizon moves. The salad beside dinner is a preference."""
+        state = self._standing_week(session_service, session, monkeypatch)
+        planned = turn_intake.plan_horizon(state, is_refinement=False)
+        assert planned.spec.roles_for("dinner") == ("main", "salad")
+        assert planned.spec.meals == state.spec.meals
+
+    def test_a_refinement_keeps_its_days(self, session_service, session, monkeypatch):
+        """'Make day 2 lighter' on a three-day plan is about that plan."""
+        state = self._standing_week(session_service, session, monkeypatch)
+        assert turn_intake.plan_horizon(state, is_refinement=True).spec.num_days == 7
+
+    def test_a_turn_that_names_its_horizon_is_believed(self, session_service, session, monkeypatch):
+        import services.planning_delta as planning_delta
+
+        monkeypatch.setattr(planning_delta, "extract_state_delta",
+                            lambda *a, **k: PlanningStateDelta(spec=PlanSpec(num_days=3)))
+        state = _intake(session_service, session.session_id, "three days please")
+        assert turn_intake.named_shape() is True
+        assert turn_intake.plan_horizon(state, is_refinement=False).spec.num_days == 3
+
+    def test_named_shape_is_per_turn(self, session_service, session, pinned):
+        _intake(session_service, session.session_id, "2 days")
+        assert turn_intake.named_shape() is True
+        turn_intake.forget()
+        assert turn_intake.named_shape() is False
+
+    def test_a_one_day_shape_is_left_alone(self, session_service, session, monkeypatch):
+        import services.planning_delta as planning_delta
+
+        monkeypatch.setattr(planning_delta, "extract_state_delta",
+                            lambda *a, **k: PlanningStateDelta())
+        state = _intake(session_service, session.session_id, "something light")
+        assert turn_intake.plan_horizon(state, is_refinement=False) is state

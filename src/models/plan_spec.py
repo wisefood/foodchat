@@ -194,6 +194,20 @@ class PlanSpec:
         meals = tuple(sorted((*self.meals, name), key=slot_sort_key))
         return replace(self, meals=meals)
 
+    def with_days(self, num_days: int) -> "PlanSpec":
+        """This shape over a different number of days. Meals and plates stay.
+
+        The horizon is a property of a REQUEST; the shape is standing. "Salads
+        on the side" should survive from one plan to the next — that is what a
+        standing shape is for. "For the week" should not: a member who planned
+        a week on Monday and asks for "a plan for today" on Tuesday has said
+        how many days they want, and it is one.
+        """
+        days = max(1, min(int(num_days), MAX_DAYS))
+        if days == self.num_days:
+            return self
+        return replace(self, num_days=days)
+
     def with_plate(self, slot: str, role: str) -> "PlanSpec":
         """This shape with one more plate on one meal.
 
