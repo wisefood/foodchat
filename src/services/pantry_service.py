@@ -328,6 +328,43 @@ def pantry_boost_ids(
 # Coverage + UI badges
 # --------------------------------------------------------------------------- #
 
+def best_covering_combo(pools: list, pantry: Iterable) -> Optional[tuple]:
+    """The one-per-slot combination that uses the most DISTINCT pantry items.
+
+    Coverage is a property of a COMBINATION, not of a plate: three dishes that
+    each use the tomatoes cover one item, and three that use tomatoes, feta and
+    basil cover three. Nothing on the daily path measured that. The pantry
+    reached the pool (coverage-first) and then the grader in prose — "prefer
+    combinations that together use as many of them as possible" — so whether
+    the member's aubergine was actually used came down to which combinations
+    the sampler happened to draw. This computes one that does, so the judge is
+    always shown it.
+
+    Greedy by slot, in the pool's own order, which is RecipeWrangler's ranking:
+    each slot takes the candidate adding the most items not already covered,
+    and ties fall to the better-ranked recipe. Not guaranteed optimal — the
+    optimum needs the full product — and it does not need to be: this earns a
+    place in the batch, the grader still chooses, and the coverage the member
+    is finally told about is measured from the plan that was served.
+    """
+    items = normalize_items(pantry)
+    if not items or not pools or any(not pool for pool in pools):
+        return None
+
+    covered: set[str] = set()
+    combo: list = []
+    for pool in pools:
+        best, best_gain = pool[0], -1
+        for candidate in pool:
+            text = getattr(candidate, "ingredients", "") or ""
+            gain = len(set(matched_items(text, items)) - covered)
+            if gain > best_gain:          # `>` keeps the first, best-ranked tie
+                best, best_gain = candidate, gain
+        combo.append(best)
+        covered |= set(matched_items(getattr(best, "ingredients", "") or "", items))
+    return tuple(combo)
+
+
 def coverage_facts(
     recipes: Iterable[tuple[str, str]], pantry: Iterable[str]
 ) -> dict:

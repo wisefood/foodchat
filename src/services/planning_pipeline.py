@@ -333,7 +333,11 @@ class PlanningPipeline:
 
         try:
             scored = self.grader.grade_daily_plans(
-                grader_query, candidates, profile, feedback_history
+                grader_query, candidates, profile, feedback_history,
+                # Not only in the prose above: the batch now contains a day
+                # built to use these up, so the instruction has something to
+                # act on rather than whatever the sampler drew.
+                prefer_items=pantry,
             )
         except Exception as exc:  # noqa: BLE001
             # The grader is a model call. Losing it should cost the *ranking*,

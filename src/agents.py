@@ -199,17 +199,19 @@ class DocumentGrader:
 
     def grade_daily_plans(
         self, query: str, candidates: CandidatesBySlot, user_profile: dict,
-        feedback_history: str = "",
+        feedback_history: str = "", prefer_items: Sequence[str] = (),
     ) -> list[ScoredPlan]:
         """The three-slot entry point. Kept because every caller uses it."""
         return self.grade_plans(
             query, candidates, user_profile, feedback_history,
             slots=("breakfast", "lunch", "dinner"),
+            prefer_items=prefer_items,
         )
 
     def grade_plans(
         self, query: str, candidates: CandidatesBySlot, user_profile: dict,
         feedback_history: str = "", slots: Optional[Sequence[str]] = None,
+        prefer_items: Sequence[str] = (),
     ) -> list[ScoredPlan]:
         """Return the top-scored days, best first (at most 3).
 
@@ -295,6 +297,22 @@ class DocumentGrader:
             return tuple(str(c.recipe_id) for c in combo)
 
         seen = {combo_key(best_combo)}
+
+        # The day that uses up the most of what the member already has.
+        #
+        # Put in the batch rather than left to the sampler: asking the grader
+        # in prose to "prefer combinations that use as many as possible" can
+        # only work on the combinations it is shown, and those were drawn at
+        # random. A member with tomatoes, feta and basil could watch all three
+        # go unused because no sampled day happened to cover them.
+        if prefer_items:
+            from services.pantry_service import best_covering_combo
+
+            covering = best_covering_combo(pools, prefer_items)
+            if covering is not None and combo_key(covering) not in seen:
+                seen.add(combo_key(covering))
+                rest.append(covering)
+
         for _ in range(wanted * 4):          # bounded attempts, not a while-true
             if len(rest) >= wanted:
                 break
