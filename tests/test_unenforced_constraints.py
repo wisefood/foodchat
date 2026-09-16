@@ -54,14 +54,24 @@ class TestNeverClaimAnUnenforcedConstraint:
         assert rows[0]["status"] == "satisfied", slug
         assert normalize_diet_tags([slug]), f"{slug} should be filterable"
 
-    def test_a_non_restrictive_label_gets_no_row_at_all(self):
-        """`omnivore` is the absence of a restriction. Reporting it as a
-        satisfied hard constraint claimed the plan honoured something never
-        asked of it; reporting it as unsupported would apologise for nothing."""
-        assert _diet_rows({"diet": ["omnivore"]}) == []
-        _filterable, unsupported = classify_diet_tags(["omnivore"])
-        assert unsupported == [], "omnivore is not an unmet constraint"
+    def test_a_non_restrictive_label_is_reported_as_the_label_it_is(self):
+        """"omnivore" is the absence of a restriction, so it is never a
+        satisfied HARD constraint.
 
+        It does keep a row. I had it dropped entirely — a constraints ledger
+        listing a non-constraint is a chip the member cannot act on — but
+        every value keeping a row is the stronger invariant: nothing a member
+        set disappears without an answer, and "a description of how you eat"
+        IS the answer.
+        """
+        rows = constraints_ledger({"diet": ["omnivore"], "preferences": []})
+        row = next(r for r in rows if r["constraint"] == "omnivore")
+
+        assert row["type"] == "soft" and row["status"] == "satisfied"
+        assert "not a recipe filter" in row["detail"]
+        # And the classifier agrees with the row: neither forwarded as a
+        # filter nor reported as something we failed to enforce.
+        assert classify_diet_tags(["omnivore"]) == ([], [])
     def test_the_row_explains_itself(self):
         rows = _diet_rows({"diet": ["halal"]})
         assert "no filter for this" in rows[0]["detail"]
@@ -114,15 +124,44 @@ class TestFreeFromReachesTheBackstop:
 
 
 class TestSplitLedgerLeavesItAlone:
-    def test_unsupported_is_neither_honored_nor_apologised_for(self):
-        """Claiming it honored is the lie this exists to stop. Putting it in the
-        reply as "couldn't honour peanut_free" would over-alarm a member whose
-        peanuts ARE screened. The ledger row carries the nuance."""
+    """Whether the REPLY mentions an unsupported value depends on whether
+    anything else covers it — which is the only question that separates
+    over-alarming a member from leaving them uninformed."""
+
+    def test_one_with_a_backstop_is_neither_honored_nor_apologised_for(self):
+        """Claiming it honoured is the lie this status exists to stop. Saying
+        "couldn't honour peanut_free" would over-alarm a member whose peanuts
+        ARE screened out of every plate. The ledger row carries the nuance."""
         from services.transparency import split_ledger
 
         honored, not_honored = split_ledger([
             {"constraint": "vegetarian", "status": "satisfied"},
-            {"constraint": "peanut_free", "status": "unsupported"},
+            {"constraint": "peanut_free", "status": "unsupported",
+             "covered_by": "peanuts"},
         ])
         assert honored == ["vegetarian"]
         assert not_honored == []
+
+    def test_one_with_nothing_behind_it_reaches_the_reply(self):
+        """`halal` has no filter AND no backstop. Leaving it out of both lists
+        means the only place the member could learn that is a chip — so the
+        reply lists it as honoured by omission, which is the same failure in
+        its quiet direction."""
+        from services.transparency import split_ledger
+
+        honored, not_honored = split_ledger([
+            {"constraint": "vegetarian", "status": "satisfied"},
+            {"constraint": "halal", "status": "unsupported"},
+        ])
+        assert honored == ["vegetarian"]
+        assert not_honored == ["halal"]
+
+    def test_the_rows_the_ledger_builds_carry_that_distinction(self):
+        """End to end, not on hand-written rows: the classifier decides which
+        of the two a real profile value is."""
+        from services.transparency import constraints_ledger, split_ledger
+
+        _honored, not_honored = split_ledger(constraints_ledger(
+            {"diet": ["peanut_free", "halal"], "preferences": []}
+        ))
+        assert not_honored == ["halal"]

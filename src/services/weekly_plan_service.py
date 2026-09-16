@@ -8,7 +8,10 @@ from .weekly_planner.action_adapter import RecipeActionSpace
 from .weekly_planner.reward_logic import RewardCalculator
 from .weekly_planner.environment import WeeklyMealPlanEnv
 from .weekly_planner.day_summary import build_day_summaries
-from .weekly_planner.explainability import build_weekly_explainability
+from .weekly_planner.explainability import (
+    annotate_shared_ingredients,
+    build_weekly_explainability,
+)
 from .transparency import split_ledger
 from .weekly_planner.planner import (
     PlanGenerationError,
@@ -436,6 +439,19 @@ class WeeklyPlanService:
             # it costs the measured rows or the scores, never the week.
             logger.warning("[%s] Weekly verification failed: %s", session_id, exc)
 
+        # Cross-day reuse the PLAN introduced, chipped separately from the
+        # member's own pantry and worded so the two cannot be confused
+        # ("also uses Monday's cabbage" vs "uses your tomatoes"). Runs last,
+        # and runs whether or not a pantry was stated — the member said
+        # nothing about these ingredients, which is the point.
+        #
+        # AFTER the repair pass above, not before: a repair swaps a plate, and
+        # a chip computed before it would name an ingredient shared with a dish
+        # that is no longer on the plan.
+        shared_facts = annotate_shared_ingredients(
+            plan_entries, pantry, explainability=explainability,
+        )
+
         if is_refinement:
             weekly_plan = self.session_service.refine_weekly_meal_plan(
                 session_id, plan_entries, day_summaries=day_summaries,
@@ -501,6 +517,36 @@ class WeeklyPlanService:
                 "unused": pantry_facts["unused"],
                 "note": pantry_note,
             }
+        if shared_facts["meals"]:
+            # Kept separate from `pantry` so the writer cannot present the
+            # plan's own reuse as something the member asked for.
+            facts["shared_ingredients"] = {
+                "meals": shared_facts["meals"],
+                "items": shared_facts["items"][:6],
+            }
+        # Repeats, split by whose doing they were. Same principle as the two
+        # pantry keys above: the writer is given the distinction rather than a
+        # total, so it cannot describe the planner's own second serving as a
+        # dish the member asked to see again.
+        repeats = (explainability.get("metrics") or {}).get("repeats") or {}
+        if repeats.get("count"):
+            facts["repeats"] = {
+                "meals": repeats["count"],
+                "you_starred": repeats["by_source"].get("member_request", 0),
+                "plans_own_choice": repeats["by_source"].get("plan", 0),
+                "min_gap_days": repeats.get("min_gap_days"),
+            }
+            if repeats.get("leftovers"):
+                # A third key rather than a bigger number, for the same reason
+                # the other two are separate: the writer may only say what the
+                # facts distinguish, and "you asked to cook once and eat twice"
+                # is a different sentence from "the plan served this again".
+                #
+                # `portions_not_tracked` is carried as a fact because the
+                # writer can only decline to claim what it is told it does not
+                # know — the reply must not promise a double portion.
+                facts["repeats"]["leftover_lunches"] = repeats["leftovers"]
+                facts["repeats"]["portions_not_tracked"] = True
         fallback_extras = " ".join(p for p in (seed_note, pantry_note) if p)
         response_text = self.response_writer.write(
             facts, content,

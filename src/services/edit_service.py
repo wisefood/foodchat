@@ -46,6 +46,12 @@ DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
 CANDIDATE_POOL = 8
 LIGHTER_RATIO = 0.85
 
+
+def _recipe_of(entry: dict) -> dict:
+    """The recipe dict on a weekly entry, or {} — entries are plain dicts."""
+    recipe = entry.get("recipe")
+    return recipe if isinstance(recipe, dict) else {}
+
 DIET_TAG_DIRECTIVES = {
     "vegetarian": "vegetarian", "vegan": "vegan",
     "gluten free": "gluten_free", "gluten-free": "gluten_free",
@@ -783,27 +789,56 @@ class EditService:
             self.session_service.add_message(session.session_id, "assistant", text)
             return EditOutcome(text=text, facts=facts)
 
-        # PATCH: copy entries, replace only the target slot. No 21-meal regen.
+        replacement = {
+            "recipe_id": choice.recipe_id,
+            "recipe_title": choice.title,
+            "recipe_ingredients": choice.ingredients,
+            "recipe_directions": choice.directions,
+            "pinned": True,
+        }
+        if new_rich:
+            nutrition = new_rich.nutrition_dict()
+            if nutrition:
+                replacement["nutrition"] = nutrition
+            replacement["image_url"] = new_rich.image_url
+            replacement["tags"] = new_rich.tags or []
+            replacement["dish_types"] = new_rich.dish_types or []
+
+        # Slots that eat this one's leftovers (M10). Editing the dinner that a
+        # later lunch is a second serving of cannot leave that lunch pointing
+        # at a dish the week no longer contains: `repeat_facts` would drop the
+        # now-false claim, which keeps the member from being lied to, but it
+        # would leave an unexplained duplicate on the plate and a violated row
+        # in the ledger. So the edit follows the food — that is what "cook
+        # once, eat twice" means, and it is the only reading in which the two
+        # slots still describe the same act of cooking.
+        dependents = self._leftover_dependents(plan.entries, target)
+
+        # PATCH: copy entries, replace only the target slot (and anything that
+        # was eating it). No 21-meal regen.
         new_entries = []
         for entry in plan.entries:
             if entry is target:
-                replacement = {
-                    "recipe_id": choice.recipe_id,
-                    "recipe_title": choice.title,
-                    "recipe_ingredients": choice.ingredients,
-                    "recipe_directions": choice.directions,
-                    "pinned": True,
-                }
-                if new_rich:
-                    nutrition = new_rich.nutrition_dict()
-                    if nutrition:
-                        replacement["nutrition"] = nutrition
-                    replacement["image_url"] = new_rich.image_url
-                    replacement["tags"] = new_rich.tags or []
-                    replacement["dish_types"] = new_rich.dish_types or []
                 new_entries.append({
                     **entry,
-                    "recipe": replacement,
+                    "recipe": dict(replacement),
+                    "reward": entry.get("reward", 0.0),
+                })
+            elif any(entry is dependent for dependent in dependents):
+                # Same dish, still marked as the leftover of the same slot —
+                # the relationship is unchanged, only the food is. `pinned` is
+                # dropped: the member asked to change the dinner, not to anchor
+                # its lunch.
+                follows = {
+                    key: value for key, value in replacement.items()
+                    if key != "pinned"
+                }
+                follows["repeat_of_day"] = _recipe_of(entry).get("repeat_of_day")
+                follows["repeat_source"] = _recipe_of(entry).get("repeat_source")
+                follows["leftover_of"] = dict(_recipe_of(entry)["leftover_of"])
+                new_entries.append({
+                    **entry,
+                    "recipe": follows,
                     "reward": entry.get("reward", 0.0),
                 })
             else:
@@ -829,6 +864,26 @@ class EditService:
         )]
         facts.update({"changed": changed[0]})
         text = self._success_text(changed[0], predicate)
+        if dependents:
+            # Said, not done quietly. A member who edits one slot and finds two
+            # cards changed has been surprised by their own plan; the sentence
+            # is what makes the cascade a feature rather than a bug report.
+            followed = sorted(
+                {int(e.get("day") or 0) for e in dependents}
+            )
+            names = ", ".join(
+                DAY_NAMES[d - 1] for d in followed if 1 <= d <= len(DAY_NAMES)
+            )
+            facts["leftovers_followed"] = [
+                {"day": d, "meal_type": "lunch"} for d in followed
+            ]
+            text += (
+                f" {names} lunch was the leftovers of that dinner, so it "
+                "follows the swap."
+                if len(followed) == 1 else
+                f" {names} lunches were the leftovers of that dinner, so they "
+                "follow the swap."
+            )
         self.session_service.add_message(session.session_id, "assistant", text)
         return EditOutcome(
             text=text, weekly_meal_plan=new_plan, changed_slots=changed, facts=facts,
@@ -837,6 +892,36 @@ class EditService:
     # ------------------------------------------------------------------ #
     # Formatting                                                           #
     # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _leftover_dependents(entries: list, target: dict) -> list:
+        """Entries serving ``target``'s dish again as leftovers (M10).
+
+        Matched on the slot the leftover names AND on the recipe id, not on
+        the slot alone: a stale marker left by an earlier edit points at a
+        slot that no longer holds its dish, and cascading a swap into it would
+        overwrite an unrelated meal the member never asked about.
+        """
+        day = target.get("day")
+        meal_type = str(target.get("meal_type") or "").lower()
+        recipe_id = str(_recipe_of(target).get("recipe_id") or "")
+        if not recipe_id or not isinstance(day, int):
+            return []
+        out = []
+        for entry in entries:
+            if entry is target:
+                continue
+            marker = _recipe_of(entry).get("leftover_of")
+            if not isinstance(marker, dict):
+                continue
+            if str(_recipe_of(entry).get("recipe_id") or "") != recipe_id:
+                continue
+            if (
+                marker.get("day") == day
+                and str(marker.get("meal_type") or "").lower() == meal_type
+            ):
+                out.append(entry)
+        return out
 
     @staticmethod
     def _changed_slot(meal_type, day, old_title, old_rich, new_title, new_rich, predicate) -> dict:

@@ -202,6 +202,44 @@ def allergen_conflict(text: str, allergies: list[str]) -> Optional[str]:
 # restriction, so forwarding one would empty every slot for no reason.
 NON_RESTRICTIVE = {"omnivore", "mediterranean", "balanced", "healthy", "flexitarian"}
 
+# What `normalize_diet_tags` does with one value.
+DIET_FILTER = "filter"                    # forwarded to RW as a hard filter
+DIET_NOT_RESTRICTIVE = "not_restrictive"  # a label, deliberately not forwarded
+DIET_UNKNOWN = "unknown"                  # no filter exists for it; reported, not dropped
+
+
+def diet_tag_status(value) -> tuple[str, Optional[str]]:
+    """``(status, rw_tag)`` for one profile diet value — the classification
+    behind `classify_diet_tags`, for one value and without its log line.
+
+    The transparency ledger needs to say which of the three things happened to
+    each value rather than assuming the first, and it should not have to
+    re-derive the rule to do it.
+
+    The ORDER of the checks is the whole of the logic. `NON_RESTRICTIVE` is
+    tested first because those words are also mapped to ``None`` in
+    `DIET_TAG_MAP`, and the two reasons for a ``None`` are not the same thing:
+
+    * ``omnivore`` is the absence of a restriction — nothing was excluded and
+      nothing was meant to be, so there is nothing to report;
+    * ``high_protein`` is a real restriction the member chose, mapped to
+      ``None`` because it is a nutrition CLAIM: the census finds it on zero
+      recipes as a diet tag, so sending it as one emptied every slot. It
+      travels as a claim tag instead, and as a DIET it is honestly unsupported.
+
+    Collapsing the second into the first would tell a member who asked for high
+    protein that their request was "a description of how you eat".
+    """
+    key = str(value).lower().strip()
+    if not key or key in NON_RESTRICTIVE:
+        return DIET_NOT_RESTRICTIVE, None
+    if key in DIET_TAG_MAP:
+        mapped = DIET_TAG_MAP[key]
+        return (DIET_FILTER, mapped) if mapped is not None else (DIET_UNKNOWN, None)
+    if key in VALID_RW_DIET_TAGS:
+        return DIET_FILTER, key
+    return DIET_UNKNOWN, None
+
 
 def screening_allergens(profile: dict) -> list[str]:
     """Allergen names to screen a plate against: stated allergies PLUS the ones
@@ -242,19 +280,14 @@ def classify_diet_tags(diet) -> tuple[list[str], list[str]]:
         key = str(d).lower().strip()
         if not key:
             continue
-        if key in DIET_TAG_MAP:
-            mapped = DIET_TAG_MAP[key]
-            if mapped is not None:
-                if mapped not in tags:
-                    tags.append(mapped)
-            elif key not in NON_RESTRICTIVE and key not in unsupported:
-                # Mapped to None but still a real restriction the member chose
-                # (the nutrition claims) — not filterable, not nothing.
-                unsupported.append(key)
-        elif key in VALID_RW_DIET_TAGS:
-            if key not in tags:
-                tags.append(key)
-        elif key not in NON_RESTRICTIVE and key not in unsupported:
+        status, tag = diet_tag_status(key)
+        if status == DIET_FILTER:
+            if tag not in tags:
+                tags.append(tag)
+        elif status == DIET_UNKNOWN and key not in unsupported:
+            # Mapped to None but still a real restriction the member chose (the
+            # nutrition claims), or a word nothing upstream knows. Not
+            # filterable, and not nothing.
             unsupported.append(key)
     if unsupported:
         logger.warning(

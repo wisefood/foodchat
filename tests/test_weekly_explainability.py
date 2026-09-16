@@ -9,6 +9,7 @@ from models.session import MealCourse
 from services.weekly_planner.explainability import (
     attach_match_reasons,
     build_weekly_explainability,
+    calorie_budget_status,
     day_breakdown,
     guideline_checklist,
     nutrition_metrics,
@@ -137,6 +138,123 @@ class TestNutritionMetrics:
         nutrition = nutrition_metrics(_week(_veg), {"calories": 14000.0})
         assert nutrition["budget_used_pct"] is None
         assert nutrition["daily_average_kcal"] is None
+
+
+class TestAReportedZeroIsMissingData:
+    """RecipeWrangler returns ``kcal: 0`` for recipes it has no composition
+    data for, and every caller read that as a measurement. On a real week two
+    such recipes made the plan claim `meals_with_data: 21 of 21`, suppress the
+    "based on N meals" note, and count the unknown calories as if the member
+    would eat nothing."""
+
+    def test_a_zero_does_not_count_as_coverage(self):
+        entries = _week(lambda rid: _veg(rid=rid, kcal=600.0))
+        entries[3]["recipe"]["nutrition"]["kcal"] = 0
+        entries[7]["recipe"]["nutrition"]["kcal"] = 0
+
+        nutrition = nutrition_metrics(entries, {"calories": 14000.0})
+
+        assert nutrition["coverage"] == {"meals_with_data": 19, "total_meals": 21}
+        assert "19 of 21 meals" in nutrition["note"]
+
+    def test_a_week_of_zeroes_knows_it_measured_nothing(self):
+        entries = _week(lambda rid: _veg(rid=rid, kcal=0.0))
+
+        nutrition = nutrition_metrics(entries, {"calories": 14000.0})
+
+        assert nutrition["coverage"]["meals_with_data"] == 0
+        assert nutrition["budget_used_pct"] is None
+        assert nutrition["daily_average_kcal"] is None
+
+    def test_a_zero_is_left_out_of_the_day_qualifier(self):
+        from services.weekly_planner.day_summary import recipe_kcal, summarize_day
+
+        assert recipe_kcal({"nutrition": {"kcal": 0}}) is None
+        assert recipe_kcal({"nutrition": {"kcal": 600.0}}) == 600.0
+
+        day = [
+            _entry(1, 0, "breakfast", _veg(rid="a", kcal=0.0)),
+            _entry(1, 1, "lunch", _veg(rid="b", kcal=900.0)),
+            _entry(1, 2, "dinner", _veg(rid="c", kcal=900.0)),
+        ]
+        # 900+900 over two known meals scaled to three is 2700 — a hearty day.
+        # Counting the zero as known averages it down to 1800 and calls it
+        # light, on the strength of a number nobody measured.
+        assert summarize_day(day) == "hearty vegetarian day"
+
+
+class TestTheCalorieBudgetHasTwoSides:
+    """A ceiling on its own is not a budget check. A real week planned at 47%
+    of target — 933 kcal a day — passed as satisfied, and `split_ledger` then
+    handed it to the reply as an honoured request."""
+
+    def test_a_week_well_under_target_is_not_satisfied(self):
+        assert calorie_budget_status(6531.0, 14000.0, 21, 21) == "under"
+
+    def test_a_week_on_target_is(self):
+        assert calorie_budget_status(13450.0, 14000.0, 21, 21) == "on_track"
+
+    def test_a_week_over_target_still_is_not(self):
+        assert calorie_budget_status(16000.0, 14000.0, 21, 21) == "over"
+
+    def test_the_floor_is_measured_against_the_meals_we_know_about(self):
+        """The property that keeps this from becoming a coverage complaint:
+        a week whose 11 known meals are on target is on target, even though
+        its total is barely half the weekly figure."""
+        on_target_for_11 = 14000.0 * 11 / 21
+
+        assert calorie_budget_status(on_target_for_11, 14000.0, 11, 21) == "on_track"
+        assert calorie_budget_status(on_target_for_11 * 0.5, 14000.0, 11, 21) == "under"
+
+    def test_nothing_measured_says_nothing(self):
+        assert calorie_budget_status(0.0, 14000.0, 0, 21) is None
+        assert calorie_budget_status(6531.0, 0.0, 21, 21) is None
+
+    def test_the_ledger_row_reports_the_shortfall(self):
+        nutrition = {"weekly_totals": {"kcal": 6531.0},
+                     "coverage": {"meals_with_data": 21, "total_meals": 21},
+                     "budget_status": "under", "note": ""}
+        ledger = weekly_constraints_ledger(
+            {"preferences": []}, meat_count=0,
+            targets={"calories": 14000.0, "meat_limit": 0},
+            selection_events=[], downvoted_count=0, nutrition=nutrition,
+        )
+        row = next(r for r in ledger if "calorie" in r["constraint"])
+
+        assert row["status"] == "violated"
+        assert "short of your target" in row["detail"]
+
+    def test_a_payload_with_no_status_is_not_read_as_a_violation(self):
+        """Pre-M10 stored plans and hand-built dicts carry no `budget_status`.
+        Deriving it is right; treating its absence as a failure would be the
+        same mistake in the other direction."""
+        nutrition = {"weekly_totals": {"kcal": 13450.0},
+                     "coverage": {"meals_with_data": 21, "total_meals": 21},
+                     "note": ""}
+        ledger = weekly_constraints_ledger(
+            {"preferences": []}, meat_count=0,
+            targets={"calories": 14000.0, "meat_limit": 0},
+            selection_events=[], downvoted_count=0, nutrition=nutrition,
+        )
+        row = next(r for r in ledger if "calorie" in r["constraint"])
+
+        assert row["status"] == "satisfied"
+
+    def test_the_justification_says_it_too(self):
+        entries = _week(lambda rid: _veg(rid=rid, kcal=200.0))
+        result = build_weekly_explainability(
+            entries, {"preferences": ["2000 calories target"]},
+        )
+
+        assert "noticeably short of what you asked for" in result["reasoning"]
+
+    def test_an_on_target_week_says_nothing_of_the_sort(self):
+        entries = _week(lambda rid: _veg(rid=rid, kcal=600.0))
+        result = build_weekly_explainability(
+            entries, {"preferences": ["2000 calories target"]},
+        )
+
+        assert "short of what you asked for" not in result["reasoning"]
 
 
 class TestWeeklyConstraintsLedger:

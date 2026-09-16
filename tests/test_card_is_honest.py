@@ -56,11 +56,14 @@ def _choices():
 def _effect(key: str, value: str) -> dict:
     """What choosing this option actually does.
 
-    Three honest ways for a control to act, and the test below accepts any of
+    Four honest ways for a control to act, and the test below accepts any of
     them. `filters` narrows the pool; `ranks` reorders it without excluding
     anything (food waste is a property of a COMBINATION — whether three meals
-    share a bunch of coriander — so it can only ever be a ranking signal); and
-    a value may be a deliberate neutral, which is what "Any" and "Off" mean.
+    share a bunch of coriander — so it can only ever be a ranking signal);
+    `admits` lets something into the pool that would otherwise never be
+    offered, which is neither of the first two (a repeat is a dish the
+    exclusion list would have kept out); and a value may be a deliberate
+    neutral, which is what "Any" and "Off" mean.
     """
     if key == "goal":
         return {
@@ -80,6 +83,21 @@ def _effect(key: str, value: str) -> dict:
             "filters": False,
             "ranks": plan_parameters.waste_mode({"food_waste": value}) != "off",
         }
+    if key == "repeat_meals":
+        values = {"repeat_meals": value}
+        return {
+            "filters": False,
+            "ranks": False,
+            # Not a filter and not a weight: it decides what the action space
+            # is ALLOWED to put in front of the planner at all.
+            "admits": (
+                any(
+                    plan_parameters.repeats_allowed(values, slot)
+                    for slot in ("breakfast", "lunch", "dinner")
+                )
+                or plan_parameters.leftovers_allowed(values)
+            ),
+        }
     return {"filters": False, "ranks": False}
 
 
@@ -93,7 +111,7 @@ class TestEveryOptionDoesSomething:
             for option in definition["options"]:
                 value = option["value"]
                 effect = _effect(definition["key"], value)
-                if effect["filters"] or effect["ranks"]:
+                if effect["filters"] or effect["ranks"] or effect.get("admits"):
                     continue
                 # Neither. Then it must be a deliberate neutral, and the only
                 # neutral values are the ones that mean "no preference".

@@ -2,6 +2,8 @@
 
 import uuid
 
+import pytest
+
 from models.recipe import CandidateRecipe, RecipeEnrichment
 from services.weekly_planner.day_summary import (
     build_day_summaries,
@@ -62,6 +64,91 @@ class TestIsMeatMeal:
         assert not is_meat_meal("Grilled Salmon", "salmon, lemon", count_fish=False)
         # Red meat still counts even when fish doesn't
         assert is_meat_meal("Beef Stew", "beef", count_fish=False)
+
+
+class TestAQualifiedMeatWordIsNotMeat:
+    """Keyword matching cannot read a qualifier, and both of these were
+    observed distorting a real plan — not just its wording. A false meat meal
+    spends one of three weekly allowances, prunes meat from every later pool,
+    and can force a `meat_limit_relaxed` event that the reply then apologises
+    for."""
+
+    def test_the_recipe_wranglers_own_veg_tag_is_honoured(self):
+        """`vegetarian_or_vegan` is the spelling it sets most often, and it
+        was not in VEG_TAGS. "Chickpea and egg burgers" carried it, hit the
+        "burger" keyword, and was counted and reported as red meat."""
+        assert not is_meat_meal(
+            "Chickpea and egg burgers",
+            "burger patties burger patty, chickpea garbanzo, free range egg",
+            tags=["main-dish", "vegetarian_or_vegan", "dairy_free"],
+        )
+
+    def test_that_tag_classifies_as_vegetarian_not_vegan(self):
+        """It cannot say which, so it says the weaker of the two."""
+        assert classify_meal({
+            "recipe_title": "Chickpea and egg burgers",
+            "recipe_ingredients": "burger patty, chickpea",
+            "tags": ["vegetarian_or_vegan"],
+        }) == "vegetarian"
+
+    @pytest.mark.parametrize("title,ingredients", [
+        ("Chickpea burger", "chickpea, bun, lettuce"),
+        ("Veggie burger", "burger, bun"),
+        ("Meat-free chilli", "kidney beans, tomato"),
+        ("Vegan sausage rolls", "vegan sausages, pastry"),
+        ("Lentil meatballs", "lentil meatballs, tomato"),
+        ("Mushroom burger", "mushroom burger, brioche"),
+    ])
+    def test_a_qualified_meat_word_with_no_tag_at_all(self, title, ingredients):
+        assert not is_meat_meal(title, ingredients)
+
+    @pytest.mark.parametrize("title,ingredients", [
+        ("Beef burger", "beef mince, bun"),
+        ("Hamburger", "hamburger patty, bun"),
+        ("Pork sausage rolls", "pork sausage, pastry"),
+        ("Roast chicken", "chicken, thyme"),
+        ("Salsa Chicken", "boneless, salsa"),
+    ])
+    def test_real_meat_is_still_meat(self, title, ingredients):
+        assert is_meat_meal(title, ingredients)
+
+    def test_a_qualifier_covers_the_same_word_named_again(self):
+        """RecipeWrangler ingredient strings repeat the noun bare — the
+        chickpea burger's read "Burger patties burger patty". A recipe that
+        says "veggie burger" once and "burger" again means one burger."""
+        assert not is_meat_meal("Veggie burger", "burger, bun")
+        assert not is_meat_meal("Lentil meatballs", "lentil meatballs, meatball")
+
+    def test_a_vegetable_beside_an_animal_is_still_that_animal(self):
+        """A vegetable next to a SHAPE is a vegetarian version of that shape;
+        a vegetable next to an animal is a dish containing the animal. Letting
+        "chickpea burger" also license "mushroom chicken" would trade a false
+        positive for a false negative, and under-counting meat is the worse
+        of the two when the point is a meat limit."""
+        assert is_meat_meal("Mushroom chicken", "mushroom, chicken thigh, soy")
+        assert is_meat_meal("Bean and beef chilli", "beans beef mince")
+
+    def test_an_outright_veg_qualifier_covers_any_meat_word(self):
+        assert not is_meat_meal("Tofu bacon", "tofu bacon, maple")
+        assert not is_meat_meal("Mock duck salad", "mock duck, cucumber")
+
+    def test_it_only_covers_the_word_that_was_qualified(self):
+        assert is_meat_meal("Beef burger with a veggie sausage", "beef mince, bun")
+        assert is_meat_meal("Chicken and veggie burgers", "veggie burger, chicken breast")
+
+    def test_the_food_databases_hens_egg_is_not_poultry(self):
+        """"eggs, chicken, whole, raw" is how the food-composition database
+        writes a hen's egg. Read literally it made every shakshuka a poultry
+        meal."""
+        assert not is_meat_meal(
+            "Shakshuka", "eggs, chicken, whole, raw, tomatoes, capsicum",
+        )
+        assert not is_meat_meal("Pancakes", "chicken egg, flour, milk")
+
+    def test_but_a_dish_with_both_eggs_and_chicken_still_counts(self):
+        """The bare-fragment shape is what identifies the database wording;
+        a real chicken dish names a cut."""
+        assert is_meat_meal("Chicken traybake", "2 eggs, chicken breast, flour")
 
 
 class TestSummarizeDay:

@@ -88,6 +88,22 @@ class TestCardAndText:
         assert by_key["cooking_time"]["value"] == 20
         assert by_key["difficulty"]["value"] is None
 
+    def test_repeat_meals_is_offered_on_the_week_and_not_on_the_day(self):
+        """A control a one-day plan cannot honour is not shown with one.
+
+        "The same breakfast may come back later in the week" is not a setting
+        a daily plan can act on, and a knob that visibly does nothing teaches
+        members that none of them do.
+        """
+        daily = plan_parameters.build_card({}, plan_type="daily")
+        weekly = plan_parameters.build_card({}, plan_type="weekly")
+        assert "repeat_meals" not in {p["key"] for p in daily["parameters"]}
+        assert "repeat_meals" in {p["key"] for p in weekly["parameters"]}
+
+    def test_the_card_never_leaks_the_scoping_key_to_the_client(self):
+        weekly = plan_parameters.build_card({}, plan_type="weekly")
+        assert all("plan_types" not in p for p in weekly["parameters"])
+
     def test_describe_is_deterministic_and_ordered(self):
         text = plan_parameters.describe({"goal": "weight_loss", "cooking_time": 20})
         assert text == (
@@ -116,6 +132,7 @@ class TestCardAttachment:
                                  is_refinement=False)
         assert turn.plan_parameters is not None
         keys = [p["key"] for p in turn.plan_parameters["parameters"]]
+        # `repeat_meals` is weekly-only and is absent from a daily card.
         assert keys == ["cooking_time", "difficulty", "goal", "food_waste"]
 
     def test_text_refinement_does_not_re_attach_the_card(self, session_service, sample_profile):
