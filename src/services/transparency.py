@@ -36,9 +36,21 @@ def match_reasons(
         for e in (profile.get("memory_log") or [])
         if e.get("kind") in ("like", "cuisine")
     }
+    # The pantry's matcher, not a substring test.
+    #
+    # `"ham" in "graham flour"` is True, and so are "egg" in eggplant, "corn"
+    # in peppercorns and "rice" in liquorice — so a chocolate loaf carried "you
+    # like beef" and a steak relish "you like broccoli". A chip is a CLAIM about
+    # why a dish is on the plan, and this one was inventing them.
+    #
+    # `matched_items` is what the pantry already uses to decide whether a member
+    # has an ingredient: word boundaries and singular/plural, one definition of
+    # "the text mentions this" shared by both.
+    from services.pantry_service import matched_items
+
     for like in profile.get("food_likes") or []:
         like_l = str(like).lower()
-        if like_l and like_l in text:
+        if like_l and matched_items(text, [like_l]):
             kind = "memory" if like_l in memory_values else "profile"
             label = f"you like {like_l}"
             reasons.append({"kind": kind, "label": label})

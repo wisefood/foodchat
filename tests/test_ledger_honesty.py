@@ -14,6 +14,8 @@ Two failure modes, both of which reached the member as prose:
 
 import uuid
 
+import pytest
+
 from services.memory_service import MemoryService
 from services.transparency import constraints_ledger, split_ledger
 
@@ -298,3 +300,38 @@ class TestMidSessionAcceptIsAttributed:
         svc.decide(session, cand, "accept")
         slugs = [r["slug"] for r in session.user_profile["goal_reconciliation"]]
         assert slugs.count("reduce_fat") == 1
+
+
+class TestALikeChipIsAClaim:
+    """A weekly plan carried "you like beef" on a choc-berry marble loaf and
+    "you like broccoli" on a steak relish.
+
+    The chip matched the member's likes against the ingredient text with a bare
+    `in`, so "ham" matched graham flour, "egg" matched eggplant, "corn" matched
+    peppercorns and "rice" matched liquorice. A chip says WHY a dish is on the
+    plan; this one was making the reason up.
+    """
+
+    @staticmethod
+    def _chips(likes, ingredients):
+        from services.transparency import match_reasons
+
+        return match_reasons("r1", ingredients, {"food_likes": likes}, set())
+
+    @pytest.mark.parametrize("like,ingredients", [
+        ("ham", "graham flour, sugar, butter"),
+        ("egg", "eggplant, olive oil, garlic"),
+        ("corn", "cornflour, peppercorns"),
+        ("rice", "liquorice, sugar"),
+    ])
+    def test_a_word_inside_another_word_is_not_a_reason(self, like, ingredients):
+        assert self._chips([like], ingredients) == []
+
+    @pytest.mark.parametrize("like,ingredients", [
+        ("beef", "beef mince, onion"),
+        ("broccoli", "broccoli florets, garlic"),
+        ("tomato", "cherry tomatoes, basil"),
+    ])
+    def test_a_real_mention_still_is(self, like, ingredients):
+        chips = self._chips([like], ingredients)
+        assert chips and chips[0]["label"] == f"you like {like}"
