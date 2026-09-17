@@ -41,6 +41,11 @@ class CandidateRecipe:
     # straight from a pool would otherwise render blank until something made a
     # second details call for a URL it had already been handed.
     image_url: Optional[str] = None
+    # Which corpus it came from ("irish_safefood", "hungarian", ...). Already in
+    # the v2 response and dropped on arrival, so nothing downstream could tell a
+    # living-lab recipe from a scraped one — including the critic, which
+    # reorders the pool and had no way to know what it was demoting.
+    source: Optional[str] = None
 
 
 # Slot name ("breakfast"/"lunch"/"dinner") → candidates for that slot.

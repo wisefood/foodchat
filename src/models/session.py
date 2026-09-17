@@ -70,11 +70,25 @@ class MealCourse:
 
     @classmethod
     def from_candidate(cls, candidate: CandidateRecipe) -> "MealCourse":
+        """A plate from a candidate, carrying what the candidate already knows.
+
+        `image_url` and `nutrition` used to be dropped here and re-fetched from
+        `/recipes/details` afterwards — so a swap whose enrichment call came
+        back empty produced a plate with no picture, and the member saw the meal
+        change while the image did not. RecipeWrangler sends both with every
+        candidate; discarding them and hoping a second request returns them is
+        two ways to fail where there was one.
+
+        Enrichment still runs and still wins where it has more (it is the only
+        source of `nutri_score_label`), so this is a floor, not a replacement.
+        """
         return cls(
             recipe_id=candidate.recipe_id,
             title=candidate.title,
             ingredients=candidate.ingredients,
             directions=candidate.directions,
+            image_url=getattr(candidate, "image_url", None),
+            nutrition=getattr(candidate, "nutrition", None),
         )
 
     def to_candidate(self) -> CandidateRecipe:

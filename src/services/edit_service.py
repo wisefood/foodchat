@@ -651,8 +651,8 @@ class EditService:
                 new_slot.match_reasons = old_slot.match_reasons
         new_course = getattr(new_plan, meal_type)
         if new_rich:
-            new_course.nutrition = new_rich.nutrition_dict()
-            new_course.image_url = new_rich.image_url
+            new_course.nutrition = new_rich.nutrition_dict() or new_course.nutrition
+            new_course.image_url = new_rich.image_url or new_course.image_url
         new_course.match_reasons = [{"kind": "pinned", "label": "swapped at your request"}]
         new_plan.constraints_applied = plan.constraints_applied
         new_plan.personalization_summary = plan.personalization_summary
@@ -751,8 +751,10 @@ class EditService:
         # stays a side, and the order the UI renders is untouched.
         replacement.role = getattr(old_course, "role", "main")
         if new_rich:
-            replacement.nutrition = new_rich.nutrition_dict()
-            replacement.image_url = new_rich.image_url
+            replacement.nutrition = new_rich.nutrition_dict() or replacement.nutrition
+            # `or` and not a plain assignment: enrichment that came back without
+            # a picture must not erase the one the candidate arrived with.
+            replacement.image_url = new_rich.image_url or replacement.image_url
         replacement.match_reasons = [
             {"kind": "pinned", "label": "swapped at your request"}
         ]

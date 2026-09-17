@@ -206,3 +206,67 @@ class TestItRunsBeforeAnythingSelects:
         assemble = inspect.getsource(PlanningPipeline._assemble_from_pool)
         assert "critic_findings" not in assemble
         assert "reasoning +=" in assemble  # the note still reaches the member
+
+
+class TestCuratedRecipesKeepTheirPlace:
+    """Reported: "curated irish hungarian and slovenian living lab recipes are
+    not prioritized".
+
+    RecipeWrangler already ranks curated corpora first. This module reorders
+    that pool, and a Nutri-Score bonus of a point and a half was enough to lift
+    a scraped recipe over a living-lab one — with nothing here able to tell them
+    apart, because the candidate did not carry its source at all.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _manifest(self, monkeypatch):
+        """The live manifest, pinned. Unreachable, it returns nothing curated —
+        which is the behaviour this replaces."""
+        from services.candidates_client import CANDIDATES
+
+        monkeypatch.setattr(CANDIDATES, "vocabularies", lambda: {"sources": [
+            {"slug": "irish_safefood", "name": "safefood", "curated": True},
+            {"slug": "hungarian", "name": "Okostányér", "curated": True},
+            {"slug": "slovenian", "name": "Slovenian", "curated": True},
+            {"slug": "recipe1m", "name": "Recipe1M", "curated": False},
+        ]})
+
+    def _cand(self, rid, title, *, source=None, nutri=None):
+        from models.recipe import CandidateRecipe
+
+        return CandidateRecipe(
+            recipe_id=rid, title=title, ingredients="x", directions="y",
+            source=source, nutri_score=nutri,
+        )
+
+    def test_a_living_lab_recipe_outranks_a_scraped_one(self):
+        from services import plate_critic
+
+        pool = [
+            self._cand("scraped", "Scraped dinner", source="recipe1m", nutri="A"),
+            self._cand("lab", "Safefood dinner", source="irish_safefood", nutri="C"),
+        ]
+        ranked = plate_critic.rank_pool({"dinner": pool})[0]["dinner"]
+
+        assert ranked[0].recipe_id == "lab", (
+            "a Nutri-Score difference lifted the scraped recipe over the curated one"
+        )
+
+    def test_curation_does_not_rescue_a_dish_that_is_wrong_for_the_slot(self):
+        """The bonus is smaller than the article penalty on purpose."""
+        from services import plate_critic
+
+        pool = [
+            self._cand("lab", "5 ways to use up leftovers", source="hungarian"),
+            self._cand("plain", "Lentil soup", source="recipe1m"),
+        ]
+        ranked = plate_critic.rank_pool({"dinner": pool})[0]["dinner"]
+
+        assert ranked[0].recipe_id == "plain"
+
+    def test_an_unknown_source_is_simply_not_curated(self):
+        from services.plate_critic import _is_curated
+
+        assert _is_curated("recipe1m") is False
+        assert _is_curated(None) is False
+        assert _is_curated("irish_safefood") is True

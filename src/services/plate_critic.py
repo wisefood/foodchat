@@ -100,6 +100,10 @@ _ARTICLE_TITLE = re.compile(
 )
 ARTICLE_TITLE_PENALTY = 2.5
 
+# Bigger than the whole Nutri-Score spread below, smaller than either penalty:
+# curation beats a grade, and does not rescue a dish that is wrong for the slot.
+CURATED_BONUS = 2.0
+
 
 @dataclass
 class Verdict:
@@ -162,7 +166,43 @@ def critique(
         verdict.score -= ARTICLE_TITLE_PENALTY
         verdict.findings.append(f"{title!r} is written as an article, not a dish")
 
+    # A recipe somebody wrote for this project outranks one that was scraped.
+    #
+    # RecipeWrangler already ranks curated corpora first, and this reordering
+    # was undoing it: a Nutri-Score bonus of a point and a half is enough to
+    # lift a scraped recipe over a living-lab one, and nothing here could tell
+    # them apart — the candidate did not carry its source. The bonus is larger
+    # than the Nutri-Score spread on purpose, so curation survives a grade
+    # difference, and smaller than the article and portion penalties, so a
+    # curated recipe that is wrong for the slot is still wrong for the slot.
+    if _is_curated(getattr(candidate, "source", None)):
+        verdict.score += CURATED_BONUS
+
     return verdict
+
+
+def _is_curated(source: Optional[str]) -> bool:
+    """Whether this corpus is one of the curated ones, per the live manifest.
+
+    Read from RecipeWrangler rather than listed here. Duplicating that registry
+    is exactly how five sources sat unfilterable for a release, and a list here
+    would fall behind the next living lab to join. An unreachable manifest
+    returns False for everything, which is the behaviour this replaces.
+    """
+    slug = str(source or "").strip().lower()
+    if not slug:
+        return False
+    try:
+        from services.candidates_client import CANDIDATES
+
+        rows = (CANDIDATES.vocabularies() or {}).get("sources") or []
+    except Exception:  # noqa: BLE001 — vocabulary is best-effort everywhere
+        return False
+    return any(
+        str(row.get("slug", "")).lower() == slug and row.get("curated")
+        for row in rows
+        if isinstance(row, dict)
+    )
 
 
 def rank(

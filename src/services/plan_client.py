@@ -379,6 +379,7 @@ class PlanClient:
                     ),
                     nutrition=_meal_nutrition(recipe),
                     nutri_score=recipe.get("default_nutri_score"),
+                    source=recipe.get("source"),
                 )
             )
         return out
@@ -441,6 +442,8 @@ class PlanClient:
                         ),
                         nutrition=_meal_nutrition(recipe),
                         nutri_score=recipe.get("default_nutri_score"),
+                        image_url=recipe.get("image_url"),
+                        source=recipe.get("source"),
                     )
 
                     conflict = allergen_conflict(
