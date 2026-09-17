@@ -175,21 +175,25 @@ def intake(session_id: str, message: str, *,
     from services import shape_intent
 
     grown, added = shape_intent.additions(message, standing_spec)
-    _SHAPE.set(added)
+    # Removals read against the GROWN shape, so one message can do both —
+    # "drop the snack and add a dessert" is one sentence and two changes.
+    shaped, removed = shape_intent.removals(message, grown)
+    changed_shape = added + removed
+    _SHAPE.set(changed_shape)
 
     for delta in deltas:
         if delta.is_empty:
             continue
-        if added and delta.spec is not None:
+        if changed_shape and delta.spec is not None:
             # An addition AMENDS the plan; it never replaces it. The horizon is
             # still the extractor's to state — "three days, and add a snack" is
             # one message — so only the meals and plates are refused.
-            grown = grown.with_days(delta.spec.num_days)
+            shaped = shaped.with_days(delta.spec.num_days)
             delta = replace(delta, spec=None)
         state = state.merge(delta)
 
-    if added:
-        state = state.merge(PlanningStateDelta(spec=grown))
+    if changed_shape:
+        state = state.merge(PlanningStateDelta(spec=shaped))
 
     # Shape ADDITIONS, before the facet retraction.
     #
@@ -271,7 +275,11 @@ def named_shape() -> bool:
 
 
 def added_shape() -> list:
-    """What this turn added to the plan's shape — `[]` when nothing.
+    """What this turn CHANGED about the plan's shape — `[]` when nothing.
+
+    Additions and removals both, because the router asks one question of this:
+    did the shape move? "Add a snack" and "drop the snack" are the same kind of
+    turn — a re-plan — and only the edit path cares which.
 
     The router reads this rather than re-deriving it: intake has already done
     the work, and two places deciding what "add a salad" means is how they come

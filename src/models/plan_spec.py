@@ -194,6 +194,45 @@ class PlanSpec:
         meals = tuple(sorted((*self.meals, name), key=slot_sort_key))
         return replace(self, meals=meals)
 
+    def without_meal(self, slot: str) -> "PlanSpec":
+        """This shape minus one meal, or unchanged when it never had it.
+
+        The counterpart `with_meal` has always needed. "Remove the snack" had
+        nothing that could act on it, so it classified as a slot edit and the
+        edit path — which can only REPLACE the dish on a slot — swapped the
+        member's lunch for a recipe called "Oat Snack Cakes" and reported it as
+        done.
+
+        A plan cannot become no plan: removing the last meal is refused, and
+        the caller says so. "Cancel the whole plan" is a different request from
+        "drop the snack" and it is not this one.
+        """
+        name = str(slot or "").strip().lower()
+        if not name or name not in self.meals or len(self.meals) <= 1:
+            return self
+        plates = {k: v for k, v in self.plates.items() if k != name}
+        return replace(
+            self,
+            meals=tuple(m for m in self.meals if m != name),
+            plates=plates,
+        )
+
+    def without_plate(self, slot: str, role: str) -> "PlanSpec":
+        """This shape minus one plate of one meal. The main is never removed —
+        a meal without a main is a side dish pretending to be dinner."""
+        name = str(slot or "").strip().lower()
+        want = str(role or "").strip().lower()
+        roles = self.roles_for(name)
+        if not name or want in ("", "main") or want not in roles:
+            return self
+        remaining = tuple(r for r in roles if r != want)
+        plates = dict(self.plates)
+        if remaining == ("main",):
+            plates.pop(name, None)
+        else:
+            plates[name] = remaining
+        return replace(self, plates=plates)
+
     def with_days(self, num_days: int) -> "PlanSpec":
         """This shape over a different number of days. Meals and plates stay.
 

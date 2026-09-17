@@ -253,6 +253,38 @@ class ChatService:
             if note:
                 profile["_seed_note"] = note
 
+        self._apply_standing_state(session_id, profile, state)
+
+        if skip_clarification:
+            return self._generate_and_store(
+                session_id, effective_message, profile, is_refinement
+            )
+
+        origin_intent = "refine_plan" if is_refinement else "daily_plan"
+        outcome = self.clarifier.start(effective_message, profile, origin_intent)
+
+        if outcome.needs_clarification:
+            logger.info("[%s] Clarification needed — persisting clarification state.", session_id)
+            self.session_service.set_clarification_state(session_id, outcome.state.to_dict())
+            self.session_service.add_message(session_id, "assistant", outcome.question)
+            return outcome.question, True, None
+
+        return self._generate_and_store(
+            session_id, outcome.final_query, outcome.profile, is_refinement
+        )
+
+    def _apply_standing_state(self, session_id: str, profile: dict, state) -> None:
+        """Stash everything standing onto the profile snapshot the pipeline reads.
+
+        Extracted because it had ONE caller and two callers needed it. A member
+        answering a clarifying question with "just a dinner" had that answer
+        heard by nobody: `continue_clarification` went straight to
+        `_generate_and_store`, which reads `profile["_plan_spec"]` and found
+        nothing there, so the shape fell back to the default three meals and
+        the member who asked for one meal got a whole day. The same silence
+        swallowed a diet, a pantry item, a cooking time and a facet stated in
+        that answer — every underscore key below.
+        """
         # Anchors set in earlier turns, re-pinned for this one.
         if state.anchors:
             carried = self._pin_from_anchors(state, profile)
@@ -298,24 +330,6 @@ class ChatService:
             profile["_facets"] = facets
         self.session_service.set_planning_state(session_id, state)
         logger.info("[%s] Standing plan state: %s", session_id, state.describe())
-
-        if skip_clarification:
-            return self._generate_and_store(
-                session_id, effective_message, profile, is_refinement
-            )
-
-        origin_intent = "refine_plan" if is_refinement else "daily_plan"
-        outcome = self.clarifier.start(effective_message, profile, origin_intent)
-
-        if outcome.needs_clarification:
-            logger.info("[%s] Clarification needed — persisting clarification state.", session_id)
-            self.session_service.set_clarification_state(session_id, outcome.state.to_dict())
-            self.session_service.add_message(session_id, "assistant", outcome.question)
-            return outcome.question, True, None
-
-        return self._generate_and_store(
-            session_id, outcome.final_query, outcome.profile, is_refinement
-        )
 
     def continue_clarification(self, session_id: str, message: str) -> Tuple[str, bool, Optional[MealPlan], str]:
         """Consume a user answer while session.state == "clarifying".
@@ -377,6 +391,20 @@ class ChatService:
             self.session_service.persist_profile(session_id)
 
         is_refinement = origin_intent == "refine_plan"
+
+        # Hear the ANSWER, not only the question it answered.
+        #
+        # "Just a dinner" is a plan shape. "I'm coeliac" is a diet. "I have
+        # spinach to use up" is a pantry. All of them arrive as clarification
+        # answers, and this path used to walk past the intake entirely — so the
+        # member watched a full day appear after asking for one meal, and read
+        # it, correctly, as not being listened to.
+        state = turn_intake.intake(
+            session_id, message, session_service=self.session_service,
+        )
+        state = turn_intake.plan_horizon(state, is_refinement=is_refinement)
+        self._apply_standing_state(session_id, outcome.profile, state)
+
         text, needs, plan = self._generate_and_store(
             session_id, outcome.final_query, outcome.profile, is_refinement
         )

@@ -147,6 +147,92 @@ def additions(
     return result, changed
 
 
+# "remove the snack", "drop the dessert", "no snack today", "skip breakfast".
+#
+# Narrow on the verb and narrow on the target, unlike `_ADD`: a removal throws
+# work away, so a loose verb that fires by accident costs the member a meal.
+_REMOVE = (
+    r"(?:remove|drop|delete|cancel|skip|lose|get rid of|take out|take off|"
+    r"do not want|don'?t want|no more|without|no)"
+)
+
+
+def removals(message: str, spec, *, focus_slot: Optional[str] = None):
+    """Meals and plates the message asks to take OUT. `(spec, notes)`.
+
+    The counterpart to `additions`, and it was missing — so "remove the snack
+    from midday" reached the edit path, which can only replace the dish on a
+    slot. It swapped the member's lunch for a recipe called "Oat Snack Cakes",
+    because the leftover word "snack" was searched as a dish title, and said
+    "Done".
+
+    Deliberately conservative in three ways, because this one destroys:
+
+    * the verb must be a removal verb and it must sit just before the target,
+      so "I had a snack earlier, plan dinner" is not a removal;
+    * a meal is only removed if the plan HAS it — there is nothing to say
+      about a breakfast that was never there;
+    * the last meal cannot go, and neither can a main. "Cancel the plan" is a
+      different request and this is not it.
+    """
+    from models.plan_spec import KNOWN_SLOTS, ROLES
+
+    text = (message or "").strip()
+    if not text:
+        return spec, []
+
+    changed: list[str] = []
+    result = spec
+    target = _named_slot(text, spec) or focus_slot
+
+    for slot in KNOWN_SLOTS:
+        if slot not in result.meals:
+            continue
+        if not _mentioned_as_removal(text, slot):
+            continue
+        # A word that is both a slot and a role, named alongside another meal,
+        # is a plate of that meal — "drop the side from dinner".
+        if slot in ROLES and target and target != slot:
+            continue
+        before = result
+        result = result.without_meal(slot)
+        if result is not before:
+            changed.append(f"removed {slot}")
+        else:
+            logger.info(
+                "Heard %r as a meal to remove but it is the only one left — "
+                "leaving the plan alone", slot,
+            )
+
+    for role in ROLES:
+        if role == "main" or not _mentioned_as_removal(text, role):
+            continue
+        slot = target if target and target != role else None
+        if slot is None:
+            logger.info(
+                "Heard %r as a plate to remove but no meal was named — leaving "
+                "the shape alone rather than guessing", role,
+            )
+            continue
+        before = result
+        result = result.without_plate(slot, role)
+        if result is not before:
+            changed.append(f"removed the {role} from {slot}")
+
+    if changed:
+        logger.info("Shape removals: %s -> %s", "; ".join(changed), result.describe())
+    return result, changed
+
+
+def _mentioned_as_removal(text: str, word: str) -> bool:
+    """A removal verb, then the target, within the same breath."""
+    pattern = (
+        _REMOVE + r"(?:\s+\w+){0,2}\s+(?:the\s+|a\s+|an\s+|my\s+|any\s+)?"
+        + word + r"(?:e?s)?\b"
+    )
+    return bool(re.search(pattern, text, re.IGNORECASE))
+
+
 # "my day doesn't have breakfast", "i don't have a lunch".
 #
 # A statement that the plan LACKS something is a request to add it — it is what

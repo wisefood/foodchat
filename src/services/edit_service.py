@@ -35,6 +35,7 @@ from models.session import MealCourse, MealPlan
 from services import plan_parameters
 from services.candidates_client import CANDIDATES, effective_diet, screening_allergens
 from .session_service import SessionService
+from models.plan_spec import KNOWN_SLOTS, ROLES
 from .weekly_planner.day_summary import build_day_summaries
 from .weekly_planner.explainability import build_weekly_explainability
 
@@ -244,15 +245,47 @@ def _named_day(message: str, *, weekdays: bool) -> Optional[int]:
     return None
 
 
+# Words that describe the SHAPE of a day, never a dish in it. A directive made
+# of nothing but these is the member talking about the plan, not naming food.
+#
+# This set is why "remove the snack from midday" stopped being answered with
+# Oat Snack Cakes, and "better before lunch" with a 1,907 kcal recipe called
+# "Sunday Lunch". A leftover phrase used to be searched as a recipe title, and
+# the corpus obligingly contains dishes named after meals — so a member's word
+# for WHEN they eat came back as WHAT they eat, at four times the calories,
+# reported as "Done".
+_STRUCTURAL_WORDS = frozenset({
+    *KNOWN_SLOTS, *ROLES,
+    "meal", "meals", "course", "courses", "plate", "plates", "dish", "dishes",
+    "midday", "midmorning", "mid", "morning", "afternoon", "evening", "night",
+    "noon", "brunch", "supper",
+    "earlier", "later", "sooner", "before", "after", "first", "second", "last",
+    "today", "tomorrow", "tonight", "day", "week",
+    "the", "a", "an", "my", "me", "i", "it", "one", "that", "this", "at",
+    "in", "on", "for", "of", "to", "and", "is", "be", "will", "have",
+})
+
+
 def _names_a_dish(directive: str) -> bool:
     """Whether an unverified directive reads as a dish name.
 
-    Errs toward yes: a false positive costs one name search that returns
-    nothing and falls back to the old behaviour; a false negative silently
-    hands the member the slot's default instead of what they asked for.
+    Errs toward yes — a false positive costs one name search that returns
+    nothing, a false negative silently hands the member the slot's default —
+    but NOT toward yes for a phrase that is entirely structural.
+
+    "Every word is structural" is the test rather than a blocklist of phrases,
+    because the member's wording is theirs: "midday", "before lunch", "later
+    today" and "the snack" are all the same request and none of them is food.
+    A real dish keeps at least one word that is not on the list, so "oat snack
+    cakes" survives the word "snack" sitting inside it.
     """
     d = (directive or "").strip().lower()
-    return bool(d) and d not in _GENERIC_DIRECTIVES and len(d) > 2
+    if not d or len(d) <= 2 or d in _GENERIC_DIRECTIVES:
+        return False
+    words = set(re.findall(r"[a-z]+", d))
+    if words and words <= _STRUCTURAL_WORDS:
+        return False
+    return True
 
 
 class EditService:
