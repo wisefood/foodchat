@@ -1399,8 +1399,9 @@ pregnancy and elderly stages and populations excluded: **IE 82, HU 171,
 SI 37**. IE weekly adult rules: 6, one of which is about physical activity.
 
 Default set: **Ireland, adults, active: 81 rules (77 without the weekly
-ones), about 6k characters.** It is sent whole. Hungary's 162 are cut to the
-most checkable 90.
+ones), about 6k characters.** That is too much for Groq's on-demand tier in the
+same minute as candidate grading, so the judge gets `GUIDELINES_MAX_CHARS`
+(3,500): 45 rules, frequency-stating rules first.
 
 ## What was built
 

@@ -253,6 +253,23 @@ class TestTheJudgesText:
         ])
         assert text.index("Eat fish") < text.index("Choose wholegrains") < text.index("Make mealtimes")
 
+    def test_a_rule_that_states_a_frequency_outranks_a_typed_one_that_does_not(self):
+        text = gs.render([
+            _rule("Count 30g cooked beef as 1 serving."),
+            _rule("Eat 5-7 servings a day of vegetables, salad, and fruit.", guideline_type=None),
+        ])
+        assert text.index("Eat 5-7 servings") < text.index("Count 30g")
+
+    def test_a_rule_too_long_for_the_budget_is_skipped_not_the_end(self, monkeypatch):
+        monkeypatch.setattr(gs, "MAX_CHARS", 60)
+        text = gs.render([
+            _rule("Eat fish at least twice a week.", id="a"),
+            _rule("Eat " + "very " * 20 + "many vegetables every day.", id="b"),
+            _rule("Drink water every day.", id="c"),
+        ])
+        assert "Eat fish" in text and "Drink water" in text and "very very" not in text
+        assert "2 of 3 rules" in text.splitlines()[0]
+
     def test_it_is_capped(self):
         """A judge handed 400 rules reads the first few and pads the rest."""
         rules = [_rule(f"Advice number {i}", id=str(i)) for i in range(400)]
@@ -558,3 +575,29 @@ class TestTheCatalogClientIsThePlatformTalkingToItself:
 
         monkeypatch.setattr(catalog, "DATA_API_URL", None)
         assert catalog.CatalogClient.available() is False
+
+
+class TestAJudgeFailureCostsOnlyItsScore:
+    def test_a_rate_limited_judge_leaves_the_plan_and_the_other_scores(self, monkeypatch):
+        """Grading the candidate days spends most of a minute's tokens; the
+        next judge being refused must not turn a finished plan into a 500."""
+        from services import plan_quality
+
+        class _Diversity:
+            def score(self, plan_text):
+                raise RuntimeError("Error code: 429 - rate limit reached")
+
+        class _Guideline:
+            def score(self, plan_text, guidelines):
+                return {"score": 4, "reasoning": f"judged against {guidelines}"}
+
+        class _Scored:
+            score, reasoning, slot_names, slots, courses = 5, "best", [], {}, []
+
+        monkeypatch.setattr(plan_quality._Graders, "diversity", classmethod(lambda cls: _Diversity()))
+        monkeypatch.setattr(plan_quality._Graders, "guideline", classmethod(lambda cls: _Guideline()))
+        result = plan_quality.metrics(_Scored(), guidelines="[G1] rules")
+        assert result["diversity_llm_score"] == 0
+        assert result["guideline_adherence_score"] == 4
+        assert result["guideline_adherence_reasoning"] == "judged against [G1] rules"
+        assert result["llm_score"] == 5
