@@ -343,3 +343,81 @@ class TestAFreshDailyRequestIsOneDay:
                             lambda *a, **k: PlanningStateDelta())
         state = _intake(session_service, session.session_id, "something light")
         assert turn_intake.plan_horizon(state, is_refinement=False) is state
+
+
+# ── an addition amends the shape; the extractor never replaces it ────────
+#
+# Reported from the canvas: "can you add a snack after my lunch?" answered
+# "Which meal should I swap — breakfast, lunch, or dinner?" — and quietly cut
+# the plan from three meals to two.
+#
+# The LLM shape extractor answers with the meals the MESSAGE mentions, not with
+# the plan the member wants: for that sentence it says `lunch, snack`. `merge`
+# takes a delta's spec wholesale, so breakfast and dinner were deleted; the
+# shape reader ran NEXT, saw a snack already in the shape, and reported no
+# addition; and the router's re-plan guard reads that empty answer and falls
+# through to the edit path, which can only replace a dish on a slot.
+#
+# Every one of these tests needs the extractor to SUCCEED. That is why the
+# suite had nothing to say about it: offline the extractor raises, the delta is
+# empty, and the reader sees the true standing shape.
+
+class TestAnAdditionNeverReplacesTheShape:
+    @pytest.fixture
+    def extractor_says(self, monkeypatch):
+        """Make the shape extractor answer with a spec, the way it does live."""
+        import services.planning_delta as planning_delta
+
+        def _set(spec: PlanSpec):
+            monkeypatch.setattr(
+                planning_delta, "extract_state_delta",
+                lambda text, extractor=None: PlanningStateDelta(spec=spec),
+            )
+        return _set
+
+    def test_the_other_meals_survive(self, session_service, session, extractor_says):
+        """The reported symptom, in one assertion."""
+        extractor_says(PlanSpec(meals=("lunch", "snack")))
+        state = _intake(session_service, session.session_id,
+                        "can you add a snack after my lunch?")
+
+        assert state.spec.meals == ("breakfast", "lunch", "snack", "dinner")
+
+    def test_the_router_is_told_the_shape_grew(self, session_service, session, extractor_says):
+        """`added_shape()` is what makes the turn re-plan instead of swapping.
+        Empty is how the member got "which meal should I swap?"."""
+        extractor_says(PlanSpec(meals=("lunch", "snack")))
+        _intake(session_service, session.session_id, "add a snack after lunch")
+
+        assert turn_intake.added_shape() == ["added snack"]
+
+    def test_a_plate_addition_keeps_every_meal(self, session_service, session, extractor_says):
+        """Same fault, one level down: "add a salad to dinner" with an extractor
+        answering `dinner` would have left a one-meal day."""
+        extractor_says(PlanSpec(meals=("dinner",)))
+        state = _intake(session_service, session.session_id, "add a salad to dinner")
+
+        assert state.spec.meals == ("breakfast", "lunch", "dinner")
+        assert state.spec.roles_for("dinner") == ("main", "salad")
+
+    def test_the_horizon_is_still_the_extractors_to_state(self, session_service, session,
+                                                          extractor_says):
+        """"three days, and add a snack" is one message. Refusing the whole spec
+        would throw away the days with the meals."""
+        extractor_says(PlanSpec(num_days=3, meals=("lunch", "snack")))
+        state = _intake(session_service, session.session_id,
+                        "three days please, and add a snack")
+
+        assert state.spec.num_days == 3
+        assert state.spec.meals == ("breakfast", "lunch", "snack", "dinner")
+
+    def test_a_message_that_describes_a_shape_still_replaces_it(self, session_service,
+                                                                session, extractor_says):
+        """The narrowing case, untouched. "Only lunch and dinner today" is not
+        an addition, so the extractor's answer is the answer — otherwise a
+        member could never make their day smaller."""
+        extractor_says(PlanSpec(meals=("lunch", "dinner")))
+        state = _intake(session_service, session.session_id, "only lunch and dinner today")
+
+        assert state.spec.meals == ("lunch", "dinner")
+        assert turn_intake.added_shape() == []

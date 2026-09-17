@@ -45,6 +45,7 @@ import contextvars
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
+from dataclasses import replace
 from typing import Callable, Optional
 
 from models.planning_state import PlanningState, PlanningStateDelta
@@ -152,11 +153,43 @@ def intake(session_id: str, message: str, *,
 
     state = session_service.get_planning_state(session_id)
     before = state
+    standing_spec = state.spec
     deltas = extract(message)
     _NAMED.set(any(d.spec is not None for d in deltas))
+
+    # The shape reader runs FIRST, against the shape that is STANDING.
+    #
+    # It used to run after the merge, and that made it blind exactly when it
+    # was needed. The LLM shape extractor answers with the meals the MESSAGE
+    # mentions, not with the plan the member wants: for "add a snack after my
+    # lunch" it says `lunch, snack`. `merge` takes a delta's spec wholesale, so
+    # the standing breakfast/lunch/dinner became lunch+snack — breakfast and
+    # dinner deleted — and the reader, running next, then saw a snack already
+    # in the shape and reported no addition at all. The member got their plan
+    # quietly cut to two meals AND "which meal should I swap?", because the
+    # router's re-plan guard reads that empty answer.
+    #
+    # Invisible offline, which is why the suite never caught it: with no
+    # network the extractor fails, the delta is empty, and the reader sees the
+    # real standing shape.
+    from services import shape_intent
+
+    grown, added = shape_intent.additions(message, standing_spec)
+    _SHAPE.set(added)
+
     for delta in deltas:
-        if not delta.is_empty:
-            state = state.merge(delta)
+        if delta.is_empty:
+            continue
+        if added and delta.spec is not None:
+            # An addition AMENDS the plan; it never replaces it. The horizon is
+            # still the extractor's to state — "three days, and add a snack" is
+            # one message — so only the meals and plates are refused.
+            grown = grown.with_days(delta.spec.num_days)
+            delta = replace(delta, spec=None)
+        state = state.merge(delta)
+
+    if added:
+        state = state.merge(PlanningStateDelta(spec=grown))
 
     # Shape ADDITIONS, before the facet retraction.
     #
@@ -170,13 +203,6 @@ def intake(session_id: str, message: str, *,
     # other half: the shape extractor answers with the meals the MESSAGE
     # mentions, and `merge` takes a delta's spec wholesale — so "add a salad to
     # lunch" would have set the day to lunch alone.
-    from services import shape_intent
-
-    grown, added = shape_intent.additions(message, state.spec)
-    _SHAPE.set(added)
-    if added:
-        state = state.merge(PlanningStateDelta(spec=grown))
-
     # Taking a facet back, last and against the merged state.
     #
     # Last because it can only remove something that is standing, and the thing
