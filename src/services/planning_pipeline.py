@@ -95,6 +95,18 @@ def _with_note(plans: list[ScoredPlan], note: str) -> list[ScoredPlan]:
 
 
 
+def _variety_key(profile: dict) -> str:
+    """Who this plan is for, for the critic's stable tiebreak.
+
+    RecipeWrangler ranks deterministically and identically for everybody, so
+    without this the corpus is read top-down by every member of every session —
+    "i havent seen diverse breakfast recipes". Keyed on the member so the same
+    person regenerating gets the same plan, and two people do not get the same
+    one.
+    """
+    return str((profile or {}).get("member_id") or (profile or {}).get("_member_id") or "")
+
+
 def _every_plate_has_a_candidate(pools_by_day: dict, spec) -> bool:
     """Whether every requested plate of every day came back with something."""
     return not _unfilled_plates(pools_by_day, spec)
@@ -303,6 +315,7 @@ class PlanningPipeline:
         # this emptied would turn a quality opinion into "no meals exist".
         candidates, critic_findings = plate_critic.rank_pool(
             candidates, kcal_target=_day_kcal_target(profile),
+            variety_key=_variety_key(profile),
         )
         if critic_findings:
             logger.info("Plate critic: %s", "; ".join(critic_findings[:4]))
@@ -515,6 +528,22 @@ class PlanningPipeline:
                         target[key] = candidates
         if not pools_by_day:
             return None
+
+        # The critic, on the path that never had it.
+        #
+        # A shaped plan composed straight from RecipeWrangler's order got no
+        # slot-fitness check, no article-title penalty, no curated bonus and no
+        # variety — the three things the classic path has had for months, on the
+        # path that now serves most plans.
+        variety_key = _variety_key(profile)
+        for day, pools in pools_by_day.items():
+            pools_by_day[day], day_findings = plate_critic.rank_pool(
+                pools,
+                kcal_target=_day_kcal_target(profile),
+                variety_key=variety_key,
+            )
+            if day_findings:
+                logger.info("Plate critic (day %s): %s", day, "; ".join(day_findings[:3]))
 
         kcal_target = _day_kcal_target(profile)
         # Compose every meal first, then judge them all in one call. Judging as

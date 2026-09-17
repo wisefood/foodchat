@@ -164,3 +164,53 @@ class TestTheWiringItself:
         assert profile["region"] == "HU"
         assert profile["age_group"] == "child"
         assert resolve_scope(profile, "daily").regions == ("HU",)
+
+
+class TestTheVarietyKey:
+    """Reported: "i see recipes fetched in order across plans, i havent seen
+    diverse breakfast recipes".
+
+    RecipeWrangler ranks deterministically and identically for everybody, so
+    the corpus is read top-down by every member of every session. `plate_critic`
+    breaks ties on a stable per-member key — which is worth nothing if the
+    profile does not carry one.
+    """
+
+    def test_the_profile_carries_the_member_id(self):
+        profile = {}
+        member = _Member()
+        member.id = "member-42"
+        _svc()._attach_context(_Client(), member, profile)
+
+        assert profile["member_id"] == "member-42"
+
+    def test_the_pipeline_reads_it(self):
+        from services.planning_pipeline import _variety_key
+
+        assert _variety_key({"member_id": "member-42"}) == "member-42"
+        assert _variety_key({}) == ""
+
+    def test_two_members_get_different_orders_and_each_a_stable_one(self):
+        from models.recipe import CandidateRecipe
+        from services import plate_critic
+
+        pool = [
+            CandidateRecipe(f"r{i}", f"Breakfast {i}", "oats", "cook", nutri_score="B")
+            for i in range(6)
+        ]
+        def order(key):
+            ranked, _ = plate_critic.rank_pool({"breakfast": list(pool)}, variety_key=key)
+            return [c.recipe_id for c in ranked["breakfast"]]
+
+        assert order("member-alice") == order("member-alice"), "not reproducible"
+        assert order("member-alice") != order("member-bob"), "same corpus, same order"
+        assert order("") == [c.recipe_id for c in pool], "no key, no reordering"
+
+    def test_the_tiebreak_never_outranks_a_real_signal(self):
+        """It separates candidates the critic considers EQUAL. A grade, a
+        curated source or a penalty must still decide."""
+        from services.plate_critic import CURATED_BONUS, NUTRI_BONUS, TIE_JITTER
+
+        assert TIE_JITTER < min(
+            abs(NUTRI_BONUS["A"] - NUTRI_BONUS["B"]), CURATED_BONUS,
+        )

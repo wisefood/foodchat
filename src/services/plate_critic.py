@@ -39,6 +39,7 @@ quality opinion into "no meals exist".
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from dataclasses import dataclass, field
@@ -104,6 +105,37 @@ ARTICLE_TITLE_PENALTY = 2.5
 # curation beats a grade, and does not rescue a dish that is wrong for the slot.
 CURATED_BONUS = 2.0
 
+# How far a stable per-member tiebreak may move a candidate.
+#
+# Smaller than one Nutri-Score step (0.75), so it can never reorder across a
+# grade, a curated source or a penalty — it only separates candidates this
+# module considers EQUAL, which RecipeWrangler's ranking then settles by
+# recipe id, identically for everybody.
+#
+# That identical settling is the report: "i see recipes fetched in order across
+# plans, i havent seen diverse breakfast recipes". The corpus is read top-down
+# by every member of every session, so the same handful of breakfasts leads the
+# pool forever. A per-member offset would fix that by paging deeper, and paging
+# deeper walks past the curated recipes this same session asked to see MORE of.
+# Varying the order WITHIN a quality tier costs nothing and keeps the tier.
+TIE_JITTER = 0.25
+
+
+def _tiebreak(key: str, recipe_id: str) -> float:
+    """A stable number in [-1, 1) from a member key and a recipe.
+
+    `hashlib`, not `hash()`: Python randomises string hashing per process, so
+    the same member would get a different plan from each pod — and a member who
+    regenerates must get the same plan, or they cannot tell a regeneration from
+    a bug.
+    """
+    if not key:
+        return 0.0
+    digest = hashlib.blake2b(
+        f"{key}:{recipe_id}".encode(), digest_size=4,
+    ).digest()
+    return (int.from_bytes(digest, "big") / 0xFFFFFFFF) * 2 - 1
+
 
 @dataclass
 class Verdict:
@@ -136,6 +168,7 @@ def critique(
     candidate,
     *,
     kcal_share: Optional[float] = None,
+    variety_key: str = "",
 ) -> Verdict:
     """Score one candidate for one slot. Never raises.
 
@@ -177,6 +210,11 @@ def critique(
     # curated recipe that is wrong for the slot is still wrong for the slot.
     if _is_curated(getattr(candidate, "source", None)):
         verdict.score += CURATED_BONUS
+
+    if variety_key:
+        verdict.score += TIE_JITTER * _tiebreak(
+            variety_key, str(getattr(candidate, "recipe_id", "") or ""),
+        )
 
     return verdict
 
@@ -235,6 +273,7 @@ def rank_pool(
     candidates: dict,
     *,
     kcal_target: Optional[float] = None,
+    variety_key: str = "",
 ) -> tuple[dict, list[str]]:
     """Reorder every slot's pool, and say what was wrong with the old head.
 
@@ -242,14 +281,21 @@ def rank_pool(
     demoted — which is exactly what a member is owed when the plan is served
     unranked, because then this ordering IS the reasoning.
     """
-    slots = tuple(candidates)
+    slots = tuple(
+        k[0] if isinstance(k, tuple) else k for k in candidates
+    )
     ranked: dict = {}
     findings: list[str] = []
-    for slot, pool in candidates.items():
+    for key, pool in candidates.items():
+        # Role pools are keyed `(slot, role)`; a plain pool by slot.
+        slot = key[0] if isinstance(key, tuple) else key
         share = (kcal_target * slot_share(slot, slots)) if kcal_target else None
-        verdicts = [critique(slot, c, kcal_share=share) for c in (pool or [])]
+        verdicts = [
+            critique(slot, c, kcal_share=share, variety_key=variety_key)
+            for c in (pool or [])
+        ]
         ordered = sorted(verdicts, key=lambda v: -v.score)
-        ranked[slot] = [v.candidate for v in ordered]
+        ranked[key] = [v.candidate for v in ordered]
         if ordered and verdicts and ordered[0] is not verdicts[0]:
             findings.extend(f"{slot}: {f}" for f in verdicts[0].findings[:1])
     return ranked, findings

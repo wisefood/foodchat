@@ -562,6 +562,13 @@ class ProfileService:
         nothing else — `resolve_scope` falls back to the deployment default,
         which is exactly what happened for every member before this.
         """
+        # Who this profile belongs to. Read by `plate_critic` as the stable
+        # key for its tiebreak, so two members do not walk the same corpus
+        # ranking top-down and see the same breakfasts forever.
+        member_id = str(getattr(member, "id", "") or getattr(member, "member_id", "") or "")
+        if member_id:
+            profile["member_id"] = member_id
+
         age_group = str(getattr(member, "age_group", "") or "").strip().lower()
         if age_group:
             profile["age_group"] = age_group
