@@ -125,7 +125,7 @@ class ScriptedWriter:
 
 def make_scorer(judge=None):
     judge = judge if judge is not None else FakeJudge()
-    return PastedPlanScorer(judge=judge, guidelines=lambda scope: f"{scope} rules"), judge
+    return PastedPlanScorer(judge=judge, guidelines=lambda scope, profile=None: f"{scope} rules"), judge
 
 
 def dish(day, slot, title, state=UNRESOLVED, rid=None, ingredients="", source=None,

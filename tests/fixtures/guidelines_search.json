@@ -1,0 +1,284 @@
+{
+ "help": "http://demo.wisefood-project.eu/api/v1/guidelines/search",
+ "success": true,
+ "result": {
+  "results": [
+   {
+    "id": "f217537b-f7af-45e1-a9ec-c541ea3acdd9",
+    "guide_urn": "urn:guide:pyramid_20260317222125",
+    "guide_region": "IE",
+    "title": "Have 2 servings a day of meat, poultry, fish, eggs, beans and nuts.",
+    "rule_text": "Have 2 servings a day of meat, poultry, fish, eggs, beans and nuts.",
+    "sequence_no": 21,
+    "action_type": "do",
+    "target_populations": [
+     "general_population"
+    ],
+    "frequency": "daily",
+    "quantity": null,
+    "food_groups": [
+     "protein_foods"
+    ],
+    "life_stage": [],
+    "health_conditions": [],
+    "nutrients": [
+     "protein"
+    ],
+    "guideline_type": "food_based",
+    "topic": [
+     "protein"
+    ],
+    "applicable_regions": [],
+    "status": "active",
+    "review_status": "verified"
+   },
+   {
+    "id": "2ad047af-2ee9-4c58-b30c-fcfdb0f6f8f0",
+    "guide_urn": "urn:guide:pyramid_20260317222125",
+    "guide_region": "IE",
+    "title": "Limit foods and drinks high in fat, sugar and salt to a maximum of once or twice a week.",
+    "rule_text": "Limit foods and drinks high in fat, sugar and salt to a maximum of once or twice a week.",
+    "sequence_no": 25,
+    "action_type": "limit",
+    "target_populations": [
+     "general_population"
+    ],
+    "frequency": "weekly",
+    "quantity": null,
+    "food_groups": [
+     "fats_and_oils",
+     "sugars_and_sweets",
+     "salt"
+    ],
+    "life_stage": [],
+    "health_conditions": [],
+    "nutrients": [
+     "fat",
+     "sugar",
+     "salt"
+    ],
+    "guideline_type": "behavioral",
+    "topic": [
+     "diet",
+     "moderation"
+    ],
+    "applicable_regions": [],
+    "status": "active",
+    "review_status": "verified"
+   },
+   {
+    "id": "602f72b6-d2c7-4517-8191-b8bd4419cd79",
+    "guide_urn": "urn:guide:meat-shelf-irish-food-pyramid-20260320103505424",
+    "guide_region": "IE",
+    "title": "Offer oily fish such as mackerel, herring, salmon, trout or sardines once a week.",
+    "rule_text": "Offer oily fish such as mackerel, herring, salmon, trout or sardines once a week.",
+    "sequence_no": 202,
+    "action_type": "eat",
+    "target_populations": [
+     "general_population"
+    ],
+    "frequency": "weekly",
+    "quantity": null,
+    "food_groups": [
+     "protein_foods"
+    ],
+    "life_stage": [],
+    "health_conditions": [],
+    "nutrients": [
+     "omega_3_fatty_acids"
+    ],
+    "guideline_type": "food_based",
+    "topic": [
+     "fish",
+     "omega3",
+     "protein"
+    ],
+    "applicable_regions": [],
+    "status": "active",
+    "review_status": "verified"
+   },
+   {
+    "id": "bbb212f1-f196-463f-9a53-63eaba30063c",
+    "guide_urn": "urn:guide:meat-shelf-irish-food-pyramid-20260320103505424",
+    "guide_region": "IE",
+    "title": "Offer red meat such as beef, lamb and pork 3 times a week.",
+    "rule_text": "Offer red meat such as beef, lamb and pork 3 times a week.",
+    "sequence_no": 201,
+    "action_type": "eat",
+    "target_populations": [
+     "general_population"
+    ],
+    "frequency": "weekly",
+    "quantity": null,
+    "food_groups": [
+     "protein_foods"
+    ],
+    "life_stage": [],
+    "health_conditions": [],
+    "nutrients": [],
+    "guideline_type": "food_based",
+    "topic": [
+     "red_meat",
+     "protein",
+     "meat"
+    ],
+    "applicable_regions": [],
+    "status": "active",
+    "review_status": "verified"
+   },
+   {
+    "id": "2994c699-05bd-4974-94d0-1de06f5dac87",
+    "guide_urn": "urn:guide:meat-shelf-irish-food-pyramid-20260320103505424",
+    "guide_region": "IE",
+    "title": "Limit processed meat such as ham or bacon to once a week and only give small amounts.",
+    "rule_text": "Limit processed meat such as ham or bacon to once a week and only give small amounts.",
+    "sequence_no": 208,
+    "action_type": "eat",
+    "target_populations": [
+     "general_population"
+    ],
+    "frequency": "weekly",
+    "quantity": null,
+    "food_groups": [
+     "protein_foods"
+    ],
+    "life_stage": [],
+    "health_conditions": [],
+    "nutrients": [],
+    "guideline_type": "food_based",
+    "topic": [
+     "processed_meat",
+     "moderation"
+    ],
+    "applicable_regions": [],
+    "status": "active",
+    "review_status": "verified"
+   },
+   {
+    "id": "090c6a29-0209-49b9-ab1a-df711fe9c0f4",
+    "guide_urn": "urn:guide:okostanyer-diet-plate-20260407095500812",
+    "guide_region": "HU",
+    "title": "Include at least 1 meat-free day each week.",
+    "rule_text": "Include at least 1 meat-free day each week.",
+    "sequence_no": 683,
+    "action_type": "eat",
+    "target_populations": [
+     "general_population"
+    ],
+    "frequency": "weekly",
+    "quantity": null,
+    "food_groups": [
+     "protein_foods"
+    ],
+    "life_stage": [],
+    "health_conditions": [],
+    "nutrients": [],
+    "guideline_type": "food_based",
+    "topic": [
+     "meat",
+     "protein"
+    ],
+    "applicable_regions": [],
+    "status": "active",
+    "review_status": "verified"
+   },
+   {
+    "id": "c16908fc-b669-4c6f-a426-6e820c31f6eb",
+    "guide_urn": "urn:guide:okostanyer-diet-plate-20260407095500812",
+    "guide_region": "HU",
+    "title": "Eat fish at least once a week.",
+    "rule_text": "Eat fish at least once a week.",
+    "sequence_no": 688,
+    "action_type": "eat",
+    "target_populations": [
+     "general_population"
+    ],
+    "frequency": "weekly",
+    "quantity": null,
+    "food_groups": [
+     "protein_foods"
+    ],
+    "life_stage": [],
+    "health_conditions": [],
+    "nutrients": [],
+    "guideline_type": "food_based",
+    "topic": [
+     "fish",
+     "omega3"
+    ],
+    "applicable_regions": [],
+    "status": "active",
+    "review_status": "verified"
+   },
+   {
+    "id": "9f31c6e3-c843-4296-a214-f716c2096af2",
+    "guide_urn": "urn:guide:okostanyer-diet-plate-20260407095500812",
+    "guide_region": "HU",
+    "title": "Have sweets or desserts no more than twice a week and with meals.",
+    "rule_text": "Have sweets or desserts no more than twice a week and with meals.",
+    "sequence_no": 700,
+    "action_type": "eat",
+    "target_populations": [
+     "general_population"
+    ],
+    "frequency": "weekly",
+    "quantity": null,
+    "food_groups": [
+     "sugars_and_sweets"
+    ],
+    "life_stage": [],
+    "health_conditions": [],
+    "nutrients": [
+     "sugar"
+    ],
+    "guideline_type": "behavioral",
+    "topic": [
+     "sweets",
+     "desserts",
+     "frequency"
+    ],
+    "applicable_regions": [],
+    "status": "active",
+    "review_status": "verified"
+   },
+   {
+    "id": "d26eb466-ff1f-4d5a-ae1e-62ab129d76ce",
+    "guide_urn": "urn:guide:dietary-recommendations-for-the-adult-population-of-hungary-20260409083706215",
+    "guide_region": "HU",
+    "title": "Eat sea fish regularly, at least once a week.",
+    "rule_text": "Eat sea fish regularly, at least once a week.",
+    "sequence_no": 669,
+    "action_type": "eat",
+    "target_populations": [
+     "adults"
+    ],
+    "frequency": "weekly",
+    "quantity": null,
+    "food_groups": [
+     "protein_foods"
+    ],
+    "life_stage": [
+     "adulthood"
+    ],
+    "health_conditions": [],
+    "nutrients": [
+     "omega3"
+    ],
+    "guideline_type": "food_based",
+    "topic": [
+     "fish",
+     "omega3",
+     "seafood"
+    ],
+    "applicable_regions": [],
+    "status": "active",
+    "review_status": "verified"
+   }
+  ],
+  "total": 9,
+  "facets": {
+   "guide_region": []
+  },
+  "max_result_window": 50000
+ }
+}

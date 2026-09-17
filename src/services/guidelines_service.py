@@ -1,66 +1,107 @@
 """
-Real dietary guidelines, for the member's own region and life stage.
+Dietary guidelines for a plan: which rules, the text the judges read, and the
+weekly checklist rows a counter can honestly fill.
 
-FoodChat grades plans against dietary guidelines and has never read one. The
-checklist it reports — eat fish 1–2 times a week, limit red meat, make most
-meals plant-based — is three rules hardcoded in the weekly explainability
-module. They are real guidance. They are also the same three rules for a
-member in Ireland, Slovenia, Hungary or Greece, and the same three for a
-pregnant member, a teenager and a 70-year-old.
+    resolve_scope(profile, plan_type, override)  → GuidelineScope
+    fetch(profile, plan_type, override)          → [rule dict] from the catalog
+    guidelines_text(plan_type, profile, override)→ numbered rules for a judge
+    split(rules)                                 → (checkable, prose)
+    checklist(checkable, category_counts, total) → {rule, target, actual, met}
 
-The catalog holds ~2,700 rules across 31 guides, faceted by exactly the things
-that would make them different for those people.
+**Which rules.** The deployment default — Ireland, adults
+(`GUIDELINES_DEFAULT_REGION`, `DEFAULT_LIFE_STAGE`) — for every member today:
+the profile carries no region or age group yet. `resolve_scope` reads
+``region`` / ``age_group`` (or ``life_stage``) from the profile when they
+appear, so supplying them later is a profile change, not a change here. A
+caller that wants another country, one guide, or a hand-picked subset of rules
+passes an ``override`` scope. Rules tagged for nobody in particular are
+ordinary rules for everyone, including the untagged ones that were plainly
+written for children ("Offer red meat 3 times a week").
 
-**Most of them cannot be checked, and this module says so.** Measured over a
-1,334-rule sample: 6.4% are food-group frequencies a plan can be counted
-against, 3% are nutrient thresholds, and 73.4% are prose — "choose wholegrain
-varieties where possible" is advice, not an assertion with a truth value. So
-the rules are split:
+**The judges get all of them** (`guidelines_text`): a numbered list the LLM can
+cite, capped so a prompt stays inside the on-demand token budget.
 
-    checkable   → the `{rule, target, actual, met}` checklist that already
-                  exists, now built from the member's own guidance
-    prose       → context handed to the grader, which can weigh advice a
-                  counter cannot
+**The checklist gets very few.** Most rules cannot be counted from a plan —
+"choose wholegrain varieties where possible" is advice, not an assertion with a
+truth value. A rule becomes a checklist row only when it is food-based, names a
+meal category the weekly planner actually counts (fish, red meat, poultry), and
+states a weekly floor, ceiling or range. In the default Irish adult set no rule
+does, so the checklist keeps its three built-in rules there. Everything else is prose. Inventing a target for a
+prose rule — or counting "vegetables" against a category counter that never
+counts vegetables — would render a number with nothing behind it as if it were
+a measurement.
 
-Inventing a target for a prose rule so it can appear in the checklist would be
-the same mistake the constraint ledger made: a number with nothing behind it,
-rendered as if it were a measurement.
-
-Everything degrades to the hardcoded three. A catalog that is unreachable, or
-simply not configured, costs the plan its regional detail and nothing else.
+Everything degrades. A catalog that is unreachable, or simply not configured,
+yields ``[]`` / ``""``; the weekly checklist falls back to its hardcoded three
+rules and the judges say they had no guideline text.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import re
 from typing import Optional
 
+from models.guidelines import LIFE_STAGES, GuidelineScope
+
 logger = logging.getLogger(__name__)
 
-# The catalog's own classifier for what KIND of rule this is. `action_type` is
-# a verb classifier ("eat", "drink", "limit") and says nothing about whether a
-# plan can be counted against the rule; `guideline_type` is the closest thing
-# the schema has to a checkability signal.
+DEFAULT_REGION = (os.getenv("GUIDELINES_DEFAULT_REGION") or "IE").strip().upper()
+DEFAULT_LIFE_STAGE = "adulthood"
+
+REGION_NAMES = {"IE": "Ireland", "HU": "Hungary", "SI": "Slovenia"}
+_STAGE_LABELS = {
+    "infancy": "infants", "early_childhood": "young children",
+    "school_age": "school-age children", "adolescence": "adolescents",
+    "adulthood": "adults", "older_adulthood": "older adults",
+    "pregnancy": "pregnancy", "lactation": "breastfeeding",
+}
+_REGION_ALIASES = {
+    "ireland": "IE", "irl": "IE", "eire": "IE", "éire": "IE",
+    "hungary": "HU", "hun": "HU", "magyarország": "HU",
+    "slovenia": "SI", "svn": "SI", "slovenija": "SI",
+}
+
+# The gateway's AgeGroupEnum, onto the catalog's life stages.
+_AGE_GROUP_STAGE = {
+    "baby": "infancy",
+    "child": "school_age",
+    "teen": "adolescence",
+    "young_adult": "adulthood",
+    "adult": "adulthood",
+    "middle_aged": "adulthood",
+    "senior": "older_adulthood",
+}
+
+# What the judge is handed. The whole default set fits (Ireland, adults: 81
+# rules, ~6k characters, ~1.5k tokens); a larger one — Hungary is 162 — is cut
+# to its most checkable rules.
+MAX_RULES = 90
+MAX_CHARS = 7000
+
+# The catalog's classifier for what KIND of rule this is. `action_type` is
+# "eat" on 2,765 of 2,790 rules and says nothing.
 CHECKABLE_TYPES = frozenset({"food_based"})
 
-# Food groups a weekly plan can actually count, mapped onto the category names
-# the weekly planner tracks. A rule about a group not in here is prose as far
-# as this module is concerned, whatever its type says.
-COUNTABLE_GROUPS: dict[str, str] = {
+# The categories `weekly_planner.day_summary.classify_meal` assigns — the ONLY
+# things a weekly checklist can count. `topic` (free-form, from enrichment) is
+# read first; `food_groups` is a coarse enum ("protein_foods" is fish AND meat)
+# and cannot name a category. "processed meat" is not here: every red-meat
+# meal would be counted against a processed-meat limit.
+TOPIC_CATEGORIES: dict[str, str] = {
+    "fish": "fish",
+    "oily_fish": "fish",
+    "seafood": "fish",
+    "red_meat": "red meat",
+    "poultry": "poultry",
+}
+TEXT_CATEGORIES: dict[str, str] = {
+    "oily fish": "fish",
     "fish": "fish",
     "seafood": "fish",
-    "oily fish": "fish",
     "red meat": "red meat",
-    "processed meat": "red meat",
-    "meat": "red meat",
-    "vegetables": "vegetables",
-    "fruit": "fruit",
-    "fruit and vegetables": "vegetables",
-    "legumes": "legumes",
-    "pulses": "legumes",
-    "wholegrains": "wholegrains",
-    "dairy": "dairy",
+    "poultry": "poultry",
 }
 
 # "twice a week", "2-3 times per week", "at least 5 a day", and — because
@@ -82,97 +123,192 @@ _WORD_NUMBERS = {
 }
 
 
-def facets_for(profile: dict, brief=None) -> dict[str, list[str]]:
-    """Which guidelines apply to this member.
+# ── which rules ───────────────────────────────────────────────────────────
 
-    Derived from what the profile actually holds. A facet nobody can fill is
-    left out rather than guessed: asking the catalog for `life_stage:adult`
-    because most members are adults would silently exclude the rules that exist
-    precisely for the members who are not.
+def resolve_scope(
+    profile: Optional[dict] = None,
+    plan_type: Optional[str] = None,
+    override: Optional[GuidelineScope] = None,
+) -> GuidelineScope:
+    """The scope a plan is judged in.
+
+    ``override`` wins outright (its own plan type is kept if it set one).
+    Otherwise the member's region and life stage when the profile carries
+    them, and the deployment default for whichever it does not.
     """
+    plan_type = plan_type if plan_type in ("daily", "weekly") else None
+    if override is not None:
+        if override.plan_type is None and plan_type:
+            return override.model_copy(update={"plan_type": plan_type})
+        return override
+
     profile = profile or {}
-    facets: dict[str, list[str]] = {}
-
-    region = (
-        profile.get("region")
-        or profile.get("country")
-        or profile.get("household_country")
+    return GuidelineScope(
+        regions=(region_code(profile.get("region")) or DEFAULT_REGION,),
+        life_stage=life_stage_of(profile) or DEFAULT_LIFE_STAGE,
+        plan_type=plan_type,
     )
-    if region:
-        facets["region"] = [str(region).strip().lower()]
-
-    life_stage = _life_stage(profile)
-    if life_stage:
-        facets["life_stage"] = [life_stage]
-
-    conditions = [
-        str(c).strip().lower()
-        for c in (profile.get("health_conditions") or profile.get("conditions") or [])
-        if c
-    ]
-    if conditions:
-        facets["health_conditions"] = conditions
-
-    # Only the food groups the plan is actually shaped around — asking for
-    # every group returns the whole corpus and tells the grader nothing.
-    if brief is not None and getattr(brief, "food_groups", None):
-        facets["food_groups"] = list(brief.food_groups)
-
-    return facets
 
 
-def _life_stage(profile: dict) -> Optional[str]:
-    """The catalog's life-stage bucket, from an age group if one is recorded."""
-    raw = str(
-        profile.get("life_stage") or profile.get("age_group") or ""
-    ).strip().lower()
-    if not raw:
+def region_code(raw) -> Optional[str]:
+    """An ISO alpha-2 code for a region the catalog has, or None.
+
+    ``household.region`` on the gateway is free text. A value that is not a
+    catalog country is None (and the caller uses the default) — never a guess.
+    """
+    text = str(raw or "").strip()
+    if not text:
         return None
-    if raw in {"infant", "toddler", "child", "children", "teen", "adolescent",
-               "adult", "older_adult", "elderly", "pregnancy", "lactation"}:
-        return raw
-    # The picker's own vocabulary, mapped rather than passed through: sending
-    # "65+" to a facet that stores "older_adult" matches nothing, and matching
-    # nothing here looks identical to "this member has no special guidance".
-    if raw in {"65+", "over 65", "senior", "seniors"}:
-        return "older_adult"
-    if raw in {"13-18", "teenager", "teenagers"}:
-        return "teen"
-    if raw in {"0-2", "0-3"}:
-        return "toddler"
-    if raw in {"4-12", "kids"}:
-        return "child"
-    if raw in {"19-64", "18-64"}:
-        return "adult"
-    return None
+    if text.upper() in REGION_NAMES:
+        return text.upper()
+    code = _REGION_ALIASES.get(text.lower())
+    if code is None:
+        logger.info("No guidelines for region %r; using the default.", text)
+    return code
 
 
-def fetch(profile: dict, brief=None, limit: int = 40) -> list[dict]:
-    """The guidelines that apply here. `[]` when the catalog cannot answer."""
+def life_stage_of(profile: dict) -> Optional[str]:
+    stage = str(profile.get("life_stage") or "").strip().lower()
+    if stage in LIFE_STAGES:
+        return stage
+    return _AGE_GROUP_STAGE.get(str(profile.get("age_group") or "").strip().lower())
+
+
+def fetch(
+    profile: Optional[dict] = None,
+    plan_type: Optional[str] = None,
+    override: Optional[GuidelineScope] = None,
+) -> list[dict]:
+    """The rules that apply here, as dicts. `[]` when the catalog cannot answer."""
     from backend.catalog import CATALOG
 
     if not CATALOG.available():
         return []
-    facets = facets_for(profile, brief)
-    rules = CATALOG.search_guidelines(facets, limit=limit)
-    # A region with no rules of its own is common — most of the corpus is
-    # Ireland. Falling back to the unfiltered set beats reporting that a member
-    # in Slovenia has no dietary guidance at all.
-    if not rules and "region" in facets:
-        narrower = {k: v for k, v in facets.items() if k != "region"}
-        rules = CATALOG.search_guidelines(narrower, limit=limit)
-        if rules:
-            logger.info("No region-specific guidelines; using the general set.")
-    return rules
+    scope = resolve_scope(profile, plan_type, override)
+    return [rule.model_dump() for rule in CATALOG.search(scope)]
 
+
+# ── the judges' text ──────────────────────────────────────────────────────
+
+def guidelines_text(
+    plan_type: str = "daily",
+    profile: Optional[dict] = None,
+    override: Optional[GuidelineScope] = None,
+) -> str:
+    """Numbered guideline rules for an LLM judge; ``""`` when there are none.
+
+    Never raises: a plan's scores are not worth a failed turn.
+    """
+    try:
+        scope = resolve_scope(profile, plan_type, override)
+        return render(fetch(profile, plan_type, override), scope)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Guideline text unavailable: %s", exc)
+        return ""
+
+
+def render(rules: list[dict], scope: Optional[GuidelineScope] = None) -> str:
+    """The rules as a judge reads them.
+
+    ::
+
+        Dietary guidelines: Ireland, adults — 81 of 81 rules (WiseFood catalogue).
+        Sources: Healthy food for life full guide; Fsai healthy eating guidelines.
+        Cite rules by id. ...
+        [G1] (weekly) Offer oily fish such as mackerel, ... once a week.
+
+    Stable ids so a reasoning line can point at a rule. Ordered so the cap cuts
+    the least checkable rules first: food-based before nutrient-based before
+    untyped before behavioural, and rules with a stated frequency first.
+    """
+    rules = [r for r in rules or [] if _rule_text(r)]
+    if not rules:
+        return ""
+
+    ordered = sorted(rules, key=_judge_priority)
+    kept: list[dict] = []
+    chars = 0
+    for rule in ordered:
+        text = _rule_text(rule)
+        if len(kept) >= MAX_RULES or chars + len(text) > MAX_CHARS:
+            break
+        kept.append(rule)
+        chars += len(text)
+
+    lines = [
+        f"Dietary guidelines: {_scope_label(scope, rules)} — "
+        f"{len(kept)} of {len(rules)} rules (WiseFood catalogue).",
+    ]
+    sources = list(dict.fromkeys(_source(r) for r in kept if _source(r)))
+    if sources:
+        lines.append("Sources: " + "; ".join(sources[:6]) + ".")
+    lines.append(
+        "Cite rules by id. A rule a meal plan cannot show — portion measuring, "
+        "mealtime behaviour, advice addressed to parents — is context, not a failure."
+    )
+    for n, rule in enumerate(kept, start=1):
+        frequency = rule.get("frequency")
+        tag = f"({frequency}) " if frequency else ""
+        lines.append(f"[G{n}] {tag}{_rule_text(rule)}")
+    return "\n".join(lines)
+
+
+_TYPE_RANK = {"food_based": 0, "nutrient_based": 1, None: 2, "behavioral": 3}
+
+
+def _judge_priority(rule: dict):
+    return (
+        _TYPE_RANK.get(rule.get("guideline_type"), 2),
+        0 if rule.get("frequency") else 1,
+    )
+
+
+def _scope_label(scope: Optional[GuidelineScope], rules: list[dict]) -> str:
+    if scope is not None and scope.rule_ids:
+        return "a selected subset"
+    regions = list(scope.regions) if scope and scope.regions else sorted(
+        {r.get("guide_region") for r in rules if r.get("guide_region")}
+    )
+    where = ", ".join(REGION_NAMES.get(code, code) for code in regions) or "all regions"
+    stage = scope.life_stage if scope else None
+    return f"{where}, {_STAGE_LABELS.get(stage, stage)}" if stage else where
+
+
+def _source(rule: dict) -> str:
+    """A readable guide name from its URN.
+
+    ``urn:guide:healthy-food-for-life-full-guide-20260330134146569`` →
+    "Healthy food for life full guide". The row carries no guide title, and a
+    lookup per guide to fetch one would be a request per plan for a label.
+    """
+    urn = str(rule.get("guide_urn") or "")
+    slug = urn.rsplit(":", 1)[-1]
+    slug = re.sub(r"[-_]?\d{8,}$", "", slug)
+    words = re.sub(r"[-_]+", " ", slug).strip()
+    return words[:1].upper() + words[1:] if words else ""
+
+
+def _rule_text(rule: dict) -> str:
+    return str(rule.get("rule_text") or rule.get("title") or "").strip()
+
+
+# ── the checklist ─────────────────────────────────────────────────────────
 
 def split(rules: list[dict]) -> tuple[list[dict], list[dict]]:
     """(checkable, prose).
 
-    Checkable means: the catalog calls it food-based, it names a food group
-    this plan can count, and it states a frequency. All three, because a rule
-    missing any one of them cannot produce an honest `actual` — and a checklist
-    row whose `actual` is a guess is worse than no row.
+    Checkable means: the catalog calls it food-based, it names one meal
+    category the weekly planner counts, and it states a weekly bound — a floor
+    ("at least once"), a ceiling ("limit to 3", "no more than 2") or a range
+    ("1-2 times"). All of them, because a rule missing any one cannot produce
+    an honest `met` — and a checklist row whose verdict is a guess is worse
+    than no row.
+
+    A bare count is not a bound. "Offer oily fish once a week" does not say
+    that two fish dinners break it, and "Offer red meat 3 times a week" does
+    not say that one red-meat dinner does; checked as exact targets, both
+    would report a sound week as failing. Those rules stay prose, where the
+    judge can weigh them.
     """
     checkable: list[dict] = []
     prose: list[dict] = []
@@ -192,7 +328,11 @@ def _as_frequency(rule: dict) -> Optional[dict]:
         return None
 
     bound = _quantity_bound(rule) or _parse_frequency(_rule_text(rule))
-    if not bound:
+    # Category counts are per plan, and a plan is a week. "Fish twice a day"
+    # checked against a weekly count would be met by two fish dinners.
+    if not bound or bound["period"] != "week":
+        return None
+    if bound["direction"] == "about" and bound.get("low") == bound.get("high"):
         return None
 
     return {
@@ -202,36 +342,38 @@ def _as_frequency(rule: dict) -> Optional[dict]:
         "low": bound.get("low"),
         "high": bound.get("high"),
         "direction": bound["direction"],
-        "source": rule.get("guide_title") or rule.get("guide_urn") or "",
-        "urn": rule.get("urn") or rule.get("id") or "",
+        "source": _source(rule),
+        "urn": rule.get("id") or rule.get("guide_urn") or "",
     }
 
 
-def _rule_text(rule: dict) -> str:
-    return str(rule.get("rule_text") or rule.get("title") or "").strip()
-
-
 def _countable_category(rule: dict) -> Optional[str]:
-    for group in rule.get("food_groups") or []:
-        category = COUNTABLE_GROUPS.get(str(group).strip().lower())
-        if category:
-            return category
-    # Some rules name the food only in their text.
+    topics = {
+        TOPIC_CATEGORIES[str(t).strip().lower()]
+        for t in rule.get("topic") or []
+        if str(t).strip().lower() in TOPIC_CATEGORIES
+    }
+    if len(topics) == 1:
+        return topics.pop()
+    if topics:
+        return None
+
+    # Some rules name the food only in their text. Exactly one category, or
+    # none: "2 servings a day of meat, poultry, fish, eggs" is not a fish rule.
     text = _rule_text(rule).lower()
-    for group, category in COUNTABLE_GROUPS.items():
-        if re.search(rf"\b{re.escape(group)}\b", text):
-            return category
-    return None
+    found = set()
+    for phrase, category in TEXT_CATEGORIES.items():
+        if re.search(rf"\b{re.escape(phrase)}\b", text):
+            found.add(category)
+    return found.pop() if len(found) == 1 else None
 
 
 def _quantity_bound(rule: dict) -> Optional[dict]:
     """The catalog's own structured quantity, when it has one.
 
-    `quantity` is a documented `{operator, value, unit, period}` triple with a
-    full mapping — and, at the time of writing, nothing populates it: the write
-    path exists and the producer does not. Read first anyway, because the day
-    an import fills it, this is the accurate source and the regex below stops
-    being the only one.
+    `quantity` is a documented `{operator, value, unit, period}` object and is
+    empty on every rule today. Read first anyway: the day an import fills it,
+    it is the accurate source and the regex below stops being the only one.
     """
     quantity = rule.get("quantity")
     if not isinstance(quantity, dict):
@@ -244,9 +386,9 @@ def _quantity_bound(rule: dict) -> Optional[dict]:
     if period not in {"day", "week"}:
         return None
     operator = str(quantity.get("operator") or "").strip().lower()
-    if operator in {"<=", "lt", "lte", "max", "at_most"}:
+    if operator in {"lt", "lte"}:
         return {"direction": "at most", "high": value, "period": period}
-    if operator in {">=", "gt", "gte", "min", "at_least"}:
+    if operator in {"gt", "gte"}:
         return {"direction": "at least", "low": value, "period": period}
     return {"direction": "about", "low": value, "high": value, "period": period}
 
@@ -258,10 +400,10 @@ def _parse_frequency(text: str) -> Optional[dict]:
     lowered = text.lower()
 
     for word, number in _WORD_NUMBERS.items():
-        match = re.search(rf"\b{word}\b\s+(?:a|per)\s+(week|day)", lowered)
+        match = re.search(rf"\b{word}\b\s+(?:a|per|each)\s+(week|day)", lowered)
         if match:
-            return {"direction": "about", "low": number, "high": number,
-                    "period": match.group(1)}
+            return _bounded(_direction_before(lowered[:match.start()]),
+                            number, number, match.group(1))
 
     match = _FREQUENCY_RE.search(lowered)
     if not match:
@@ -269,20 +411,39 @@ def _parse_frequency(text: str) -> Optional[dict]:
     low = float(match.group("low"))
     high = float(match.group("high")) if match.group("high") else None
     qualifier = (match.group("qualifier") or "").strip()
-    period = match.group("period")
-
     if qualifier in {"at most", "no more than", "up to", "under"}:
-        return {"direction": "at most", "high": low, "period": period}
-    if qualifier in {"at least", "over"}:
-        return {"direction": "at least", "low": low, "period": period}
-    return {"direction": "about", "low": low, "high": high or low, "period": period}
+        direction = "at most"
+    elif qualifier in {"at least", "over"}:
+        direction = "at least"
+    else:
+        direction = _direction_before(lowered[:match.start()])
+    return _bounded(direction, low, high or low, match.group("period"))
+
+
+def _direction_before(before: str) -> str:
+    """The words ahead of the count: "at least once" is a floor, "limit red
+    meat to once" a ceiling, anything else a target."""
+    if re.search(r"\bat least\s*$", before):
+        return "at least"
+    if re.search(r"\b(?:at most|no more than|up to|maximum of)\s*$", before):
+        return "at most"
+    if re.search(r"\blimit\b", before):
+        return "at most"
+    return "about"
+
+
+def _bounded(direction: str, low: float, high: float, period: str) -> dict:
+    if direction == "at most":
+        return {"direction": direction, "high": high, "period": period}
+    if direction == "at least":
+        return {"direction": direction, "low": low, "period": period}
+    return {"direction": direction, "low": low, "high": high, "period": period}
 
 
 def checklist(rules: list[dict], category_counts: dict, total_meals: int) -> list[dict]:
     """The `{rule, target, actual, met}` rows, from real guidance.
 
-    Same shape the UI already renders and the weekly metrics already carry —
-    the receiver was right all along, it was just being fed three constants.
+    Same shape the UI already renders and the weekly metrics already carry.
     """
     out: list[dict] = []
     for parsed in rules:
@@ -317,28 +478,11 @@ def _n(value) -> str:
     return str(int(value)) if float(value).is_integer() else str(value)
 
 
-def prose_context(rules: list[dict], limit: int = 8) -> str:
-    """The advice a counter cannot check, for the grader that can weigh it.
-
-    Capped: a grader handed 400 lines of guidance is a grader that reads the
-    first few and pads the rest of its answer, which is worse than being handed
-    the few that matter.
-    """
-    lines: list[str] = []
-    for rule in rules[:limit]:
-        text = _rule_text(rule)
-        if not text:
-            continue
-        source = rule.get("guide_title") or ""
-        lines.append(f"- {text}" + (f" ({source})" if source else ""))
-    return "\n".join(lines)
-
-
 def reason_chips(plate_ingredients: str, rules: list[dict]) -> list[dict]:
     """`{kind: "guideline"}` chips for a plate that satisfies a countable rule.
 
-    `guideline` has been a documented reason kind — declared in the shared
-    contract, rendered by the UI with its own icon — that nothing ever emitted.
+    `guideline` is a documented reason kind — declared in the shared contract,
+    rendered by the UI with its own icon.
     """
     text = (plate_ingredients or "").lower()
     chips: list[dict] = []
@@ -358,3 +502,4 @@ def reason_chips(plate_ingredients: str, rules: list[dict]) -> list[dict]:
                 "label": f"{category} — {parsed['rule'][:60]}",
             })
     return chips
+

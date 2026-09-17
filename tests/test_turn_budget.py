@@ -237,12 +237,12 @@ class TestSheddingExecuted:
         called: list = []
         monkeypatch.setattr(
             ChatService, "_compute_metrics",
-            lambda self, sid, plan: called.append(True) or {"llm_score": 9},
+            lambda self, sid, plan, profile, plan_type="daily": called.append(True) or {"llm_score": 9},
         )
         with turn_budget.start(1):
             metrics = (
                 {} if turn_budget.skip("quality metrics", turn_budget.COST_METRICS)
-                else service._compute_metrics("s", None)
+                else service._compute_metrics("s", None, {})
             )
         assert metrics == {} and not called
 

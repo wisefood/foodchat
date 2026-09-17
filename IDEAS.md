@@ -317,8 +317,8 @@ finished plan the way parts of the daily metrics do.
 - Four quality metrics (`chat_service._compute_metrics`,
   `chat_service.py:360-385`): `llm_score`/`llm_reasoning` from the grader,
   `fvs_count` (deterministic unique-ingredient count), LLM diversity
-  score, LLM guideline-adherence score (graded against
-  `belgium_dietary_guidelines_augmentation.cypher` when present).
+  score, LLM guideline-adherence score (graded against the WiseFood data
+  catalog's rules — see "Guideline adherence from the WiseFood data catalog").
 - `services/transparency.py` (pure functions, no LLM/IO): per-course
   `match_reasons` chips (kinds: pinned | favorite | memory | profile |
   feedback | diner | guideline), plan-level `constraints_applied` ledger
@@ -385,7 +385,7 @@ explanations can diverge from actual causes (e.g. random tiebreaks).
   ("9 vegetarian, 3 fish, 2 red meat, …") — zero cost, arguably the most
   user-meaningful weekly variety statement.
 - **Deterministic guideline checks:** food-based dietary guidelines
-  (including the Belgian set the daily grader uses) are largely WEEKLY
+  are largely WEEKLY
   frequency rules — "fish 1-2×/week", "limit red meat per week". A day
   can barely be graded against those; a week genuinely can, and the
   frequency-type rules are checkable straight from the category counts,
@@ -940,17 +940,13 @@ Two of these shape the design:
 
 ## Guidelines: out of scope here
 
-The daily adherence judge reads `chat_service.GUIDELINES_PATH`, which
-points at a file that is not in the repo, so it scores with an empty
-guidelines text today. That is left as it is. The working assumption is
-that guideline text will come from an external endpoint later, so the
-scorer reads it through one function, `plan_scoring.guidelines_text(scope)`
-with `scope` in `{"daily", "weekly"}`, which for now returns the file read
-(or `""`) for both scopes. When the endpoint exists, that function is the
-only thing that changes. The two scopes are separate from day one because
-the weekly judge is meant to be given frequency rules (fish twice a week,
-red meat at most three times) that make no sense for a single day, and the
-daily judge the per-day ones.
+The scorer reads guideline text through one function,
+`plan_scoring.guidelines_text(scope)`, with `scope` in `{"daily", "weekly"}`,
+so the source can change without touching the scorer. The two scopes are
+separate because the weekly judge is given frequency rules (fish twice a
+week, red meat at most three times) that make no sense for a single day.
+That source is now the WiseFood data catalog (see "Guideline adherence from
+the WiseFood data catalog").
 
 ## The shape of the feature
 
@@ -1342,3 +1338,112 @@ in the intent table and the `/score-plan` entry next to `/compose`.
    card; `CHANGES.md` entry; `CHAT_ENDPOINT_PIPELINE.md`.
 7. Follow-ups, not in this cut: "adopt this plan" onto a canvas; attach the
    weekly judges to generated weeks.
+
+
+# Guideline adherence from the WiseFood data catalog
+
+**Status (2026-09-17): the core is built** (CHANGES.md, "Guideline adherence
+reads the WiseFood data catalog"). Every guideline-adherence judge (daily
+plan, N-day and weekly plan, pasted plan) now receives the active catalog
+rules as a numbered list, and the weekly checklist counts the few catalog
+rules a meal-category count can check. What is below is the reference for
+the API, what was decided, and what is left.
+
+Before this, every adherence score was the model grading against its own
+idea of healthy eating: the daily and weekly quality calls passed no
+guideline text, and the scorer's text came back empty. The existing catalog
+client matched nothing (`region:(ireland)`, `life_stage:adult`, and it parsed
+the SDK's `Response` object as if it were the payload).
+
+## Decided
+
+- **Active rules only** (`status:active`, 526 of 2,790).
+- **Everyone is an Irish adult for now.** `GUIDELINES_DEFAULT_REGION=IE`,
+  life stage `adulthood`. The profile carries no region or age group today.
+  `guidelines_service.resolve_scope` already reads `region` (ISO code or
+  country name) and `age_group` / `life_stage` when the profile carries them.
+- **Untagged children's rules are ordinary rules.** "Offer red meat such as
+  beef, lamb and pork 3 times a week" has no life-stage tag, so it applies to
+  adults, and the judges are given it.
+- **A bare count is not a checklist row.** "Offer oily fish once a week" does
+  not say that two fish dinners break it. Only floors, ceilings and ranges
+  are counted, so the Irish adult set keeps the three built-in rows.
+
+## The API, as it actually is (probed live 2026-09-17)
+
+Swagger: `https://demo.wisefood-project.eu/dc/docs`, spec at
+`/dc/openapi.json` ("WiseFood Data API" 0.0.1). Re-download it rather than trusting
+this table if anything drifts.
+
+| Fact | Detail |
+|---|---|
+| Base | `https://demo.wisefood-project.eu/dc/api/v1`. The SDK appends `/api/v1` itself, so `DATA_API_URL=https://demo.wisefood-project.eu/dc`. Not proxied by the `/rest` gateway (its spec only has `foodscholar/guidelines/*` ingestion routes). |
+| Auth | Bearer required (401 without). The demo *user* token from `.wisefood_demo_token` works. **Not verified:** a client-credentials token from `WISEFOOD_CLIENT_ID/SECRET`, which is what `CatalogClient` uses. |
+| Envelope | `{help, success, result}`; search `result` = `{results, total, facets, max_result_window}`. `_results_of` already handles it. |
+| `POST /guidelines/search` | Body `SearchSchema`: `q`, `limit` (≤1000), `offset`, `fq[]`, `sort`, `fields[]` (facets), highlight. `fq` is Solr/ES-ish: `field:value`, `field:(A OR B)`, `-field:(...)` and `-field:*` all work. |
+| `POST /guidelines/by-guide/{guide_urn}/search` | Same body, scoped to one guide. `GET /guidelines/by-guide/{urn}?limit&offset` returns the bare list. |
+| `GET /guides`, `POST /guides/search` | 31 guides. Guide carries `region` (ISO alpha-2, upper), `language`, `status`, `title`. |
+| Known breakage | `fl` (field list) → **500**. `q` works. Facets cannot be switched off: omitting `fields` or sending `fields: []` returns every facet (~14 KB per call), so always send one cheap field, e.g. `["guide_region"]`. |
+| Corpus | 2,790 guidelines: IE 1,757 · HU 541 · SI 492. No other country. Rule text is in English for all three regions. |
+| Status | `status`: draft 2,264 / active 526. `review_status`: unreviewed 2,264 / verified 526 (the same rows). |
+| Region | Denormalised onto each guideline as `guide_region`. `applicable_regions` is empty on all 2,790 rows. |
+| Life stage | `life_stage` ∈ infancy, early_childhood, school_age, adolescence, adulthood, older_adulthood, pregnancy, lactation. Many rows have none (general). Also `target_populations` ∈ general_population, adults, elderly, under_5_years, ages_5_to_18, infants, pregnant_people, lactating_people; and `age_min_months/age_max_months`. |
+| Frequency | `frequency` ∈ daily 383, per_meal 137, weekly 100, occasional 18, monthly 2 (rest null). **This is the daily/weekly scope split, for free.** |
+| Quantity | `quantity {operator, value, unit, period}` is populated on **0** rows. The regex in `guidelines_service` stays the only source of numbers. |
+| Food groups | `food_groups` is a coarse enum (protein_foods, grains, vegetables, fruits, dairy, fats_and_oils, beverages, salt, sugars_and_sweets, mixed). Fish and meat are both `protein_foods`. The free-form `topic` is finer: `fish`, `oily_fish`, `red_meat`, `processed_meat`, `meat`, `fruit`, `vegetables`, ... |
+| Type | `guideline_type`: food_based 1,287, behavioral 736, nutrient_based 250, activity 69. `action_type` is "eat" on 2,765 rows and carries no information. |
+| Quality | AI-enriched fields (`ai_generated_fields`, `enrichment_confidence`). There are near-duplicates ("Eat fish, particularly sea fish, at least once a week" / "Eat sea fish regularly, at least once a week"), and children's rules leak into the untagged set ("Offer red meat such as beef, lamb and pork 3 times a week" has no life stage). |
+
+Sizes that matter for prompt budgets, active rules with the child,
+pregnancy and elderly stages and populations excluded: **IE 82, HU 171,
+SI 37**. IE weekly adult rules: 6, one of which is about physical activity.
+
+Default set: **Ireland, adults, active: 81 rules (77 without the weekly
+ones), about 6k characters.** It is sent whole. Hungary's 162 are cut to the
+most checkable 90.
+
+## What was built
+
+| Piece | Where |
+|---|---|
+| `GuidelineScope`: regions, life stage, plan type, guide URNs, rule ids. The one place `fq` strings are built. | `models/guidelines.py` |
+| `CatalogClient.search(scope) -> list[Guideline]`: paged, deduplicated, cached per scope, `[]` on any failure. Same credentials as member profiles. | `backend/catalog.py` |
+| `resolve_scope`, `fetch`, `guidelines_text`, `render` (`[G1]…` ids, capped, food-based first) | `services/guidelines_service.py` |
+| Checklist: only fish / red meat / poultry (the categories `classify_meal` counts) with a *weekly* floor, ceiling or range. Topic first, then text naming exactly one category. | `guidelines_service.split` |
+| A failed catalog request starts a 30 s backoff (not cached as "no rules"). | `backend/catalog.py` |
+| Judges wired: `ChatService._compute_metrics(…, profile, plan_type)`, weekly `plan_quality.metrics(…, guidelines=…)`, `PastedPlanScorer` passes the profile. | chat, weekly, scorer |
+
+Prompts were not changed. The rendered text carries its own header ("Cite
+rules by id. A rule a meal plan cannot show … is context, not a failure").
+The pinned planner-prompt hashes stand, and Langfuse needs no new prompt
+names.
+
+## Left to do
+
+1. **Verify client credentials against `/dc`.** It works with
+   username/password (the local `.env`). Deployments with
+   `WISEFOOD_CLIENT_ID/SECRET` use `/system/mtm` on the data API, which has
+   not been tried.
+2. **Region and age group into the profile.** `household.region` (free
+   text) and the member's `age_group` are on the gateway but not in
+   `_map_profile`. Once they are mapped in as `region` / `age_group`, scope
+   resolution picks them up with no other change.
+3. **Switching country / subset from outside.** Every function takes
+   `override: GuidelineScope`. Still to build: persisting it on the session
+   (`sessions.guideline_scope`, replica-safe like `clarification_state`), a
+   field on `/plan-parameters`, a regions endpoint from the `/guides/search`
+   region facet, then gateway + UI and `CHAT_ENDPOINT_PIPELINE.md`.
+4. **Say what a score was judged against.** Add
+   `metrics.guideline_source {regions, rule_count, rule_ids}` so a score
+   against zero rules is visibly one. It is additive, but it touches the
+   `MealPlan` model, persistence and the router.
+5. **The pasted-plan checklist** still uses the three built-in rules
+   (`scoring._weekly_measured` calls `guideline_checklist` without a
+   profile), because `scale_checklist` recognises them by their wording.
+6. **Per-rule verdicts.** Switch the adherence judge to structured output,
+   `[{rule_id, verdict, why}]`, giving daily plans a checklist too. In the
+   live run the judge still counted "fluid intake not addressed" as a
+   breach despite the header, so the wording alone is not enough.
+7. **Enrichment quality** is the catalog's, not ours: near-duplicate
+   wordings survive exact-text dedupe, and some rules sit on the wrong
+   frequency.

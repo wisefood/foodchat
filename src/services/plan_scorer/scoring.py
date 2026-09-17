@@ -705,7 +705,7 @@ class PastedPlanScorer:
     def __init__(
         self,
         judge=None,
-        guidelines: Callable[[str], str] = guidelines_text,
+        guidelines: Callable[[str, dict], str] = guidelines_text,
     ):
         if judge is None:
             from agents import PlanJudge
@@ -740,7 +740,7 @@ class PastedPlanScorer:
 
         inputs = judge_inputs(
             profile, violations, judge_text, weekly, days, context,
-            self.guidelines("weekly" if weekly else "daily"), facts,
+            self.guidelines("weekly" if weekly else "daily", profile), facts,
         )
         try:
             payload = retrying(lambda: self.judge.judge(**inputs))()

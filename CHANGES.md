@@ -2,6 +2,75 @@
 
 ---
 
+# Guideline adherence reads the WiseFood data catalog
+
+> **Date:** 2026-09-17
+> **Branch:** main
+> No API change. `guideline_adherence_score` / `_reasoning` are now judged
+> against real rules, and weekly `metrics.guideline_checklist` rows can come
+> from the catalog. New env var `GUIDELINES_DEFAULT_REGION` (default `IE`);
+> `DATA_API_URL` now takes the data API's root (demo:
+> `https://demo.wisefood-project.eu/dc`).
+
+Every guideline-adherence judge graded against nothing: the daily and weekly
+quality calls passed no guideline text, and the scorer's came back empty. The
+catalog client written for this matched nothing in the real catalog, and it
+read the SDK's `Response` object as the payload, so it returned `[]` on every
+call. Probed against the live demo first (plan and API facts: IDEAS.md,
+"Guideline adherence from the WiseFood data catalog").
+
+| What | Detail |
+|---|---|
+| `models/guidelines.py` (new) | `GuidelineScope`: regions, life stage, plan type, guide URNs, rule ids. It is the one place filter strings are built, in the syntax verified live: `guide_region:(IE)`, `life_stage:(adulthood) OR (*:* -life_stage:*)` (the shorter `OR -life_stage:*` matches nothing), quoted URNs, `status:active`, no activity rules, and no weekly or monthly rules for a single day. A `rule_ids` scope ignores every other facet. `Guideline`: the typed row. |
+| `backend/catalog.py` | `search(scope) -> list[Guideline]` replaces `search_guidelines(filters)`. Reads `.json()`, pages to `total`, dedupes identical wordings, caches per scope. A failure is not cached: it starts a 30 s backoff, so a catalog that is down does not cost every plan turn a timeout. Never sends `fl` (500 on the API). Always sends one facet field, because facets cannot be turned off. Logs in with `backend.platform.credentials_from_env`, the same identity as member profiles; username/password now works, where it previously required client credentials. |
+| `backend/platform.py` | `credentials_from_env()` hoisted out of `WiseFoodPool._get_credentials`. Behaviour unchanged. |
+| `services/guidelines_service.py` | `resolve_scope(profile, plan_type, override)` defaults to Ireland/adults and reads `region` and `age_group` / `life_stage` from the profile once it carries them. `guidelines_text` → `render`: numbered `[G1]…` rules under a header naming the scope and guides, food-based rules first, capped at 90 rules / 7,000 characters (the Irish adult set, 77–81 rules, fits whole), `""` on any failure. `facets_for` and `prose_context` are gone. |
+| Weekly checklist rows | `split` keeps only rules a meal-category count can check: fish, red meat or poultry (what `classify_meal` counts), read from `topic` or from text naming exactly one of them, with a weekly floor ("at least once"), ceiling ("limit to 3", "no more than 2") or range ("1-2 times"). A bare count is not a bound: "Offer oily fish once a week" would fail a week with two fish dinners, and "Offer red meat 3 times a week" a week with one. Those rules stay prose for the judge, so the Irish adult set yields no rows and the checklist keeps its three built-in rules, as members see today. Before, "vegetables" and "fruit" rules would have been counted against categories nobody counts and reported `actual: 0`. Structured-quantity operators follow the catalog enum (`lt/lte/gt/gte/eq/approx`). "Limit red meat to 3 times a week" reads as a ceiling. |
+| `services/plan_scoring.py` | `guidelines_text` is `guidelines_service.guidelines_text`. The local guideline file path and its read are removed. |
+| `ChatService._compute_metrics(session_id, plan, profile, plan_type="daily")` | Passes the member's daily rules. The structured path passes `"weekly"` for a plan of more than one day. |
+| `weekly_plan_service` | Weekly `plan_quality.metrics` gets the weekly rules. |
+| `PastedPlanScorer` | `guidelines(plan_type, profile)`: the pasted plan is judged against the member's rules. |
+| `weekly_planner/explainability.guideline_checklist` | Asks for the weekly scope. The three built-in rules remain the fallback. |
+| Prompts | Unchanged. The rendered text says to cite rule ids and that a rule a plan cannot show is not a failure. Pinned hashes and Langfuse prompt names stand. |
+| `.env.example`, `CHAT_ENDPOINT_PIPELINE.md` | Data API section rewritten; the guideline-text lines now name the catalog. |
+
+## Verification
+
+`tests/test_guidelines.py` was rewritten (75 tests). The old tests passed
+with filters that matched nothing, because their rows were hand-written.
+Parsing now runs against a recorded, trimmed demo response
+(`tests/fixtures/guidelines_search.json`, 9 IE/HU rules), and the scope's
+filter strings are pinned exactly as the live API accepted them. The tests
+also cover: paging, dedupe, the failure backoff, an unconfigured
+catalog asking nobody, the render header / order / cap, the daily and N-day
+metrics receiving the right rules, checklist rows from the real rules, and
+the Irish set leaving the built-in checklist in place. The two tests that stub
+`_compute_metrics` follow its new signature.
+Full suite: 2,220 passed, 1 skipped, 1 failed — `test_platform_client`, as on
+main (the installed client does not take `telemetry`). Ruff clean on the
+touched files.
+
+**Live** (demo data API, `.env` username/password): Ireland/adults returns 77
+daily and 81 weekly rules; Hungary 162; a two-id subset 2; Slovenia for a
+`senior` profile 34. One
+`GuidelineAdherenceGrader` call on a fry-up / ham baguette / burger day with
+the Irish daily text (6,985 characters, 77 rules) scored it 1 and cited rules
+G5–G76 by id.
+
+**Live, through the app** (local demo harness; the `telemetry` SDK mismatch
+shimmed in a throwaway launcher): `/score-plan` for a 3-day plan fetched the
+81 weekly Irish rules; the judge scored adherence 3 and cited G11, and the
+checklist kept its three built-in rows (all met). A fry-up day fetched the 77
+daily rules and scored 1, citing G6. Plan generation could not be exercised:
+the untracked demo harness fails on `plan_meals(tags=…)` before any
+generation step, including the metrics.
+
+Not done: client-credential login against `/dc`, region and age group in
+the profile, a way to switch scope from outside, and per-rule verdicts
+(IDEAS.md, "Left to do").
+
+---
+
 # Plan scorer: merged with three weeks of planning
 
 > **Date:** 2026-09-17

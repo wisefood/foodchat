@@ -156,7 +156,7 @@ class TestExecutedEndToEnd:
         service = ChatService.__new__(ChatService)
         monkeypatch.setattr(
             ChatService, "_compute_metrics",
-            lambda self, sid, plan: {
+            lambda self, sid, plan, profile, plan_type="daily": {
                 "llm_score": 0, "llm_reasoning": "",
                 "fvs_count": 11, "fvs_reasoning": "eleven items",
                 "diversity_llm_score": 4, "diversity_llm_reasoning": "varied",
@@ -165,7 +165,9 @@ class TestExecutedEndToEnd:
         )
         plan = _two_days()
         with turn_budget.start(300):
-            metrics = service._compute_metrics("s", scored_plan_from(plan))
+            metrics = service._compute_metrics(
+                "s", scored_plan_from(plan), {}, plan_type="weekly",
+            )
             for key, value in metrics.items():
                 if key not in ("llm_score", "llm_reasoning"):
                     setattr(plan, key, value)

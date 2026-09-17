@@ -153,7 +153,10 @@ correctly after a process restart or on a different replica.
   |      llm_score / llm_reasoning            (from grading)
   |      fvs_count / fvs_reasoning            (unique-ingredient count, no LLM)
   |      diversity_llm_score / _reasoning     (MealDiversityGrader)
-  |      guideline_adherence_score / _reason  (GuidelineAdherenceGrader)
+  |      guideline_adherence_score / _reason  (GuidelineAdherenceGrader, given
+  |        guidelines_service.guidelines_text("daily", profile): the numbered
+  |        catalog rules a single day can show; "" when the catalog is
+  |        unset or unreachable)
   |
   +--> store:
   |      is_refinement -> session_service.refine_meal_plan  (version+1, parent_id)
@@ -325,8 +328,10 @@ POST /sessions/{id}/score-plan                 chat message classified (or
   |      fit shares PLAN_SCORING_RUBRIC with the planner's grader and is
   |        capped in code: allergen -> 1 (even with no judge), broken diet
   |        -> 2; the reasoning names the dish
-  |      guideline text = plan_scoring.guidelines_text(scope): "" today (the
-  |        file is absent), an external endpoint later
+  |      guideline text = plan_scoring.guidelines_text(scope, profile): the
+  |        member's rules from the WiseFood data catalog
+  |        (guidelines_service; Ireland/adults until the profile carries a
+  |        region and age group), "" when the catalog cannot answer
   |
   +--> 5. reply: ResponseWriter over facts (scores, broken constraints, dishes
   |       not found, close matches) with a deterministic fallback; then
@@ -469,7 +474,10 @@ POST /sessions/{id}/score-plan                 chat message classified (or
   |      have nutrition data, so a coverage gap never reads as an underfed
   |      week; a reported kcal of 0 is missing data, not a free meal), personalization counts,
   |      weekly metrics (variety + category distribution, deterministic
-  |      guideline frequency checklist, nutrition trackers with coverage,
+  |      guideline frequency checklist (catalog rules a meal-category count
+  |      can check -- fish / red meat / poultry with a weekly floor, ceiling
+  |      or range -- else
+  |      the three built-in rules), nutrition trackers with coverage,
   |      per-day breakdown) and the whole-week justification prose
   +--> pantry_service.annotate_weekly_entries (after explainability, so its
   |      chips are appended to, not overwritten): per-entry pantry badges,
