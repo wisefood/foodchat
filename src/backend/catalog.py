@@ -103,9 +103,6 @@ class CatalogClient:
 
             from backend.platform import credentials_from_env
 
-            # The platform talking to itself, not a user — as in
-            # `backend.platform`. With username/password credentials the SDK
-            # would otherwise report every guideline lookup as member usage.
             cls._client = Client(
                 DATA_API_URL, credentials_from_env(),
                 default_timeout=DATA_API_TIMEOUT,
