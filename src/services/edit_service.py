@@ -266,6 +266,35 @@ _STRUCTURAL_WORDS = frozenset({
 })
 
 
+def _names_a_cuisine(directive: str) -> bool:
+    """Whether the directive is a CUISINE rather than a dish.
+
+    "Greek breakfast?" asked for a Greek-style breakfast and got Greek chicken —
+    a main course, served as breakfast. The named-dish search runs with no
+    course-type filter, deliberately: a member asking for apple pie at breakfast
+    has decided pie is breakfast food and the taxonomy should not argue.
+
+    A cuisine is not that. It describes a STYLE, and every slot has one, so
+    overriding the slot's courses for it is how a title search lands on the
+    first Greek thing in the corpus whatever meal it belongs to. Falling through
+    to the slot's own candidates keeps breakfast a breakfast.
+
+    Read from RecipeWrangler's live vocabulary rather than a list kept here, so
+    a cuisine the corpus gains is understood without a deploy. Unreachable
+    returns False, which is exactly the behaviour this replaces.
+    """
+    word = (directive or "").strip().lower()
+    if not word:
+        return False
+    try:
+        from services.candidates_client import CANDIDATES
+
+        cuisines, _ingredients = CANDIDATES.split_cuisines([word])
+    except Exception:  # noqa: BLE001 — the vocabulary is best-effort everywhere
+        return False
+    return bool(cuisines)
+
+
 def _names_a_dish(directive: str) -> bool:
     """Whether an unverified directive reads as a dish name.
 
@@ -440,7 +469,11 @@ class EditService:
         # the slot's course taxonomy: someone asking for pie at breakfast has
         # already decided pie is breakfast food. Hard constraints still hold —
         # the name search runs with the member's allergens, diet and dislikes.
-        if predicate.kind == "unverified" and _names_a_dish(predicate.directive):
+        if (
+            predicate.kind == "unverified"
+            and _names_a_dish(predicate.directive)
+            and not _names_a_cuisine(predicate.directive)
+        ):
             named = self._resolve_named_dish(predicate.directive, profile, exclude_ids)
             if named is not None:
                 enrichment = self.client.fetch_details([old_recipe_id, named.recipe_id])

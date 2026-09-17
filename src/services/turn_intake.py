@@ -179,6 +179,32 @@ def intake(session_id: str, message: str, *,
     # "drop the snack and add a dessert" is one sentence and two changes.
     shaped, removed = shape_intent.removals(message, grown)
     changed_shape = added + removed
+
+    # "Add a snack BEFORE MY LUNCH" is one request, and the second half used to
+    # reach nothing: the router skips its reorder branch whenever the shape
+    # grew, on the reasoning that an addition mentioning an order is still an
+    # addition. It is — and the order is still part of what was asked for, so
+    # it is applied to the shape the addition just produced, where it costs
+    # nothing and lands in the same re-plan.
+    from services import plan_navigation
+
+    move = plan_navigation.reorder_request(message)
+    if move is not None:
+        slot, where, anchor = move
+        moved = shaped.reorder(slot, **{where: anchor})
+        if moved is not shaped:
+            shaped = moved
+            changed_shape.append(f"moved {slot} {where} {anchor}")
+
+    # How many days, read deterministically. The LLM extractor may abstain, and
+    # on a REFINEMENT `plan_horizon` deliberately leaves the days alone — so
+    # "switch to daily from three days plan" said one day, nothing read it as a
+    # number, and the three-day plan came back three days long.
+    days = shape_intent.horizon(message)
+    if days is not None and days != shaped.num_days:
+        shaped = shaped.with_days(days)
+        changed_shape.append(f"{days} day(s)")
+
     _SHAPE.set(changed_shape)
 
     for delta in deltas:

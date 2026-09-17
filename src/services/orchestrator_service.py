@@ -471,11 +471,45 @@ class OrchestratorService:
         and chicken noodle soup for dinner" is how a plan arrives in a chat
         box. The request-verb guard is what keeps "adding salmon for dinner"
         out of it.
+
+        And the dishes have to BE dishes. "Greek for lunch, lighter for
+        breakfast" parses identically — two slots, two titles — and is a member
+        asking for two changes. It came back scored: 2/5 for guidelines, with a
+        note that the day lacks a dinner. They asked for a swap and got a report
+        card.
+
+        The discriminator is not prose versus structure, because a plan written
+        in prose is still a plan. It is that "greek" and "lighter" are single
+        words describing HOW, while "fried eggs" and "chicken noodle soup" name
+        WHAT. A prose listing whose every dish is one word is a request; the
+        written-out form is exempt, because "breakfast: eggs" is a real line in
+        a real plan.
         """
+        if not cls._lists_meals(message):
+            return False
+        return not cls._is_prose_of_single_words(message or "")
+
+    @classmethod
+    def _lists_meals(cls, message: str) -> bool:
+        """Two slots with dishes, and no verb asking FoodChat to do something."""
         text = message or ""
         if cls._PLAN_REQUEST_RE.search(text):
             return False
         return looks_like_plan_listing(text, structured_only=False)
+
+    @staticmethod
+    def _is_prose_of_single_words(text: str) -> bool:
+        """A prose-only listing in which no dish title is more than one word."""
+        from services.plan_scorer.parsing import scan
+
+        try:
+            result = scan(text)
+        except Exception:  # noqa: BLE001 — the parser is the scorer's, not ours
+            return False
+        if not result.used_prose or result.structured_meals:
+            return False
+        titles = [str(getattr(meal, "title", "") or "") for meal in result.plan.meals]
+        return bool(titles) and all(len(title.split()) < 2 for title in titles)
 
     @classmethod
     def is_explicit_score_request(cls, message: str) -> bool:
@@ -489,7 +523,12 @@ class OrchestratorService:
         text = message or ""
         if cls._SCHOLAR_CONSULT_RE.search(text) or not cls._SCORE_REQUEST_RE.search(text):
             return False
-        return cls.looks_like_a_pasted_plan(text)
+        # The listing check WITHOUT the single-word guard. That guard exists to
+        # separate a plan from a request when nothing else can, and "rate this"
+        # already did: a member who says it has told us which one this is, even
+        # if their dishes are one word each ("rate this: oats for breakfast,
+        # soup for lunch").
+        return cls._lists_meals(text)
 
     def _compose_scholar_question(self, session, message: str) -> str:
         """The question FoodScholar should answer for an explicit consult.
@@ -578,6 +617,7 @@ class OrchestratorService:
             # budget) and its default is "chat". A message listing meals in
             # two slots is not small talk, and answering it as such is how a
             # pasted plan came back as chatter on a rate-limited key.
+
             logger.warning(
                 "[%s] Classification unavailable — the message lists meals, scoring it.", session_id,
             )

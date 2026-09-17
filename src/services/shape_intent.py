@@ -233,6 +233,61 @@ def _mentioned_as_removal(text: str, word: str) -> bool:
     return bool(re.search(pattern, text, re.IGNORECASE))
 
 
+# "switch to daily", "make it one day", "just today", "three days", "a week".
+#
+# Deterministic, because the LLM shape extractor is allowed to abstain and
+# routinely does on a REFINEMENT — "switch to daily from three days plan" is a
+# sentence about the plan already on screen, and `plan_horizon` deliberately
+# leaves a refinement's days alone. So the member asked for one day, nothing
+# read it as a number, and the three-day plan came back three days long.
+_DAY_WORDS = {
+    "one": 1, "a": 1, "single": 1, "two": 2, "three": 3, "four": 4,
+    "five": 5, "six": 6, "seven": 7,
+}
+# The count has to be ASKED FOR, not merely mentioned. "I have three days of
+# leftovers" is a fact about a fridge, and the first version of this read it as
+# a three-day plan — the exact false positive the docstring below warns about,
+# committed in the same breath as the warning.
+_N_DAYS = re.compile(
+    r"(?:^(?:for\s+)?|\b(?:plan|planning|make|make it|give me|do|want|need|"
+    r"switch to|just|only|create)\s+(?:me\s+|it\s+|for\s+)?(?:a\s+)?)"
+    r"(?P<n>\d|" + "|".join(_DAY_WORDS) + r")\s+days?\b",
+    re.IGNORECASE,
+)
+_ONE_DAY = re.compile(
+    r"\b(?:switch to|make it|just|only)\s+(?:a\s+)?(?:daily|one day|today|a day)\b"
+    r"|\bdaily (?:plan|instead)\b|\bjust (?:today|one day)\b",
+    re.IGNORECASE,
+)
+_A_WEEK = re.compile(
+    r"\b(?:switch to|make it|for)\s+(?:a\s+)?(?:weekly|week)\b|\bweekly plan\b",
+    re.IGNORECASE,
+)
+
+
+def horizon(message: str) -> Optional[int]:
+    """How many days the member just asked for, or None.
+
+    Narrow on purpose. "I have three days of leftovers" is not a plan horizon,
+    so the number has to be attached to the word `day` or be one of the few
+    phrasings that mean a horizon and nothing else.
+    """
+    text = (message or "").strip()
+    if not text:
+        return None
+    if _ONE_DAY.search(text):
+        return 1
+    match = _N_DAYS.search(text)
+    if match:
+        raw = match.group("n").lower()
+        days = int(raw) if raw.isdigit() else _DAY_WORDS.get(raw, 0)
+        if 1 <= days <= 7:
+            return days
+    if _A_WEEK.search(text):
+        return 7
+    return None
+
+
 # "my day doesn't have breakfast", "i don't have a lunch".
 #
 # A statement that the plan LACKS something is a request to add it — it is what

@@ -109,3 +109,117 @@ class TestAStructuralPhraseIsNotADish:
     ])
     def test_a_real_dish_still_is_one(self, phrase):
         assert _names_a_dish(phrase) is True, phrase
+
+
+class TestOneSentenceCanDoTwoThings:
+    """"Add a snack before my lunch on all days" is one request and the second
+    half reached nothing: the router skips its reorder branch whenever the shape
+    grew — an addition that mentions an order is still an addition — and nothing
+    else applied the order. The snack was added and landed after lunch, by the
+    eating-order rule it was explicitly asked to break."""
+
+    def test_the_addition_and_the_order_both_land(self):
+        from services import plan_navigation, shape_intent
+
+        spec = PlanSpec(num_days=3, meals=("breakfast", "lunch", "dinner"))
+        grown, added = shape_intent.additions("add a snack before my lunch on all days", spec)
+        assert added == ["added snack"]
+        assert grown.meals == ("breakfast", "lunch", "snack", "dinner"), (
+            "precondition: eating order puts a snack after lunch"
+        )
+
+        move = plan_navigation.reorder_request("add a snack before my lunch on all days")
+        moved = grown.reorder(move[0], **{move[1]: move[2]})
+
+        assert moved.meals == ("breakfast", "snack", "lunch", "dinner")
+
+
+class TestHowManyDays:
+    """"Switch to daily from three days plan" said one day, and the three-day
+    plan came back three days long: the LLM extractor may abstain, and on a
+    REFINEMENT `plan_horizon` deliberately leaves the days alone."""
+
+    @pytest.mark.parametrize("message,days", [
+        ("switch to daily from three days plan", 1),
+        ("switch to daily", 1),
+        ("just one day", 1),
+        ("make it one day", 1),
+        ("just today", 1),
+        ("plan me three days", 3),
+        ("plan for 5 days", 5),
+        ("for 5 days", 5),
+        ("three days please", 3),
+        ("make it 2 days", 2),
+        ("weekly plan", 7),
+    ])
+    def test_a_horizon_that_was_asked_for(self, message, days):
+        from services import shape_intent
+
+        assert shape_intent.horizon(message) == days
+
+    @pytest.mark.parametrize("message", [
+        "i have three days of leftovers",
+        "we ate the same thing for three days",
+        "the kids were off school for three days",
+        "add a snack",
+        "something lighter for lunch",
+    ])
+    def test_a_number_merely_mentioned_is_not_a_horizon(self, message):
+        """The first version of this read "i have three days of leftovers" as a
+        three-day plan — the exact false positive its own docstring warned
+        about, written in the same breath as the warning. A count has to be
+        ASKED for."""
+        from services import shape_intent
+
+        assert shape_intent.horizon(message) is None
+
+
+class TestACuisineIsNotADishName:
+    """Reported: "greek breakfast?" → "Done — I swapped the breakfast: Soy
+    banana bran muffins → Greek chicken", answered with "this is a main
+    dish....."
+
+    The named-dish search runs with NO course-type filter, on purpose: someone
+    asking for apple pie at breakfast has decided pie is breakfast food. A
+    cuisine is not that — it describes a style, every slot has one, and letting
+    it override the slot's courses lands a title search on the first Greek thing
+    in the corpus whatever meal it belongs to.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _vocabulary(self, monkeypatch):
+        """The live vocabulary, pinned — offline it is unreachable and the
+        function then answers False, which is the old behaviour."""
+        from services.candidates_client import CANDIDATES
+
+        known = {"greek", "italian", "thai", "mexican", "hungarian"}
+        monkeypatch.setattr(
+            CANDIDATES, "split_cuisines",
+            lambda likes: ([w for w in likes if w in known],
+                           [w for w in likes if w not in known]),
+        )
+
+    @pytest.mark.parametrize("word", ["greek", "Greek", " italian ", "thai"])
+    def test_a_cuisine_is_recognised(self, word):
+        from services.edit_service import _names_a_cuisine
+
+        assert _names_a_cuisine(word) is True
+
+    @pytest.mark.parametrize("word", [
+        "apple pie", "shakshuka", "something with feta", "lighter", "",
+    ])
+    def test_a_real_dish_or_directive_is_not(self, word):
+        from services.edit_service import _names_a_cuisine
+
+        assert _names_a_cuisine(word) is False
+
+    def test_the_search_branch_asks_both_questions(self):
+        """The named-dish search must be gated on BOTH, or the cuisine check
+        is a function nothing calls."""
+        import inspect
+
+        from services.edit_service import EditService
+
+        source = inspect.getsource(EditService._find_replacement)
+        assert "_names_a_cuisine(predicate.directive)" in source
+        assert "not _names_a_cuisine" in source

@@ -1114,3 +1114,55 @@ class TestScorePlanEndpoint:
         ]
         assert card.scored_plan.entries == []
         assert any("No lunch is listed" in w for w in card.warnings)
+
+
+class TestARequestIsNotAPlanToScore:
+    """Reported: "i asked for a swap i got a score."
+
+    "Greek for lunch, lighter for breakfast" parses exactly like a pasted plan —
+    two slots, two titles — and is a member asking for two changes. With the
+    classifier down it was scored: 2/5 for guidelines, with a note that the day
+    lacks a dinner.
+
+    The discriminator is not prose versus structure; a plan written in prose is
+    still a plan, which is what `TestClassifierOutage` above exists to protect.
+    It is that "greek" and "lighter" are single words describing HOW, while
+    "fried eggs" and "chicken noodle soup" name WHAT.
+    """
+
+    @pytest.mark.parametrize("message", [
+        "greek for lunch, lighter for breakfast",
+        "lighter for breakfast, quicker for dinner",
+        "vegetarian for lunch, italian for dinner",
+    ])
+    def test_directives_in_two_slots_are_not_a_plan(self, message):
+        from services.orchestrator_service import OrchestratorService
+
+        assert OrchestratorService.looks_like_a_pasted_plan(message) is False
+
+    @pytest.mark.parametrize("message", [
+        "fried eggs for breakfast, pasta with zucchini for lunch, soup for dinner",
+        "porridge with berries for breakfast and lentil soup for lunch",
+    ])
+    def test_a_prose_plan_is_still_a_plan(self, message):
+        from services.orchestrator_service import OrchestratorService
+
+        assert OrchestratorService.looks_like_a_pasted_plan(message) is True
+
+    def test_the_written_out_form_is_exempt(self):
+        """"breakfast: eggs" is a real line in a real plan, and every dish in
+        one can be a single word."""
+        from services.orchestrator_service import OrchestratorService
+
+        assert OrchestratorService.looks_like_a_pasted_plan(
+            "breakfast: eggs\nlunch: soup\ndinner: fish",
+        ) is True
+
+    def test_saying_rate_this_settles_it(self):
+        """The guard separates a plan from a request when nothing else can. A
+        member who says "rate this" has already told us which one it is."""
+        from services.orchestrator_service import OrchestratorService
+
+        assert OrchestratorService.is_explicit_score_request(
+            "rate this: greek for lunch, oats for breakfast",
+        ) is True
