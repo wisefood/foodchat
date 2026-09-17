@@ -233,6 +233,65 @@ def _mentioned_as_removal(text: str, word: str) -> bool:
     return bool(re.search(pattern, text, re.IGNORECASE))
 
 
+# "fruit for the snack", "i prefer some fruit for my snack", "veg at lunch".
+#
+# A taste scoped to ONE meal, which nothing could express: facets are
+# plan-wide, so "fruit" applied to the whole day or to nothing, and the member
+# who asked for fruit at the snack got a kumara and sun-dried tomato dip.
+#
+# Food groups only, not free text. They are a closed vocabulary RecipeWrangler
+# can actually filter a slot on; "something nice" is not, and pretending to
+# honour it is how a preference becomes a claim nobody measured.
+_FOOD_GROUPS = (
+    "vegetables", "vegetable", "veg", "fruit", "fruits", "grains", "grain",
+    "nuts_and_seeds", "nuts", "seeds", "dairy", "meat", "poultry", "chicken",
+    "fish", "seafood", "eggs", "egg", "legumes", "beans", "pulses",
+    "herbs_and_spices", "sugars",
+)
+# The corpus's own names for them. A member says "veg"; the index says
+# "vegetables", and a filter for a word the index does not carry matches
+# nothing at all.
+_FOOD_GROUP_CANON = {
+    "vegetable": "vegetables", "veg": "vegetables", "fruits": "fruit",
+    "grain": "grains", "nuts": "nuts_and_seeds", "seeds": "nuts_and_seeds",
+    "chicken": "poultry", "egg": "eggs", "beans": "legumes",
+    "pulses": "legumes",
+}
+_GROUP_FOR_SLOT = re.compile(
+    r"\b(?P<group>" + "|".join(_FOOD_GROUPS) + r")\b"
+    r"[^.!?]{0,24}?"
+    r"\b(?:for|at|with|in|as)\s+(?:the\s+|my\s+|a\s+)?"
+    r"(?P<slot>breakfast|brunch|lunch|dinner|snack|dessert|supper)\b",
+    re.IGNORECASE,
+)
+
+
+def slot_food_groups(message: str, spec) -> tuple:
+    """`(spec, notes)` — a food group the member wants at ONE meal.
+
+    Deliberately not a general "taste for this slot": a food group is a closed
+    vocabulary the planner can filter a single slot on, so what is heard is
+    what is applied. Anything looser would be recorded and then not honoured,
+    which is the failure this whole surface keeps producing.
+    """
+    text = (message or "").strip()
+    if not text:
+        return spec, []
+
+    result, notes = spec, []
+    for match in _GROUP_FOR_SLOT.finditer(text):
+        raw = match.group("group").lower()
+        slot = match.group("slot").lower()
+        group = _FOOD_GROUP_CANON.get(raw, raw)
+        before = result
+        result = result.with_food_groups(slot, [group])
+        if result is not before:
+            notes.append(f"{group} for {slot}")
+    if notes:
+        logger.info("Slot tastes: %s", "; ".join(notes))
+    return result, notes
+
+
 # "switch to daily", "make it one day", "just today", "three days", "a week".
 #
 # Deterministic, because the LLM shape extractor is allowed to abstain and

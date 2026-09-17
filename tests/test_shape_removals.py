@@ -223,3 +223,58 @@ class TestACuisineIsNotADishName:
         source = inspect.getsource(EditService._find_replacement)
         assert "_names_a_cuisine(predicate.directive)" in source
         assert "not _names_a_cuisine" in source
+
+
+class TestATasteForOneMeal:
+    """Reported: "i prefer some fruit for the snack" → a kumara and sun-dried
+    tomato dip.
+
+    Facets are plan-wide, so "fruit" applied to the whole day or to nothing —
+    and applying it to the whole day asks for a fruit dinner. Nothing could
+    express a taste scoped to one meal, so the request was heard and dropped.
+    """
+
+    SPEC = PlanSpec(meals=("breakfast", "lunch", "snack", "dinner"))
+
+    @pytest.mark.parametrize("message,slot,group", [
+        ("i prefer some fruit for the snack", "snack", "fruit"),
+        ("fruit for the snack", "snack", "fruit"),
+        ("more veg at lunch", "lunch", "vegetables"),
+        ("fish for dinner", "dinner", "fish"),
+        ("eggs for breakfast", "breakfast", "eggs"),
+    ])
+    def test_it_lands_on_that_meal_only(self, message, slot, group):
+        from services import shape_intent
+
+        spec, notes = shape_intent.slot_food_groups(message, self.SPEC)
+
+        assert notes == [f"{group} for {slot}"]
+        assert spec.slot_food_groups == {slot: (group,)}
+
+    def test_the_corpus_name_is_used_not_the_members(self):
+        """A filter for a word the index does not carry matches nothing at
+        all, so "veg" has to become "vegetables" before it is sent."""
+        from services import shape_intent
+
+        spec, _notes = shape_intent.slot_food_groups("veg for lunch", self.SPEC)
+        assert spec.slot_food_groups["lunch"] == ("vegetables",)
+
+    @pytest.mark.parametrize("message", [
+        "i had fruit earlier", "add a snack", "something lighter for lunch",
+    ])
+    def test_a_mention_is_not_a_request(self, message):
+        from services import shape_intent
+
+        spec, notes = shape_intent.slot_food_groups(message, self.SPEC)
+        assert notes == [] and spec is self.SPEC
+
+    def test_it_reaches_the_request_for_that_slot(self):
+        """The whole point: the plate the meal is built from carries it."""
+        spec = self.SPEC.with_food_groups("snack", ["fruit"])
+        entries = {e["slot"]: e for e in spec.to_request_slots()}
+
+        assert entries["snack"]["food_groups"] == ["fruit"]
+        assert "food_groups" not in entries["dinner"]
+
+    def test_a_meal_the_plan_does_not_have_is_ignored(self):
+        assert self.SPEC.with_food_groups("brunch", ["fruit"]) is self.SPEC

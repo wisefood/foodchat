@@ -135,6 +135,12 @@ class PlanSpec:
     meals: tuple[str, ...] = DEFAULT_MEALS
     # slot -> ordered roles. A slot absent from this map is a single `main`.
     plates: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    # slot -> food groups that slot should carry ("fruit for the snack").
+    #
+    # Per slot because the plan-level facet cannot express it: applying `fruit`
+    # to the whole plan asks for a fruit dinner too, so a member who wanted
+    # fruit at the snack got a kumara and sun-dried tomato dip instead.
+    slot_food_groups: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
     @property
     def is_default(self) -> bool:
@@ -267,6 +273,24 @@ class PlanSpec:
         else:
             plates[name] = remaining
         return replace(self, plates=plates)
+
+    def with_food_groups(self, slot: str, groups) -> "PlanSpec":
+        """This shape, with `slot` asking for these food groups as well."""
+        name = str(slot or "").strip().lower()
+        wanted = tuple(
+            dict.fromkeys(
+                str(g).strip().lower() for g in (groups or []) if str(g).strip()
+            )
+        )
+        if not name or not wanted or name not in self.meals:
+            return self
+        existing = self.slot_food_groups.get(name, ())
+        merged = tuple(dict.fromkeys((*existing, *wanted)))
+        if merged == existing:
+            return self
+        return replace(
+            self, slot_food_groups={**self.slot_food_groups, name: merged},
+        )
 
     def with_days(self, num_days: int) -> "PlanSpec":
         """This shape over a different number of days. Meals and plates stay.
@@ -402,13 +426,18 @@ class PlanSpec:
             roles = self.roles_for(slot)
             wanted = depth if (len(roles) > 1 or not only_multiplate) else 1
             for role in roles:
-                out.append(
-                    {
-                        "slot": slot,
-                        "count": wanted,
-                        "course_types": list(request_course_types(role)),
-                    }
-                )
+                entry = {
+                    "slot": slot,
+                    "count": wanted,
+                    "course_types": list(request_course_types(role)),
+                }
+                # Only on the plate that carries the meal. A member asking for
+                # fruit at the snack means the snack itself, not the drink
+                # beside it.
+                groups = self.slot_food_groups.get(slot, ())
+                if groups and role == "main":
+                    entry["food_groups"] = list(groups)
+                out.append(entry)
         return out
 
     def role_sequence(self) -> list[tuple[str, str]]:

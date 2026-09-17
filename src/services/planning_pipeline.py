@@ -97,14 +97,36 @@ def _with_note(plans: list[ScoredPlan], note: str) -> list[ScoredPlan]:
 
 def _every_plate_has_a_candidate(pools_by_day: dict, spec) -> bool:
     """Whether every requested plate of every day came back with something."""
+    return not _unfilled_plates(pools_by_day, spec)
+
+
+def _unfilled_plates(pools_by_day: dict, spec) -> set:
+    """The `(slot, role)` plates that came back with nothing."""
     if not pools_by_day:
-        return False
+        return {(slot, role) for slot in spec.meals for role in spec.roles_for(slot)}
+    unfilled = set()
     for pools in pools_by_day.values():
         for slot in spec.meals:
             for role in spec.roles_for(slot):
                 if not pools.get((slot, role)):
-                    return False
-    return True
+                    unfilled.add((slot, role))
+    return unfilled
+
+
+def _spec_for_plates(spec, plates: set):
+    """A spec covering only these plates, for a second, narrower fetch."""
+    from models.plan_spec import PlanSpec
+
+    slots = tuple(slot for slot in spec.meals if any(s == slot for s, _r in plates))
+    roles = {
+        slot: tuple(r for s, r in plates if s == slot)
+        for slot in slots
+    }
+    return PlanSpec(
+        num_days=spec.num_days,
+        meals=slots,
+        plates={slot: rs for slot, rs in roles.items() if rs != ("main",)},
+    )
 
 
 class PlanningPipeline:
@@ -462,18 +484,35 @@ class PlanningPipeline:
             per_plate=per_plate,
             offset=window_offset,
         )
-        if recent and not _every_plate_has_a_candidate(pools_by_day, spec):
+        unfilled = _unfilled_plates(pools_by_day, spec) if recent else set()
+        if unfilled:
+            # Only the plates that emptied, which is what the classic path has
+            # always done ("the other slots keep their fresh dishes, so asking
+            # twice costs the repeat of one meal rather than of the whole day").
+            #
+            # This path gave up the history for the WHOLE plan instead, and a
+            # shaped plan runs out of new dishes sooner precisely because it has
+            # more plates — so one thin slot, a snack or a narrow diet, made
+            # every other plate repeat too. That is the "recipes are getting
+            # repetitive between plans" report.
             logger.info(
-                "Nothing new left to fill every plate — planning without the "
-                "recently-served exclusion"
+                "Nothing new left for %s — refetching those without the "
+                "recently-served exclusion",
+                ", ".join(f"{slot}/{role}" for slot, role in sorted(unfilled)),
             )
-            pools_by_day, relaxations = meal_composer.role_pools(
-                profile, spec,
+            refilled, more = meal_composer.role_pools(
+                profile, _spec_for_plates(spec, unfilled),
                 exclude_recipe_ids=list(exclude_recipe_ids or []),
                 boost_ids=boost_ids,
                 per_plate=per_plate,
                 offset=window_offset,
             )
+            relaxations = list(relaxations or []) + list(more or [])
+            for day, pools in (refilled or {}).items():
+                target = pools_by_day.setdefault(day, {})
+                for key, candidates in pools.items():
+                    if candidates and not target.get(key):
+                        target[key] = candidates
         if not pools_by_day:
             return None
 

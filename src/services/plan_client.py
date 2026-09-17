@@ -104,6 +104,19 @@ class PlanClient:
                 return field in (entry.get("accepts") or [])
         return False
 
+    def accepts_per_slot(self, tool: str, field: str) -> bool:
+        """Whether the live service takes this field on a SLOT entry.
+
+        `accepts` covers the request's top level; a slot's own fields live a
+        level down and are advertised separately. Absent — an older
+        RecipeWrangler — is a NO, for the same reason as `accepts`: guessing yes
+        turns every plan request into a 422 the moment the two services drift.
+        """
+        for entry in self.manifest().get("tools") or []:
+            if entry.get("name") == tool:
+                return field in (entry.get("accepts_per_slot") or [])
+        return False
+
     def planning_options(self) -> dict[str, Any]:
         """What a user can actually ask for, from the live service.
 
@@ -226,6 +239,13 @@ class PlanClient:
                 only_multiplate=deepen_multiplate_only,
             )
             days = spec.num_days
+            # A per-slot field the live service does not take is a 422, not a
+            # shrug — `MealSlotRequest` forbids extras, deliberately. The
+            # manifest advertises the slot entry's own fields separately from
+            # the request's, because `accepts` lists only the top level.
+            if not self.accepts_per_slot("plan_meals", "food_groups"):
+                for entry in request_slots:
+                    entry.pop("food_groups", None)
         else:
             request_slots = [
                 {"slot": slot, "count": max(1, int(count_per_slot))} for slot in slots

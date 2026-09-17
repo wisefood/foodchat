@@ -363,3 +363,56 @@ class TestARefinementAvoidsThePlanItIsRefining:
 
         src = inspect.getsource(WeeklyPlanService.process_message)
         assert "avoid_recent" in src and "is_refinement" in src
+
+
+class TestOneThinSlotDoesNotRepeatTheWholeDay:
+    """Reported: "between different plans it seems recipes are getting
+    repetitive".
+
+    The structured path gave up the recently-served history for the WHOLE plan
+    the moment any one plate came back empty — and a shaped plan runs out of new
+    dishes sooner precisely because it has more plates. So one thin slot (a
+    snack, or a narrow diet) made every other plate repeat too. The classic path
+    has always refetched only the slot that emptied.
+    """
+
+    def _spec(self):
+        return PlanSpec(meals=("breakfast", "lunch", "snack", "dinner"))
+
+    def test_only_the_empty_plates_are_refetched(self):
+        from services.planning_pipeline import _spec_for_plates, _unfilled_plates
+
+        spec = self._spec()
+        pools = {1: {
+            ("breakfast", "main"): ["b"],
+            ("lunch", "main"): ["l"],
+            ("snack", "main"): [],          # nothing new left here
+            ("dinner", "main"): ["d"],
+        }}
+        unfilled = _unfilled_plates(pools, spec)
+
+        assert unfilled == {("snack", "main")}
+        assert _spec_for_plates(spec, unfilled).meals == ("snack",)
+
+    def test_a_plate_with_roles_keeps_them(self):
+        from services.planning_pipeline import _spec_for_plates
+
+        spec = PlanSpec(meals=("dinner",), plates={"dinner": ("main", "salad")})
+        narrowed = _spec_for_plates(spec, {("dinner", "salad")})
+
+        assert narrowed.meals == ("dinner",)
+        assert narrowed.roles_for("dinner") == ("salad",)
+
+    def test_a_full_pool_needs_no_second_fetch(self):
+        from services.planning_pipeline import _every_plate_has_a_candidate
+
+        spec = self._spec()
+        pools = {1: {(slot, "main"): ["x"] for slot in spec.meals}}
+
+        assert _every_plate_has_a_candidate(pools, spec) is True
+
+    def test_nothing_at_all_counts_every_plate_as_unfilled(self):
+        from services.planning_pipeline import _unfilled_plates
+
+        spec = self._spec()
+        assert len(_unfilled_plates({}, spec)) == 4
