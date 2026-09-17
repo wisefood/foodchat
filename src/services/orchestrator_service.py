@@ -452,6 +452,18 @@ class OrchestratorService:
         # always extracted and neither pays twice.
         turn_intake.intake(session_id, message, session_service=self.session_service)
 
+        # Going back to a version, or asking for an order we cannot give.
+        #
+        # Deterministic and ahead of the classifier, like the FoodScholar
+        # bypass below: both of these classify as slot edits, and an edit can
+        # only replace the dish on a slot. "Go back to the first version"
+        # produced a new plan — the one thing the member was asking not to
+        # happen — and "better before lunch" swapped an 82 kcal breakfast for a
+        # 1,907 kcal recipe called "Sunday Lunch".
+        navigated = self._maybe_navigate(session, session_id, message)
+        if navigated is not None:
+            return navigated
+
         if self._SCHOLAR_CONSULT_RE.search(message):
             logger.info("Explicit FoodScholar consult — routing to the M1 bridge")
             return self._handle_nutrition_question(
@@ -596,6 +608,71 @@ class OrchestratorService:
         return self._answer_from_tool(
             session, session_id, message, name, spec, result, choice,
         )
+
+    def _maybe_navigate(self, session, session_id: str, message: str):
+        """Restore a version, or decline an order we cannot serve. None to route on."""
+        from services import plan_navigation
+
+        canvas = session.active_canvas
+        wanted = plan_navigation.restore_request(message)
+
+        if wanted is not None:
+            if canvas is None:
+                return None          # nothing to go back to; route normally
+            versions = self.session_service.plan_versions(session_id, canvas.plan_type)
+            if not versions:
+                return None
+            current = next((v for v, _id, is_current in versions if is_current), None)
+            target = (current - 1) if wanted == "previous" else int(wanted)
+
+            if target is not None and current is not None and target == current:
+                text = f"You're already on version {current}."
+                self._say(session_id, message, text)
+                return ChatTurn(role="assistant", content=text, intent="chat")
+
+            plan = (self.session_service.restore_plan_version(
+                session_id, target, canvas.plan_type,
+            ) if target and target >= 1 else None)
+            if plan is None:
+                have = ", ".join(str(v) for v, _i, _c in versions)
+                text = (
+                    f"I don't have a version {target} of this plan — "
+                    f"there {'is' if len(versions) == 1 else 'are'} {have}."
+                )
+                self._say(session_id, message, text)
+                return ChatTurn(role="assistant", content=text, intent="chat")
+
+            text = f"Back to version {target}."
+            self._say(session_id, message, text)
+            turn = ChatTurn(role="assistant", content=text, intent="chat")
+            # Nothing was regenerated, so the canvas the member is looking at
+            # has to be the one that comes back with this turn.
+            if canvas.plan_type == "weekly":
+                turn.weekly_meal_plan = plan
+            else:
+                turn.meal_plan = plan
+            turn.plan_version = getattr(plan, "version", None)
+            turn.plan_parent_id = getattr(plan, "parent_id", None)
+            return turn
+
+        # A reorder is only declined when nothing else in the sentence can be
+        # served: "add a salad before lunch" is an addition that happens to
+        # mention an order, and re-planning it is a better answer than a no.
+        if (
+            plan_navigation.asks_to_reorder(message)
+            and canvas is not None
+            and not turn_intake.added_shape()
+        ):
+            self._say(session_id, message, plan_navigation.CANNOT_REORDER)
+            return ChatTurn(
+                role="assistant", content=plan_navigation.CANNOT_REORDER, intent="chat",
+            )
+        return None
+
+    def _say(self, session_id: str, message: str, text: str) -> None:
+        """Record the exchange the way every other handler does."""
+        self.session_service.add_message(session_id, "user", message)
+        self.session_service.add_message(session_id, "assistant", text)
 
     @staticmethod
     def _describe_canvas_shape(plan, plan_type: str) -> str:

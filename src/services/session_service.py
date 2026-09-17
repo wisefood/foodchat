@@ -784,6 +784,92 @@ class SessionService:
     # Canvas persistence                                                   #
     # ------------------------------------------------------------------ #
 
+    # ------------------------------------------------------------------ #
+    # Version lineage: going back to one the member liked                  #
+    # ------------------------------------------------------------------ #
+
+    def _canvas_and_plans(self, session, plan_type: str):
+        if plan_type == "weekly":
+            return session.weekly_canvas, session.weekly_meal_plans
+        return session.daily_canvas, session.meal_plans
+
+    def plan_versions(self, session_id: str, plan_type: str = "daily") -> list:
+        """Every version on this canvas, oldest first: `[(version, id, is_current)]`.
+
+        A canvas has always BEEN a versioned lineage — `version`, `parent_id`,
+        `root_id`, `current_id` — and nothing could read it back. "Go back to
+        the first version" therefore fell through to the edit path and produced
+        a NEW plan, which is precisely what the member was asking not to happen.
+
+        Walked from the current plan to the root rather than filtered by
+        `version`: restoring an earlier version and editing from there branches
+        the canvas, so two plans can wear the same number and only one of them
+        is on the line the member is actually looking at.
+        """
+        session = self.get_session(session_id)
+        if session is None:
+            return []
+        canvas, plans = self._canvas_and_plans(session, plan_type)
+        if canvas is None:
+            return []
+
+        by_id = {p.id: p for p in plans}
+
+        def in_lineage(plan) -> bool:
+            """Whether this plan descends from the canvas's root."""
+            node, seen = plan, set()
+            while node is not None and node.id not in seen:
+                if node.id == canvas.root_id:
+                    return True
+                seen.add(node.id)
+                node = by_id.get(str(getattr(node, "parent_id", "") or ""))
+            return False
+
+        # From the ROOT outward, not backwards from the current plan. Walking
+        # ancestors would mean that restoring v1 made v2 and v3 unreachable —
+        # a member who went back and wanted to change their mind again would
+        # find the versions gone, which is a worse trap than the one this fixes.
+        chain = sorted(
+            (p for p in plans if in_lineage(p)),
+            key=lambda p: int(getattr(p, "version", 1) or 1),
+        )
+        return [
+            (int(getattr(p, "version", i + 1) or i + 1), p.id, p.id == canvas.current_id)
+            for i, p in enumerate(chain)
+        ]
+
+    def restore_plan_version(self, session_id: str, version: int,
+                             plan_type: str = "daily"):
+        """Point the canvas back at an earlier version. The plan, or None.
+
+        A pointer move, not a regeneration — which is the entire point of the
+        request. Nothing is deleted: the later versions stay in the lineage, so
+        restoring v1 and then changing something branches from v1 instead of
+        erasing what came after it.
+        """
+        session = self.get_session(session_id)
+        if session is None:
+            return None
+        canvas, plans = self._canvas_and_plans(session, plan_type)
+        if canvas is None:
+            return None
+
+        wanted = int(version)
+        ids = {v: pid for v, pid, _current in self.plan_versions(session_id, plan_type)}
+        plan_id = ids.get(wanted)
+        if plan_id is None:
+            return None
+        plan = next((p for p in plans if p.id == plan_id), None)
+        if plan is None:
+            return None
+
+        canvas.current_id = plan.id
+        self._persist_canvases(session_id, session)
+        logger.info(
+            "[%s] Restored %s plan v%d (%s)", session_id, plan_type, wanted, plan.id,
+        )
+        return plan
+
     def _persist_canvases(self, session_id: str, session: Session) -> None:
         daily_data = None
         if session.daily_canvas:
