@@ -7,6 +7,7 @@ safety check (allergens are hard constraints — a seed that violates one is
 NEVER pinned), and assigns each accepted seed to a plan slot:
 
     resolve_seeds(seeds, profile)                → list[SeedResolution]
+    find_dish(name)                              → list[CandidateRecipe]  (plan scorer; unfiltered)
     place_weekly(resolutions)                    → ({(day, meal_idx): CandidateRecipe}, dropped)
     place_daily(resolutions)                     → ({slot_name: CandidateRecipe}, dropped)
 
@@ -120,6 +121,27 @@ class SeedService:
 
             resolutions.append(self._finalize_resolution(seed, name, resolved, profile))
         return resolutions
+
+    def find_dish(self, name: str, limit: int = 5) -> list[CandidateRecipe]:
+        """Catalogue recipes that might be the named dish — NOT filtered by the member.
+
+        The plan scorer's lookup (``services.plan_scorer.grounding``). Seed
+        resolution narrows its search to what the member can eat because a
+        seed is about to be planned. A dish in a pasted plan has already been
+        eaten: filtering would swap the "peanut noodles" the member wrote for
+        a peanut-free recipe and hide the allergen the score most needs to
+        report. Same two indexes as ``resolve_seeds`` — analysed search first,
+        tolerant autocomplete as the fallback — returned as candidates so the
+        caller chooses by title instead of taking the first hit. No detail
+        fetch, no adapted-recipe overlay and no allergy gate happen here.
+        """
+        found = self._search_by_name(name, {})
+        if found:
+            return list(found[:limit])
+        return [
+            CandidateRecipe(recipe_id=recipe_id, title=title, ingredients="", directions="")
+            for recipe_id, title in self._autocomplete_tolerant(name)[:limit]
+        ]
 
     def _finalize_resolution(self, seed: dict, name: str, resolved, profile: dict) -> SeedResolution:
         """Adapted-version overlay + allergy gate, shared by id and name paths."""

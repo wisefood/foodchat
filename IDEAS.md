@@ -832,3 +832,513 @@ back labelled as the plan's own doing rather than the member's.
    the member-facing control 2026-09-09.
 3. ~~**Component 3**~~ — done 2026-09-09, without portion arithmetic and
    saying so.
+
+# Plan scorer — paste a plan, get the metrics
+
+**Status: implemented in this service 2026-09-15** — the `score_plan`
+intent, steps 1–5, persistence and `POST /sessions/{id}/score-plan`
+(CHANGES.md, "Plan scorer, steps 1–3" and "Plan scorer, steps 4–5"). Still
+open: the gateway route and the UI text box and card (not in this
+repository), the external guidelines endpoint, attaching the weekly judges to
+generated weeks, and "adopt this plan".
+
+Deviations from the text below, each for a reason found while building it:
+- grounding uses a new unfiltered `SeedService.find_dish` rather than a flag
+  on `_finalize_resolution` — the member's filters are applied in the search
+  itself, one layer earlier;
+- `ScoredPlan` is unchanged; a partial pasted day gets `None` from
+  `DailyScoringInput.as_scored_plan()`, and the daily metrics are computed
+  from course lists with the same functions;
+- weekly metrics call the explainability functions one by one instead of
+  `build_weekly_explainability`, which assumes seven days and counts snacks
+  as meals; targets are scaled to the days pasted;
+- a daily pasted plan also gets a calorie metric (`nutrition_metrics` for one
+  day), because the routine existed and a day without it hid the obvious;
+- an approximate match's catalogue tags are not used for categories or diet
+  checks — the member's words outrank a recipe that merely resembles them;
+- the explicit "rate this" bypass requires a structured listing and no
+  request verb, so "what do you think of adding salmon for dinner and oats
+  for breakfast?" still goes to the classifier;
+- the three judges are ONE call (`agents.PlanJudge`), because three cost
+  three prompts and three reasoning passes over the same plan — about 3,400
+  input tokens against 2,100, and three requests against one;
+- a dish no recipe gives calories to gets a typical serving written by a
+  small model and profiled in RecipeWrangler's composition tables
+  (`nutrition_source: "typical_ingredients"`), or, when that fails, the
+  model's own calorie guess (`"model_estimate"`), labelled everywhere it is
+  shown; the same guessed serving fills the food-variety count for a dish
+  with no ingredient list, and each grounding row names its guesses in
+  `guess_remarks`;
+- a close title is only a match when it is the same dish: it keeps every
+  part the member named and adds no food, diet or cuisine word; what the member wrote
+  outranks a matched recipe's ingredients, and catalogue calories too low to
+  be a meal are set aside;
+- spellings of one dish ("lasagne"/"lasagna") normalise before comparison,
+  and the other spelling is searched when the first query finds no match.
+
+A member pastes a daily or weekly meal plan they wrote themselves — or got
+from anywhere else — and FoodChat scores it with the same metrics it uses to
+judge its own plans, with the reasoning behind each number. The score is a
+third kind of card in the session, shown alongside the daily and weekly plan
+cards, and reachable two ways:
+
+- **as an intent.** A message that *contains* a plan ("here is what I eat
+  this week: Mon breakfast oats, lunch …") or asks to score one is routed
+  by the orchestrator to the scorer, like any other turn;
+- **as an endpoint.** A dedicated text box in the UI posts to
+  `POST /foodchat/sessions/{id}/score-plan`, skipping intent
+  classification, exactly the way the compose canvas and the slider card
+  already bypass it.
+
+Both paths call one `PlanScorerService`, produce one payload, and persist
+one assistant message with the score attached, so the card survives a
+reload the way FoodScholar citations do. The point is comparability: a
+plan FoodChat produced and a plan the member typed are graded by the same
+code, in the same session, with the same profile.
+
+## What already exists (reuse it, do not rebuild it)
+
+The evaluation routines are all written; they are just buried inside the
+two planning flows and take planner-internal objects as input. The scorer
+is mostly an adapter that gets free text into those objects.
+
+| Metric | Where it lives today | Input it expects | LLM? |
+|---|---|---|---|
+| Holistic fit score (1–5) | `agents.DocumentGrader.grade_daily_plans` + `prompts.GRADER_SYSTEM` | a *batch* of `(breakfast, lunch, dinner)` candidate triples, the query, the profile | yes |
+| Food variety score (unique ingredient count) | `chat_service._food_variety_score` | `ScoredPlan` with per-course `ingredients` text | no |
+| Meal diversity (1–5) | `agents.MealDiversityGrader.score` | rendered plan text | yes |
+| Guideline adherence (1–5) | `agents.GuidelineAdherenceGrader.score` | rendered plan text + guidelines text | yes |
+| Daily plan text rendering | `chat_service._plan_as_text` | `ScoredPlan` | no |
+| Weekly variety (distinct recipes, repeats, unique ingredients, category mix) | `weekly_planner.explainability.variety_metrics` | entry dicts `{day, meal_idx, recipe: {...}}` | no |
+| Weekly guideline checklist (fish 1–2×, red meat ≤3, ≥half plant-based) | `explainability.guideline_checklist` | category counts from `variety_metrics` | no |
+| Weekly nutrition vs budget (totals, daily average, over/under/on-track, coverage) | `explainability.nutrition_metrics` + `calorie_budget_status` | entry dicts with `recipe.nutrition`, targets from `WeeklyNutritionalTracker(profile).targets` | no |
+| Meal category / meat detection | `day_summary.classify_meal`, `day_summary.is_meat_meal` | `{title, ingredients, tags?}` dict | no |
+| Profile constraints ledger (allergies, diets, dislikes) | `transparency.constraints_ledger`, `weekly_constraints_ledger` | profile dict | no |
+| Allergen check | `candidates_client.allergen_conflict(text, allergies)` | ingredient text + allergy list | no |
+| Diet-tag check | `candidates_client.normalize_diet_tags`, `diet_tag_status` | recipe tags + profile diet | no |
+| Ingredient normalization | `chat_service._extract_ingredient_names` **and** `explainability._ingredient_names` (two copies of the same regex) | free text | no |
+| Dish-name → recipe resolution | `seed_service.SeedService.resolve_seeds` (autocomplete → `fetch_recipe`, allergen-checked) | `[{name, meal_type?, day?}]` | no (HTTP to RecipeWrangler) |
+| Per-recipe nutrition lookup | `candidates_client.CANDIDATES.fetch_details(ids)` | recipe ids | no (HTTP) |
+| Non-chat entry that still yields a chat turn | `foodchat_router.compose_plan`, `apply_plan_parameters` | request body → `ChatTurnResponse` | — |
+| Structured payload persisted on a message | `Message.attribution` (FoodScholar citations) | JSON column on `messages` | — |
+| Persisted clarification with a service-specific `kind` | `FoodScholarService.CLARIFICATION_KIND`, `"edit_slot"`, `"favorites_offer"` | `sessions.clarification_state` | — |
+
+Two of these shape the design:
+
+- **`build_weekly_explainability` is already "score a finished week".** It
+  takes an entry list and a profile, nothing from the planner's runtime (its
+  docstring says so: it exists so slot-edited plans can be re-scored with no
+  environment). With `selection_events=[]` it is the weekly scorer. The
+  deterministic half of the weekly feature is: build entry dicts from text,
+  call that function, hand back `metrics` + `constraints_applied` +
+  `reasoning`.
+- **`DocumentGrader` is comparative, not absolute.** It grades a batch, and
+  its rubric leans on "the user's immediate query" and feedback history —
+  neither of which a pasted plan has. The scorer's fit score is a separate
+  judge that shares the rubric but grades one plan against the *profile*.
+  See step 4.
+
+## Guidelines: out of scope here
+
+The daily adherence judge reads `chat_service.GUIDELINES_PATH`, which
+points at a file that is not in the repo, so it scores with an empty
+guidelines text today. That is left as it is. The working assumption is
+that guideline text will come from an external endpoint later, so the
+scorer reads it through one function, `plan_scoring.guidelines_text(scope)`
+with `scope` in `{"daily", "weekly"}`, which for now returns the file read
+(or `""`) for both scopes. When the endpoint exists, that function is the
+only thing that changes. The two scopes are separate from day one because
+the weekly judge is meant to be given frequency rules (fish twice a week,
+red meat at most three times) that make no sense for a single day, and the
+daily judge the per-day ones.
+
+## The shape of the feature
+
+```text
+                 chat turn                          text box
+  POST /sessions/{id}/chat                POST /sessions/{id}/score-plan
+  { member_id, content }                  { member_id, plan_text,
+        │                                   plan_type?: daily|weekly|auto,
+        ▼                                   context?: "trying to eat less meat" }
+  OrchestratorService ── intent ──┐               │
+     "score_plan"                 │               │  no intent classification
+                                  ▼               ▼
+                        [PlanScorerService.score(session, text, plan_type, context)]
+                                  │
+        ├─ 0. profile    session.user_profile (fetched from WiseFood by
+        │                member_id at session creation, merged with diners)
+        │
+        ├─ 1. parse      regex pre-pass + PlanTextParser (one FAST_MODEL call)
+        │                → ParsedPlan{plan_type, days[{day, meals[{slot, title,
+        │                  ingredients?}]}], unparsed[]}
+        │                nothing parsed / ambiguous shape → clarification,
+        │                kind="score_plan", pasted text kept in the state
+        │
+        ├─ 2. ground     SeedService resolution per dish (autocomplete →
+        │                fetch_recipe) → recipe_id, ingredients, nutrition,
+        │                tags   — matched | approximate | unresolved
+        │
+        ├─ 3. build      daily  → ScoredPlan-shaped courses
+        │                weekly → entry dicts [{day, meal_idx, recipe}]
+        │
+        ├─ 4. score      hard constraints  allergen_conflict, diet tags (code)
+        │                daily   _food_variety_score, MealDiversityGrader,
+        │                        GuidelineAdherenceGrader, PlanFitGrader
+        │                weekly  build_weekly_explainability,
+        │                        WeeklyMealDiversityGrader,
+        │                        WeeklyGuidelineAdherenceGrader, PlanFitGrader
+        │
+        └─ 5. respond    user message + assistant message persisted, the
+                         PlanScore payload attached to the assistant message;
+                         ChatTurnResponse{intent="score_plan", plan_score=…}
+```
+
+Nothing is written to a canvas. The pasted plan is scored, not adopted:
+refine / edit intents keep targeting the member's own canvas, and
+`plan_version` / `plan_parent_id` stay `None` on the turn. "Adopt this
+plan" — promoting a scored plan onto the daily or weekly canvas as version
+1 so it can be refined — is a natural follow-up and is explicitly not in
+this cut (it needs a placement policy for unresolved dishes and a decision
+about what a canvas built from someone else's plan claims in its ledger).
+
+### The intent
+
+`score_plan` becomes the tenth intent in `OrchestratorSchema`, the
+`Intent` literal in `models/session.py`, and the orchestrator prompt. The
+prompt rule, and what it must be told apart from:
+
+- **`score_plan`** — the message itself contains a meal listing (dishes
+  named per slot, optionally per day) that the member is presenting rather
+  than requesting, or asks to score/rate/evaluate such a listing given in
+  this or the previous message. "Here's my week, how does it look?",
+  "rate this: breakfast oats, lunch lentil soup, dinner salmon".
+- not `daily_plan` / `weekly_plan` — those *ask for* a plan; a message
+  that *brings* one is a score request even when it also asks "is this
+  ok?".
+- not `nutrition_question` — "is my current plan healthy?" about the
+  canvas goes to FoodScholar as before. A pasted plan is not the canvas.
+  If the member asks a health question *and* pastes a plan, the plan
+  wins: score it, and the summary can point at FoodScholar for the
+  medical part.
+- not `plan_question` — that is a lookup in the existing canvas.
+- not `compose` — compose picks recipes by id on a blank canvas; the
+  scorer never touches a canvas.
+
+The orchestrator hands the raw message to the scorer; it does not extract
+the plan itself (one LLM call per turn for routing stays the rule). The
+turn also runs the usual memory-nudge extraction, since "I always have
+oats on Monday" is a preference whether or not it arrived inside a plan.
+
+### The endpoint
+
+`POST /foodchat/sessions/{session_id}/score-plan`, body
+`{member_id, plan_text, plan_type?, context?}`, response `ChatTurnResponse`
+— same as `/compose` and `/plan-parameters`. Session-scoped, because the
+card lives in the conversation and the profile comes from the session.
+Same ownership guard (404 on mismatch) and error mapping as every other
+session endpoint. `plan_type` defaults to `"auto"`; when the UI has a
+daily/weekly toggle next to the box, it sends the explicit value and the
+parser is told rather than asked. `context` is the optional free-text
+"what I'm trying to do" that feeds the fit score.
+
+The text box is the same message as the chat path with intent
+classification skipped, so it also persists the user's pasted text as a
+user message. The conversation then shows what was scored.
+
+### Step 1 — parse free text into a plan (`PlanTextParser`)
+
+New agent in `agents.py`, `ParsedPlanSchema` in `schemas.py`, prompt in
+`prompts.py` registered through `_reg`. Runs on `FAST_MODEL`: span-picking,
+not judgment, the same category as the plan-spec and seed extractors.
+
+```text
+plan_type:  "daily" | "weekly"      # what the text looks like, not what was asked
+days:       [{ day: 1..7 | null, label: "Monday" | "Day 2" | null,
+               meals: [{ slot: breakfast|lunch|dinner|snack|other,
+                         title: str,
+                         ingredients: str | null,     # only if the user wrote them
+                         quantity_note: str | null }] }]
+unparsed:   [str]                    # lines it could not place, verbatim
+```
+
+Rules the prompt must state, because each one is a way to lie about the
+plan otherwise:
+
+- Never invent ingredients. If the user wrote "chicken curry",
+  `ingredients` is null; grounding fills it in from a real recipe or it
+  stays unknown, and the metrics say what they were computed on.
+- A day with one or two meals listed is a partial day, not an error.
+  Unmentioned slots are absent, not "skipped" and not filled.
+- `plan_type` follows the structure: two or more labelled days → weekly. A
+  3-day plan is a "weekly" with 3 days; the checklist scales its targets by
+  `total_meals` already.
+- Anything it cannot place goes to `unparsed`, verbatim. Silent dropping
+  is the failure mode to design against.
+
+Deterministic pre-pass before the LLM: split on day-name / "Day N" headers
+and `slot:` prefixes with a regex and pass the structure as a hint. Most
+pasted plans are already shaped like that, and the regex path makes the
+common case testable with no fake LLM.
+
+**Clarification.** Two outcomes stop the flow and ask instead of guessing,
+through the persisted state machine with `kind="score_plan"` and the
+pasted text stored in the state so the member does not re-paste:
+
+- zero meals parsed ("I couldn't find any meals in that — could you list
+  them as `breakfast: …`, `lunch: …`?");
+- `plan_type="auto"`, one unlabeled block of more than three meals (is it
+  one day with snacks, or several days?).
+
+The member's answer is routed by `kind` alone, no intent classification,
+like every other clarification. A second failure returns the `unparsed`
+lines in the reply and ends the loop; nobody gets asked three times.
+
+### Step 2 — ground dishes against RecipeWrangler
+
+Reuse `SeedService`'s resolution path, factored so it can be called
+without the seed-extraction LLM step: `resolve_seeds` already takes
+`[{name, meal_type, day}]` dicts, which is exactly the parsed output. Each
+dish ends up in one of three states, and the response says which:
+
+| state | meaning | what gets scored |
+|---|---|---|
+| `matched` | autocomplete hit with a confident title match | the RecipeWrangler recipe: its ingredients, nutrition, tags |
+| `approximate` | a hit, but title similarity below a threshold | the recipe's nutrition and tags, but the user's own ingredients if given; flagged |
+| `unresolved` | nothing found | title + whatever ingredients the user wrote; no nutrition; category from keywords only |
+
+The threshold is the part `SeedService` does not have today — for seeding
+a near-miss is fine because the member sees the pinned dish and can
+object; for scoring, a near-miss silently changes the number. Normalized
+token overlap on the title is enough to start; the matched title is in
+the response so the member can see what was assumed.
+
+`SeedService` today *drops* a dish that conflicts with an allergy. The
+scorer must not: it grounds the dish anyway and reports the conflict (step
+4). Factor the allergen decision out of `_finalize_resolution` behind a
+flag rather than duplicating the resolution code.
+
+### Step 3 — build the objects the existing scorers want
+
+- **Daily.** `MealCourse(recipe_id, title, ingredients, directions="",
+  nutrition, …)` per slot → a `ScoredPlan` so `_plan_as_text` and
+  `_food_variety_score` work unchanged. Missing slots: `ScoredPlan` assumes
+  three courses. Either allow `None` there or build a placeholder course
+  the text renderer omits and the variety count ignores. The first is
+  cleaner; do it only if `ScoredPlan` has few consumers (check first).
+- **Weekly.** Entry dicts `{day, meal_idx, recipe: {recipe_id, title,
+  ingredients, nutrition, tags}}` in the shape `environment.py` produces;
+  `explainability._recipe` / `_title` / `_ingredients` read both key
+  spellings already. No `pinned`, no `repeat_of`, no `selection_events`,
+  so every duplicate would come out `unexplained`. That is wrong for a
+  plan the member wrote (they *chose* the repeat), so tag repeats with a
+  new source label, `REPEAT_BY_AUTHOR`, and a ledger row that says the
+  repeats are the member's own. Do not reuse `REPEAT_BY_MEMBER`, which
+  means "a starred recipe came back".
+- **Profile.** `session.user_profile` — fetched from WiseFood by
+  `member_id` when the session was created and merged with any diners
+  since. Allergies, diet, dislikes, likes, goals, nutrition profile and
+  the calorie target all come from there, as they do for the planners.
+  No profile-less mode: the endpoint is session-scoped and a session
+  always has a member.
+
+### Step 4 — score
+
+**Hard constraints first, in code, not in a prompt.** Over the grounded
+dishes:
+
+- `allergen_conflict(ingredients, profile.allergies)` per dish → a
+  `violated` ledger row naming the dish, the allergen, and (household)
+  the diner it protects, from `constraint_origins`.
+- diet: `classify_meal` / `diet_tag_status` against `profile.diet` → a
+  `violated` row for a meat dish on a vegetarian profile, etc.
+- `food_dislikes` present in grounded ingredients → a `soft` row,
+  `violated`.
+
+These rows go into `constraints_applied` next to the usual profile rows
+from `constraints_ledger`. Today the daily ledger only ever says
+`satisfied` because the planner filtered at fetch time; the scorer is the
+first daily consumer that can produce `violated`, and the UI already
+treats unknown statuses as informational.
+
+**Fit score — `PlanFitGrader`.** A new judge, not `DocumentGrader` with a
+batch of one: it grades a single plan against the profile, on the same
+1–5 rubric text factored out of `GRADER_SYSTEM` into a shared constant so
+the two prompts cannot drift. Inputs, in this order of weight:
+
+1. allergies — listed as *hard*: the prompt is told any presence means
+   the plan fails, and the code caps the score at 1 whenever step 4's
+   allergen rows are non-empty, whatever the model returned. A hard
+   constraint is not a matter of judgment;
+2. diet — same treatment, cap at 2 (mirrors the existing rubric's
+   "implausible slot → at most 2");
+3. preferences, likes, dislikes, dietary goals, nutrition profile and the
+   calorie target — soft, weighed by the model;
+4. `context` — the member's stated aim for this plan, if any; otherwise
+   the prompt says none was given and the goals stand in for it.
+
+Same `ScoringSchema` output. One prompt for both plan types; the user
+message says how many days the plan spans and groups the text by day. The
+reasoning must name the dish behind every deduction, as the daily grader's
+already must.
+
+**Daily**, in the order `ChatService._compute_metrics` uses, so the numbers
+are the numbers the daily canvas carries:
+
+1. `_food_variety_score` (LLM-free)
+2. `MealDiversityGrader.score(plan_text)`
+3. `GuidelineAdherenceGrader.score(plan_text, guidelines_text("daily"))`
+4. `PlanFitGrader.score(plan_text, profile, context)`
+
+Hoist `_compute_metrics` out of `ChatService` into
+`plan_scoring.compute_daily_metrics(plan, guidelines_text, graders)` so the
+chat flow and the scorer call one function. Same for the duplicate
+ingredient normalizer: keep `explainability._ingredient_names`, delete
+`chat_service._extract_ingredient_names`, import the one.
+
+**Weekly**:
+
+1. `build_weekly_explainability(entries, profile, selection_events=[])` →
+   `metrics` (`variety`, `guideline_checklist`, `nutrition`, `days`),
+   `constraints_applied`, `reasoning`. LLM-free, unchanged.
+2. `WeeklyMealDiversityGrader` — a new prompt, not the daily one with a
+   preamble. The daily prompt reasons about three meals; a week is 21 and
+   the questions differ: does the same protein source carry every dinner,
+   do cuisines rotate or sit in one place, does produce variety hold
+   across days rather than within one, are breakfasts a rut or a
+   sensible routine (a repeated breakfast is not a diversity failure —
+   the planner's own `repeat_meals` setting says so). Output stays
+   `ScoringSchema` so the metric card is identical in shape.
+3. `WeeklyGuidelineAdherenceGrader` — its own prompt, fed
+   `guidelines_text("weekly")`. Where the daily judge asks "does this
+   day have enough vegetables and whole grains", the weekly judge asks
+   the frequency questions the checklist already asks deterministically
+   — fish, red meat, legumes, plant-based share — plus balance across
+   the week. The deterministic checklist is passed in as facts so the
+   judge explains rather than recounts; its score must not contradict a
+   checklist row it was handed.
+4. `PlanFitGrader` on the week.
+
+Both weekly judges are constructor-parameterized variants of the existing
+classes (`MealDiversityGrader(prompt=WEEKLY_MEAL_DIVERSITY_SYSTEM)`), so
+existing constructor calls stay unchanged. Once they exist,
+`WeeklyPlanService` can attach them to the plans it generates so a
+generated week and a pasted week carry the same numbers — that is a
+separate change, since it adds two Groq calls to every weekly plan.
+
+**What the judges see.** Grounded ingredients when a dish is `matched`,
+the member's own text otherwise, and the plan text handed to every judge
+marks which is which ("ingredients from recipe *X*" vs "as written"). No
+judge is ever told a grounded ingredient list is what the member wrote.
+
+### Step 5 — response and persistence
+
+```text
+PlanScore                                   # attached to the assistant Message,
+  plan_type:        "daily" | "weekly"      # JSON column like `attribution`
+  days_scored:      int
+  meals_scored:     int
+  scored_plan:      MealPlanResponse | WeeklyMealPlanResponse shape,
+                    origin="pasted", no id lineage   # so the plan card component renders it
+  metrics: [ { key: "fvs" | "diversity" | "guideline_adherence" | "fit"
+                    | "weekly_variety" | "weekly_guidelines" | "weekly_nutrition",
+               label: str,
+               score: number | null,
+               kind: "likert5" | "count" | "percent" | "checklist" | "status",
+               reasoning: str,
+               detail: dict } ]             # checklist rows, totals, coverage, cap applied
+  constraints_applied: [ledger rows]        # profile rows + violated rows from step 4
+  grounding: [ { slot, day, title_given, title_matched, recipe_id, state,
+                 has_nutrition } ]
+  unparsed:  [str]
+  warnings:  [str]                          # "3 of 21 meals had no nutrition data", ...
+```
+
+`ChatTurnResponse` gains `plan_score: Optional[PlanScoreResponse]`, and
+`/conversation` returns it on the message it belongs to, the way
+`attribution` rides today. `content` is the summary prose: 2–4 sentences
+from `ResponseWriter` over a facts dict (metric reasonings, violated
+rows, warnings) — the writer's contract already forbids claiming what it
+was not told, which is the property a scorer summary needs most.
+
+`metrics` is a list of uniformly shaped items rather than the flat
+`fvs_count` / `fvs_reasoning` / … fields `MealPlanResponse` has, because
+the score card renders N rows and should not know the metric names in
+advance. `scored_plan` reuses the existing plan-card shape precisely so
+the UI can show the pasted plan next to the daily/weekly cards with the
+component it already has, with `origin="pasted"` to suppress the
+refine/edit affordances.
+
+### Gateway and UI
+
+New endpoint → gateway route → UI text box, in one change. The gateway
+also needs to know this turn costs 4–5 Groq calls with no candidate fetch
+in front of it; the session message cap applies as usual since both paths
+persist messages. `CHAT_ENDPOINT_PIPELINE.md` gets the `score_plan` branch
+in the intent table and the `/score-plan` entry next to `/compose`.
+
+## Tests (LLM-free, as always)
+
+- `tests/test_orchestrator_routing.py`: a message carrying a meal listing
+  routes to `score_plan`; "is my plan healthy?" with no listing still
+  routes to `nutrition_question`; a clarification with `kind="score_plan"`
+  bypasses classification.
+- `tests/test_plan_scorer.py`
+  - regex pre-pass: day headers in three styles (`Monday`, `Day 2`,
+    `Tue:`), slot prefixes, a plan with no day headers → daily.
+  - parser fake returning a fixed `ParsedPlanSchema`; `unparsed` survives
+    to the response verbatim; zero meals → clarification state with the
+    pasted text stored; the answer continues without re-pasting.
+  - grounding with a fake `RecipeCandidatesClient`: matched / approximate
+    / unresolved; an unresolved dish still gets a category from
+    `classify_meal` on its title; an allergen-conflicting dish is grounded,
+    not dropped.
+  - allergen in a pasted dish vs a profile with that allergy → a
+    `violated` row naming both, and the fit score capped at 1 whatever
+    the fake grader returned; a meat dish on a vegetarian profile → cap 2.
+  - weekly with a deliberate repeat → `planned_repeats == 1`,
+    `unexplained_repeats == 0`, source is the author's.
+  - weekly with 3 days → checklist targets scaled to 9 meals.
+  - fake graders (same pattern as the `ChatService` tests) → the daily
+    `metrics` list has exactly the four keys in the documented order; the
+    weekly list has its four.
+  - judge input text marks grounded vs as-written ingredients.
+  - both entry points persist a user message and an assistant message with
+    `plan_score` attached; `plan_version` is `None`; no canvas is created.
+- `tests/test_weekly_explainability.py`: one case calling
+  `build_weekly_explainability` on hand-built entries with no
+  `selection_events`, if there is not one already — it is the contract the
+  scorer depends on.
+- Regression: `ChatService._compute_metrics` callers unchanged after the
+  hoist.
+
+## Decided
+
+- Fit score is graded against the profile fetched by member id, with
+  allergens hard (cap 1, in code), diet hard (cap 2), everything else
+  soft, and `context` as the optional query.
+- Judges see grounded ingredients when matched and the member's text
+  otherwise, labelled as such.
+- No cache.
+- Weekly diversity and weekly adherence get their own prompts; weekly
+  adherence is designed for a weekly-scope rules text that does not exist
+  yet.
+- Guidelines stay as they are behind `guidelines_text(scope)`; an external
+  endpoint will supply them later.
+
+## Staging
+
+1. Hoist `compute_daily_metrics`, dedupe the ingredient normalizer, add
+   `guidelines_text(scope)`. Pure refactor with existing tests as the net.
+2. Parser (regex pre-pass + `PlanTextParser`) + grounding + the
+   `score_plan` clarification kind, returning `grounding` / `unparsed` /
+   `warnings` only — no scores yet. This is the part with the most ways to
+   be wrong, and it is checkable by eye.
+3. Hard-constraint rows + `PlanFitGrader` with the shared rubric.
+4. Weekly scoring: `build_weekly_explainability` + author repeats + the two
+   weekly judges.
+5. Daily scoring via the hoisted function.
+6. `score_plan` intent in the orchestrator; `/score-plan` endpoint;
+   `plan_score` on the turn and the message; gateway; UI text box and
+   card; `CHANGES.md` entry; `CHAT_ENDPOINT_PIPELINE.md`.
+7. Follow-ups, not in this cut: "adopt this plan" onto a canvas; attach the
+   weekly judges to generated weeks.

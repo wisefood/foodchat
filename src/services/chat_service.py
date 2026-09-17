@@ -18,8 +18,6 @@ survives restarts and works across replicas (see ``services.clarification``).
 """
 
 import logging
-import re
-from pathlib import Path
 from typing import Optional, Tuple
 
 from agents import GuidelineAdherenceGrader, MealDiversityGrader, ResponseWriter, SimpleChatBot
@@ -34,15 +32,22 @@ from services.candidates_client import CANDIDATES
 from services.clarification import ClarificationManager, ClarificationState
 from services.feedback_service import FeedbackService
 from services.planning_pipeline import PlanningPipeline
+from services.plan_scoring import (  # noqa: F401 — GUIDELINES_PATH re-exported for existing importers
+    GUIDELINES_PATH,
+    compute_daily_metrics,
+    food_variety_score,
+    guidelines_text,
+    ingredient_names,
+    plan_as_text,
+)
 from services.seed_service import SeedService
 from services.transparency import apply_transparency, split_ledger
 from .session_service import SessionService
 
 logger = logging.getLogger(__name__)
 
-# National dietary guidelines used by the adherence grader. Optional: when the
-# file is absent the grader scores against an empty context (logged once per call).
-GUIDELINES_PATH = Path(__file__).resolve().parents[2] / "belgium_dietary_guidelines_augmentation.cypher"
+# The guideline text, the variety count and the plan text the judges read live
+# in services.plan_scoring, shared with the plan scorer (services.plan_scorer).
 
 def no_plan_message(profile: dict) -> str:
     """The empty-plan answer, naming what stood in the way.
@@ -94,40 +99,17 @@ def _format_plan_as_context(plan: MealPlan) -> str:
 
 
 def _extract_ingredient_names(ingredients_text: str) -> list[str]:
-    """Normalize a free-text ingredients blob into comparable item names."""
-    if not isinstance(ingredients_text, str):
-        return []
-    cleaned = []
-    for part in re.split(r"[\n,;•\-]+", ingredients_text):
-        t = part.strip().lower()
-        t = re.sub(r"\([^\)]*\)", "", t)
-        t = re.sub(r"[^a-zA-Z\s]", " ", t)
-        t = re.sub(r"\s+", " ", t).strip()
-        if t:
-            cleaned.append(t)
-    return cleaned
+    """Kept for existing importers — ``plan_scoring.ingredient_names``."""
+    return ingredient_names(ingredients_text)
 
 
 def _food_variety_score(plan: ScoredPlan) -> tuple[int, str]:
-    """Count unique food items across the plan's three courses (FVS metric)."""
-    items: list[str] = []
-    for course in plan.courses:
-        items.extend(_extract_ingredient_names(course.ingredients))
-    unique_items = sorted(set(items))
-    reasoning = (
-        f"Unique food items across meals: {len(unique_items)} "
-        f"(e.g., {', '.join(unique_items[:8])}{'...' if len(unique_items) > 8 else ''})"
-    )
-    return len(unique_items), reasoning
+    """FVS over a daily plan's three courses (``plan_scoring.food_variety_score``)."""
+    return food_variety_score(plan.courses)
 
 
 def _plan_as_text(plan: ScoredPlan) -> str:
-    return "\n".join(
-        f"{name}: {course.title}\nIngredients: {course.ingredients}\nDirections: {course.directions}\n"
-        for name, course in (
-            ("Breakfast", plan.breakfast), ("Lunch", plan.lunch), ("Dinner", plan.dinner),
-        )
-    )
+    return plan_as_text(plan)
 
 
 class ChatService:
@@ -583,31 +565,16 @@ class ChatService:
         return formatted, False, meal_plan
 
     def _compute_metrics(self, session_id: str, plan: ScoredPlan) -> dict:
-        """Compute the four plan-quality metrics surfaced in the API response."""
-        plan_text = _plan_as_text(plan)
+        """The four plan-quality metrics surfaced in the API response.
 
-        fvs_count, fvs_reasoning = _food_variety_score(plan)
-        logger.info("[%s] FVS: %d unique ingredients.", session_id, fvs_count)
-
-        diversity = self.diversity_grader.score(plan_text)
-
-        guidelines_text = ""
-        try:
-            guidelines_text = GUIDELINES_PATH.read_text(encoding="utf-8")
-        except OSError as e:
-            logger.warning("[%s] Guidelines file unavailable (%s) — scoring without it.", session_id, e)
-        adherence = self.guideline_grader.score(plan_text, guidelines_text)
-
-        return {
-            "llm_score": plan.score,
-            "llm_reasoning": plan.reasoning,
-            "fvs_count": fvs_count,
-            "fvs_reasoning": fvs_reasoning,
-            "diversity_llm_score": int(diversity.get("score", 0)),
-            "diversity_llm_reasoning": str(diversity.get("reasoning", "")),
-            "guideline_adherence_score": int(adherence.get("score", 0)),
-            "guideline_adherence_reasoning": str(adherence.get("reasoning", "")),
-        }
+        Delegates to ``plan_scoring.compute_daily_metrics``; the plan scorer
+        grades pasted plans with the same functions and the same judges.
+        """
+        metrics = compute_daily_metrics(
+            plan, self.diversity_grader, self.guideline_grader, guidelines_text("daily"),
+        )
+        logger.info("[%s] FVS: %d unique ingredients.", session_id, metrics["fvs_count"])
+        return metrics
 
     # ------------------------------------------------------------------ #
     # Helpers                                                              #

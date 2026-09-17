@@ -2,6 +2,466 @@
 
 ---
 
+# Plan scorer: what a live battery of pasted plans got wrong
+
+> **Date:** 2026-09-17
+> **Branch:** main
+> `plan_score.grounding[].guess_remarks` can carry two new sentences (a
+> catalogue figure set aside; a profiled figure far off the guess). Some dishes
+> that were `matched` are now `approximate`. No schema change.
+
+Eleven live cases against Groq and the WiseFood demo catalogue, over HTTP:
+daily and weekly plans, dish names only and full pasted recipes, `/score-plan`
+and chat (with and without a scoring word), plus three messages that must not
+be scored. All returned 200 with every metric scored and every intent right;
+reading the scored dishes showed what follows. Fixed, then run again.
+
+## Which recipe a dish is
+
+| What | Detail |
+|---|---|
+| `grounding.same_dish`, `parsing.dish_heads` | A title at Dice ≥ 0.75 is `matched` only when the recipe's name keeps every part the member named and adds only `DESCRIPTIVE_WORDS`. Live: "roast chicken with potatoes" matched "Roast potatoes" (64 kcal, and the vegetarian check lost the chicken); "caesar salad" matched "Chicken Caesar salad"; "avocado toast" "Avocado ricotta toast"; "beef tacos" "Beef and kimchi tacos". A generic word at the end of a part ("salad", "soup") passes to the word before it, so "Tuna nicoise salad" is still "Tuna Niçoise". Hits that are the same dish rank above closer-worded ones. |
+| Diet and cuisine words are not descriptive | Tried and removed within the battery: "caesar salad" then matched "Vegan caesar salad" and failed a tree-nut allergy on its cashews, and after that "Mexican Caesar salad", counted as red meat. |
+| `grounding.borrowable` | A generic name lends calories only when it also keeps every part: "Hummus" no longer stands in for "houmous and pitta" (47 kcal), nor "Roasted vegetables" for "baked cod with roasted vegetables". |
+| Member-written ingredients win | A matched recipe no longer replaces what the member wrote: "Banana oat pancakes (2 bananas, 2 eggs, 50 g oat flour)" was failed for the milk in the catalogue's "Banana Pancakes". The recipe's allergens, ingredients and tags are then not used; its calories still are. |
+| `parsing._meal_from_segment` | "(150 g yogurt, 20 g walnuts, 1 tsp honey)" is ingredients. It started with a digit and was read as an amount, so a whole pasted week had no ingredient lists. A bracket with a comma is a list. |
+
+## Which calories to believe
+
+| What | Detail |
+|---|---|
+| `MIN_MEAL_KCAL` (120), `MIN_SNACK_KCAL` (40) | Catalogue per-serving figures below these are set aside and the dish estimated instead (`rejected_recipe_kcal`, with a remark). Live: Quick Chili 12, Tomato Basil Soup 24, Crunchy fruit and yoghurt 47, Quick Chicken Stir-Fry 49, Scrambled egg on toast 61, Pancakes 97, Quinoa Salad 11, Mushroom Stroganoff 7. |
+| `MAX_PROFILE_DISAGREEMENT` (2.0) | A profiled typical serving more than double off the model's own guess is not used; the guess is, with a remark naming the discarded figure. Probe: pho profiled at 2,025 kcal (guess 600), minestrone 1,138 (guess 500), both with full coverage. |
+| `MAX_ESTIMATED_DISHES` (21) | The one estimator call covers a week's dishes; only profiling stays at `MAX_PROFILE_CALLS`. A 21-dish week had left its last three dishes with no calories. |
+| Parser prompt, estimator prompt | "Serves 2" in a pasted recipe goes to `quantity_note`; the estimator divides a whole recipe's quantities down to one serving and lists each ingredient once (it had repeated "black pudding"). |
+| `PROFILE_TIMEOUT_SECONDS` 12 → 15 | Four parallel calls returned at 11.9–12.0 s on the demo gateway. |
+
+## Allergies and the reply
+
+| What | Detail |
+|---|---|
+| `PLANT_DAIRY` in `allergen_conflicts` | "coconut milk" was lactose and dairy. The mask the diet check already used now applies to dairy and lactose allergies too, and only to them: peanut butter is still peanuts. |
+| Possible allergens in the judge's conflicts | Marked `POSSIBLE ONLY` and "not a broken hard constraint", and the judge prompt says so. Live, muesli that only a catalogue recipe put almonds in scored fit 1 "for breaking your allergy"; rerun, fit 4 with the warning. |
+| `service.allergen_sentences` | One sentence per certainty and set of allergens, naming every dish: "“Walnut yogurt”, “Cashew stir fry” and “Almond porridge” contain tree nuts". A three-day week had repeated the sentence three times. A reply writing "tree‑nut" with a non-breaking hyphen counts as naming it. |
+| `service.ensure_calorie_caveat` | A reply quoting kcal without a word that they are partly known or estimated gets "Calories for 2 of 3 dishes are estimates, not recipe figures." (or "known for only N of M dishes"). The writer had the instruction and ignored it twice. |
+
+## Verification
+
+Tests for every row above in `tests/test_plan_scorer.py` and
+`tests/test_plan_scoring.py`. Full suite: 951 passed. Ruff: no new findings.
+
+Live, rerun after the fixes: routing still right in all eleven (planner
+request -> daily_plan, "adding salmon for dinner" -> not scored, small talk ->
+chat). Confirmed on the live data:
+
+- 7-day week: "roast chicken with potatoes" now breaks the vegetarian diet as
+  chicken; all 21 dishes have calories (was 18); 61% of target, was 69% with
+  the 7–97 kcal catalogue figures in it;
+- pasted recipes: no dairy verdicts on coconut milk or on a matched recipe's
+  milk (fit 1 -> 4); the "serves 2" curry 438 kcal a serving (was 900 and
+  then 1,250);
+- a possible allergen (muesli) keeps its warning and no longer sets fit to 1;
+- pho 619 kcal (was 1,349); replies quoting calories now say they are
+  estimated; the tree-nut warning appears once.
+
+Still imperfect, and not changed here: the catalogue's own figures above the
+floor are taken as given (Thai green curry 1,304 kcal), and the weekly ledger's
+default "at most N meat meals" row reads to the writer as the member's own limit.
+
+---
+
+# Plan scorer: calories per dish, and guessed servings in the variety count
+
+> **Date:** 2026-09-17
+> **Branch:** main
+> `plan_score.grounding[]` rows gain `kcal`, `typical_ingredients` and
+> `guess_remarks`; `fvs` detail gains `dishes_with_guessed_ingredients`, as
+> does `weekly_variety` detail when it applies. Additive; rows stored before
+> this read back with the defaults.
+
+| What | Detail |
+|---|---|
+| `GroundedMeal.kcal` → row `kcal` | Calories per serving, rounded, from whichever source `nutrition_source` names; `null` when unknown. The UI can show where a day's total comes from. |
+| `GroundedMeal.typical_ingredients` → row `typical_ingredients` | The estimator's serving, `[{name, quantity}]`. It is now written for dishes missing ingredients too, not only calories (one call either way; dishes missing calories are first under `MAX_PROFILE_CALLS`). A dish that already has calories is not profiled. |
+| `GroundedMeal.guess_remarks()` → row `guess_remarks` | One plain sentence per guess in the row: calories estimated from a typical serving; calories a rough model guess; ingredients a typical serving that counts towards variety but is not checked against allergies, diet or dislikes. Empty when nothing is guessed. |
+| `scoring._daily_measured` (`fvs`) | A dish with no ingredient list counts its typical serving's ingredient names. The sentence names those dishes: "2 dish(es) (“fried eggs”, “pasta with zucchini”) are counted with a typical serving's ingredients — a guess, not what you wrote or a recipe". Without guesses the count is computed exactly as before. |
+| `scoring.with_guesses` (`weekly_variety`) | The same for a week's unique-ingredient count over main meals. `variety_metrics` is the planner's and is not changed: only `unique_ingredients` and its sentence are recounted; distinct recipes and meal categories still come from the member's words and matched recipes. |
+| `scoring._ingredient_line` | The judge reads a guessed serving as "Ingredients not known; a typical serving might contain (a guess, not the user's words): …". |
+| Guesses are not evidence | `ingredients`, which the allergy, diet and dislike rows read, is never filled from a guess. A test pins that a guessed "peanuts" leaves the peanut allergy row satisfied. |
+
+## Verification
+
+New tests: the row's kcal, serving and both remarks; the rough-guess remark;
+the member's own ingredients kept over the guess; a dish with calories but no
+ingredients getting a serving without a profiling call; an empty row; dishes
+missing calories first under the cap; `fvs` and weekly counts with guesses and
+their sentences; the judge's line; a guessed allergen producing no verdict.
+Full suite: 918 passed. Ruff: no new findings.
+
+**Live** (`POST /score-plan`, same three dishes): 200 in 9.8 s, 3 model calls,
+3,350 tokens. Fried eggs `kcal: 180`, `typical_ingredients`, two remarks. The
+demo profiler answered 503 for the pasta this time, so it carried
+`nutrition_source: "model_estimate"`, `kcal: 450` and the rough-guess remark,
+which is the guess path running live for the first time. The soup `kcal: 345`
+from its recipe, no remarks. `fvs` went from 10 to 14 and names both guessed
+dishes.
+
+---
+
+# Plan scorer: calories from typical ingredients
+
+> **Date:** 2026-09-17
+> **Branch:** main
+> `plan_score.grounding[].nutrition_source` values change: `profiled` is gone,
+> `typical_ingredients` and `model_estimate` are new. No other API change.
+
+A live paste of fried eggs, pasta with zucchini and chicken noodle soup came
+back with calories for one dish of three. The two loose matches were different
+dishes, so they rightly lent nothing; the profiling fallback then timed out
+twice at 60 s and held the turn for two minutes. Once the endpoint answered,
+three more faults showed, and the reply called the one-dish figure "a large
+calorie shortfall".
+
+## Where the calories come from
+
+| What | Detail |
+|---|---|
+| `agents.DishIngredientEstimator` + `DISH_ESTIMATOR_SYSTEM` / `_USER` | One call on the fast model (`openai/gpt-oss-20b`, a separate Groq budget from the judge's) for every dish still without calories: a typical single serving with quantities, keeping the member's own ingredients and amount, plus a calorie guess. `schemas.DishEstimatesSchema`. Returns `{}` on any failure. |
+| `grounding.DishGrounder._estimate_missing` | Replaces `_profile_missing`. Each ingredient list goes to the profiler as `Title / Serves 1 / one ingredient per line`. Reliable figures become the dish's nutrition (`typical_ingredients`); otherwise a guess between 20 and 2,500 kcal is used (`model_estimate`, calories only); otherwise nothing. A repeated dish is estimated once. Still capped at `MAX_PROFILE_CALLS` distinct dishes. No estimator passed, no estimate and no call: the orchestrator and the default `PlanScorerService` wire one in. |
+| Why not send the dish name alone | The profiler invents a recipe for a bare title and weighed the pasta in "pasta with zucchini" at 0 g. Given ingredient lines it looks each one up in composition tables, which is the figure worth having. |
+| `grounding._profile_all` | Profiling calls run in parallel (4 workers) with `PROFILE_TIMEOUT_SECONDS` (12 s) each. The first `candidates_client.ProfilingTimeout` stops calls not yet started; those dishes fall back to the guess. A healthy pipeline answers in 1–7 s. |
+
+## Reading the profiler
+
+| What | Detail |
+|---|---|
+| `candidates_client.profile_nutrition` | Rewritten against a real response. Reads `profiling_totals.total_energy_kcal_per_serving_<table>` and its protein, carbohydrate and fat siblings (the table named by `nutrition_source_key` wins), falling back to `full_profile.nutrition_summary.energy_kcal_per_serving`. The guessing reader it replaces took whole-recipe calories, which doubled a two-serving dish, and macros from the first ingredient. |
+| `models.recipe.ProfiledNutrition` | `nutrition`, `coverage`, `low_coverage`; `reliable` is false when the profiler flags low coverage or matched under `MIN_PROFILE_COVERAGE` (0.6) of the ingredients. |
+| `profile_recipe(..., timeout=None)` | Both the production client and the demo client take a timeout and raise `ProfilingTimeout` on it; other failures still return None. `DemoSession.call` gains an optional `timeout`. The demo client already sent the bearer token; the earlier failures were a stalled pipeline, not authentication (without a token the gateway answers 401 in 0.2 s). |
+
+## The fixes around it
+
+| What | Detail |
+|---|---|
+| Labels | The calorie metric, the plan-score warnings and the judge's plan text say "estimated from typical ingredients" or "a rough guess", never "as written". |
+| `service.summary_facts` → `calories` | When some dishes have no calories, the writer is told in so many words not to state or compare the plan's total, or call it short of or over a target. When all are known but some estimated, it is told to say so if it mentions calories. |
+| `service.allergen_sentences` | One sentence per dish and certainty: "“Pasta with zucchini” may contain lactose and dairy, which are on your allergy list." instead of one sentence per allergen. `ensure_allergen_warnings` appends it when the reply leaves out any of its allergens. |
+| `scoring.constraint_rows` → `violations["possible_allergens"]` | An allergen only the closest recipe has now reaches the judge's conflicts as "may contain …, a possibility, not a fact". Live, the judge had written "no allergens" beside the warning. It still caps nothing. |
+
+## Verification
+
+`tests/test_plan_scorer.py`: typical ingredients profiled with the member's own
+ingredients passed on; low coverage, the profiler's own flag, an implausible
+guess, no estimator, no endpoint, a failing profiler, a failing estimator; one
+timeout stopping the rest; a repeated dish estimated once; the cap; the reader
+on the live response shape (per serving, not whole recipe; named table; summary
+fallback; no calories); the estimator's parsing of partial and malformed
+output. `tests/test_plan_scoring.py`: both labels in the metric and the judge's
+text, possible allergens reaching the judge without capping fit, the merged
+warning, the calorie facts. Full suite: 909 passed. Ruff: no new findings.
+
+**Live**, `POST /score-plan` over HTTP against Groq and the WiseFood demo
+gateway, the same three dishes, a member allergic to lactose and dairy:
+
+| | |
+|---|---|
+| Result | 200 in 10.2 s; 3 model calls, 3,310 tokens (estimator 570 on the fast model, judge 1,899, writer 841) |
+| Fried eggs | closest recipe a pumpkin rösti, so estimated: 2 eggs, 1 tsp olive oil → 180 kcal, coverage 1.0, profiled in 3.3 s |
+| Pasta with zucchini | closest recipe a creamy bacon pasta, so estimated: 80 g dry pasta, 150 g zucchini, 1 tsp oil → 360 kcal, coverage 1.0, 5.6 s |
+| Chicken noodle soup | matched, the recipe's own figures |
+| Day | about 885 kcal against 1,800, every dish counted |
+| Reply | one merged "may contain lactose and dairy" warning; the judge's fit reasoning says dairy presence is uncertain |
+
+Not exercised live: a profiler timeout, and the guess path.
+
+---
+
+# A pasted plan reaches the scorer without the classifier
+
+> **Date:** 2026-09-16
+> **Branch:** main
+> `OrchestratorAgent.classify` now returns `failed: True` when every attempt
+> failed; the intent it returns is unchanged. No API change.
+
+Live, this message was answered as small talk:
+
+> Rate for me a daily plan consisting of fried eggs for breakfast, pasta with
+> zucchini for lunch and chicken noodle soup for dinner
+
+Two independent causes, both fixed here.
+
+| What | Detail |
+|---|---|
+| The classifier was never asked successfully | Three attempts, three 429s on the day's token budget, and `classify` defaults to `chat` on failure. The member got the small-talk bot, which succeeded because its prompt is smaller than the classifier's 2,105 tokens. `classify` now reports the failure, and `_classify_and_route` scores a message that lists meals instead of chatting at it. Every other message still falls back to `chat` exactly as before. |
+| The bypass should have skipped the classifier | It required `slot:` lines or bullets, and this plan is prose. `looks_like_plan_listing(text, structured_only=False)` counts the prose form too, and the new `OrchestratorService.looks_like_a_pasted_plan` pairs it with the request-verb guard, which now also catches "adding", "including" and "put". So "what do you think of adding salmon for dinner and oats for breakfast?" is still a request for the classifier, and a pasted plan with a scoring word costs no classifier call at all. |
+
+## Verification
+
+`tests/test_plan_scoring.py`: the live message bypasses the classifier; a
+listing reaches the scorer when classification fails; "adding salmon for
+dinner", "what's for dinner tonight?" and "thanks, that looks great" still
+fall back to chat; `classify` reports `failed` after its retries. Full suite:
+891 passed, no new lint findings. Not re-run live — the day's Groq token
+budget is spent.
+
+---
+
+# Plan scorer: one judge call, estimated calories, and one spelling per dish
+
+> **Date:** 2026-09-16
+> **Branch:** main
+> `plan_score.grounding` rows gain `nutrition_source`. No other API change.
+> The planner's own judges are restored to exactly their committed form.
+
+Three changes to the scorer, all from what the live runs cost and got wrong.
+
+## One judge call instead of three
+
+| What | Detail |
+|---|---|
+| `agents.PlanJudge` + `PLAN_JUDGE_DAILY_SYSTEM` / `PLAN_JUDGE_WEEKLY_SYSTEM` / `PLAN_JUDGE_USER` | Diversity, guideline adherence and fit come back from one call as one JSON object (`schemas.PlanJudgementSchema`). The daily and weekly prompts differ only in how the two food criteria are judged. |
+| Measured cost | Three calls sent the plan, the profile and a system prompt three times: about 3,400 input tokens and three outputs. One call is about 2,100 input tokens and one output, and one request instead of three. On the Groq on-demand tier (8,000 tokens a minute, 200,000 a day) that is the difference between a paste fitting in a minute's allowance and not. |
+| `agents.MealDiversityGrader`, `GuidelineAdherenceGrader` | Back to their committed form: no `system_prompt`, `run_name` or `facts` parameters. The planner's daily flow is byte-identical again, and `PLAN_FIT_SYSTEM`, `WEEKLY_MEAL_DIVERSITY_SYSTEM` and `WEEKLY_GUIDELINE_ADHERENCE_SYSTEM` are gone. |
+| `scoring.run_judges` removed | With one call there is no fan-out, so the thread pool and its context copying go too. `retrying` stays: one retry when the call raises or returns no usable score. |
+| Partial answers survive | A payload missing one section, or carrying a score off the 1–5 scale, leaves that one metric ungraded instead of discarding the other two. |
+
+## Calories when no recipe matches
+
+| What | Detail |
+|---|---|
+| `candidates_client.profile_recipe` | `POST {RECIPEWRANGLER_API_URL}/api/v1/recipes/profile` ("Run parsing + profiling pipeline on raw recipe text"), through the gateway at `/api/v1/recipewrangler/recipes/profile`. Sends the dish as the member wrote it: title, their amount, their ingredients. |
+| `candidates_client.profile_nutrition` | Reads per-serving calories out of the response. **The response shape is not in the gateway's OpenAPI document and the demo deployment answers 503 (`upstream/unavailable`), so this has never seen a real payload.** It therefore looks up the figures by name at any nesting depth, accepts the plausible spellings (`kcal_per_serving`, `calories`, …), and returns None when it finds no calorie figure. |
+| `grounding.DishGrounder._profile_missing` | Runs after the details batch, for dishes that still have no calories. One call per distinct dish, capped at `MAX_PROFILE_CALLS` (10) per plan, each failure silent. A deployment without the endpoint passes `profile_client=None` and simply gets no estimates. |
+| `GroundedMeal.nutrition_source` | `recipe` \| `closest_recipe` \| `profiled` \| `""`. An estimate is labelled in the grounding row, in the calorie metric's sentence, in the plan-score warnings and in the text the judge reads, so it is never presented as a measurement. |
+
+## One spelling per dish
+
+| What | Detail |
+|---|---|
+| `parsing.SPELLING_VARIANTS`, `fold_accents` | "lasagne"/"lasagna", "yoghurt"/"yogurt", "houmous"/"hummus" and similar normalise to one form on both sides before comparison, and accents fold ("crème fraîche" = "creme fraiche"). Live, the knowledge-graph search offered "Roasted vegetable lasagne" for "vegetable lasagna" and the literal matcher rejected it. |
+| `parsing.spelling_variants` | The other spellings of a title, for searching. `grounding.DishGrounder._search` uses them only when the first query found nothing that scores as a match, so a hit costs one request as before. |
+
+## Verification
+
+`tests/test_plan_scorer.py` and `tests/test_plan_scoring.py` cover the merged
+judge (one call carries the guideline text, the measured facts and the plan;
+weekly gets the weekly prompt; a retry; a missing section; a failed call
+leaving the measured metrics), the fallback (estimated calories and their
+label, a matched recipe's own figures kept, a missing endpoint, a failing
+profiler, the cap) and the spellings (normalisation, similarity, variant
+search only when needed). Full suite: 885 passed. Ruff: no new findings.
+
+**Live:** both pastes went through `POST /score-plan` over HTTP against Groq
+and the WiseFood demo catalogue. Each returned 200 `application/json` with all
+its metrics scored, in **two** model calls instead of four:
+
+| Paste | Calls | Input | Output (incl. reasoning) | Total | Time |
+|---|---|---|---|---|---|
+| 3 days | judge + writer | 2,980 | 466 (281) | 3,446 | 10.5 s |
+| 1 day | judge + writer | 2,157 | 529 (277) | 2,686 | 5.3 s |
+
+The judge returned all three scores both times, and the caps still bit: the
+day with peanut noodles and a chicken caesar salad scored fit 1 with the
+allergy and the diet named.
+
+**Not verified live:** the calorie fallback. The demo's profiling pipeline
+answers 503 (`upstream/unavailable`) for every dish, which the run logged and
+carried on from, so no estimate has ever come back. Its response shape is
+still guessed, and `profile_nutrition` is written to tolerate that.
+
+---
+
+# Plan scorer, steps 4–5: a pasted plan gets FoodChat's scores
+
+> **Date:** 2026-09-15
+> **Branch:** main
+> New endpoint `POST /foodchat/sessions/{id}/score-plan`. `ChatTurnResponse.plan_score`
+> is now fully populated and typed; `/conversation` messages gain `plan_score`.
+> New nullable column `messages.plan_score` (added by `init_db`'s migration).
+> Generated daily and weekly plans are unchanged — see "The planner, fenced".
+> **Not in this change:** the wisefood-api gateway route and the UI text box
+> and card live in other repositories and still need the matching change.
+
+A member can now paste a daily or weekly plan — into the chat or into a text
+box — and get it scored with the metrics FoodChat uses on its own plans, with
+the reasoning behind each number, the constraints it breaks, and a short
+reply. Nothing is written to a canvas; the score card is stored with the reply
+so it survives a reload.
+
+## The planner, fenced
+
+| What | Detail |
+|---|---|
+| `services/plan_scoring.py` (new) | `ingredient_names`, `food_variety_score`, `plan_as_text`, `compute_daily_metrics`, `guidelines_text(scope)` — moved out of `ChatService`, bodies unchanged. `ChatService._compute_metrics` delegates to it; the old private names stay as thin aliases. `weekly_planner/explainability` imports the same `ingredient_names` instead of keeping a copy (and drops the now-unused `re` import). |
+| `prompts.GRADER_SYSTEM_INSTRUCTIONS` | The rubric, slot-plausibility and assessor paragraphs were extracted into `PLAN_SCORING_RUBRIC`, `SLOT_PLAUSIBILITY_RULES` and `ASSESSOR_STANCE` by a script that cut the exact substrings, so the fit judge shares them. The assembled grader prompt is byte-identical; its hash is pinned. |
+| `agents.MealDiversityGrader`, `GuidelineAdherenceGrader` | Optional `system_prompt` / `run_name` (and `facts` on the guideline judge). With the defaults the planner gets the same prompt, the same message text and the same trace name — asserted against a recording client. |
+| `tests/test_plan_scoring.py` | Verbatim copies of the pre-hoist functions as an oracle; SHA-256 of the seven planner prompts; the default judges' messages; eleven everyday planner messages that must not be taken for an explicit score request, and must still reach the classifier. |
+
+## Step 4 — scoring (`services/plan_scorer/scoring.py`, new)
+
+| What | Detail |
+|---|---|
+| Constraint rows | `transparency.constraints_ledger(profile)` rows — same wording and household attribution as a generated plan — re-measured dish by dish. Allergy, checkable diets (vegetarian, vegan, pescatarian, gluten-, dairy-, nut-free) and dislikes become `violated` naming the dishes, or `satisfied` with a note when some dishes could only be checked by name. Goals and non-checkable diets are `unchecked`. Catalogue tags count only for a matched dish. |
+| Daily metrics | `fvs`, `daily_nutrition` (`nutrition_metrics` against a one-day target), `diversity` and `guideline_adherence` with the planner's own judges and prompts, `fit`. |
+| Weekly metrics | `weekly_variety`, `weekly_guidelines`, `weekly_nutrition`, `diversity`, `guideline_adherence`, `fit`. The explainability functions are called one by one rather than through `build_weekly_explainability`, which divides by seven and counts snacks as meals: targets are scaled to the days pasted, snacks count for calories but not meals, and "eat fish 1–2 times a week" is not applicable to a shorter plan with no fish. Measured rows (meat limit, calories, repeats) say "over these N days". |
+| `WEEKLY_MEAL_DIVERSITY_SYSTEM`, `WEEKLY_GUIDELINE_ADHERENCE_SYSTEM` (new prompts) | Judge across days — protein rotation, produce across the week, repeats as routine versus monotony. The weekly guideline judge is handed the measured checklist as facts and told not to contradict it. |
+| `agents.PlanFitGrader` + `PLAN_FIT_SYSTEM/USER` (new) | One plan against the profile: allergies and diet as hard constraints, the conflicts code found, likes, dislikes, goals, nutrition targets, and the member's aim (the text box's `context` plus what they wrote around the listing). |
+| Caps, in code | An allergen caps fit at 1 — and sets 1 even if the fit judge failed; a broken checkable diet caps it at 2. The reasoning names the dish. |
+| Judges | Run concurrently, each in a copy of the turn's context so Langfuse still groups them. A failed judge gives `score: None` and a sentence, never 0. |
+
+## Step 5 — reply, persistence, endpoint
+
+| What | Detail |
+|---|---|
+| `plan_scorer/service.py` | `ResponseWriter` writes the reply from facts (scores, broken constraints, dishes not found, close matches); the deterministic fallback reads and scores. Any allergen the reply does not name is appended as a fixed sentence. The clarification state now carries `plan_type` and `context`. |
+| Payload | `metrics[{key, label, score, kind, reasoning, detail}]`, `constraints_applied`, `grounding`, `unparsed`, `warnings`, `scored_plan{origin: "pasted", plan_type, days, entries}`, `context`. `scored_plan.days` uses `DayPlanResponse`, which can show a partial or two-plate day; `entries` uses the weekly card's entry shape. |
+| `db.MessageRow.plan_score`, `SessionService.add_message(plan_score=)`, `Message.plan_score` | Stored with the reply, loaded with the session, returned by `get_messages_page` and `/conversation`. Idempotent `ALTER TABLE` in `_migrate_existing_db`. |
+| `POST /sessions/{id}/score-plan` + `OrchestratorService.score_plan` | `{member_id, plan_text (≤ 8000), plan_type: auto|daily|weekly, context? (≤ 500)}` → `ChatTurnResponse`. Ownership 404, message cap, blank text 400; supersedes a pending clarification; no classification; memory nudges still run on the pasted text. |
+| Typed wire models | `PlanScoreMetric`, `PastedPlanView`, `ScorePlanRequest`; `PlanScoreResponse.metrics` is typed. |
+| `OrchestratorService.is_explicit_score_request` | Now requires a *structured* listing (`slot:` lines or bullets, not "X for dinner" prose) and no request verb (make, swap, change, add, plan my…). "What do you think of adding salmon for dinner and oats for breakfast?" goes to the classifier, as it did before the scorer existed. |
+| `plan_scorer` steps 1–3 | Parser keeps the lines around a listing as `notes`; grounding makes one details call for every grounded dish it uses (images for matched dishes). |
+
+## Close matches, corrected after the first live run
+
+The first run against the WiseFood demo catalogue produced confident, wrong
+claims that no unit test had caught, because the fakes returned tidy titles.
+
+| What the live run showed | Fix |
+|---|---|
+| "porridge with banana and honey" **matched** "Honey banana cups" (0.8). `cups` was on the stop-word list, so the catalogue title was compared as "honey banana". | `parsing.MEASURE_WORDS` split from `STOPWORDS`; `title_similarity` drops amount words from the member's title only, keeping them in the catalogue title, where they name the dish. The pair now scores 0.67. |
+| "vegetable lasagna" read as a beef "Lasagna": the vegetarian row said **violated by vegetable lasagna (red meat)**, the meat count rose, and the reply repeated it. "peanut noodles" read as a salmon noodle recipe was reported as fish. | An approximate match **never lends ingredients or tags**. Diet, category and meat checks read only the member's words unless the dish is matched. |
+| "an apple" read as "Apple strudel", with the strudel's calories and 20-odd ingredients in the variety count. | An approximate match lends **nutrition only** when its name is a more generic form of the member's (`grounding.borrowable`: "Lasagna" for "vegetable lasagna", "Hummus" for "hummus and carrots"), never when it names something they did not write. `GroundedMeal.borrows_nutrition` and the grounding row say which; the reply names both cases differently. |
+| An allergen present only in a resembling recipe would have capped the fit score. | New evidence `closest_recipe`: the reply says "may contain", the allergy row is `unchecked` with the dish named, and no cap applies. |
+| The daily diversity judge and the weekly fit judge returned nothing while the router battery ran in parallel; alone, sequentially and three at a time, every call succeeded. | Each judge gets one retry on an exception or an unusable score (`scoring.retrying`); the failure is logged with its type. |
+| Similarity was computed on the search hit's title and shown with the fetched record's title. | Recomputed on the fetched title when they differ. Not the cause of the porridge match, which was the stop word, but the number must describe the recipe actually used. |
+
+## Verification
+
+**Unit tests (LLM-free):** 876 passed — the 712 that existed before the scorer
+work, plus the two scorer files. Ruff reports exactly the findings it reports
+on `HEAD`; nothing new. mypy is not installed in this environment and was not run.
+
+**Live, WiseFood demo catalogue + Groq:** the first run, before the close-match
+fixes, sent a pasted day and a pasted three-day plan through `/score-plan` and
+produced the wrong claims listed under "Close matches". After the fixes the same
+pastes were sent over HTTP to the real router (FastAPI `TestClient`): both
+returned 200 `application/json` (20.8 kB weekly, 5.8 kB daily) with every
+`plan_score` field; grounding, the measured metrics and the constraint rows were
+correct (vegetarian broken only by the chicken caesar salad and the grilled
+salmon; the lasagna lends calories only); `/conversation` returned both cards.
+The daily token quota was still spent, so one judge answered (weekly diversity,
+4/5, 997 input and 354 output tokens of which 88 reasoning) and the rest returned
+`score: null` with the deterministic reply, as designed.
+
+**Live, not verified:** the router prompt battery (planner messages must route as
+the committed prompt routes them; pasted plans must route to `score_plan`). The
+run hit the Groq on-demand daily token limit for `openai/gpt-oss-120b` (200,000
+tokens a day): 218 router calls failed and fell back to `chat` for all three
+prompt variants — the committed one included — so it shows nothing about the
+prompts. The first live run's chat paste and its ordinary daily-plan request
+both landed in small talk, most likely for the same reason. Both checks need a
+rerun with quota to spare (`scratchpad` scripts `live_router.py`, `live_e2e.py`).
+
+**Cost note:** a pasted plan costs up to four calls on the reasoning model
+(three judges and the reply writer) plus one fast-model parser call when the
+text is not structured, and a failed judge is retried once.
+
+## Still open
+
+- The gateway route for `/score-plan` and the UI text box and score card (other repositories).
+- `guidelines_text` still reads a file that is not in this repository and returns `""`; the external guidelines endpoint replaces that one function.
+- Generated weeks do not yet carry the weekly diversity and guideline judges; attaching them adds two Groq calls to every weekly plan.
+- "Adopt this plan" onto a canvas.
+- The same dish twice on one day of a pasted week still counts as an unexplained duplicate.
+
+---
+
+# Plan scorer, steps 1–3: a plan the member wrote becomes a reading
+
+> **Date:** 2026-09-14
+> **Branch:** main
+> New intent `score_plan`. `ChatTurnResponse` gains an optional `plan_score`.
+> No canvas, storage, or existing-intent behaviour changes. No metric is
+> computed yet — that is steps 4–5 of IDEAS.md "Plan scorer".
+
+A member can paste a daily or weekly plan they wrote into the chat. FoodChat
+now recognises that as its own intent, reads the text into days, slots and
+dishes, matches each dish to the recipe catalogue, and builds the same objects
+the planners produce, so the existing evaluation routines can grade it in the
+next step. The reply says what was read, which dishes matched only roughly or
+not at all, which dishes carry one of the member's allergens, and that scores
+are not available yet. Nothing is written to a canvas.
+
+## Recognising the intent apart from the others
+
+| What | Detail |
+|---|---|
+| `schemas.OrchestratorSchema`, `OrchestratorAgent.VALID_INTENTS`, `models.session.Intent` | `score_plan` added. |
+| `prompts.ORCHESTRATOR_SYSTEM` | Tenth intent, and rule 8 to keep it apart from its neighbours: a message that *brings* a listing is `score_plan`, even with "is this healthy?" attached; a request *for* a plan that names a few dishes stays `daily_plan`/`weekly_plan`; a question about the plan FoodChat made stays `plan_question`/`nutrition_question`. Rule 5 now defers to rule 8. |
+| `OrchestratorAgent.system_prompt` + `prompts.SCORE_PLAN_INTENT_ADDENDUM` | The live router prompt is a managed Langfuse copy that predates this intent, and a deploy never overwrites it. When the compiled text does not mention `score_plan`, the addendum is appended — otherwise production could never emit the intent while every local test passed. |
+| `OrchestratorService.is_explicit_score_request` | A scoring word ("rate", "score", "how does this look") plus a listing in at least two meal slots skips the classifier, like an explicit FoodScholar consult, and supersedes a pending clarification. A FoodScholar mention keeps its own bypass; "rate my week" with no listing still goes to the classifier. |
+| `OrchestratorService._route` | `score_plan` is checked first and goes to `PlanScorerService`. |
+| `OrchestratorService._handle_clarification_turn` | `kind == "score_plan"` resumes the scorer. A reply that answers nothing is routed as a fresh turn with `score_may_ask=False`, so the member is never asked a score question twice in a row. |
+
+## Step 1 — parsing
+
+| What | Detail |
+|---|---|
+| `models/pasted_plan.py` (new) | `PastedMeal`, `PastedDay`, `PastedPlan`, `GroundedMeal`; JSON round-trip so a parsed plan can ride inside clarification state. |
+| `services/plan_scorer/parsing.py` (new) | A line scanner reads day headings ("Monday", "Day 2", "Tue:"), `slot:` prefixes, bullets under a slot heading, trailing "(ingredients)", and "oats for breakfast" prose. A heading must end like a heading, so "Sun-dried tomato pasta" is not Sunday. Preamble and questions are ignored; any other line it cannot place is kept verbatim in `unparsed`. |
+| No model call for structured text | When the scanner reads the text from structure alone and places every line, its reading is used as is. Most pasted plans are shaped that way. |
+| `agents.PlanTextParser` + `prompts.PLAN_TEXT_PARSER_*` (new) | Fast model, called only for text the scanner could not fully read, with the scanner's reading as a hint. A new prompt name, so it syncs to Langfuse. |
+| Checked against the text, in code | A title the text does not support is dropped; an ingredient list with any item the member did not write is dropped whole; an `unparsed` line must be a verbatim substring. Each drop leaves a warning. A parser failure leaves the scanner's reading. |
+| Shape question | One block with no day names in which two or more meals repeat asks "one day or several?" (`days_from_answer`: "3 days", "the whole week", "just one day", "several days"). Two dinners alone is one dinner on two plates, not a question. |
+| `parsing.singular` | Its own symmetric stem. `pantry_service.singular` maps "berries" to "berri" and leaves "berry" alone, by design, for regex re-inflection — so "Berry Oatmeal" never matched "oatmeal with berries". |
+
+## Step 2 — grounding
+
+| What | Detail |
+|---|---|
+| `SeedService.find_dish` (new) | The seed path's search and tolerant autocomplete, **not** filtered by the member's allergens, diet or dislikes, with no detail fetch, overlay or allergy gate. IDEAS.md suggested a flag on `_finalize_resolution`; filtering happens in the search, one layer earlier, so a flag there would still have swapped "peanut noodles" for a peanut-free recipe. |
+| `services/plan_scorer/grounding.py` (new) | Dice similarity over content words picks the best candidate: ≥ 0.75 matched (recipe ingredients, nutrition, tags), ≥ 0.40 approximate (member's ingredients when written, recipe nutrition and tags), else unresolved (member's words only). One lookup per distinct title; one `fetch_details` batch fills missing nutrition. Lookup failures leave a dish unresolved, never fail the turn. |
+| `allergen_conflicts` | Every profile allergen found in a dish, with `evidence` `as_written` or `recipe`, using the same synonym-expanded matcher as the seed gate. Reported and kept — never used to drop the dish. |
+
+## Step 3 — building
+
+| What | Detail |
+|---|---|
+| `services/plan_scorer/building.py` (new) | Weekly: entry dicts in the `WeeklyMealPlanEnv` shape, so `build_weekly_explainability` runs on a pasted week unchanged; snacks and "other" kept in `extras`, because the guideline checklist counts meals. Daily: course lists per slot; `as_scored_plan()` only for a complete one-dish-per-slot day. `ScoredPlan` is unchanged — its three consumers all assume a full day. |
+| Dish identity | A matched dish keeps the catalogue id. An approximate or unresolved dish gets a stable `pasted:<title words>` id, so "chicken curry" and "Thai green curry" landing near one recipe are not a repeat. |
+| `weekly_planner/explainability.REPEAT_BY_AUTHOR` (new) | A dish on an earlier day is the member's own repeat. Chip: "the same breakfast as Monday, as you planned it". When every repeat is the author's, the ledger row is "repeats are your own choice", source "your own plan", status satisfied — not measured against the planner's cooldown. The prose names them too. |
+
+## The turn
+
+| What | Detail |
+|---|---|
+| `services/plan_scorer/service.py` (new) | Persists the member's text and a deterministic reply (intent `score_plan`). Clarification states `{kind: "score_plan", reason: "no_meals" | "shape", pasted_text, plan?}` keep the pasted text so nobody re-pastes. |
+| `ChatTurn.plan_score` / `routers.PlanScoreResponse` (new) | `plan_type`, `days_scored`, `meals_scored`, `grounding[]`, `unparsed[]`, `warnings[]`; `metrics` and `constraints_applied` are empty lists until step 4. |
+| `CHAT_ENDPOINT_PIPELINE.md` | Section 1 (bypass, clarification kind, route), new section 5b, section 6 field. |
+
+## Verification
+
+`tests/test_plan_scorer.py` (new, 56 tests, LLM-free): scanner heading styles,
+bullets, parentheses, preamble vs stray lines, "Sun-dried" and "haddock";
+parser output checked against the text; shape question and answers; grounding
+states, unfiltered lookup, allergen kept with its evidence, one lookup per
+dish, one nutrition batch, lookup failure; weekly entries, author repeats
+through `variety_metrics` and `build_weekly_explainability`, three-day
+checklist scaling; daily completeness; the turn (no canvas, persisted
+messages, both clarification reasons, unanswered replies); routing (classified,
+explicit bypass, superseding a pending question, no bypass without a listing,
+never asking twice, the stale-prompt guard, the wire model). Full suite: 768
+passed.
+
+## Still open
+
+- Steps 4–5: metrics, hard-constraint ledger rows, fit score, summary prose.
+- `plan_score` is returned on the turn but not stored with the message, so the card does not survive a conversation reload yet.
+- The `/sessions/{id}/score-plan` endpoint for the text box, and the gateway and UI.
+- The same dish twice on one day of a pasted week cannot carry `repeat_of_day` and still counts as an unexplained duplicate.
+
+---
+
 # A repeat you asked for is offered, not waited for
 
 > **Date:** 2026-09-09

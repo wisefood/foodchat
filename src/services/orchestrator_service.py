@@ -17,16 +17,30 @@ The ONLY intent classification in the pipeline happens here (one
   preference_update  → acknowledge a stated durable preference ("remember I
                        don't like chicken") — the durable write stays
                        consent-gated behind the M3 memory nudge
+  score_plan         → PlanScorerService (a plan the member WROTE and pasted:
+                       parsed, grounded against RecipeWrangler, built into the
+                       planners' objects; never touches a canvas)
   chat               → ChatService.process_smalltalk
+
+An explicit score request — a scoring word ("rate", "score", "how does it
+look") together with a meal listing in at least two slots (prose counts), and
+no request to make or change a plan — bypasses the classifier, like an explicit
+FoodScholar consult, and supersedes any pending clarification: the member has
+moved on to a different question. ``score_plan()`` is the same turn for the
+``/score-plan`` endpoint (the text box), with no classification at all. When
+the classifier itself fails — its default is "chat" — a message that lists
+meals is scored rather than answered as small talk.
 
 While a session is mid-clarification (session.state == "clarifying"), the
 classifier is normally skipped — the user is answering our question. The
 persisted clarification dict routes the turn: ``kind == "foodscholar"`` goes
-back to FoodScholarService, anything else to ChatService (plan flow, whose
+back to FoodScholarService, ``kind == "score_plan"`` to PlanScorerService,
+anything else to ChatService (plan flow, whose
 state carries the original intent). Both are restart-safe (data, not objects).
-Edit-slot clarifications are the exception: when the reply still doesn't
-resolve the slot it usually isn't an answer at all, so the turn falls back to
-normal classification instead of re-interrogating.
+Edit-slot and score-plan clarifications are the exception: when the reply
+doesn't answer the question it usually isn't an answer at all, so the turn
+falls back to normal classification instead of re-interrogating (and a
+score_plan classification on that fall-through never asks again).
 
 Memory nudges (M3) run on EVERY turn — including clarification turns — so a
 preference stated while answering a question is never silently dropped.
@@ -39,13 +53,17 @@ import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from agents import OrchestratorAgent, PlanAnalyst
+from agents import DishIngredientEstimator, OrchestratorAgent, PlanAnalyst
 from backend.observability import trace_context
 from models.attribution import Attribution
 from models.session import MealPlan, WeeklyMealPlan
 from . import plan_parameters
 from .edit_service import EditService
 from .foodscholar_service import FoodScholarService
+from .plan_scorer import CLARIFICATION_KIND as SCORE_CLARIFICATION_KIND
+from .plan_scorer import PlanScorerService
+from .plan_scorer.grounding import DishGrounder
+from .plan_scorer.parsing import looks_like_plan_listing
 from .seed_service import SeedService
 from .session_service import SessionService
 
@@ -92,6 +110,10 @@ class ChatTurn:
     # Optional slider card (time/difficulty/goal) attached to fresh daily
     # plans; answered via POST /sessions/{id}/plan-parameters
     plan_parameters: Optional[dict] = None
+    # What the plan scorer read from a pasted plan (score_plan turns only):
+    # {plan_type, days_scored, meals_scored, metrics, constraints_applied,
+    #  grounding[], unparsed[], warnings[], scored_plan, context}
+    plan_score: Optional[dict] = None
 
 
 class OrchestratorService:
@@ -103,12 +125,17 @@ class OrchestratorService:
         weekly_plan_service: Any,
         foodscholar_service: Optional[FoodScholarService] = None,
         memory_service: Any = None,
+        plan_scorer: Optional[PlanScorerService] = None,
     ):
         self.session_service = session_service
         self.chat_service = chat_service
         self.weekly_plan_service = weekly_plan_service
         self.foodscholar_service = foodscholar_service or FoodScholarService(session_service)
         self.seed_service = SeedService()
+        self.plan_scorer = plan_scorer or PlanScorerService(
+            session_service,
+            grounder=DishGrounder(self.seed_service, estimator=DishIngredientEstimator()),
+        )
         self.edit_service = EditService(session_service)
         self.memory_service = memory_service
         self.orchestrator = OrchestratorAgent()
@@ -173,10 +200,18 @@ class OrchestratorService:
             if limit_turn is not None:
                 return limit_turn
 
+            # An explicit "rate this: <listing>" is unambiguous — no classifier
+            # call, and it supersedes a pending question the member has moved on
+            # from (the same courtesy compose extends).
+            if self.is_explicit_score_request(message):
+                if session.state == "clarifying":
+                    logger.info("[%s] Explicit plan score supersedes a pending clarification.", session_id)
+                    self.session_service.clear_clarification_state(session_id)
+                turn = self._handle_score_plan(session_id, message)
             # Mid-clarification turns usually bypass classification — the user
             # is answering our question. Handlers may still bounce the turn
             # back to normal routing when the reply clearly isn't an answer.
-            if session.state == "clarifying":
+            elif session.state == "clarifying":
                 turn = self._handle_clarification_turn(session_id, message)
             else:
                 turn = self._classify_and_route(session, session_id, message)
@@ -189,6 +224,54 @@ class OrchestratorService:
     # PlanAnalyst ROLE-PLAYED the consult ("I've checked with the Food
     # Scholar...") without the bridge ever running.
     _SCHOLAR_CONSULT_RE = re.compile(r"\bfood\s*scholar\b", re.IGNORECASE)
+
+    # A scoring word. Only half of the explicit-score test: the message must
+    # ALSO carry a meal listing, or "rate my week" about the canvas would skip
+    # the classifier it needs.
+    _SCORE_REQUEST_RE = re.compile(
+        r"\b(?:score|rate|grade|evaluate|assess|judge)\b"
+        r"|\bhow\s+(?:does|do|would)\s+(?:this|it|these|that|my)\b[^.?!]*\blook"
+        r"|\bwhat\s+do\s+you\s+think\s+of\b",
+        re.IGNORECASE,
+    )
+
+    # Words that ask FoodChat to make or change something. A message carrying
+    # one is not a plan the member is presenting, even when it lists meals
+    # ("make my week like this: breakfast: oats…") — the classifier decides it.
+    _PLAN_REQUEST_RE = re.compile(
+        r"\b(?:make|create|generate|build|swap|change|replace|suggest|recommend"
+        r"|add|adding|added|include|including|put|remove|instead)\b"
+        r"|\bgive\s+me\b|\bplan\s+(?:my|me|a|the|for|out)\b",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def looks_like_a_pasted_plan(cls, message: str) -> bool:
+        """Meals in at least two slots, and nothing asking FoodChat to plan.
+
+        Prose counts: "fried eggs for breakfast, pasta with zucchini for lunch
+        and chicken noodle soup for dinner" is how a plan arrives in a chat
+        box. The request-verb guard is what keeps "adding salmon for dinner"
+        out of it.
+        """
+        text = message or ""
+        if cls._PLAN_REQUEST_RE.search(text):
+            return False
+        return looks_like_plan_listing(text, structured_only=False)
+
+    @classmethod
+    def is_explicit_score_request(cls, message: str) -> bool:
+        """A scoring word plus a meal listing the member is presenting.
+
+        Skips the classifier, so a miss only costs a classifier call while a
+        false hit would score a message that asked for a plan. An explicit
+        FoodScholar consult keeps its own bypass: a member who names the
+        scholar asked the scholar.
+        """
+        text = message or ""
+        if cls._SCHOLAR_CONSULT_RE.search(text) or not cls._SCORE_REQUEST_RE.search(text):
+            return False
+        return cls.looks_like_a_pasted_plan(text)
 
     def _compose_scholar_question(self, session, message: str) -> str:
         """The question FoodScholar should answer for an explicit consult.
@@ -219,7 +302,8 @@ class OrchestratorService:
             return f"{question}\n\nContext — the meals under discussion:\n{summary}"
         return question
 
-    def _classify_and_route(self, session, session_id: str, message: str) -> ChatTurn:
+    def _classify_and_route(self, session, session_id: str, message: str,
+                            score_may_ask: bool = True) -> ChatTurn:
         """One classifier call, then dispatch — the only intent decision per turn."""
         if self._SCHOLAR_CONSULT_RE.search(message):
             logger.info("Explicit FoodScholar consult — routing to the M1 bridge")
@@ -235,11 +319,26 @@ class OrchestratorService:
         classification = self.orchestrator.classify(message, history)
         intent = classification["intent"]
         target_plan_type = classification.get("target_plan_type")
+        if classification.get("failed") and self.looks_like_a_pasted_plan(message):
+            # The classifier could not answer (an outage, or a spent API
+            # budget) and its default is "chat". A message listing meals in
+            # two slots is not small talk, and answering it as such is how a
+            # pasted plan came back as chatter on a rate-limited key.
+            logger.warning(
+                "[%s] Classification unavailable — the message lists meals, scoring it.", session_id,
+            )
+            intent, target_plan_type = "score_plan", None
         logger.info("[%s] intent=%s target=%s", session_id, intent, target_plan_type)
-        return self._route(session, session_id, message, intent, target_plan_type)
+        return self._route(session, session_id, message, intent, target_plan_type,
+                           score_may_ask=score_may_ask)
 
     def _route(self, session, session_id: str, message: str, intent: str,
-               target_plan_type: Optional[str]) -> ChatTurn:
+               target_plan_type: Optional[str], score_may_ask: bool = True) -> ChatTurn:
+
+        if intent == "score_plan":
+            # Checked first: a pasted plan is never a request to plan, edit or
+            # refine, whatever else the message says.
+            return self._handle_score_plan(session_id, message, may_ask=score_may_ask)
 
         if intent == "switch_plan_type":
             return self._handle_switch(session_id, message, target_plan_type)
@@ -468,6 +567,17 @@ class OrchestratorService:
                 return self._classify_and_route(session, session_id, message)
             return self._turn_from_edit(session_id, outcome)
 
+        if pending.get("kind") == SCORE_CLARIFICATION_KIND:
+            # The member is telling us what their pasted plan is (its meals,
+            # or how many days it covers).
+            outcome = self.plan_scorer.continue_clarification(session_id, message)
+            if outcome.unresolved:
+                # Not an answer — the state is cleared and nothing was logged.
+                # Route it as a fresh turn, and never ask a score question twice.
+                session = self.session_service.get_session(session_id)
+                return self._classify_and_route(session, session_id, message, score_may_ask=False)
+            return self._turn_from_score(outcome)
+
         # FoodScholar clarifications are tagged with kind="foodscholar";
         # plan-flow states (ClarificationState.to_dict) have no "kind" key.
         if pending.get("kind") == FoodScholarService.CLARIFICATION_KIND:
@@ -537,6 +647,31 @@ class OrchestratorService:
             changed_slots=outcome.changed_slots or None,
             plan_version=plan.version if plan else None,
             plan_parent_id=plan.parent_id if plan else None,
+        )
+
+    def _handle_score_plan(
+        self, session_id: str, message: str, may_ask: bool = True,
+        plan_type: str = "auto", context: Optional[str] = None,
+    ) -> ChatTurn:
+        """Score a plan the member wrote: parse, ground, build, score, reply.
+
+        No canvas is touched and no plan version created — refine and edit
+        turns keep targeting the member's own plan.
+        """
+        return self._turn_from_score(
+            self.plan_scorer.process(
+                session_id, message, plan_type=plan_type, context=context, may_ask=may_ask,
+            )
+        )
+
+    @staticmethod
+    def _turn_from_score(outcome) -> ChatTurn:
+        return ChatTurn(
+            role="assistant",
+            content=outcome.text,
+            intent="score_plan",
+            needs_clarification=outcome.needs_clarification,
+            plan_score=outcome.plan_score,
         )
 
     def _handle_nutrition_question(self, session_id: str, message: str,
@@ -967,6 +1102,31 @@ class OrchestratorService:
             # in sync, even on the refine paths where the handlers skip it.
             turn.plan_parameters = plan_parameters.build_card(session.user_profile, target)
             return turn
+
+    def score_plan(
+        self, session_id: str, member_id: str, plan_text: str,
+        plan_type: str = "auto", context: Optional[str] = None,
+    ) -> ChatTurn:
+        """The text box: score a pasted plan with no intent classification.
+
+        Same guards as every entry point (ownership, message cap), the same
+        turn as a ``score_plan`` chat message, and it supersedes a pending
+        clarification — pasting a plan into the box is a deliberate action.
+        ``plan_type`` "daily"/"weekly" settles the shape instead of asking;
+        ``context`` is what the member is aiming for, read by the fit judge.
+        """
+        with trace_context(session_id=session_id, user_id=member_id):
+            session = self._owned_session(session_id, member_id)
+            limit_turn = self._limit_turn(session)
+            if limit_turn is not None:
+                return limit_turn
+            if session.state == "clarifying":
+                logger.info("[%s] Plan scoring supersedes a pending clarification.", session_id)
+                self.session_service.clear_clarification_state(session_id)
+            turn = self._handle_score_plan(
+                session_id, plan_text, plan_type=plan_type, context=context,
+            )
+            return self._attach_memory_suggestions(session, turn, plan_text)
 
     def compose_plan(
         self, session_id: str, member_id: str, picks: list[dict],

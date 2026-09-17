@@ -30,7 +30,7 @@ MAX_MESSAGES_PER_SESSION = int(os.getenv("SESSION_MAX_MESSAGES", "200"))
 Intent = Literal[
     "daily_plan", "weekly_plan", "refine_plan", "edit_plan_slot",
     "switch_plan_type", "nutrition_question", "plan_question",
-    "favorites_offer", "chat",
+    "favorites_offer", "score_plan", "chat",
 ]
 
 
@@ -44,6 +44,9 @@ class Message:
     # FoodScholar provenance (dict form of models.attribution.Attribution) —
     # persisted so the citation box survives conversation reloads.
     attribution: Optional[dict] = None
+    # Plan-scorer payload on a score_plan reply — persisted so the score card
+    # survives conversation reloads, like the citation box above.
+    plan_score: Optional[dict] = None
 
 
 @dataclass

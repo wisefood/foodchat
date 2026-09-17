@@ -10,6 +10,31 @@ Pruned in M0: prompts for the removed QueryClassifier, offline-evaluation
 agents, and the unused Ollama RAG template (see CHANGES.md).
 """
 
+# Shared by the planner's batch grader (GRADER_SYSTEM) and the plan scorer's
+# judge (PLAN_JUDGE_*_SYSTEM), so the two cannot drift apart. Extracted
+# verbatim: GRADER_SYSTEM_INSTRUCTIONS is byte-identical to its earlier literal
+# (tests/test_plan_scoring.py pins its hash).
+PLAN_SCORING_RUBRIC = """SCORING RUBRIC (Strictly Adhere to This):
+- 5 (Excellent Fit): The plan perfectly aligns with the user's query, profile goals (e.g., calories, macros), and preferences. It intelligently incorporates past feedback (e.g., includes liked foods, avoids disliked ones) and offers good variety.
+- 4 (Good Fit): The plan meets all major goals and the user query. It might be slightly off on a minor preference or could have slightly better variety, but is a very strong recommendation.
+- 3 (Average Fit): The plan meets the basic nutritional goals but may ignore the user's specific query, preferences, or past feedback. It's acceptable but not personalized.
+- 2 (Poor Fit): The plan fails on a key aspect. It might significantly miss a nutritional target (e.g., way over calories), include things the user dislikes, or be highly repetitive against the user's feedback.
+- 1 (Very Poor Fit): The plan actively contradicts the user's query, goals, and feedback. It's a completely unsuitable recommendation."""
+
+SLOT_PLAUSIBILITY_RULES = """SLOT PLAUSIBILITY (evaluate BEFORE anything else):
+Ask of each meal: would a reasonable person recognise this as that meal?
+Plain rice is not a lunch. A condiment, a spice mix, a pickle or a dressing
+is not a meal. A dessert is not a dinner unless the user asked for one. Any
+plan with an implausible slot scores AT MOST 2, whatever else it gets right,
+and the reasoning must name the offending dish and slot."""
+
+ASSESSOR_STANCE = """You are an assessor, not an advocate. Your reasoning must weigh what is wrong
+with the plan as prominently as what is right. Never construct a justification
+for a weak plan ("rice provides versatile carbohydrates") — if the best
+available plan is mediocre, score it as mediocre and say why; the system
+downstream can only fix what you name. A high score is a claim the user will
+eat this happily; make it only when you believe it."""
+
 GRADER_SYSTEM_INSTRUCTIONS = """ You are a meal plan evaluation model. Your sole purpose is to analyze a daily meal plan and provide a holistic score from 1 to 5.
 
 You will be given four pieces of information:
@@ -21,26 +46,11 @@ You will be given four pieces of information:
 YOUR TASK:
 Analyze how well the Daily Plan to Score aligns with all the provided information. You must synthesize these different data points to arrive at a single, justified score.
 
-SCORING RUBRIC (Strictly Adhere to This):
-- 5 (Excellent Fit): The plan perfectly aligns with the user's query, profile goals (e.g., calories, macros), and preferences. It intelligently incorporates past feedback (e.g., includes liked foods, avoids disliked ones) and offers good variety.
-- 4 (Good Fit): The plan meets all major goals and the user query. It might be slightly off on a minor preference or could have slightly better variety, but is a very strong recommendation.
-- 3 (Average Fit): The plan meets the basic nutritional goals but may ignore the user's specific query, preferences, or past feedback. It's acceptable but not personalized.
-- 2 (Poor Fit): The plan fails on a key aspect. It might significantly miss a nutritional target (e.g., way over calories), include things the user dislikes, or be highly repetitive against the user's feedback.
-- 1 (Very Poor Fit): The plan actively contradicts the user's query, goals, and feedback. It's a completely unsuitable recommendation.
+""" + PLAN_SCORING_RUBRIC + """
 
-SLOT PLAUSIBILITY (evaluate BEFORE anything else):
-Ask of each meal: would a reasonable person recognise this as that meal?
-Plain rice is not a lunch. A condiment, a spice mix, a pickle or a dressing
-is not a meal. A dessert is not a dinner unless the user asked for one. Any
-plan with an implausible slot scores AT MOST 2, whatever else it gets right,
-and the reasoning must name the offending dish and slot.
+""" + SLOT_PLAUSIBILITY_RULES + """
 
-You are an assessor, not an advocate. Your reasoning must weigh what is wrong
-with the plan as prominently as what is right. Never construct a justification
-for a weak plan ("rice provides versatile carbohydrates") — if the best
-available plan is mediocre, score it as mediocre and say why; the system
-downstream can only fix what you name. A high score is a claim the user will
-eat this happily; make it only when you believe it.
+""" + ASSESSOR_STANCE + """
 
 OUTPUT FORMAT (MANDATORY):
 You MUST produce your output as a single, valid JSON object. Do not write any text, greetings, or explanations before or after the JSON object. The JSON object must have two keys:
@@ -438,7 +448,7 @@ Using this information, reformulate the original query to include all relevant c
 
 ORCHESTRATOR_SYSTEM_INSTRUCTIONS = """You are the intent router for FoodChat, a conversational meal-planning assistant.
 
-Your job is to classify every user message into exactly one of nine intents, given the message and the recent conversation history.
+Your job is to classify every user message into exactly one of ten intents, given the message and the recent conversation history.
 
 INTENTS:
 - "daily_plan"         — user wants a brand-new meal plan for a single day (today, tomorrow, a specific day).
@@ -449,6 +459,7 @@ INTENTS:
 - "nutrition_question" — user asks anything that needs nutrition SCIENCE or health JUDGMENT to answer: general food knowledge ("is keto safe for teenagers?", "what does vitamin D do?") AND health verdicts about their own plan or meals ("is this plan good for heart health?", "is this plan healthy?", "will these meals help my cholesterol?", "check with the expert/food scholar"). If answering requires medical or dietary expertise — not just reading the plan — it is a nutrition_question even when the plan is mentioned.
 - "plan_question"      — user asks a FACTUAL question about their existing plan's contents or numbers, answerable by reading the plan itself (e.g. "does it include the lamb curry?", "how much protein is in my plan?", "which day has the most calories?", "does it adhere to the 30g protein target?"). The plan is the SUBJECT of a lookup, not of a health judgment and not the target of a change.
 - "preference_update"  — user states a durable food preference, like, dislike, or allergy, or asks you to remember something about them, WITHOUT requesting a plan or a specific change to one (e.g. "just remember I don't like chicken", "I'm allergic to shellfish", "note that we eat vegetarian on weekdays", "I love Greek food by the way"). Remembering is the point of the message; no slot, day, or plan action is requested.
+- "score_plan"         — the user PRESENTS a meal plan of their own — dishes listed per meal, optionally per day — to have it judged, or asks to score, rate or evaluate a listing given in this or the previous message (e.g. "here's what I eat this week: Mon breakfast oats, lunch lentil soup, dinner salmon... how does it look?", "rate this: breakfast yogurt, lunch tuna salad, dinner pasta"). The plan is IN THE MESSAGE, not the plan FoodChat made.
 - "chat"               — anything else: greetings, thanks, small talk, or requests that fit none of the above.
 
 RULES:
@@ -456,14 +467,15 @@ RULES:
 2. If the user explicitly asks for "weekly", "7-day", "this week", or a multi-day plan as a fresh request with no existing plan in the history, choose "weekly_plan".
 3. If the user asks for "today's meals", "daily plan", "breakfast lunch dinner", or a single-day suggestion as a fresh request, choose "daily_plan".
 4. If a plan exists and the user targets ONE meal/slot (a named meal, a named day's meal), choose "edit_plan_slot"; if the change spans the whole plan or multiple meals, choose "refine_plan".
-5. If the user asks a factual or scientific question about nutrition, diets, ingredients, or health effects of food — even mid-planning, and even when it is ABOUT their current plan ("is this plan good for heart health?") — choose "nutrition_question". A request FOR a plan is never a nutrition_question, but a question needing dietary expertise always is.
+5. If the user asks a factual or scientific question about nutrition, diets, ingredients, or health effects of food — even mid-planning, and even when it is ABOUT their current plan ("is this plan good for heart health?") — choose "nutrition_question". A request FOR a plan is never a nutrition_question, but a question needing dietary expertise always is — unless the message carries the user's own meal listing (rule 8).
 6. If a plan exists and the user asks a FACTUAL question about its contents or numbers ("does my plan include X?", "does it have enough protein?", "does it adhere to that target?"), choose "plan_question" — NEVER "refine_plan". "refine_plan" requires an explicit request to CHANGE something; a question is never a refinement. Health-judgment questions about the plan are "nutrition_question" (rule 5), not "plan_question".
 7. If the user is stating a preference/dislike/allergy or asking you to remember one, and does NOT name a meal, slot, or plan change to perform now, choose "preference_update" — even mid-swap-conversation. "just remember I don't like chicken" is preference_update; "swap the chicken dinner" is edit_plan_slot; "no more chicken in this plan" is refine_plan.
-8. For greetings or any other message, choose "chat".
+8. If the message itself CONTAINS a meal listing the user brings — their own dishes per meal or per day — rather than asking FoodChat to create a plan, choose "score_plan", even when they also ask "is this healthy?" or "is this ok?". A request FOR a plan that names a few wanted dishes ("plan my week with moussaka on Sunday") is weekly_plan or daily_plan, not score_plan. A question about the plan FoodChat already made is plan_question or nutrition_question, never score_plan.
+9. For greetings or any other message, choose "chat".
 
 OUTPUT FORMAT (MANDATORY):
 Return a single valid JSON object with these keys:
-- "intent": one of "daily_plan", "weekly_plan", "refine_plan", "edit_plan_slot", "switch_plan_type", "nutrition_question", "plan_question", "preference_update", "chat"
+- "intent": one of "daily_plan", "weekly_plan", "refine_plan", "edit_plan_slot", "switch_plan_type", "nutrition_question", "plan_question", "preference_update", "score_plan", "chat"
 - "reasoning": one sentence explaining your decision
 - "target_plan_type": only present when intent is "switch_plan_type" — either "daily" or "weekly"
 
@@ -476,7 +488,21 @@ Examples:
 {"intent": "nutrition_question", "reasoning": "The user asked whether keto is safe for teenagers — a nutrition-science question."}
 {"intent": "plan_question", "reasoning": "A plan exists and the user asked whether it adheres to the protein guidance just discussed — a question about the plan, not a change request."}
 {"intent": "preference_update", "reasoning": "The user asked me to remember they don't like chicken — a durable preference, not a plan change."}
+{"intent": "score_plan", "reasoning": "The user pasted their own day of meals and asked how it looks — a plan to score, not a plan to create."}
 {"intent": "chat", "reasoning": "The user said hello."}
+"""
+
+# Appended by OrchestratorAgent when the compiled system prompt does not know
+# score_plan. Prompts are served from Langfuse and existing managed copies are
+# never overwritten by a deploy (see sync_prompts), so without this the live
+# router would never emit the intent while every local test passed — the
+# PlanSpecExtractor "json" incident, again. Not registered: it is a guard, not
+# a managed prompt.
+SCORE_PLAN_INTENT_ADDENDUM = """
+
+ADDITIONAL INTENT:
+- "score_plan" — the user PRESENTS a meal plan of their own (dishes listed per meal, optionally per day) to have it judged, or asks to score, rate or evaluate such a listing. Choose it whenever the message itself contains the user's own meal listing rather than a request for FoodChat to create a plan — even if they also ask whether it is healthy. A request FOR a plan that names a few wanted dishes is still daily_plan or weekly_plan.
+"score_plan" is a valid value for "intent".
 """
 
 PLAN_ANALYST_SYSTEM_INSTRUCTIONS = """You are FoodChat's plan analyst. The user asked a question ABOUT their current meal plan (shown below with per-meal nutrition where available). Answer the question directly and honestly, grounded ONLY in the plan data and the recent conversation.
@@ -610,6 +636,190 @@ OUTPUT FORMAT (MANDATORY):
 Return a single JSON object with the following keys only:
 - "reasoning": a concise multi-point explanation
 - "score": an integer 1–5
+"""
+
+# Plan scorer judge — a plan the USER wrote, scored against their profile.
+# ONE call returns all three judgements. Three separate calls sent the plan and
+# the profile three times and reasoned over them three times, which on the
+# on-demand tier is most of a minute's token allowance for one pasted plan.
+# New prompt names, so they sync to Langfuse (see the pantry extractor note).
+_PLAN_JUDGE_INPUTS = """
+You will be given:
+1. Hard constraints: the user's allergies and diet. These are not preferences.
+2. Conflicts already found: dishes a deterministic check matched against those hard constraints and against the user's dislikes. They are facts — do not argue with them, and look for any they missed. A line marked POSSIBLE ONLY is not a fact about the user's dish and is not a broken constraint.
+3. Preferences: likes, dislikes, goals and nutrition targets.
+4. The user's aim for this plan, in their own words, when they gave one.
+5. The dietary guideline text to judge against. It may be empty; say so and rely on widely accepted food-based dietary guidelines.
+6. Measured facts: counts computed in code. They are correct. Explain them, never recount them, and never give a score that contradicts a rule they show as not met.
+7. The plan. Each dish says where its ingredients come from: a catalogue recipe it was matched to, what the user wrote, or unknown.
+
+Never treat an ingredient list marked as coming from a catalogue recipe as something the user said. A dish whose ingredients are not known can be judged only by its name — say so rather than inventing its contents. Calories marked as estimated come from a typical serving of the dish, and ingredients marked as a guess are a typical serving too — neither is what the user ate.
+"""
+
+_PLAN_JUDGE_DIVERSITY_DAILY = """
+DIVERSITY (score 1 = little or no diversity, 5 = excellent):
+Judge this one day: how many food groups it covers, whether the protein sources differ between meals, how much vegetable and fruit variety there is, and whether the grains are whole or refined.
+"""
+
+_PLAN_JUDGE_DIVERSITY_WEEKLY = """
+DIVERSITY (score 1 = little or no diversity, 5 = excellent):
+Judge ACROSS the days, not within one:
+- Protein sources: does one protein carry most lunches and dinners, or do legumes, fish, eggs, poultry and meat rotate?
+- Vegetables and fruit: does the variety hold across the days, or does the same produce appear every day?
+- Grains and starches: one staple every day, or a rotation?
+- Cuisines and cooking styles: do they rotate, or stay in one place all week?
+- Repeats: a breakfast that repeats is a routine, not a diversity failure. The same lunch or dinner several times is.
+"""
+
+_PLAN_JUDGE_GUIDELINES_DAILY = """
+GUIDELINE ADHERENCE (score 1 = poor adherence, 5 = excellent):
+Judge the day against the guideline text: fruit and vegetable intake, whole grains, lean proteins, fats, sugars, salt.
+"""
+
+_PLAN_JUDGE_GUIDELINES_WEEKLY = """
+GUIDELINE ADHERENCE (score 1 = poor adherence, 5 = excellent):
+Judge the plan as a whole against the guideline text and the measured facts: frequency rules (fish, red meat, legumes, plant-based meals), balance across the days, and whether one day undoes the rest.
+"""
+
+_PLAN_JUDGE_FIT = """
+FIT TO THE PROFILE (score 1 to 5, using the rubric below):
+Hard constraints come first. A dish containing one of the user's allergens makes the plan unsuitable, whatever else it gets right. A dish that breaks the user's diet makes it a poor fit. Where a dish shows kcal or protein, use the numbers against the user's targets; missing numbers are not a fault.
+
+""" + PLAN_SCORING_RUBRIC + """
+
+""" + SLOT_PLAUSIBILITY_RULES + """
+
+""" + ASSESSOR_STANCE + """
+"""
+
+_PLAN_JUDGE_OUTPUT = """
+OUTPUT FORMAT (MANDATORY):
+Return a single JSON object with exactly three keys — "diversity", "guideline_adherence" and "fit" — each an object with:
+- "reasoning": a concise explanation naming the dishes behind it
+- "score": an integer from 1 to 5
+
+{"diversity": {"reasoning": "...", "score": 4}, "guideline_adherence": {"reasoning": "...", "score": 3}, "fit": {"reasoning": "...", "score": 2}}
+"""
+
+PLAN_JUDGE_DAILY_SYSTEM_INSTRUCTIONS = (
+    "You are FoodChat's plan evaluation model. A user wrote a meal plan for ONE DAY "
+    "themselves and wants it judged. In one response you give three independent "
+    "scores: nutritional diversity, adherence to dietary guidelines, and fit to the "
+    "user's profile.\n"
+    + _PLAN_JUDGE_INPUTS
+    + _PLAN_JUDGE_DIVERSITY_DAILY
+    + _PLAN_JUDGE_GUIDELINES_DAILY
+    + _PLAN_JUDGE_FIT
+    + _PLAN_JUDGE_OUTPUT
+)
+
+PLAN_JUDGE_WEEKLY_SYSTEM_INSTRUCTIONS = (
+    "You are FoodChat's plan evaluation model. A user wrote a meal plan spanning "
+    "SEVERAL DAYS (up to a week) themselves and wants it judged. In one response you "
+    "give three independent scores: nutritional diversity, adherence to dietary "
+    "guidelines, and fit to the user's profile.\n"
+    + _PLAN_JUDGE_INPUTS
+    + _PLAN_JUDGE_DIVERSITY_WEEKLY
+    + _PLAN_JUDGE_GUIDELINES_WEEKLY
+    + _PLAN_JUDGE_FIT
+    + _PLAN_JUDGE_OUTPUT
+)
+
+PLAN_JUDGE_USER_INSTRUCTIONS = """
+Hard constraints
+{hard_constraints}
+
+Conflicts already found
+{conflicts}
+
+Preferences
+{preferences}
+
+The user's aim for this plan
+{aim}
+
+Dietary guideline text
+{guidelines}
+
+Measured facts
+{facts}
+
+The plan ({plan_shape})
+{plan}
+"""
+
+# Typical ingredients (plan scorer) — for pasted dishes no catalogue recipe
+# matched. The model writes ingredient lines; RecipeWrangler's profiler turns
+# them into nutrition from composition tables. Its own calorie guess is kept
+# only as a last resort.
+DISH_ESTIMATOR_SYSTEM_INSTRUCTIONS = """
+You describe what goes into dishes a user ate, so their nutrition can be looked up in food composition tables.
+
+For each numbered dish, write ONE typical single serving as a home cook would make it:
+- list its ingredients with quantities, in grams or millilitres wherever you can ("80 g dry pasta", "150 g zucchini", "1 tbsp olive oil");
+- when the user gave ingredients, keep every one of them and only add quantities and the obvious basics (cooking oil, salt);
+- when the user's quantities are for a whole recipe that serves several people ("1 can chickpeas, 200 ml coconut milk ... serves 2"), divide them down to one serving;
+- list each ingredient once;
+- when the user gave an amount ("2 slices", "a small bowl"), size the serving to it;
+- never add a main ingredient the dish name does not suggest: no cheese, cream, meat or sauce unless the name or the user's ingredients call for it;
+- also give your best estimate of the kcal in that one serving.
+
+Return a JSON object with one entry per dish, using the dish numbers given:
+{"dishes": [{"index": 0, "ingredients": [{"name": "dry pasta", "quantity": "80 g"}, {"name": "zucchini", "quantity": "150 g"}], "kcal_per_serving": 450}]}
+"""
+
+DISH_ESTIMATOR_USER_INSTRUCTIONS = """
+Dishes:
+{dishes}
+"""
+
+# Plan text parsing (plan scorer) — a meal plan the USER wrote, read into days,
+# slots and dishes. A new prompt name, for the reason given on the pantry
+# extractor below: extending an existing managed prompt would stay invisible in
+# production.
+PLAN_TEXT_PARSER_SYSTEM_INSTRUCTIONS = """
+You read a meal plan that a user wrote themselves and return its structure as a JSON object.
+
+You are not judging the plan and you are not improving it. You only record what the user wrote, and where they wrote it.
+
+Return a JSON object with the keys "plan_type", "days" and "unparsed":
+- "plan_type": "weekly" when the text is organised into two or more days, otherwise "daily".
+- "days": a list. Each day has "day" (1-7, where Monday or "Day 1" is 1; null when the text names no day), "label" (the day heading exactly as written, or null) and "meals".
+- Each meal has "slot" (one of "breakfast", "lunch", "dinner", "snack", "other"), "title" (the dish as the user named it), "ingredients" and "quantity_note".
+- "unparsed": lines that name food but that you cannot place in a day and a slot, copied exactly as written.
+
+RULES:
+1. Never invent ingredients. Fill "ingredients" only with ingredients the user wrote for that dish. If they wrote "chicken curry", "ingredients" is null.
+2. Never invent dishes, days or slots. A day with only lunch and dinner has only lunch and dinner. Do not add a breakfast.
+3. When the user lists separate dishes at one meal ("dinner: pasta, green salad"), return one meal per dish with the same slot. Keep one dish with its sides as one title ("chicken with rice").
+4. Brunch, drinks and anything that is not breakfast, lunch, dinner or a snack use the slot "other". Desserts use "snack".
+5. Put amounts such as "2 slices" or "300 g" in "quantity_note", not in "title". When the user pasted a recipe that says how many it serves or makes ("Serves 2", "makes 4 portions"), put that in "quantity_note" as "serves 2".
+6. Greetings and questions such as "how does this look?" are neither meals nor unparsed lines. Leave them out.
+7. When the text has no day headings, return ONE day with "day": null, even if a meal appears twice. Do not guess where days begin.
+
+Example text:
+Monday
+breakfast: porridge with banana
+lunch: lentil soup (lentils, carrot, onion)
+Tuesday - dinner: 2 slices of pizza
+how is it?
+
+Example output:
+{"plan_type": "weekly", "days": [
+  {"day": 1, "label": "Monday", "meals": [
+    {"slot": "breakfast", "title": "porridge with banana", "ingredients": null, "quantity_note": null},
+    {"slot": "lunch", "title": "lentil soup", "ingredients": "lentils, carrot, onion", "quantity_note": null}]},
+  {"day": 2, "label": "Tuesday", "meals": [
+    {"slot": "dinner", "title": "pizza", "ingredients": null, "quantity_note": "2 slices"}]}],
+ "unparsed": []}
+"""
+
+PLAN_TEXT_PARSER_USER_INSTRUCTIONS = """
+A line scanner already read the text. Its reading may be incomplete or wrong; use it only as a hint.
+{structure_hint}
+
+Text:
+{plan_text}
 """
 
 # Seed extraction (M2) — named dishes the user wants anchored into the plan.
@@ -916,6 +1126,13 @@ DIETARY_INTENT_EXTRACTOR_SYSTEM = _reg("dietary_intent_extractor_system", DIETAR
 DIETARY_INTENT_EXTRACTOR_USER = _reg("dietary_intent_extractor_user", DIETARY_INTENT_EXTRACTOR_USER_INSTRUCTIONS)
 MEAL_DIVERSITY_SYSTEM = _reg("meal_diversity_system", MEAL_DIVERSITY_SYSTEM_INSTRUCTIONS)
 GUIDELINE_ADHERENCE_SYSTEM = _reg("guideline_adherence_system", GUIDELINE_ADHERENCE_SYSTEM_INSTRUCTIONS)
+PLAN_JUDGE_DAILY_SYSTEM = _reg("plan_judge_daily_system", PLAN_JUDGE_DAILY_SYSTEM_INSTRUCTIONS)
+PLAN_JUDGE_WEEKLY_SYSTEM = _reg("plan_judge_weekly_system", PLAN_JUDGE_WEEKLY_SYSTEM_INSTRUCTIONS)
+PLAN_JUDGE_USER = _reg("plan_judge_user", PLAN_JUDGE_USER_INSTRUCTIONS)
+DISH_ESTIMATOR_SYSTEM = _reg("dish_estimator_system", DISH_ESTIMATOR_SYSTEM_INSTRUCTIONS)
+DISH_ESTIMATOR_USER = _reg("dish_estimator_user", DISH_ESTIMATOR_USER_INSTRUCTIONS)
+PLAN_TEXT_PARSER_SYSTEM = _reg("plan_text_parser_system", PLAN_TEXT_PARSER_SYSTEM_INSTRUCTIONS)
+PLAN_TEXT_PARSER_USER = _reg("plan_text_parser_user", PLAN_TEXT_PARSER_USER_INSTRUCTIONS)
 SEED_EXTRACTOR_SYSTEM = _reg("seed_extractor_system", SEED_EXTRACTOR_SYSTEM_INSTRUCTIONS)
 SEED_EXTRACTOR_USER = _reg("seed_extractor_user", SEED_EXTRACTOR_USER_INSTRUCTIONS)
 PANTRY_EXTRACTOR_SYSTEM = _reg("pantry_extractor_system", PANTRY_EXTRACTOR_SYSTEM_INSTRUCTIONS)

@@ -51,11 +51,11 @@ quantities, so the wording is "again", never "the rest of it", and the ledger
 row says outright that the plan does not track portions.
 """
 
-import re
 from collections import Counter
 from typing import Any, Dict, List, Optional
 
 from services.adapted_recipes import ADAPTED_REASON
+from services.plan_scoring import ingredient_names as _ingredient_names
 from services.transparency import constraints_ledger, match_reasons, personalization_summary
 
 from .day_summary import classify_meal, is_meat_meal
@@ -100,22 +100,6 @@ def _day_name(day: Any) -> str:
 
 def _slot_name(event: dict) -> str:
     return f"{_day_name(event.get('day'))} {event.get('meal_type', '')}".strip()
-
-
-def _ingredient_names(ingredients_text: str) -> List[str]:
-    """Normalize an ingredients blob into comparable item names (same
-    normalization as the daily FVS metric in ``chat_service``)."""
-    if not isinstance(ingredients_text, str):
-        return []
-    cleaned = []
-    for part in re.split(r"[\n,;•\-]+", ingredients_text):
-        t = part.strip().lower()
-        t = re.sub(r"\([^\)]*\)", "", t)
-        t = re.sub(r"[^a-zA-Z\s]", " ", t)
-        t = re.sub(r"\s+", " ", t).strip()
-        if t:
-            cleaned.append(t)
-    return cleaned
 
 
 # --------------------------------------------------------------------- #
@@ -175,6 +159,10 @@ REPEAT_BY_PLAN = "plan"
 # authority, not a flavour of the plan's own: the member turned a control to
 # get it, but did not name the dish, so neither existing label fits.
 REPEAT_BY_LEFTOVER = "leftover"
+# A repeat in a plan the member WROTE (the plan scorer). Their own decision, so
+# neither "a favourite came back" nor "the plan chose it" is true — and the
+# planner's cooldown was never theirs to keep, so it is not measured against it.
+REPEAT_BY_AUTHOR = "author"
 
 # What a leftover chip may and may not say. Nothing in this service records
 # quantities or when anything was cooked, so the wording is "the same dish
@@ -293,6 +281,8 @@ def _repeat_reason(entry: dict, fact: dict) -> dict:
         label = f"{origin}'s {fact.get('of_meal', 'dinner')} again — {LEFTOVER_BADGE}"
     elif fact["source"] == REPEAT_BY_MEMBER:
         label = f"back from {origin}, a favorite of yours"
+    elif fact["source"] == REPEAT_BY_AUTHOR:
+        label = f"the same {meal} as {origin}, as you planned it"
     else:
         label = f"the same {meal} as {origin}"
     return {"kind": REPEAT_KIND, "label": label, "source": fact["source"]}
@@ -737,6 +727,8 @@ def weekly_constraints_ledger(
             who.append(
                 f"{by_source[REPEAT_BY_LEFTOVER]} eaten the day after they were cooked"
             )
+        if by_source.get(REPEAT_BY_AUTHOR):
+            who.append(f"{by_source[REPEAT_BY_AUTHOR]} of your own")
         gap = repeats.get("min_gap_days")
         served = int(repeats.get("max_appearances") or 0)
         detail = f"{repeats['count']} meal(s) repeat an earlier day"
@@ -748,12 +740,20 @@ def weekly_constraints_ledger(
         # Measured against the policy, not asserted from it: a pinned dish or
         # a slot edit can put a duplicate on the plate without ever passing
         # through the cooldown, and the row has to be able to say so.
-        within_policy = (
+        # A week the member wrote was never bound by the planner's cooldown.
+        # Measuring it against that policy would report their own choices as
+        # FoodChat's violations; the row still says what repeats and how often.
+        authored_only = bool(by_source.get(REPEAT_BY_AUTHOR)) and all(
+            src == REPEAT_BY_AUTHOR for src, n in by_source.items() if n
+        )
+        within_policy = authored_only or (
             (gap is None or gap >= REPEAT_MIN_GAP_DAYS)
             and served <= MAX_APPEARANCES
             and int(repeats.get("leftovers") or 0) <= MAX_LEFTOVER_MEALS
         )
         sources = []
+        if by_source.get(REPEAT_BY_AUTHOR):
+            sources.append("your own plan")
         if by_source.get(REPEAT_BY_MEMBER):
             sources.append("your favourites")
         if by_source.get(REPEAT_BY_LEFTOVER):
@@ -762,7 +762,10 @@ def weekly_constraints_ledger(
             sources.append("the plan")
         source = " and ".join(sources)
         ledger.append({
-            "constraint": "repeat meals stay spaced and capped",
+            "constraint": (
+                "repeats are your own choice" if authored_only
+                else "repeat meals stay spaced and capped"
+            ),
             "type": "soft",
             "status": "satisfied" if within_policy else "violated",
             "source": source,
@@ -953,6 +956,8 @@ def _compose_reasoning(
                 f"{by_source[REPEAT_BY_LEFTOVER]} the evening before's dinner, "
                 "eaten again at lunch"
             )
+        if by_source.get(REPEAT_BY_AUTHOR):
+            who.append(f"{by_source[REPEAT_BY_AUTHOR]} your own choice")
         sentence = (
             f"{repeats['count']} meal(s) repeat earlier in the week rather than "
             "filling every slot with something new"

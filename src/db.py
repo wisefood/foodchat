@@ -100,6 +100,7 @@ class MessageRow(Base):
     plan_id = Column(String, nullable=True)
     timestamp = Column(DateTime(timezone=True), default=utcnow)
     attribution = Column(Text, nullable=True)  # JSON Attribution (FoodScholar provenance) or NULL
+    plan_score = Column(Text, nullable=True)   # JSON plan-scorer payload (score_plan replies) or NULL
 
 
 class MealPlanRow(Base):
@@ -162,6 +163,8 @@ def _migrate_existing_db() -> None:
         existing_message_cols = {c["name"] for c in inspector.get_columns("messages")}
         if "attribution" not in existing_message_cols:
             conn.execute(sa.text("ALTER TABLE messages ADD COLUMN attribution TEXT"))
+        if "plan_score" not in existing_message_cols:
+            conn.execute(sa.text("ALTER TABLE messages ADD COLUMN plan_score TEXT"))
 
         # sessions backward compat: drop active_context if it exists (no data needed)
         # — we leave it in place to avoid destructive migration; it's simply ignored
@@ -344,6 +347,7 @@ def db_add_message(
     intent: Optional[str] = None,
     plan_id: Optional[str] = None,
     attribution: Optional[str] = None,
+    plan_score: Optional[str] = None,
 ) -> MessageRow:
     row = MessageRow(
         session_id=session_id,
@@ -352,6 +356,7 @@ def db_add_message(
         intent=intent,
         plan_id=plan_id,
         attribution=attribution,
+        plan_score=plan_score,
     )
     db.add(row)
     db.commit()
