@@ -48,9 +48,20 @@ def candidate_kcal(candidate: Dict[str, Any]) -> Optional[float]:
 
 
 def is_meat_candidate(candidate: Dict[str, Any], count_fish: bool = True) -> bool:
+    """Whether this candidate counts against the weekly meat limit.
+
+    Reads `meal_ingredients` when the candidate is a composed MEAL rather than
+    a single dish: the bacon in the side salad is meat the member is eating, and
+    a limit that only inspects mains is a limit with a hole in it.
+    """
     return is_meat_meal(
         str(candidate.get("recipe_title") or candidate.get("title") or ""),
-        str(candidate.get("recipe_ingredients") or candidate.get("ingredients") or ""),
+        str(
+            candidate.get("meal_ingredients")
+            or candidate.get("recipe_ingredients")
+            or candidate.get("ingredients")
+            or ""
+        ),
         tags=candidate.get("tags"),
         count_fish=count_fish,
     )

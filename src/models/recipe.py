@@ -5,7 +5,7 @@ Layering rule: ``models`` has no imports from ``agents`` or ``services`` —
 both of those import from here. Keep this module dependency-free.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 
@@ -36,6 +36,11 @@ class CandidateRecipe:
     nutrition: Optional[dict] = None
     # Letter grade, from the v2 planning surface only.
     nutri_score: Optional[str] = None
+    # Card image, also from the v2 planning surface. Carried for the same
+    # reason as the macros: it is already in the response, and a plate composed
+    # straight from a pool would otherwise render blank until something made a
+    # second details call for a URL it had already been handed.
+    image_url: Optional[str] = None
 
 
 # Slot name ("breakfast"/"lunch"/"dinner") → candidates for that slot.
@@ -62,6 +67,10 @@ class RecipeEnrichment:
     nutri_score_label: Optional[str] = None
     tags: list[str] = None
     dish_types: list[str] = None
+    # The recipe's OWN dietary tags, straight from the corpus. The difference
+    # from `profile["diet"]` matters: that is what was asked for, this is what
+    # arrived, and only the second one can verify the first.
+    diet_tags: list[str] = None
     allergens: list[str] = None
 
     def nutrition_dict(self) -> Optional[dict]:
@@ -92,19 +101,102 @@ class ResolvedRecipe:
     tags: list[str]
 
 
+# Display order for slots, mirroring `utils/planMeals.ts` in the UI. Anything
+# unlisted sorts after, alphabetically, so an unknown slot is placed rather
+# than dropped.
+SLOT_ORDER: tuple[str, ...] = (
+    "breakfast", "brunch", "lunch", "snack", "dinner", "supper",
+    "side", "dessert", "drink",
+)
+
+
+def slot_sort_key(slot: str) -> int:
+    """Position in eating order; everything unknown ties at the end.
+
+    Returns the index alone, not `(index, name)`, so Python's stable sort keeps
+    unknown slots in the order they were inserted. That matters for labels the
+    planner builds rather than the corpus — "day 2 dinner (side)" is not in
+    SLOT_ORDER, and sorting those alphabetically would put every day 2 dinner
+    before its lunch.
+    """
+    name = str(slot or "").lower()
+    try:
+        return SLOT_ORDER.index(name)
+    except ValueError:
+        return len(SLOT_ORDER)
+
+
 @dataclass(frozen=True)
 class ScoredPlan:
-    """One LLM-graded daily-plan combination."""
+    """One LLM-graded day of a plan.
 
-    breakfast: CandidateRecipe
-    lunch: CandidateRecipe
-    dinner: CandidateRecipe
+    Held as `slots`, a mapping, rather than three named fields. The three
+    fields were why the grader could only ever score breakfast/lunch/dinner —
+    and therefore why a multi-plate or four-meal day could not be ranked at
+    all, and the structured path shipped with no grading and no quality
+    metrics.
+
+    The three names remain as properties, and the keyword constructor still
+    accepts them, because every existing caller and test addresses them that
+    way and a day with those three slots is still the common case. What
+    changes is that it is no longer the only case.
+    """
+
     score: int
     reasoning: str
+    slots: dict[str, CandidateRecipe] = field(default_factory=dict)
+
+    def __init__(
+        self,
+        score: int,
+        reasoning: str,
+        slots: Optional[dict] = None,
+        breakfast: Optional[CandidateRecipe] = None,
+        lunch: Optional[CandidateRecipe] = None,
+        dinner: Optional[CandidateRecipe] = None,
+    ):
+        merged = dict(slots or {})
+        for name, course in (("breakfast", breakfast), ("lunch", lunch),
+                             ("dinner", dinner)):
+            if course is not None:
+                merged.setdefault(name, course)
+        # frozen dataclass: __setattr__ is blocked, so assign through object.
+        object.__setattr__(self, "score", score)
+        object.__setattr__(self, "reasoning", reasoning)
+        object.__setattr__(self, "slots", merged)
+
+    @property
+    def breakfast(self) -> Optional[CandidateRecipe]:
+        return self.slots.get("breakfast")
+
+    @property
+    def lunch(self) -> Optional[CandidateRecipe]:
+        return self.slots.get("lunch")
+
+    @property
+    def dinner(self) -> Optional[CandidateRecipe]:
+        return self.slots.get("dinner")
+
+    @property
+    def slot_names(self) -> list[str]:
+        """Every slot on this plan, in the order a person eats them."""
+        return sorted(self.slots, key=slot_sort_key)
 
     @property
     def courses(self) -> list[CandidateRecipe]:
-        return [self.breakfast, self.lunch, self.dinner]
+        """The recipes, in slot order.
+
+        Callers use this to build a plan and to fetch enrichment. It used to
+        return exactly three; it now returns however many the day has, which
+        is what makes `refine_meal_plan` and `_compute_metrics` work on a day
+        that is not three meals.
+        """
+        return [self.slots[name] for name in self.slot_names]
+
+    @property
+    def is_classic(self) -> bool:
+        """The three-slot shape `MealPlan.from_courses` can store directly."""
+        return self.slot_names == ["breakfast", "lunch", "dinner"]
 
 
 # Below this share of ingredients matched in the composition tables, the

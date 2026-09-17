@@ -14,6 +14,9 @@ No data files, vector stores, or embedding models are required to boot.
 """
 
 import logging
+
+import obs_context
+import wf_telemetry
 import os
 import threading
 from contextlib import asynccontextmanager
@@ -23,11 +26,12 @@ from dotenv import load_dotenv
 # Load .env before any module reads os.getenv at import time (agents, backends).
 load_dotenv()
 
-from fastapi import FastAPI
+from fastapi import FastAPI  # noqa: E402 — must follow load_dotenv()
 
-from db import init_db
-from routers import foodchat_router
-from services import (
+import auth  # noqa: E402
+from db import init_db  # noqa: E402
+from routers import foodchat_router, review_router  # noqa: E402
+from services import (  # noqa: E402
     init_chat_service,
     init_weekly_plan_service,
     init_memory_service,
@@ -40,10 +44,32 @@ from services import (
 # back to INFO, because a typo'd log level must not stop the pod from booting.
 _LOG_LEVELS = {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"}
 _LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+# `force=True` because basicConfig is a no-op once the root logger has
+# handlers — which it does under pytest and under uvicorn's own log config, so
+# without this the level and format silently did not apply there.
 logging.basicConfig(
     level=_LOG_LEVEL if _LOG_LEVEL in _LOG_LEVELS else "INFO",
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    format="%(asctime)s [%(levelname)s] %(name)s: [%(request_id)s] %(message)s",
+    force=True,
 )
+# Every line carries the correlation id of the request that caused it — the same
+# id the gateway assigned and forwarded — so one user action can be followed
+# across services. LOG_FORMAT=json additionally preserves `extra={...}` fields,
+# which the text formatter silently drops.
+_LOG_JSON = (os.getenv("LOG_FORMAT", "text") or "text").strip().lower() == "json"
+for _handler in logging.getLogger().handlers:
+    _handler.setFormatter(
+        obs_context.JsonFormatter()
+        if _LOG_JSON
+        else obs_context.ContextTextFormatter(
+            "%(asctime)s [%(levelname)s] %(name)s: [%(request_id)s] %(message)s"
+        )
+    )
+obs_context.install_log_filter()
+# Report turns and model spend back to the gateway, which owns the
+# analytics store. No-op unless ANALYTICS_ENABLED and an ingest secret
+# are both set.
+wf_telemetry.TELEMETRY.start(app="foodchat")
 logger = logging.getLogger(__name__)
 
 
@@ -60,7 +86,22 @@ async def lifespan(app: FastAPI):
         try:
             from prompts import sync_prompts
             result = sync_prompts()
-            if any(result.values()):
+            # Always logged, and the created NAMES with it. A deploy that adds
+            # prompts needs one line saying which ones landed — the counts
+            # alone cannot tell you whether the twelve you expected are the
+            # twelve that arrived, and the alternative is opening the UI and
+            # comparing by eye.
+            if result.get("names"):
+                logger.info(
+                    "Langfuse prompt sync created %d: %s",
+                    result["created"], ", ".join(result["names"]),
+                )
+            if result.get("unchecked") or result.get("failed"):
+                logger.warning(
+                    "Langfuse prompt sync incomplete: %s — rerun happens on "
+                    "the next boot", result,
+                )
+            elif any(v for k, v in result.items() if k != "names"):
                 logger.info("Langfuse prompt sync: %s", result)
         except Exception as exc:  # observability must never break the app
             logger.warning("Langfuse prompt sync failed: %s", exc)
@@ -93,7 +134,29 @@ init_memory_service()
 init_orchestrator_service()
 logger.info("Services initialized (chat, weekly, memory, orchestrator).")
 
+# Verify the gateway's signed member assertion on every member-scoped request.
+# Registered before the router so a route cannot be reached without it — see
+# auth.py for why the gateway is the only party that can make this assertion.
+app.middleware("http")(auth.assertion_middleware)
+
+# Adopt the gateway's X-Request-Id (or mint one for a direct caller). Added
+# after the assertion middleware, so it sits outermost: the id exists before
+# anything else can log, including an assertion rejection.
+app.add_middleware(obs_context.RequestContextMiddleware)
+
+if auth.enforcing():
+    logger.info("Member assertions ENFORCED (FOODCHAT_ASSERTION_SECRET is set).")
+else:
+    logger.warning(
+        "FOODCHAT_ASSERTION_SECRET is not set: FoodChat will accept any "
+        "member_id it is given. Anything that can reach this port can act as "
+        "any member. Set the same secret here and on the gateway to close it."
+    )
+
 app.include_router(foodchat_router.router)
+# Review-scoped reads, gated at the gateway on an admin or expert token. Kept
+# out of the member-scoped router so its ownership guarantee stays absolute.
+app.include_router(review_router.router)
 
 
 @app.get("/")

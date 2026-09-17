@@ -1,7 +1,6 @@
 """WiseFood Client connection pool for efficient client instance management."""
 import os
 import logging
-from typing import Optional
 from threading import Lock
 from contextlib import contextmanager
 
@@ -85,7 +84,8 @@ class WiseFoodPool:
             raise ValueError("WISEFOOD_API_URL environment variable is required")
 
         credentials = self._get_credentials()
-        return Client(WISEFOOD_API_URL, credentials)
+        # The platform talking to itself, not a user.
+        return Client(WISEFOOD_API_URL, credentials, telemetry=False)
 
     def _initialize_pool(self):
         """Initialize the pool with connections."""

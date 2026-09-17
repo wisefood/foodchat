@@ -211,8 +211,10 @@ POST /sessions/{id}/score-plan                 chat message classified (or
   plan_type: auto|daily|weekly, context? }     score_plan — section 1
         |                                              |
 [foodchat_router.score_plan]                           |
+  _require_member (identity) -> 401                    |
   blank text -> 400                                    |
 [OrchestratorService.score_plan]                       |
+  one turn per session (busy turn) + turn_budget       |
   ownership -> 404 | message cap -> limit turn         |
   pending clarification -> cleared (superseded)        |
   NO classification                                    |
@@ -334,6 +336,7 @@ POST /sessions/{id}/score-plan                 chat message classified (or
   |       dish that has it, for any allergen the reply does not name)
   |
   +--> assistant message (intent score_plan) with messages.plan_score = payload
+  |       (the endpoint returns through _finalize_turn, like every turn endpoint)
        -> returned on ChatTurn.plan_score and on /conversation messages
 ```
 

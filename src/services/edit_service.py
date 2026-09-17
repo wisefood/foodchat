@@ -23,6 +23,7 @@ Directive predicates (quantitative when nutrition data exists):
                                 unverified in the response facts)
 """
 
+import copy
 import logging
 import re
 from dataclasses import dataclass, field
@@ -30,7 +31,9 @@ from typing import Optional
 
 from agents import EditCommandExtractor
 from models.recipe import CandidateRecipe, RecipeEnrichment
-from services.candidates_client import CANDIDATES
+from models.session import MealCourse, MealPlan
+from services import plan_parameters
+from services.candidates_client import CANDIDATES, effective_diet, screening_allergens
 from .session_service import SessionService
 from .weekly_planner.day_summary import build_day_summaries
 from .weekly_planner.explainability import build_weekly_explainability
@@ -201,6 +204,46 @@ _GENERIC_DIRECTIVES = frozenset({
 })
 
 
+# Ordinal words for "the second day". Only as far as a plan can go.
+_ORDINALS = {
+    "first": 1, "second": 2, "third": 3, "fourth": 4,
+    "fifth": 5, "sixth": 6, "seventh": 7,
+}
+_DAY_N_RE = re.compile(r"\bday\s*([1-7])\b")
+_ORDINAL_RE = re.compile(
+    r"\b(" + "|".join(_ORDINALS) + r")\s+day\b"
+)
+
+
+def _named_day(message: str, *, weekdays: bool) -> Optional[int]:
+    """The day the member named, read from their own words. None when none.
+
+    A deterministic fallback for when the extractor returns no day — which it
+    routinely does on a multi-day DAILY plan, because the prompt telling it
+    how to answer says the day field is "only for weekly plans". That prompt
+    is Langfuse-managed: editing the text here would ship dead (`sync_prompts`
+    skips prompts that already exist), and a new prompt name is a bigger
+    change than this needs. So the day is read here instead, from the same
+    message, with no model call.
+
+    `weekdays` is False for a multi-day daily plan on purpose: such a plan
+    carries no calendar anchoring — its day 1 is "the first day", not Monday —
+    so mapping "Wednesday" onto index 3 would be a guess presented as a fact.
+    """
+    text = (message or "").lower()
+    match = _DAY_N_RE.search(text)
+    if match:
+        return int(match.group(1))
+    match = _ORDINAL_RE.search(text)
+    if match:
+        return _ORDINALS[match.group(1)]
+    if weekdays:
+        for idx, name in enumerate(DAY_NAMES, start=1):
+            if re.search(rf"\b{name.lower()}\b", text):
+                return idx
+    return None
+
+
 def _names_a_dish(directive: str) -> bool:
     """Whether an unverified directive reads as a dish name.
 
@@ -246,22 +289,29 @@ class EditService:
 
         self.session_service.add_message(session_id, "user", message)
 
-        # Weekly edits need a day; daily edits need a meal type. Ask once.
+        # Every edit needs a meal type. A day is needed whenever the plan HAS
+        # days — weekly always, and a daily canvas holding a multi-day plan,
+        # which used to silently edit day 1 whatever the member named.
+        needs_day = self._needs_day(session, canvas)
+        if needs_day and command.get("day") is None:
+            command["day"] = _named_day(message, weekdays=canvas.plan_type == "weekly")
+
         missing_slot = (
             command.get("needs_slot_clarification")
             or command.get("meal_type") is None
-            or (canvas.plan_type == "weekly" and command.get("day") is None)
+            or (needs_day and command.get("day") is None)
         )
         if missing_slot:
             question = command.get("question") or (
                 "Which meal should I swap — breakfast, lunch, or dinner"
-                + (", and on which day?" if canvas.plan_type == "weekly" else "?")
+                + (", and on which day?" if needs_day else "?")
             )
             self.session_service.set_clarification_state(session_id, {
                 "kind": "edit_slot",
                 "original_message": message,
                 "command": command,
                 "plan_type": canvas.plan_type,
+                "needs_day": needs_day,
             })
             self.session_service.add_message(session_id, "assistant", question)
             return EditOutcome(text=question, needs_clarification=True)
@@ -281,9 +331,16 @@ class EditService:
         self.session_service.clear_clarification_state(session_id)
 
         combined = f"{pending.get('original_message', '')} — {message}"
-        command = self.extractor.extract(combined, plan_type=pending.get("plan_type", "daily"))
+        plan_type = pending.get("plan_type", "daily")
+        command = self.extractor.extract(combined, plan_type=plan_type)
+        # `needs_day` is carried in the state rather than re-derived: the rule
+        # must be the same one that asked the question, even if the canvas
+        # moved on between turns.
+        needs_day = bool(pending.get("needs_day", plan_type == "weekly"))
+        if command is not None and needs_day and command.get("day") is None:
+            command["day"] = _named_day(combined, weekdays=plan_type == "weekly")
         if command is None or command.get("meal_type") is None or (
-            pending.get("plan_type") == "weekly" and command.get("day") is None
+            needs_day and command.get("day") is None
         ):
             return EditOutcome(text="", unresolved=True)
 
@@ -300,8 +357,28 @@ class EditService:
         predicate = DirectivePredicate(command.get("directive", "different"))
 
         if canvas.plan_type == "daily":
-            return self._edit_daily(session, meal_type, predicate, original_message)
+            return self._edit_daily(
+                session, meal_type, predicate, original_message,
+                day=command.get("day"),
+            )
         return self._edit_weekly(session, command.get("day"), meal_type, predicate, original_message)
+
+    def _needs_day(self, session, canvas) -> bool:
+        """Whether an edit on this canvas has to name a day.
+
+        Weekly always does. A daily canvas does when the plan on it spans more
+        than one day — the shape `plan_structured` produces and that the daily
+        edit path used to flatten.
+        """
+        if canvas is None:
+            return False
+        if canvas.plan_type == "weekly":
+            return True
+        try:
+            plan = session.get_current_daily_plan()
+        except Exception:  # noqa: BLE001
+            return False
+        return plan is not None and len(plan.day_plans) > 1
 
     def _find_replacement(
         self, session, meal_type: str, predicate: DirectivePredicate,
@@ -311,7 +388,16 @@ class EditService:
 
         Returns (choice, old_enrichment, new_enrichment, facts).
         """
-        profile = session.user_profile
+        # The standing constraints, applied to the profile this fetch uses. An
+        # edit is a fetch like any other: "swap the dinner, but keep it under
+        # 20 minutes" has to narrow the replacement pool, and the pool is
+        # narrowed by `plan_parameters.max_duration_minutes(profile[...])`.
+        from services import plan_parameters, turn_intake
+
+        profile = plan_parameters.apply_state(
+            dict(session.user_profile or {}),
+            turn_intake.current(session.session_id, session_service=self.session_service),
+        )
 
         # A directive that names a dish resolves BY NAME, before any slot
         # candidates. "i want apple pie for breakfast" used to classify as an
@@ -420,15 +506,19 @@ class EditService:
         the taxonomy. Allergens, diet and dislikes still apply; a named dish
         that violates them returns nothing rather than something unsafe.
         """
-        from services.candidates_client import normalize_diet_tags
         from services.plan_client import PLANNER
 
         try:
             hits = PLANNER.find_recipes(
                 name,
-                allergens=profile.get("allergies") or [],
-                diet=normalize_diet_tags(profile.get("diet")),
+                allergens=screening_allergens(profile),
+                diet=effective_diet(profile),
                 exclude_ingredients=profile.get("food_dislikes") or [],
+                max_minutes=plan_parameters.max_duration_minutes(
+                    profile.get("plan_parameters") or {}
+                ),
+                min_nutri_score=profile.get("min_nutri_score"),
+                favorite_recipe_ids=profile.get("favorite_recipe_ids") or [],
                 limit=3,
             )
         except Exception as exc:  # noqa: BLE001
@@ -439,12 +529,22 @@ class EditService:
                 return hit
         return None
 
-    def _edit_daily(self, session, meal_type: str, predicate, original_message: str) -> EditOutcome:
+    def _edit_daily(self, session, meal_type: str, predicate, original_message: str,
+                    day: Optional[int] = None) -> EditOutcome:
         plan = session.get_current_daily_plan()
         if plan is None:
             text = "I couldn't find the current daily plan to edit."
             self.session_service.add_message(session.session_id, "assistant", text)
             return EditOutcome(text=text)
+
+        # A plan with `days` is the source of truth for itself. Rebuilding it
+        # from three scalar courses — which is all the path below can do —
+        # keeps day 1's mains and throws away every other day and every side,
+        # dessert and drink. So a plan that has days is patched in place.
+        if plan.days is not None:
+            return self._edit_structured(
+                session, plan, day, meal_type, predicate, original_message,
+            )
 
         old_course = getattr(plan, meal_type)
         current_ids = [plan.breakfast.recipe_id, plan.lunch.recipe_id, plan.dinner.recipe_id]
@@ -503,16 +603,161 @@ class EditService:
         # property of this turn: pin it so the next refinement re-anchors it
         # instead of regenerating it away — which is exactly how the apple
         # pie vanished one turn after being served.
-        if facts.get("named_dish"):
-            from models.planning_state import PlanningStateDelta
-            state = self.session_service.get_planning_state(session.session_id)
-            self.session_service.set_planning_state(
-                session.session_id,
-                state.merge(PlanningStateDelta(anchors={meal_type: choice.recipe_id})),
-            )
+        #
+        # And the dish they swapped AWAY is a standing rejection, recorded the
+        # same way. `_standing_exclusions` has read that list since it was
+        # written and nothing ever wrote to it: every consumer of
+        # `excluded_recipe_ids` was in place — the daily fetch, the structured
+        # fetch, the swap itself — with no producer, so a regenerate could hand
+        # back the exact dinner the member had just replaced.
+        self._record_edit(session, meal_type, old_course, choice, facts)
         self.session_service.add_message(session.session_id, "assistant", text)
         return EditOutcome(
             text=text, meal_plan=new_plan, changed_slots=changed, facts=facts,
+        )
+
+    def _edit_structured(
+        self, session, plan, day: Optional[int], meal_type: str, predicate,
+        original_message: str,
+    ) -> EditOutcome:
+        """Swap ONE plate of a multi-day / multi-plate plan, in place.
+
+        The plan is the shape `plan_structured` builds: N days, each with its
+        own meals, each meal one or more plates. Every plate outside the target
+        comes through byte-identical — the plan is deep-copied and exactly one
+        `MealCourse` is replaced, so nothing depends on a rebuild getting the
+        rest right.
+
+        The copy matters twice: the parent version is a live object in
+        `session.meal_plans`, so patching `plan.days` in place would rewrite
+        history the member can scroll back to.
+        """
+        days = plan.day_plans
+        target_day = int(day) if day else (int(days[0].day) if len(days) == 1 else 0)
+
+        coords = None
+        for di, dp in enumerate(days):
+            if int(getattr(dp, "day", di + 1)) != target_day:
+                continue
+            for mi, meal in enumerate(dp.meals):
+                if meal.meal_type != meal_type:
+                    continue
+                # The same plate `Meal.main` resolves to, by index so the copy
+                # below can be addressed identically.
+                mains = [
+                    pi for pi, plate in enumerate(meal.plates)
+                    if getattr(plate, "role", "main") == "main"
+                ]
+                coords = (di, mi, (mains or [0])[0])
+                break
+            break
+
+        if coords is None:
+            text = self._structured_miss_text(days, target_day, meal_type)
+            self.session_service.add_message(session.session_id, "assistant", text)
+            return EditOutcome(text=text)
+
+        di, mi, pi = coords
+        old_course = days[di].meals[mi].plates[pi]
+
+        # Every recipe already in the plan is excluded, not just three slots —
+        # otherwise a swap on day 2 can hand back day 5's dinner.
+        in_plan = [
+            plate.recipe_id
+            for dp in days for meal in dp.meals for plate in meal.plates
+            if plate.recipe_id
+        ]
+        choice, old_rich, new_rich, facts = self._find_replacement(
+            session, meal_type, predicate, old_course.recipe_id,
+            in_plan + self._standing_exclusions(session),
+        )
+        if choice is None:
+            text = self._failure_text(
+                meal_type, predicate, facts,
+                day=target_day if len(days) > 1 else None, weekdays=False,
+            )
+            self.session_service.add_message(session.session_id, "assistant", text)
+            return EditOutcome(text=text, facts=facts)
+
+        new_days = copy.deepcopy(days)
+        replacement = MealCourse.from_candidate(choice)
+        # The plate keeps its place in the meal: a main stays a main, a side
+        # stays a side, and the order the UI renders is untouched.
+        replacement.role = getattr(old_course, "role", "main")
+        if new_rich:
+            replacement.nutrition = new_rich.nutrition_dict()
+            replacement.image_url = new_rich.image_url
+        replacement.match_reasons = [
+            {"kind": "pinned", "label": "swapped at your request"}
+        ]
+        new_days[di].meals[mi].plates[pi] = replacement
+
+        metrics = {  # a slot swap doesn't re-grade the plan
+            "llm_score": plan.llm_score, "llm_reasoning": plan.llm_reasoning,
+            "fvs_count": plan.fvs_count, "fvs_reasoning": plan.fvs_reasoning,
+            "diversity_llm_score": plan.diversity_llm_score,
+            "diversity_llm_reasoning": plan.diversity_llm_reasoning,
+            "guideline_adherence_score": plan.guideline_adherence_score,
+            "guideline_adherence_reasoning": plan.guideline_adherence_reasoning,
+        }
+        new_plan = MealPlan.from_days(
+            new_days,
+            reasoning=f"Swapped day {target_day} {meal_type}: {predicate.directive}",
+            metrics=metrics,
+        )
+        # Set before storing: `refine_prepared_meal_plan` serializes to the
+        # database inside the call, so anything attached afterwards would be
+        # missing from the row the next reload reads.
+        new_plan.constraints_applied = plan.constraints_applied
+        new_plan.personalization_summary = plan.personalization_summary
+        new_plan = self.session_service.refine_prepared_meal_plan(
+            session.session_id, new_plan,
+        )
+
+        # A day is reported only when the plan HAS days. On a single-day plan
+        # `target_day` is 1 by construction, and carrying it made the reply
+        # name a day the member never mentioned ("Monday's dinner" on a plan
+        # with one unnamed day) and made the UI look for a slot key of
+        # "1-dinner" where the single-day canvas renders "dinner" — so the
+        # before/after flash never fired either.
+        changed = [self._changed_slot(
+            meal_type, target_day if len(days) > 1 else None,
+            old_course.title, old_rich, choice.title, new_rich, predicate,
+        )]
+        for key in ("named_dish", "named_miss"):
+            if key in facts:
+                changed[0][key] = facts[key]
+        facts.update({"changed": changed[0]})
+        text = self._success_text(changed[0], predicate, weekdays=False)
+
+        self._record_edit(session, meal_type, old_course, choice, facts)
+        self.session_service.add_message(session.session_id, "assistant", text)
+        return EditOutcome(
+            text=text, meal_plan=new_plan, changed_slots=changed, facts=facts,
+        )
+
+    @staticmethod
+    def _structured_miss_text(days: list, day: int, meal_type: str) -> str:
+        """Say what the plan actually covers rather than editing the wrong slot."""
+        numbers = [int(getattr(dp, "day", i + 1)) for i, dp in enumerate(days)]
+        matching = [dp for i, dp in enumerate(days) if numbers[i] == day]
+        if not matching:
+            span = ", ".join(f"day {n}" for n in numbers)
+            return (
+                f"This plan covers {span} — I don't have a day {day} to change. "
+                "Tell me which of those you meant and I'll swap it."
+            )
+        have = [m.meal_type for m in matching[0].meals]
+        # Offering to ADD it, not asking which existing meal to change.
+        #
+        # The old sentence sent the member in a circle: they asked for a meal
+        # the plan does not have, and were asked to pick one it does. Saying
+        # "ask me to add it" is the way out, and the shape reader upstream
+        # (`shape_intent`) is what makes "add breakfast" work when they do.
+        return (
+            f"This plan has no {meal_type} — it has "
+            f"{', '.join(have) or 'no meals'}. Say \"add {meal_type}\" and I "
+            f"will plan one in, or tell me which of those to change instead."
         )
 
     def _edit_weekly(self, session, day: int, meal_type: str, predicate, original_message: str) -> EditOutcome:
@@ -690,8 +935,26 @@ class EditService:
         }
 
     @staticmethod
-    def _success_text(changed: dict, predicate) -> str:
-        where = f"{DAY_NAMES[changed['day'] - 1]}'s {changed['meal_type']}" if changed["day"] else f"the {changed['meal_type']}"
+    def _slot_phrase(meal_type: str, day: Optional[int], *, weekdays: bool) -> str:
+        """Name the slot the way the plan is entitled to name it.
+
+        A weekly plan's day 3 IS Wednesday. A multi-day plan on the daily
+        canvas has no weekdays at all — it starts when the member cooks it — so
+        "I swapped Wednesday's dinner" answered a swap on day 3 of a plan that
+        has no Wednesday in it. `_named_day` already refuses to READ weekdays
+        there for exactly this reason; the reply now agrees with it.
+        """
+        if not day:
+            return f"the {meal_type}"
+        if weekdays and 1 <= int(day) <= 7:
+            return f"{DAY_NAMES[int(day) - 1]}'s {meal_type}"
+        return f"day {int(day)}'s {meal_type}"
+
+    @staticmethod
+    def _success_text(changed: dict, predicate, *, weekdays: bool = True) -> str:
+        where = EditService._slot_phrase(
+            changed["meal_type"], changed["day"], weekdays=weekdays,
+        )
         text = f"Done — I swapped {where}: “{changed['old']['title']}” → “{changed['new']['title']}”."
         old_kcal, new_kcal = changed["old"]["kcal"], changed["new"]["kcal"]
         if predicate.kind == "lighter" and old_kcal and new_kcal:
@@ -714,8 +977,9 @@ class EditService:
         return text
 
     @staticmethod
-    def _failure_text(meal_type, predicate, facts, day=None) -> str:
-        where = f"{DAY_NAMES[day - 1]}'s {meal_type}" if day else f"the {meal_type}"
+    def _failure_text(meal_type, predicate, facts, day=None, *,
+                      weekdays: bool = True) -> str:
+        where = EditService._slot_phrase(meal_type, day, weekdays=weekdays)
         text = (f"I looked for a replacement for {where} that's provably "
                 f"“{predicate.directive}”, but nothing in the matching recipes passes the bar")
         nearest = facts.get("nearest_miss")
@@ -725,6 +989,41 @@ class EditService:
         else:
             text += ". Want me to relax the requirement or another constraint?"
         return text
+
+    def _record_edit(self, session, meal_type: str, old_course, choice, facts: dict) -> None:
+        """What this swap means for the NEXT plan, not just this one.
+
+        Two standing facts, and both were previously half-wired:
+
+        * a dish the member NAMED and got is anchored, so the next refinement
+          re-pins it instead of regenerating it away;
+        * the dish they swapped away is excluded, so it cannot come back.
+
+        Best-effort: a state write that fails costs the memory, never the swap
+        the member can already see.
+        """
+        from models.planning_state import PlanningStateDelta
+
+        rejected = getattr(old_course, "recipe_id", "") or ""
+        anchors = (
+            {meal_type: choice.recipe_id} if facts.get("named_dish") else None
+        )
+        if not rejected and not anchors:
+            return
+        try:
+            state = self.session_service.get_planning_state(session.session_id)
+            self.session_service.set_planning_state(
+                session.session_id,
+                state.merge(PlanningStateDelta(
+                    anchors=anchors,
+                    excluded_recipe_ids=(rejected,) if rejected else (),
+                )),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[%s] Could not record the edit as standing state: %s",
+                session.session_id, exc,
+            )
 
     def _standing_exclusions(self, session) -> list[str]:
         """Recipes the member already rejected (downvote, "not that one").

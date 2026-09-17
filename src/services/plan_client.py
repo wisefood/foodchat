@@ -82,6 +82,28 @@ class PlanClient:
     def vocabularies(self) -> dict:
         return self.manifest().get("vocabularies") or {}
 
+    def accepts(self, tool: str, field: str) -> bool:
+        """Whether the live service takes this request field on this tool.
+
+        The planning surface rejects unknown fields with a 422 rather than
+        ignoring them — deliberately, so a misremembered name is reported
+        instead of silently widening a query. The consequence for a caller is
+        that there is no safe way to try an optional parameter and see: it
+        either knows the field exists or it must not send it.
+
+        So the manifest says. Each tool entry carries `accepts`, generated from
+        its own request model, and FoodChat asks here before sending anything
+        newer than the oldest deployment it might be talking to.
+
+        Absent `accepts` — an older RecipeWrangler — is a NO. Guessing yes
+        would turn every plan request into a 422 the moment the two services
+        drifted, which is the outage this method exists to prevent.
+        """
+        for entry in self.manifest().get("tools") or []:
+            if entry.get("name") == tool:
+                return field in (entry.get("accepts") or [])
+        return False
+
     def planning_options(self) -> dict[str, Any]:
         """What a user can actually ask for, from the live service.
 
@@ -115,7 +137,11 @@ class PlanClient:
             "max_plates_per_meal": MAX_PLATES_PER_MEAL,
             "supports_multi_course_meals": True,
             "supports_nutri_score_floor": True,
-            "supports_macro_targets": True,
+            # No macro targeting: `plan_meals` has no calorie or protein
+            # parameter, and advertising one told the agent it could promise
+            # something the endpoint cannot do. Flips to True when the
+            # planning surface grows nutrition targets.
+            "supports_macro_targets": False,
         }
 
     def describe_options(self) -> str:
@@ -129,8 +155,9 @@ class PlanClient:
             "and a salad, or a main and a dessert. I can steer by cuisine "
             "({n_cuisines} available, "
             "e.g. {cuisine_examples}), by mood, flavour or food group, cap the "
-            "cooking time, set a minimum Nutri-Score, and hit calorie or protein "
-            "targets. Allergens and dietary requirements are never relaxed."
+            "cooking time and set a minimum Nutri-Score. I cannot hit calorie "
+            "or protein targets yet. Allergens and dietary requirements are "
+            "never relaxed."
         ).format(
             days=options["max_days"],
             meals=options["max_meals_per_day"],
@@ -148,6 +175,14 @@ class PlanClient:
         days: int = 1,
         slots: tuple[str, ...] = MEAL_SLOTS,
         count_per_slot: int = 1,
+        # Spend `count_per_slot` only on plates of meals that have more than
+        # one. A single-plate meal has nothing to compose, so a deeper pool for
+        # it is recipes fetched and ranked to arrive at the first one anyway.
+        deepen_multiplate_only: bool = False,
+        # Where each slot's window starts. The ranking is deterministic, so
+        # every request without this draws from the same top of the same list —
+        # which is why asking for a second plan returned the first one.
+        offset: int = 0,
         spec: Optional["PlanSpec"] = None,
         allergens: Optional[list[str]] = None,
         diet: Optional[list[str]] = None,
@@ -155,6 +190,7 @@ class PlanClient:
         moods: Optional[list[str]] = None,
         flavor_profiles: Optional[list[str]] = None,
         food_groups: Optional[list[str]] = None,
+        tags: Optional[list[str]] = None,
         include_ingredients: Optional[list[str]] = None,
         exclude_ingredients: Optional[list[str]] = None,
         exclude_recipe_ids: Optional[list[str]] = None,
@@ -174,11 +210,21 @@ class PlanClient:
         degrade from that, and inventing a second failure convention for the
         same kind of problem would mean two sets of error handling.
         """
-        # A spec supersedes `slots`/`count_per_slot`/`days`. Those remain for
-        # the simple case — three meals, one recipe each — because most callers
-        # want exactly that and should not have to construct an object to say so.
+        # A spec supersedes `slots` and `days`. Those remain for the simple
+        # case — three meals, one recipe each — because most callers want
+        # exactly that and should not have to construct an object to say so.
+        #
+        # `count_per_slot` is NOT superseded: it is recipes per plate, which is
+        # orthogonal to the shape. It used to be silently ignored whenever a
+        # spec was passed, so a caller asking a shaped plan for four candidates
+        # per plate got one — and a composer handed one candidate per plate has
+        # nothing to compose. A parameter that reaches nothing is worse than one
+        # that does not exist.
         if spec is not None:
-            request_slots = spec.to_request_slots()
+            request_slots = spec.to_request_slots(
+                count=max(1, int(count_per_slot)),
+                only_multiplate=deepen_multiplate_only,
+            )
             days = spec.num_days
         else:
             request_slots = [
@@ -202,10 +248,39 @@ class PlanClient:
             "favorite_recipe_ids": favorite_recipe_ids or [],
             "allow_relaxation": True,
         }
+        # Claim tags (high_protein, high_fibre, low_calorie, …) ride a
+        # parameter that older RecipeWrangler deployments do not have, and its
+        # request model rejects unknown fields with a 422 rather than ignoring
+        # them. So the key is only added when the live manifest advertises the
+        # vocabulary — the vocabulary IS the capability flag, and it is already
+        # cached, so this costs nothing per call.
+        if tags:
+            from services.candidates_client import CANDIDATES
+
+            if CANDIDATES.vocabularies().get("tags"):
+                payload["tags"] = list(tags)
+            else:
+                logger.info(
+                    "Not sending tags=%s — this RecipeWrangler does not "
+                    "advertise the vocabulary", tags,
+                )
         if max_minutes:
             payload["max_minutes"] = int(max_minutes)
         if min_nutri_score:
             payload["min_nutri_score"] = str(min_nutri_score).upper()
+        # Gated on the manifest, like `tags`, and for the same reason: the
+        # request model rejects unknown fields with a 422, so sending this to a
+        # RecipeWrangler that predates it would break every plan rather than
+        # degrade. Without it the pool is page one, every time.
+        if offset > 0:
+            if self.accepts("plan_meals", "offset"):
+                payload["offset"] = int(offset)
+            else:
+                logger.info(
+                    "Not sending offset=%d — this RecipeWrangler does not "
+                    "advertise it, so every plan draws from the same window",
+                    offset,
+                )
 
         logger.info(
             "plan_meals days=%d slots=%s cuisines=%s max_minutes=%s",
@@ -230,6 +305,10 @@ class PlanClient:
         diet: Optional[list[str]] = None,
         exclude_ingredients: Optional[list[str]] = None,
         course_types: Optional[list[str]] = None,
+        exclude_recipe_ids: Optional[list[str]] = None,
+        favorite_recipe_ids: Optional[list[str]] = None,
+        max_minutes: Optional[int] = None,
+        min_nutri_score: Optional[str] = None,
     ) -> list[CandidateRecipe]:
         """Search the corpus by free text, honouring the member's constraints.
 
@@ -243,7 +322,9 @@ class PlanClient:
         More importantly it takes the member's allergens and diet. Resolving a
         named dish without them means offering someone a seed they cannot eat
         and discovering it one step later, which is how "I'd love that" becomes
-        an apology.
+        an apology. It also takes the Nutri-Score floor and the cooking-time
+        slider, which every other fetch applied and this one did not — so a
+        seed could be anchored that the planner would have refused.
 
         Returns `[]` on failure — a seed that cannot be resolved is simply not
         anchored, which the caller already handles.
@@ -260,7 +341,18 @@ class PlanClient:
             "diet": diet or [],
             "exclude_ingredients": exclude_ingredients or [],
             "course_types": course_types or [],
+            "exclude_recipe_ids": exclude_recipe_ids or [],
+            "favorite_recipe_ids": favorite_recipe_ids or [],
         }
+        # The member's numeric constraints, which this call used to skip. A
+        # named dish resolved without them can be anchored into a plan the
+        # planner itself would never have chosen it for — the Nutri-Score floor
+        # and the cooking-time slider applied to every other fetch and not to
+        # this one.
+        if max_minutes:
+            payload["max_minutes"] = int(max_minutes)
+        if min_nutri_score:
+            payload["min_nutri_score"] = str(min_nutri_score).upper()
         try:
             with httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS) as client:
                 response = client.post(
@@ -367,6 +459,98 @@ class PlanClient:
         if dropped:
             logger.warning("Allergen backstop dropped %d candidate(s)", dropped)
         return by_slot
+
+    @staticmethod
+    def to_role_pools(
+        envelope: dict[str, Any],
+        spec: "PlanSpec",
+        allergens: Optional[list[str]] = None,
+    ) -> dict[int, dict[tuple[str, str], list[CandidateRecipe]]]:
+        """`{day: {(slot, role): [CandidateRecipe]}}` — a pool per PLATE.
+
+        `to_candidates` buckets by slot name alone, which is right for the
+        three-single-plate case and wrong the moment a meal has two plates: a
+        main and a salad both land in `by_slot["lunch"]`, mixed together, with
+        nothing left to say which was which. That is the whole reason multi-plate
+        planning had no producer — the renderer was ready, the request was
+        already one entry per plate, and the reply was being read back through a
+        function that threw the distinction away.
+
+        **Paired entry-wise, not recipe-wise.** `to_request_slots` emits one
+        entry per plate and `role_sequence` regenerates the same order, so the
+        Nth entry of the response is the Nth plate — whatever number of recipes
+        it contains. `plan_structured` zipped the FLATTENED recipe list against
+        the role sequence instead, which is correct only while every plate
+        returns exactly one recipe: a plate the corpus could not fill shifts
+        every role after it by one, so a two-plate lunch with an empty main
+        rendered the salad as the main and the next slot's main as a side. Here
+        the count per plate is deliberately greater than one — there is no
+        composition to make without a choice — so recipe-wise pairing is not
+        merely fragile, it is wrong.
+        """
+        from services.candidates_client import allergen_conflict
+
+        sequence = spec.role_sequence()
+        out: dict[int, dict[tuple[str, str], list[CandidateRecipe]]] = {}
+        dropped = 0
+
+        for index, day_payload in enumerate(envelope.get("days") or []):
+            day = int(day_payload.get("day") or index + 1)
+            entries = day_payload.get("slots") or []
+            if len(entries) != len(sequence):
+                # Worth a line rather than a silent truncation: the pairing is
+                # positional, so a response that does not echo one entry per
+                # requested plate means the plates below this point are being
+                # matched to the wrong roles.
+                logger.warning(
+                    "day %s returned %d slot entries for %d requested plates — "
+                    "pairing what lines up and dropping the rest",
+                    day, len(entries), len(sequence),
+                )
+            pools: dict[tuple[str, str], list[CandidateRecipe]] = {}
+            for (expected_slot, role), entry in zip(sequence, entries):
+                # The slot name comes from the response so a service that
+                # reorders is still read correctly; the role comes from the
+                # request because roles are FoodChat's vocabulary and the
+                # response has never carried them.
+                slot = str(entry.get("slot") or expected_slot)
+                bucket = pools.setdefault((slot, role), [])
+                for recipe in entry.get("recipes") or []:
+                    recipe_id = str(recipe.get("recipe_id") or "").strip()
+                    if not recipe_id:
+                        continue
+                    candidate = CandidateRecipe(
+                        recipe_id=recipe_id,
+                        title=str(recipe.get("title") or ""),
+                        ingredients=str(recipe.get("ingredients") or ""),
+                        directions=str(
+                            recipe.get("directions") or recipe.get("instructions") or ""
+                        ),
+                        nutrition=_meal_nutrition(recipe),
+                        nutri_score=recipe.get("default_nutri_score"),
+                        image_url=recipe.get("image_url"),
+                    )
+                    # Same backstop, same reason: the corpus's allergen tags
+                    # have been wrong in production, and a server-side filter
+                    # cannot be the only thing between a member and an
+                    # allergen.
+                    conflict = allergen_conflict(
+                        f"{candidate.title} {candidate.ingredients}", allergens or [],
+                    )
+                    if conflict:
+                        dropped += 1
+                        logger.warning(
+                            "Dropping %r from %s %s — mentions %r despite the "
+                            "server-side allergen filter",
+                            candidate.title, slot, role, conflict,
+                        )
+                        continue
+                    bucket.append(candidate)
+            out[day] = pools
+
+        if dropped:
+            logger.warning("Allergen backstop dropped %d candidate(s)", dropped)
+        return out
 
     @staticmethod
     def describe_relaxations(envelope: dict[str, Any]) -> list[str]:

@@ -156,6 +156,67 @@ Daily Plan to Score
 
 """
 
+# The grader, for a day of ANY shape.
+#
+# A new name, not an edit: `sync_prompts` creates only missing prompts and
+# never overwrites, so changing `grader_system` in place would work locally and
+# ship dead. The old pair stays registered and unused rather than being
+# deleted, because a Langfuse copy someone has edited by hand is not ours to
+# remove.
+#
+# The rubric is unchanged. What changes is that the plan is described as "the
+# meals of one day" rather than "a combination of breakfast, lunch and dinner",
+# because a day can now be two meals, or four, or a dinner served as a main and
+# a side.
+PLAN_GRADER_SYSTEM_INSTRUCTIONS = """
+You are a meal plan evaluation model. Your sole purpose is to analyze ONE DAY of eating and provide a holistic score from 1 to 5.
+
+A day is whatever meals it contains. Usually breakfast, lunch and dinner; it may also include a snack or a dessert, and a single meal may be served as several plates (a main with a side). Score the day you are given, not the day you expected.
+
+You will be given four pieces of information:
+1.  User's Immediate Query: the user's most recent request in their own words.
+2.  User Preferences: the user's stored preferences (likes/dislikes).
+3.  User Feedback Summary: what the user has liked or disliked in the past.
+4.  Candidate Days to Score: each one a set of meals, labelled by slot.
+
+YOUR TASK:
+Analyze how well each day aligns with all the provided information. Synthesize these data points into a single, justified score.
+
+SCORING RUBRIC (Strictly Adhere to This):
+- 5 (Excellent Fit): perfectly aligns with the query, profile goals (calories, macros) and preferences. Intelligently incorporates past feedback and offers good variety.
+- 4 (Good Fit): meets all major goals and the query. Slightly off on a minor preference, or could have better variety, but a strong recommendation.
+- 3 (Average Fit): meets basic nutritional goals but ignores the specific query, preferences or past feedback. Acceptable, not personalized.
+- 2 (Poor Fit): fails on a key aspect — significantly misses a nutritional target, includes disliked foods, or repeats what the user has rejected.
+- 1 (Very Poor Fit): actively contradicts the query, goals and feedback. Unsuitable.
+
+SLOT PLAUSIBILITY (evaluate BEFORE anything else):
+Ask of each meal: would a reasonable person recognise this as that meal? Plain rice is not a lunch. A condiment, a spice mix, a pickle or a dressing is not a meal. A dessert is not a dinner unless the user asked for one. A side dish may be small — that is what a side is — but a MAIN that is only a garnish is implausible. Any day with an implausible slot scores AT MOST 2, whatever else it gets right, and the reasoning must name the offending dish and slot.
+
+You are an assessor, not an advocate. Your reasoning must weigh what is wrong with the day as prominently as what is right. Never construct a justification for a weak day ("rice provides versatile carbohydrates") — if the best available day is mediocre, score it as mediocre and say why; the system downstream can only fix what you name. A high score is a claim the user will test at dinner.
+"""
+
+PLAN_GRADER_USER_INSTRUCTIONS = """
+Below are {plan_count} candidate days, each marked "PLAN <index>". Each day lists its own meals by slot; different days in this batch have the same slots as each other.
+
+Score EVERY one of them against your instructions. Because you can see them side by side, grade comparatively: the strongest day of the batch should outscore the others, and two days should only tie when they are genuinely interchangeable.
+
+Where a dish shows kcal and protein, use the numbers: a day whose meals sum far outside a sensible daily intake, or whose lunch is a fraction of its breakfast, is a worse day than one that adds up. Missing numbers are not a fault — score what is shown.
+
+User's Immediate Query
+{query}
+
+User Preferences
+{preferences}
+
+User Feedback Summary
+{feedback_history}
+
+Candidate Days
+{plans}
+
+Return a JSON object: {{"grades": [{{"plan_index": <int>, "reasoning": <str>, "score": <1-5>}}, ...]}}
+"""
+
 BATCH_GRADER_USER_INSTRUCTIONS = """
 Below are {plan_count} candidate daily plans, each marked "PLAN <index>".
 Score EVERY one of them against your instructions. Because you can see them
@@ -928,6 +989,100 @@ User message: {message}
 """
 
 # Edit-command extraction (M4b) — targeted slot edits with a directive.
+# Tool selection.
+#
+# A new pair, not an edit to `orchestrator_system`: that prompt is
+# Langfuse-managed and `sync_prompts` never overwrites, so adding tool intents
+# there would work locally and ship dead. This runs on the same
+# pre-classification seam the FoodScholar bypass uses.
+TOOL_SELECTOR_SYSTEM_INSTRUCTIONS = """
+You decide whether one of FoodChat's capabilities answers the user's message, and which one. You do not answer the message yourself.
+
+The user HAS a meal plan on screen. Every capability below acts on it.
+
+CAPABILITIES:
+{tools}
+
+RULES:
+1. Most messages are NOT a capability. Return an empty tool for anything that is a new plan request, a change to the plan's content ("make dinner lighter", "swap the salmon"), a nutrition question, or conversation. Empty is the correct and common answer — forcing a choice turns "thanks, that looks great" into a week summary nobody asked for.
+2. Pick a capability only when the user is asking for exactly what it does. "How does my week look?" is a week summary. "How many calories is this?" is the totals. "Redo Thursday" is replacing that day.
+3. A capability that names a day needs one. Read it from the message: a weekday (Monday = 1 … Sunday = 7), "day 3", "the second day". If the user clearly wants a day but did not say which, return an empty tool — a guess replaces the wrong dinner.
+4. Never choose a capability that CHANGES the plan unless the user asked for a change to a whole day. "I don't like Thursday's dinner" is one meal, not the day — return empty and let the normal editing path handle it.
+5. `title` only for keeping a plan, and only when the user gave it a name: "save this as Meatless Monday" is a title, "save this" is not. Do not invent one.
+6. `saved`: false only when the user is taking a plan back OFF their list ("actually don't keep that one"). Otherwise leave it true.
+7. `reason`: one short sentence naming what you read in the message. Not a restatement of the tool.
+
+OUTPUT (MANDATORY): a single JSON object with exactly the keys "tool", "day", "plan_type", "title", "saved", "reason".
+"""
+
+TOOL_SELECTOR_USER_INSTRUCTIONS = """
+The plan on screen: {plan_type}, {plan_shape}.
+
+User message: {message}
+"""
+
+MEAL_COMPOSER_SYSTEM_INSTRUCTIONS = """
+You choose which combination of dishes makes the best MEAL, for meals that are served as more than one plate.
+
+Each meal below is offered as a few complete options. Every option is already legal: allergens, diet and cooking time have been filtered, the arithmetic on portions and repeated ingredients is already done, and the options are already ordered by that arithmetic. Your job is the part arithmetic cannot do — whether these dishes belong on a table together.
+
+WHAT TO WEIGH, in order:
+1. Do they go together? A rich main wants a sharp or fresh side, not a second rich dish. Two dishes from clashing cuisines on one plate is worse than two from the same one.
+2. Is there variety in kind? A main and a side that are both roasted root vegetables is one dish served twice, even when the ingredients differ.
+3. Does it read like a meal someone would actually cook and serve at that time of day? A dessert-like dish beside a breakfast main usually does not.
+
+RULES:
+1. `pick` is the 0-based position of the option you choose, from the options shown for THAT meal. Nothing else is a valid answer.
+2. Copy `meal` back exactly as it is labelled. It is how the choice is matched to the meal; a mismatched label is discarded.
+3. Option 0 is the arithmetic's own winner. Choose it whenever nothing about the alternatives is clearly better — agreeing is a real answer and the common one.
+4. Do not comment on nutrition, calories or health. Those are measured elsewhere, against the member's own targets, and a second opinion here would contradict a number.
+5. `reason`: one short clause about THESE dishes. "The pickled slaw cuts the rich pork" — not "this is a balanced choice".
+6. One entry per meal you are shown, and no entries for meals you are not.
+
+OUTPUT (MANDATORY): a single JSON object with one key, "choices", holding a list of objects with the keys "meal", "pick" and "reason".
+"""
+
+MEAL_COMPOSER_USER_INSTRUCTIONS = """
+The member asked: {message}
+
+Meals to choose for:
+{meals}
+"""
+
+PLAN_STRATEGIST_SYSTEM_INSTRUCTIONS = """
+You decide HOW to search for a meal plan, before any recipe is fetched. You do not choose recipes and you do not write prose to the user.
+
+You are given: the member's request, what is already standing for this session, and the CLOSED VOCABULARIES the recipe corpus actually carries.
+
+Your job is to turn what the member wants into search terms that exist.
+
+RULES:
+1. Every cuisine, mood, flavour and food group MUST be copied from the vocabulary lists you are given. The search ANDs these values and never relaxes an unknown one — so an invented value does not narrow the search, it EMPTIES it, and the member is told no meals exist. If nothing in the vocabulary fits, return an empty list. An empty list is a correct answer.
+2. Claim tags must come from this list only: high_protein, low_fat, high_fibre, low_calorie, healthy_and_nutritious, 30_minutes_or_less, 5_ingredients_or_less.
+3. Prefer FEW strong terms over many weak ones. Three ANDed facets over a 4,500-recipe corpus is often zero results. Two is usually plenty.
+4. Do NOT restate the member's diet or allergies. Those are handled separately and are not yours to set, soften or drop.
+5. `relaxation_order` may only REORDER these: tags, moods, flavor_profiles, food_groups, cuisines, max_minutes. Put the thing that matters LEAST to this member first. Anything else you write is ignored.
+6. `kcal_target` only when the request implies a daily calorie budget and the member has not set one. Between 1200 and 4000.
+7. `rationale`: one sentence, concrete, about THIS request. "Read 'something light after the gym' as high protein with a light mood" — not "I will find suitable recipes."
+
+Think about what the words MEAN in food terms before mapping them:
+- "energy boost" is sustaining food — protein and fibre — not a mood that exists.
+- "comfort food" is usually a mood, not a cuisine.
+- "something light" is a mood AND often a calorie claim.
+- A named country is a cuisine; a named dish is not a facet at all.
+
+OUTPUT (MANDATORY): a single JSON object with exactly these keys: cuisines, moods, flavor_profiles, food_groups, claim_tags, kcal_target, relaxation_order, rationale.
+"""
+
+PLAN_STRATEGIST_USER_INSTRUCTIONS = """
+Member request: {message}
+
+Already standing for this session: {standing}
+
+Vocabularies the corpus carries (copy from these, exactly):
+{vocabularies}
+"""
+
 EDIT_COMMAND_EXTRACTOR_SYSTEM_INSTRUCTIONS = """
 You parse a user's request to change ONE slot of an existing meal plan into a structured edit command.
 
@@ -960,14 +1115,23 @@ User message: {message}
 RESPONSE_WRITER_SYSTEM_INSTRUCTIONS = """
 You are FoodChat's voice: warm, concise, and concrete. You write the assistant's chat message from STRUCTURED FACTS about what the system just did.
 
-Rules:
+You are helping a household eat better, not reporting the result of a constraint solver. Nobody asks for dinner in order to be told which rules were satisfied.
+
+WHAT TO LEAD WITH — the food, and why it suits these people:
+- Name a dish or two. Say what makes the plan good for them, using `plan_value`: what it adds up to, how varied it is, what the dietary guidance says about it, what it uses up from their kitchen.
+- Speak to the household when there is one. Cooking for four is a different job from cooking for one, and the reply should sound like it knows which it did.
+
+HOW TO TREAT CONSTRAINTS — with decency:
+- They are reassurance, not the subject. At most ONE short clause, and only when it is worth saying: "all nut-free" is fine. A list of every restriction is not, and neither is making it the first thing.
+- NEVER lead with, dwell on, or enumerate a health condition, allergy, or dietary requirement. Someone's coeliac disease is not the headline of their dinner. The plan respects it; that is all that needs saying, if anything.
+- Do not congratulate them, or yourself, on compliance.
+- When something genuinely could NOT be honoured, say it plainly and once, as a fact and not an apology. That is the one case where a constraint leads.
+
+ALWAYS:
 - 1-3 short sentences. Vary your phrasing; never sound templated.
-- Mention the most meaningful specifics from the facts (a dish name, a swap with its calorie change, an honored request, who you're cooking for) — not all of them.
-- State the OUTCOME, never the deliberation. "I swapped X for Y, but then
-  realizing you avoid mushrooms..." narrates a thought process the user never
-  needed and undermines the result. Say what IS on the plan and why it fits;
-  if something couldn't be honored, say that plainly as a fact.
-- NEVER invent recipes, numbers, or promises that are not in the facts.
+- Pick the most meaningful specifics — not all of them. A reply that mentions everything in the facts mentions nothing.
+- State the OUTCOME, never the deliberation. "I swapped X for Y, but then realizing you avoid mushrooms..." narrates a thought process nobody needed and undermines the result.
+- NEVER invent recipes, numbers, or promises that are not in the facts. In particular: only call something healthy, balanced or sustainable if `plan_value` gives you a measurement or a judgement that says so. "Healthy" is not a number you may supply yourself.
 - If the facts include "seed_note" or "verification", weave them in naturally.
 - If the facts include recent user wording, you may echo it briefly ("since Tuesday felt heavy...").
 - No markdown headers, no bullet lists — plain conversational text. Emoji at most one, only when natural.
@@ -999,9 +1163,22 @@ CHATBOT_SYSTEM_INSTRUCTIONS = (
     "asks what you can do, mention this; if their request implies a shape "
     "('I skip breakfast', 'we want a starter too'), plan that shape rather than "
     "defaulting to three meals. "
-    "You can steer by cuisine, mood, flavour, food group, cooking time, "
-    "Nutri-Score and calorie or protein targets. Allergies and dietary "
-    "requirements are never relaxed to make a plan fit. "
+    # What follows must stay a description of what the planner can actually
+    # do. It has been wrong in both directions: it promised mood, flavour,
+    # food group, calorie and protein steering when none of it was wired, and
+    # then — after the facets WERE wired — it went on telling the model to
+    # refuse three capabilities the planner had gained.
+    "You can steer by cuisine, mood, flavour and food group ('something "
+    "comforting', 'light and fresh', 'more vegetables', 'Thai tonight'), by "
+    "cooking time ('under 20 minutes'), by nutrition claims the recipes carry "
+    "('high protein', 'low fat', 'quick'), and by a minimum Nutri-Score. You "
+    "can also use up what someone has in ('I have spinach to use') and keep "
+    "a dish they name. "
+    "Do NOT promise calorie or protein TARGETS from chat — a plan is checked "
+    "against a calorie budget when the member's profile carries one, but they "
+    "cannot set a number by asking, and offering that makes the next turn a "
+    "disappointment. Allergies and dietary requirements are never relaxed to "
+    "make a plan fit. "
     "Nutrition-science questions are answered for you by FoodScholar, WiseFood's "
     "evidence-based Q&A service, so never tell the user a question can't be answered here. "
     "For this conversation: respond warmly and briefly, stay food-related where natural, "
@@ -1036,6 +1213,71 @@ _prompt_logger = _logging.getLogger(__name__)
 
 # Namespace within the shared Langfuse project (FoodScholar reports to the same
 # instance). A slash renders as a folder in the Langfuse UI.
+SESSION_TITLE_SYSTEM_INSTRUCTIONS = """You name a meal-planning conversation from its opening message.
+
+Return ONLY the name. No quotes, no punctuation at the end, no preamble, no
+explanation. Three to six words. Title Case.
+
+The name has to be recognisable in a list of a dozen others weeks later, so it
+must say what this conversation was ABOUT — the food, the occasion, the
+constraint — never how it was phrased.
+
+Good:
+- Vegetarian Week Without Nuts
+- Quick Weeknight Dinners
+- High Protein Meal Plan
+- Birthday Dinner For Six
+- Using Up Leftover Rice
+
+Bad, and why:
+- "Meal Plan" — every conversation here is a meal plan
+- "User Wants Vegetarian Food" — describes the message, not the topic
+- "Help" or "Question" — says nothing
+- "I Need Something Vegetarian" — echoes the phrasing instead of naming it
+
+If the message is too vague to name (a greeting, a single word), return exactly:
+NONE
+"""
+
+SESSION_TITLE_USER_INSTRUCTIONS = """Opening message:
+\"\"\"{message}\"\"\"
+
+Name:"""
+
+PLAN_INTENT_EXTRACTOR_SYSTEM_INSTRUCTIONS = """You read one message and name the
+recipe qualities it asks for, using ONLY the vocabularies given to you.
+
+Return JSON with four lists: "cuisines", "moods", "flavor_profiles",
+"food_groups". Every value MUST be copied exactly from the matching vocabulary
+below. Anything you cannot match to a listed value is left out — a value that is
+not in the list is worse than nothing, because it becomes a hard filter that
+matches no recipe at all and the member is told no meals exist.
+
+VOCABULARIES
+cuisines: {cuisines}
+moods: {moods}
+flavor_profiles: {flavor_profiles}
+food_groups: {food_groups}
+
+Read for INTENT, not keywords. Map the member's own words onto the closest
+listed value:
+- "cosy", "comforting", "something warming" -> the mood that means that
+- "I want energy", "something sustaining" -> nothing here; energy is not a mood
+- "not too heavy", "something small" -> the mood meaning light
+- "more veg" -> the food group for vegetables
+- "Thai tonight" -> the cuisine
+
+Only take what the member ASKED FOR. A dish they mention as an example of what
+they do NOT want is not a request. A food named as an ingredient they have at
+home is not a food-group request.
+
+Empty lists when the message asks for none of this. Most messages do."""
+
+PLAN_INTENT_EXTRACTOR_USER_INSTRUCTIONS = """Message:
+\"\"\"{message}\"\"\"
+
+JSON:"""
+
 _NS = "foodchat/"
 
 # Populated as each _Prompt is constructed; consumed by sync_prompts + the
@@ -1107,6 +1349,8 @@ def _reg(name: str, fallback: str) -> _Prompt:
 GRADER_SYSTEM = _reg("grader_system", GRADER_SYSTEM_INSTRUCTIONS)
 GRADER_USER = _reg("grader_user", GRADER_USER_INSTRUCTIONS)
 BATCH_GRADER_USER = _reg("batch_grader_user", BATCH_GRADER_USER_INSTRUCTIONS)
+PLAN_GRADER_SYSTEM = _reg("plan_grader_system", PLAN_GRADER_SYSTEM_INSTRUCTIONS)
+PLAN_GRADER_USER = _reg("plan_grader_user", PLAN_GRADER_USER_INSTRUCTIONS)
 QUERY_RECONCILER_SYSTEM = _reg("query_reconciler_system", QUERY_RECONCILER_SYSTEM_INSTRUCTIONS)
 QUERY_RECONCILER_USER = _reg("query_reconciler_user", QUERY_RECONCILER_USER_INSTRUCTIONS)
 QUERY_CHECKER_SYSTEM = _reg("query_checker_system", QUERY_CHECKER_SYSTEM_INSTRUCTIONS)
@@ -1139,11 +1383,74 @@ PANTRY_EXTRACTOR_SYSTEM = _reg("pantry_extractor_system", PANTRY_EXTRACTOR_SYSTE
 PANTRY_EXTRACTOR_USER = _reg("pantry_extractor_user", PANTRY_EXTRACTOR_USER_INSTRUCTIONS)
 PREFERENCE_EXTRACTOR_SYSTEM = _reg("preference_extractor_system", PREFERENCE_EXTRACTOR_SYSTEM_INSTRUCTIONS)
 PREFERENCE_EXTRACTOR_USER = _reg("preference_extractor_user", PREFERENCE_EXTRACTOR_USER_INSTRUCTIONS)
+# New names, not edits to existing ones: `sync_prompts` creates only missing
+# prompts and never overwrites, so a changed prompt body would ship dead.
+TOOL_SELECTOR_SYSTEM = _reg("tool_selector_system", TOOL_SELECTOR_SYSTEM_INSTRUCTIONS)
+TOOL_SELECTOR_USER = _reg("tool_selector_user", TOOL_SELECTOR_USER_INSTRUCTIONS)
+MEAL_COMPOSER_SYSTEM = _reg("meal_composer_system", MEAL_COMPOSER_SYSTEM_INSTRUCTIONS)
+MEAL_COMPOSER_USER = _reg("meal_composer_user", MEAL_COMPOSER_USER_INSTRUCTIONS)
+PLAN_STRATEGIST_SYSTEM = _reg("plan_strategist_system", PLAN_STRATEGIST_SYSTEM_INSTRUCTIONS)
+PLAN_STRATEGIST_USER = _reg("plan_strategist_user", PLAN_STRATEGIST_USER_INSTRUCTIONS)
 EDIT_COMMAND_EXTRACTOR_SYSTEM = _reg("edit_command_extractor_system", EDIT_COMMAND_EXTRACTOR_SYSTEM_INSTRUCTIONS)
 EDIT_COMMAND_EXTRACTOR_USER = _reg("edit_command_extractor_user", EDIT_COMMAND_EXTRACTOR_USER_INSTRUCTIONS)
-RESPONSE_WRITER_SYSTEM = _reg("response_writer_system", RESPONSE_WRITER_SYSTEM_INSTRUCTIONS)
+# v2. `sync_prompts` creates only MISSING prompts and never overwrites, so
+# editing this text under the existing name would ship it dead and leave the
+# old voice live.
+#
+# The old text asked for "an honored request" among the specifics worth
+# mentioning, and the facts it was given were five parts constraint bookkeeping
+# to zero parts health — so every plan was explained as a compliance result.
+# FoodChat is not a constraint solver: it is meant to help a household eat
+# better and say why. `plan_value` is the other half of the facts, and this is
+# the voice that leads with it.
+RESPONSE_WRITER_SYSTEM = _reg("response_writer_system_v2", RESPONSE_WRITER_SYSTEM_INSTRUCTIONS)
 RESPONSE_WRITER_USER = _reg("response_writer_user", RESPONSE_WRITER_USER_INSTRUCTIONS)
-CHATBOT_SYSTEM = _reg("chatbot_system", CHATBOT_SYSTEM_INSTRUCTIONS)
+# v3, and the reason is the same one that made it v2: `sync_prompts` creates
+# only MISSING prompts and never overwrites, so editing this text under an
+# existing name ships it dead and leaves the wrong description live forever.
+#
+# v2 stopped the persona promising four things the planner could not do. v3
+# stops it refusing three it can: mood, flavour and food group became real
+# filters when the facet extractor was wired, and the prompt went on telling
+# the model to say no. A capability nobody is told about is the same defect as
+# one that does not exist — this file has now shipped both directions of it,
+# which is the argument for the prompt being derived from the code rather than
+# describing it.
+CHATBOT_SYSTEM = _reg("chatbot_system_v3", CHATBOT_SYSTEM_INSTRUCTIONS)
+SESSION_TITLE_SYSTEM = _reg("session_title_system", SESSION_TITLE_SYSTEM_INSTRUCTIONS)
+SESSION_TITLE_USER = _reg("session_title_user", SESSION_TITLE_USER_INSTRUCTIONS)
+PLAN_INTENT_EXTRACTOR_SYSTEM = _reg(
+    "plan_intent_extractor_system", PLAN_INTENT_EXTRACTOR_SYSTEM_INSTRUCTIONS
+)
+PLAN_INTENT_EXTRACTOR_USER = _reg(
+    "plan_intent_extractor_user", PLAN_INTENT_EXTRACTOR_USER_INSTRUCTIONS
+)
+
+
+def _read_failure_means_missing(exc: BaseException) -> bool:
+    """Whether this failed existence check means the prompt is not there yet.
+
+    The distinction is the whole safety of `sync_prompts`. A 404 means seed it.
+    A timeout, a 5xx, an expired key or a DNS blip means **we do not know** —
+    and `create_prompt` on a name that already exists adds a VERSION and moves
+    the `production` label onto FoodChat's in-code text. That silently reverts
+    whatever a prompt engineer edited in the UI, which is the exact outcome
+    this module promises never happens.
+
+    So the read failure is classified, and anything unrecognised is treated as
+    "leave it alone". A prompt that genuinely was missing gets seeded on the
+    next boot; a prompt that was edited in the UI is never overwritten by a
+    network hiccup.
+
+    Matched on the exception's name and message rather than an imported type:
+    the SDK's error classes have moved between major versions, and an
+    ImportError here would turn the safe path into the unsafe one.
+    """
+    name = type(exc).__name__.lower()
+    text = str(exc).lower()
+    if "notfound" in name or "not_found" in name:
+        return True
+    return "404" in text or "not found" in text
 
 
 def sync_prompts(*, client=None, registry=None) -> dict:
@@ -1152,9 +1459,19 @@ def sync_prompts(*, client=None, registry=None) -> dict:
     Idempotent and safe on every pod start: an existing prompt is left
     untouched because live text may be a deliberate UI edit — the UI is the
     source of truth and overwriting it would silently revert prompt-engineering
-    work. Returns ``{"created", "skipped", "failed"}`` counts.
+    work.
+
+    Returns ``{"created", "skipped", "unchecked", "failed"}`` counts plus
+    ``"names"``, the prompts it actually created. The names matter after a
+    deploy that adds some: the counts alone cannot tell you whether the twelve
+    you expected are the twelve that landed.
+
+    ``unchecked`` is the honest fourth state — prompts whose existence could
+    not be established, and which were therefore left alone rather than
+    risked. It used to be folded into "create it": every transient read error
+    became a write.
     """
-    counts = {"created": 0, "skipped": 0, "failed": 0}
+    counts = {"created": 0, "skipped": 0, "unchecked": 0, "failed": 0, "names": []}
     if client is None:
         client = get_langfuse_client()
     if client is None:
@@ -1166,8 +1483,16 @@ def sync_prompts(*, client=None, registry=None) -> dict:
         # WITHOUT the cache (ttl 0), so it isn't answered from stale state.
         try:
             existing = client.get_prompt(prompt.name, label=prompt.label, cache_ttl_seconds=0)
-        except Exception:
-            existing = None  # not found / transient error → treat as missing
+        except Exception as exc:  # noqa: BLE001
+            if not _read_failure_means_missing(exc):
+                _prompt_logger.warning(
+                    "Could not check whether %s exists (%s) — leaving it "
+                    "alone rather than risk overwriting a UI edit.",
+                    prompt.name, exc,
+                )
+                counts["unchecked"] += 1
+                continue
+            existing = None
         if existing is not None:
             counts["skipped"] += 1
             continue
@@ -1179,6 +1504,7 @@ def sync_prompts(*, client=None, registry=None) -> dict:
                 labels=[prompt.label],
             )
             counts["created"] += 1
+            counts["names"].append(prompt.name)
         except Exception as exc:
             _prompt_logger.warning("create_prompt(%s) failed: %s", prompt.name, exc)
             counts["failed"] += 1

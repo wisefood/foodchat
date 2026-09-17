@@ -18,12 +18,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Literal, Optional
 
+from models.recipe import CandidateRecipe
+
 
 def _utcnow() -> datetime:
     """Aware UTC now — every timestamp in the domain model carries tzinfo."""
     return datetime.now(timezone.utc)
-
-from models.recipe import CandidateRecipe
 
 MAX_MESSAGES_PER_SESSION = int(os.getenv("SESSION_MAX_MESSAGES", "200"))
 
@@ -44,6 +44,10 @@ class Message:
     # FoodScholar provenance (dict form of models.attribution.Attribution) —
     # persisted so the citation box survives conversation reloads.
     attribution: Optional[dict] = None
+    # Everything else the turn produced: memory nudges, slot-edit proofs, the
+    # plan-parameter card. Persisted for the same reason `attribution` is —
+    # they were grafted onto the message client-side, so a reload erased them.
+    extras: Optional[dict] = None
     # Plan-scorer payload on a score_plan reply — persisted so the score card
     # survives conversation reloads, like the citation box above.
     plan_score: Optional[dict] = None

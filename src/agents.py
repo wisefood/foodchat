@@ -31,17 +31,23 @@ import json
 import logging
 import os
 import random
-from typing import Optional
+from typing import TYPE_CHECKING, Optional, Sequence
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from backend.groq import GROQ_CHAT
 from backend.observability import build_trace_config
-from models.recipe import CandidatesBySlot, ScoredPlan
+from models.recipe import CandidatesBySlot, ScoredPlan, slot_sort_key
+if TYPE_CHECKING:  # import-time cycle: models.plan_spec reaches back here
+    from models.plan_spec import PlanSpec
+
 from prompts import (
-    BATCH_GRADER_USER,
-    GRADER_SYSTEM,
-    GRADER_USER,
+    PLAN_GRADER_SYSTEM,
+    TOOL_SELECTOR_SYSTEM,
+    TOOL_SELECTOR_USER,
+    PLAN_GRADER_USER,
+    PLAN_STRATEGIST_SYSTEM,
+    PLAN_STRATEGIST_USER,
     PLAN_ANALYST_SYSTEM,
     PLAN_JUDGE_DAILY_SYSTEM,
     PLAN_JUDGE_USER,
@@ -72,8 +78,17 @@ from prompts import (
     RESPONSE_WRITER_SYSTEM,
     RESPONSE_WRITER_USER,
     CHATBOT_SYSTEM,
+    SESSION_TITLE_SYSTEM,
+    SESSION_TITLE_USER,
+    PLAN_INTENT_EXTRACTOR_SYSTEM,
+    PLAN_INTENT_EXTRACTOR_USER,
+    MEAL_COMPOSER_SYSTEM,
+    MEAL_COMPOSER_USER,
 )
 from schemas import (
+    MealCompositionSchema,
+    PlanStrategySchema,
+    ToolChoiceSchema,
     BatchScoringSchema,
     ScoringSchema,
     QueryReconcilerSchema,
@@ -87,6 +102,7 @@ from schemas import (
     PantryExtractionSchema,
     PreferenceExtractionSchema,
     EditCommandSchema,
+    PlanIntentSchema,
 )
 
 logger = logging.getLogger(__name__)
@@ -127,11 +143,67 @@ DEFAULT_TEMPERATURE = _opt_float("FOODCHAT_LLM_TEMPERATURE")
 CHATBOT_TEMPERATURE = float(os.getenv("FOODCHAT_CHATBOT_TEMPERATURE", "0.7"))
 MAX_RETRIES = int(os.getenv("FOODCHAT_MAX_RETRIES", "3"))
 MAX_PLANS_TO_SCORE = int(os.getenv("FOODCHAT_MAX_PLANS_TO_SCORE", "10"))
+
+# How far into the combination space the grader will walk before it stops
+# enumerating and samples instead.
+#
+# `itertools.product` over three slots of eight candidates is 512 — cheap to
+# materialise, which is why the old three-slot grader could. Over seven slots
+# it is two million, and a day with a main and two sides is worse. The scan is
+# bounded so a generalised grader cannot hang the turn on exactly the plans it
+# exists to support; the batch itself is still `MAX_PLANS_TO_SCORE`.
+_COMBO_SCAN_LIMIT = 512
 CHATBOT_HISTORY_TURNS = int(os.getenv("FOODCHAT_CHATBOT_HISTORY_TURNS", "12"))
 
 
+
+def as_json_messages(messages: list) -> list:
+    """The same messages, guaranteed to contain the word Groq requires.
+
+    Groq rejects any `json_object` request whose messages do not contain the
+    string "json" — a 400 on every call. Each agent's `except` turns that into
+    a silent fallback ("no shape extracted", "no diet found"), so the symptom is
+    a feature that quietly does nothing.
+
+    It has happened. The in-code prompt said "json"; the managed copy in
+    Langfuse did not, and prompts are served from Langfuse at runtime while
+    existing copies are never overwritten by a deploy — so multi-plate planning
+    was disabled in production while every local test passed.
+
+    That is why the guarantee cannot live in the prompt text. It lives here, at
+    the last point before the call, applied to whatever the messages turned out
+    to be. `tests/test_prompt_contracts.py` fails the build if a schema agent
+    invokes without it, so a new agent cannot inherit the bug by forgetting.
+    """
+    if not messages:
+        return messages
+    if "json" in " ".join(
+        str(getattr(m, "content", "") or "") for m in messages
+    ).lower():
+        return messages
+    head, *rest = messages
+    logger.info(
+        "Prompt reached the client without the word 'json' — adding the "
+        "instruction Groq requires rather than taking a 400."
+    )
+    return [
+        SystemMessage(
+            content=f"{getattr(head, 'content', '')}\nReturn the result as a JSON object."
+        ),
+        *rest,
+    ]
+
+
 class DocumentGrader:
-    """Scores breakfast×lunch×dinner combinations against the query + profile."""
+    """Scores candidate days against the query + profile.
+
+    `grade_daily_plans` is the three-slot entry point every existing caller
+    uses, and it now delegates to `grade_plans`, which takes whatever slots it
+    is given. The three-slot version was not a simplification — it was the
+    reason a four-meal day, or a dinner served as a main and a side, could not
+    be ranked at all, which is why the structured planning path shipped with no
+    grading and no quality metrics.
+    """
 
     def __init__(self, model: str = None, temperature: float = None, max_plans_to_score: int = None):
         self.grader = GROQ_CHAT.get_client(
@@ -143,9 +215,21 @@ class DocumentGrader:
 
     def grade_daily_plans(
         self, query: str, candidates: CandidatesBySlot, user_profile: dict,
-        feedback_history: str = "",
+        feedback_history: str = "", prefer_items: Sequence[str] = (),
     ) -> list[ScoredPlan]:
-        """Return the top-scored combinations, best first (at most 3).
+        """The three-slot entry point. Kept because every caller uses it."""
+        return self.grade_plans(
+            query, candidates, user_profile, feedback_history,
+            slots=("breakfast", "lunch", "dinner"),
+            prefer_items=prefer_items,
+        )
+
+    def grade_plans(
+        self, query: str, candidates: CandidatesBySlot, user_profile: dict,
+        feedback_history: str = "", slots: Optional[Sequence[str]] = None,
+        prefer_items: Sequence[str] = (),
+    ) -> list[ScoredPlan]:
+        """Return the top-scored days, best first (at most 3).
 
         One LLM call for the whole batch. One call *per combination* made
         grading the latency floor of every plan request — ten sequential
@@ -160,20 +244,107 @@ class DocumentGrader:
         top-of-ranking combo is always in the batch; the rest of the space
         still gets sampled so the judge sees variety.
         """
-        combos = list(itertools.product(
-            candidates.get("breakfast", []),
-            candidates.get("lunch", []),
-            candidates.get("dinner", []),
-        ))
-        logger.info("Grading daily plans — %d possible combinations", len(combos))
-        if not combos:
-            logger.warning("No possible daily plans — at least one slot has no candidates")
+        # Which slots this day has. Given explicitly by the three-slot entry
+        # point; otherwise whatever the pool actually filled, in eating order.
+        if slots:
+            # An explicitly requested shape fails CLOSED. The three-slot entry
+            # point's caller stores the result through `MealPlan.from_courses`,
+            # which requires exactly three — so quietly grading a two-slot day
+            # because lunch came back empty would turn a "no candidates"
+            # warning into a 500 two frames later. The caller degrades to the
+            # unranked pool on `[]`, which is the right answer here.
+            names = [str(n) for n in slots]
+            empty = [n for n in names if not candidates.get(n)]
+            if empty:
+                logger.warning(
+                    "No candidates for %s — cannot grade the requested shape",
+                    ", ".join(empty),
+                )
+                return []
+        else:
+            # An inferred shape takes whatever the pool actually filled: there
+            # is no downstream contract to break, and a day of two real meals
+            # beats no ranking at all.
+            names = [
+                n for n in sorted(candidates, key=slot_sort_key) if candidates.get(n)
+            ]
+        if not names:
+            logger.warning("No slot has candidates — nothing to grade")
             return []
 
-        # combos[0] is top-of-ranking in every slot by construction of
-        # itertools.product over best-first lists.
-        rest = random.sample(combos[1:], min(len(combos) - 1, self.max_plans_to_score - 1))
-        sampled = [combos[0]] + rest
+        # The product is bounded before it is built, not after.
+        #
+        # Three slots of eight candidates is 512 combinations; the old code
+        # materialised all of them and sampled ten. Seven slots of eight is
+        # two million, and a day with a main and two sides is worse — so a
+        # generalised grader that kept `list(itertools.product(...))` would
+        # hang the turn on exactly the plans this change exists to support.
+        #
+        # `islice` walks the product lazily and stops. Because `product`
+        # iterates its LAST argument fastest, walking a prefix would vary only
+        # the final slot — so the prefix is taken for its guaranteed
+        # top-of-ranking first element, and the variety comes from independent
+        # per-slot sampling below.
+        pools = [candidates[n] for n in names]
+        best_combo = tuple(pool[0] for pool in pools)
+        head = list(itertools.islice(itertools.product(*pools), _COMBO_SCAN_LIMIT))
+        logger.info(
+            "Grading %d-slot days (%s) — scanned %d combination(s)",
+            len(names), ", ".join(names), len(head),
+        )
+
+        # The top-of-ranking day is always graded; the rest of the batch is
+        # sampled per slot so the judge sees variety across every slot rather
+        # than across the last one only.
+        # Deduplicated by RECIPE ID, not by hashing the candidates.
+        #
+        # `CandidateRecipe` is a frozen dataclass, so it looks hashable — until
+        # one of its fields is the `nutrition` dict, and then `hash()` raises
+        # `TypeError: unhashable type: 'dict'`. Every candidate from
+        # `plan_meals` carries nutrition, so putting a combination in a set
+        # threw on EVERY real plan: the pipeline caught it, served the unranked
+        # pool, and told the member "not ranked — grader unavailable". Not
+        # flaky — every single time, and invisible here because the test
+        # fixtures build candidates with no macros at all.
+        wanted = max(0, self.max_plans_to_score - 1)
+        rest: list[tuple] = []
+
+        def combo_key(combo) -> tuple:
+            return tuple(str(c.recipe_id) for c in combo)
+
+        seen = {combo_key(best_combo)}
+
+        # The day that uses up the most of what the member already has.
+        #
+        # Put in the batch rather than left to the sampler: asking the grader
+        # in prose to "prefer combinations that use as many as possible" can
+        # only work on the combinations it is shown, and those were drawn at
+        # random. A member with tomatoes, feta and basil could watch all three
+        # go unused because no sampled day happened to cover them.
+        if prefer_items:
+            from services.pantry_service import best_covering_combo
+
+            covering = best_covering_combo(pools, prefer_items)
+            if covering is not None and combo_key(covering) not in seen:
+                seen.add(combo_key(covering))
+                rest.append(covering)
+
+        for _ in range(wanted * 4):          # bounded attempts, not a while-true
+            if len(rest) >= wanted:
+                break
+            combo = tuple(random.choice(pool) for pool in pools)
+            key = combo_key(combo)
+            if key in seen:
+                continue
+            seen.add(key)
+            rest.append(combo)
+        # A pool small enough to enumerate gets exhaustive coverage instead of
+        # sampling, which is the old behaviour for three short slots.
+        if len(head) <= self.max_plans_to_score:
+            rest = [
+                c for c in head if combo_key(c) != combo_key(best_combo)
+            ][:wanted]
+        sampled = [best_combo] + rest
 
         def course_text(slot: str, course) -> str:
             lines = [f"{slot}: {course.title}"]
@@ -191,22 +362,22 @@ class DocumentGrader:
         plans_text = "\n\n".join(
             f"PLAN {i}\n" + "\n".join(
                 course_text(slot, course)
-                for slot, course in (("breakfast", b), ("lunch", l), ("dinner", d))
+                for slot, course in zip(names, combo)
             )
-            for i, (b, l, d) in enumerate(sampled)
+            for i, combo in enumerate(sampled)
         )
 
         try:
-            result = self.grader.invoke([
-                SystemMessage(content=GRADER_SYSTEM.compile()),
-                HumanMessage(content=BATCH_GRADER_USER.compile(
+            result = self.grader.invoke(as_json_messages([
+                SystemMessage(content=PLAN_GRADER_SYSTEM.compile()),
+                HumanMessage(content=PLAN_GRADER_USER.compile(
                     plan_count=len(sampled),
                     query=query,
                     plans=plans_text,
                     preferences=",".join(user_profile.get("preferences", [])),
                     feedback_history=feedback_history or "No prior feedback.",
                 )),
-            ], config=build_trace_config(run_name="plan_grade_batch", tags=["planning"]))
+            ]), config=build_trace_config(run_name="plan_grade_batch", tags=["planning"]))
             grades = json.loads(result.content).get("grades", [])
         except Exception as exc:  # noqa: BLE001
             # The caller already degrades to the unranked pool on [].
@@ -217,11 +388,11 @@ class DocumentGrader:
         for grade in grades:
             try:
                 index = int(grade.get("plan_index"))
-                breakfast, lunch, dinner = sampled[index]
+                combo = sampled[index]
             except (TypeError, ValueError, IndexError):
                 continue
             scored.append(ScoredPlan(
-                breakfast=breakfast, lunch=lunch, dinner=dinner,
+                slots=dict(zip(names, combo)),
                 score=int(grade.get("score", 0)),
                 reasoning=str(grade.get("reasoning", "")),
             ))
@@ -243,10 +414,10 @@ class MealDiversityGrader:
         )
 
     def score(self, plan_text: str) -> dict:
-        result = self.client.invoke([
+        result = self.client.invoke(as_json_messages([
             SystemMessage(content=MEAL_DIVERSITY_SYSTEM.compile()),
             HumanMessage(content=plan_text),
-        ], config=build_trace_config(run_name="meal_diversity", tags=["metrics"]))
+        ]), config=build_trace_config(run_name="meal_diversity", tags=["metrics"]))
         try:
             return json.loads(result.content)
         except Exception:
@@ -264,10 +435,10 @@ class GuidelineAdherenceGrader:
         )
 
     def score(self, plan_text: str, guidelines_text: str) -> dict:
-        result = self.client.invoke([
+        result = self.client.invoke(as_json_messages([
             SystemMessage(content=GUIDELINE_ADHERENCE_SYSTEM.compile()),
             HumanMessage(content=f"GUIDELINES:\n{guidelines_text}\n\nMEAL PLAN:\n{plan_text}"),
-        ], config=build_trace_config(run_name="guideline_adherence", tags=["metrics"]))
+        ]), config=build_trace_config(run_name="guideline_adherence", tags=["metrics"]))
         try:
             return json.loads(result.content)
         except Exception:
@@ -303,7 +474,7 @@ class PlanJudge:
         conflicts: str, preferences: str, aim: str, guidelines: str, facts: str,
     ) -> dict:
         system = PLAN_JUDGE_WEEKLY_SYSTEM if weekly else PLAN_JUDGE_DAILY_SYSTEM
-        result = self.client.invoke([
+        result = self.client.invoke(as_json_messages([
             SystemMessage(content=system.compile()),
             HumanMessage(content=PLAN_JUDGE_USER.compile(
                 hard_constraints=hard_constraints,
@@ -315,7 +486,7 @@ class PlanJudge:
                 plan_shape=plan_shape,
                 plan=plan_text,
             )),
-        ], config=build_trace_config(
+        ]), config=build_trace_config(
             run_name="plan_judge_weekly" if weekly else "plan_judge",
             tags=["metrics", "scoring"],
         ))
@@ -375,10 +546,10 @@ class QueryReconciler:
         known_facts = "; ".join(filter(None, [
             ", ".join(user_profile.get("preferences") or []),
             user_profile.get("history") or "",
-            ", ".join(f"likes {l}" for l in (user_profile.get("food_likes") or [])[:5]),
+            ", ".join(f"likes {like}" for like in (user_profile.get("food_likes") or [])[:5]),
         ])) or "(nothing on file)"
 
-        result = self.query_reconciler.invoke([
+        result = self.query_reconciler.invoke(as_json_messages([
             SystemMessage(content=QUERY_RECONCILER_SYSTEM.compile()),
             HumanMessage(content=QUERY_RECONCILER_USER.compile(
                 query=query,
@@ -386,7 +557,7 @@ class QueryReconciler:
                 allergies=user_profile.get("allergies", []),
                 known_facts=known_facts,
             )),
-        ], config=build_trace_config(run_name="query_reconcile", tags=["clarify"]))
+        ]), config=build_trace_config(run_name="query_reconcile", tags=["clarify"]))
         return json.loads(result.content)
 
 
@@ -404,10 +575,10 @@ class DietaryIntentExtractor:
 
     def extract(self, query: str) -> list[str]:
         try:
-            result = self.llm.invoke([
+            result = self.llm.invoke(as_json_messages([
                 SystemMessage(content=DIETARY_INTENT_EXTRACTOR_SYSTEM.compile()),
                 HumanMessage(content=DIETARY_INTENT_EXTRACTOR_USER.compile(query=query)),
-            ], config=build_trace_config(run_name="dietary_intent", tags=["extract"]))
+            ]), config=build_trace_config(run_name="dietary_intent", tags=["extract"]))
             return json.loads(result.content).get("dietary_tags", [])
         except Exception as e:
             logger.warning("DietaryIntentExtractor failed: %s", e)
@@ -448,20 +619,10 @@ class PlanSpecExtractor:
         try:
             system_text = PLAN_SPEC_EXTRACTOR_SYSTEM.compile()
             user_text = PLAN_SPEC_EXTRACTOR_USER.compile(query=query)
-            # Groq rejects any json_object request whose messages don't
-            # contain the word "json" — a 400 on every call, which this
-            # except swallows into "no shape extracted", silently. The
-            # in-code prompt says it, but prompts are served from Langfuse
-            # at runtime and existing managed copies are never overwritten
-            # by a deploy — so a stale managed prompt disabled multi-plate
-            # planning in production while every local test passed. This
-            # guard makes the requirement structural instead of editorial.
-            if "json" not in f"{system_text} {user_text}".lower():
-                system_text += "\nReturn the result as a JSON object."
-            result = self.llm.invoke([
+            result = self.llm.invoke(as_json_messages([
                 SystemMessage(content=system_text),
                 HumanMessage(content=user_text),
-            ], config=build_trace_config(run_name="plan_spec", tags=["extract"]))
+            ]), config=build_trace_config(run_name="plan_spec", tags=["extract"]))
             payload = json.loads(result.content)
         except Exception as e:
             logger.warning("PlanSpecExtractor failed: %s", e)
@@ -513,14 +674,10 @@ class PlanTextParser:
             user_text = PLAN_TEXT_PARSER_USER.compile(
                 plan_text=text, structure_hint=structure_hint or "(none)",
             )
-            # Same structural guard as PlanSpecExtractor: Groq rejects a JSON
-            # response format unless a message says "json".
-            if "json" not in f"{system_text} {user_text}".lower():
-                system_text += "\nReturn the result as a JSON object."
-            result = self.llm.invoke([
+            result = self.llm.invoke(as_json_messages([
                 SystemMessage(content=system_text),
                 HumanMessage(content=user_text),
-            ], config=build_trace_config(run_name="plan_text_parse", tags=["extract", "scoring"]))
+            ]), config=build_trace_config(run_name="plan_text_parse", tags=["extract", "scoring"]))
             payload = json.loads(result.content)
         except Exception as e:
             logger.warning("PlanTextParser failed: %s", e)
@@ -568,12 +725,10 @@ class DishIngredientEstimator:
         try:
             system_text = DISH_ESTIMATOR_SYSTEM.compile()
             user_text = DISH_ESTIMATOR_USER.compile(dishes="\n".join(listing))
-            if "json" not in f"{system_text} {user_text}".lower():
-                system_text += "\nReturn the result as a JSON object."
-            result = self.llm.invoke([
+            result = self.llm.invoke(as_json_messages([
                 SystemMessage(content=system_text),
                 HumanMessage(content=user_text),
-            ], config=build_trace_config(run_name="dish_estimate", tags=["extract", "scoring"]))
+            ]), config=build_trace_config(run_name="dish_estimate", tags=["extract", "scoring"]))
             payload = json.loads(result.content)
         except Exception as e:
             logger.warning("DishIngredientEstimator failed: %s", e)
@@ -624,10 +779,10 @@ class PreferenceExtractor:
 
     def extract(self, message: str) -> list[dict]:
         try:
-            result = self.llm.invoke([
+            result = self.llm.invoke(as_json_messages([
                 SystemMessage(content=PREFERENCE_EXTRACTOR_SYSTEM.compile()),
                 HumanMessage(content=PREFERENCE_EXTRACTOR_USER.compile(message=message)),
-            ], config=build_trace_config(run_name="preference_extract", tags=["memory"]))
+            ]), config=build_trace_config(run_name="preference_extract", tags=["memory"]))
             memories = json.loads(result.content).get("memories", [])
             return [m for m in memories if isinstance(m, dict) and m.get("value") and m.get("kind")]
         except Exception as e:
@@ -654,10 +809,10 @@ class SeedExtractor:
 
     def extract(self, query: str) -> list[dict]:
         try:
-            result = self.llm.invoke([
+            result = self.llm.invoke(as_json_messages([
                 SystemMessage(content=SEED_EXTRACTOR_SYSTEM.compile()),
                 HumanMessage(content=SEED_EXTRACTOR_USER.compile(query=query)),
-            ], config=build_trace_config(run_name="seed_extract", tags=["planning"]))
+            ]), config=build_trace_config(run_name="seed_extract", tags=["planning"]))
             seeds = json.loads(result.content).get("seeds", [])
             return [s for s in seeds if isinstance(s, dict) and s.get("name")]
         except Exception as e:
@@ -695,12 +850,10 @@ class PantryExtractor:
             # Same structural guard as PlanSpecExtractor: Groq 400s any
             # json_object request whose messages omit the word "json", and a
             # managed prompt edit can strip it silently.
-            if "json" not in f"{system_text} {user_text}".lower():
-                system_text += "\nReturn the result as a JSON object."
-            result = self.llm.invoke([
+            result = self.llm.invoke(as_json_messages([
                 SystemMessage(content=system_text),
                 HumanMessage(content=user_text),
-            ], config=build_trace_config(run_name="pantry_extract", tags=["planning"]))
+            ]), config=build_trace_config(run_name="pantry_extract", tags=["planning"]))
             payload = json.loads(result.content)
         except Exception as e:
             logger.warning("PantryExtractor failed: %s", e)
@@ -729,12 +882,12 @@ class EditCommandExtractor:
         """Returns the command dict, or None when parsing fails (caller
         degrades to a whole-plan refinement)."""
         try:
-            result = self.llm.invoke([
+            result = self.llm.invoke(as_json_messages([
                 SystemMessage(content=EDIT_COMMAND_EXTRACTOR_SYSTEM.compile()),
                 HumanMessage(content=EDIT_COMMAND_EXTRACTOR_USER.compile(
                     plan_type=plan_type, message=message,
                 )),
-            ], config=build_trace_config(run_name="edit_command", tags=["edit"]))
+            ]), config=build_trace_config(run_name="edit_command", tags=["edit"]))
             command = json.loads(result.content)
             if not command.get("directive"):
                 command["directive"] = "different"
@@ -808,6 +961,368 @@ class PlanAnalyst:
         ).content
 
 
+class PlanIntentExtractor:
+    """Names the recipe qualities a message asks for, as RecipeWrangler facets.
+
+    A separate agent from `DietaryIntentExtractor` rather than an extension of
+    it: that one's prompt is Langfuse-managed and a deploy never overwrites an
+    existing copy, so adding facets there would work locally and ship dead.
+
+    The live vocabulary is injected into the prompt at call time. It is not
+    decoration — RecipeWrangler ANDs facet values and an unlisted one matches no
+    recipe, so a hallucinated "energising" mood would empty every slot and the
+    member would be told no meals exist. Post-validated against the same
+    vocabulary anyway, because a prompt instruction is not a guarantee.
+    """
+
+    def __init__(self, model: str = None, temperature: float = None):
+        self.llm = GROQ_CHAT.get_client(
+            model=model or FAST_MODEL,
+            temperature=(
+                temperature if temperature is not None else DEFAULT_TEMPERATURE
+            ),
+            format=PlanIntentSchema.model_json_schema(),
+        )
+
+    def extract(self, message: str, vocabularies: dict) -> dict:
+        """{"cuisines": [...], "moods": [...], ...} — only listed values."""
+        families = ("cuisines", "moods", "flavor_profiles", "food_groups")
+        allowed = {
+            family: [str(v).lower() for v in (vocabularies.get(family) or [])]
+            for family in families
+        }
+        if not any(allowed.values()):
+            # No vocabulary means no safe value to send. Sending nothing is the
+            # behaviour that existed before facets were wired at all.
+            return {family: [] for family in families}
+
+        empty = {family: [] for family in families}
+        try:
+            system_text = PLAN_INTENT_EXTRACTOR_SYSTEM.compile(
+                **{f: ", ".join(allowed[f]) or "(none)" for f in families}
+            )
+            user_text = PLAN_INTENT_EXTRACTOR_USER.compile(message=message)
+            result = self.llm.invoke(as_json_messages([
+                SystemMessage(content=system_text),
+                HumanMessage(content=user_text),
+            ]), config=build_trace_config(run_name="plan_intent", tags=["planning"]))
+            payload = json.loads(result.content)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("PlanIntentExtractor failed: %s", exc)
+            return empty
+
+        out = {}
+        for family in families:
+            values = payload.get(family) or []
+            permitted = set(allowed[family])
+            kept = []
+            for value in values:
+                slug = str(value).strip().lower().replace("-", "_").replace(" ", "_")
+                if slug in permitted and slug not in kept:
+                    kept.append(slug)
+                elif slug:
+                    logger.info(
+                        "Dropping %s=%r — not in the live vocabulary", family, value
+                    )
+            out[family] = kept
+        return out
+
+
+class ToolSelector:
+    """Chooses one of FoodChat's own capabilities, or none.
+
+    The tool registry has been complete and unreachable from chat: `manifest()`
+    and `describe_tools()` are generated from it, and neither reached a prompt.
+    The only in-chat tool call was one hardcoded `plan_totals` to stop the
+    analyst doing arithmetic in prose. So "summarise my week" and "redo
+    Thursday" had no path — the closest available action was a full refinement,
+    which regenerates every slot and throws away a swap the member already
+    approved.
+
+    Fast tier, and a small prompt. This is a routing decision over a handful of
+    named capabilities, not a judgement about food — and it runs before the
+    intent classifier, so it must be cheap enough that a turn which selects
+    NOTHING has barely paid for the question.
+
+    Returns `{}` for "no tool", which is the expected answer for most messages.
+    A failure is also `{}`: the turn then routes exactly as it did before this
+    existed.
+    """
+
+    def __init__(self, model: str = None, temperature: float = None):
+        self.llm = GROQ_CHAT.get_client(
+            model=model or FAST_MODEL,
+            temperature=(
+                temperature if temperature is not None else DEFAULT_TEMPERATURE
+            ),
+            format=ToolChoiceSchema.model_json_schema(),
+        )
+
+    def choose(self, message: str, *, plan_type: str, plan_shape: str,
+               manifest: str, allowed: set) -> dict:
+        """`{"tool": name, "day": int|None, ...}` or `{}`. Never raises."""
+        if not message.strip() or not allowed:
+            return {}
+        try:
+            system_text = TOOL_SELECTOR_SYSTEM.compile(tools=manifest)
+            user_text = TOOL_SELECTOR_USER.compile(
+                message=message[:400], plan_type=plan_type, plan_shape=plan_shape,
+            )
+            result = self.llm.invoke(as_json_messages([
+                SystemMessage(content=system_text),
+                HumanMessage(content=user_text),
+            ]), config=build_trace_config(run_name="tool_select", tags=["tools"]))
+            payload = json.loads(result.content)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("ToolSelector failed, routing normally: %s", exc)
+            return {}
+
+        if not isinstance(payload, dict):
+            return {}
+        name = str(payload.get("tool") or "").strip()
+        if not name:
+            return {}
+        if name not in allowed:
+            # A tool that does not exist, or one this canvas cannot serve.
+            # Dropped rather than attempted: the registry would reject it, but
+            # a 400 is a worse answer than routing the message normally.
+            logger.info("ToolSelector chose %r, which is not available here", name)
+            return {}
+        logger.info("Tool selected: %s — %s", name, payload.get("reason") or "")
+        return payload
+
+
+class PlanStrategist:
+    """Decides HOW to search, before a recipe is fetched.
+
+    The reasoning half of the hybrid. The pipeline stays the executor and the
+    verifier stays deterministic; what this adds is a step that reads what the
+    member actually meant and shapes the search accordingly, instead of a fixed
+    chain that maps the same words to the same filters every time.
+
+    It runs on the REASONING tier, not the fast one, and that is the point:
+    "something light after the gym" becoming high protein with a light mood is
+    a judgement about food, not a span to pick out of a sentence.
+
+    Three things keep it safe:
+
+    * It cannot touch allergens or diet. Those are not in its schema, they are
+      derived deterministically, and the verifier checks them on the way back.
+      A reasoning step may decide how to search; it may not decide to drop a
+      safety constraint.
+    * Every value it proposes is validated against the LIVE vocabulary by
+      `PlanBrief.with_strategy` before it reaches a search — because the search
+      ANDs facet values and never relaxes an unknown one, so an invented mood
+      empties the result set rather than narrowing it.
+    * A failure returns `{}`, leaving the deterministic brief exactly as it
+      was. The plan that used to be built is the floor, never the casualty.
+    """
+
+    def __init__(self, model: str = None, temperature: float = None):
+        self.llm = GROQ_CHAT.get_client(
+            model=model or DEFAULT_MODEL,
+            temperature=(
+                temperature if temperature is not None else DEFAULT_TEMPERATURE
+            ),
+            format=PlanStrategySchema.model_json_schema(),
+        )
+
+    def propose(self, message: str, brief, vocabularies: dict) -> dict:
+        """A proposal dict for `PlanBrief.with_strategy`. Never raises.
+
+        Returns `{}` — meaning "no adjustment" — whenever the vocabulary is
+        unavailable or the call fails. With no live list there is no value that
+        is safe to add, and the deterministic brief is a working plan on its
+        own.
+        """
+        families = ("cuisines", "moods", "flavor_profiles", "food_groups")
+        allowed = {
+            family: [str(v).lower() for v in (vocabularies.get(family) or [])]
+            for family in families
+        }
+        if not any(allowed.values()):
+            return {}
+
+        try:
+            vocab_text = "\n".join(
+                f"{family}: {', '.join(allowed[family]) or '(none)'}"
+                for family in families
+            )
+            system_text = PLAN_STRATEGIST_SYSTEM.compile()
+            user_text = PLAN_STRATEGIST_USER.compile(
+                message=(message or "")[:600],
+                standing=brief.describe(),
+                vocabularies=vocab_text,
+            )
+            result = self.llm.invoke(as_json_messages([
+                SystemMessage(content=system_text),
+                HumanMessage(content=user_text),
+            ]), config=build_trace_config(run_name="plan_strategy", tags=["planning"]))
+            payload = json.loads(result.content)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("PlanStrategist failed, using the plain brief: %s", exc)
+            return {}
+
+        if not isinstance(payload, dict):
+            return {}
+        logger.info("Plan strategy: %s", payload.get("rationale") or payload)
+        return payload
+
+
+class MealJudge:
+    """Chooses between complete meals the arithmetic could not separate.
+
+    The last step of composition, and deliberately the only part of it that
+    costs a model call. Whether two plates are the same dish, repeat an
+    ingredient, or add up to the meal's share of the day is measurable, and
+    `meal_composer` measures it. Whether a dish SUITS another one is not: the
+    corpus's cuisine annotation does not survive into the planning envelope in
+    any shape this service reads, and texture and richness are not annotated
+    at all. So that judgement goes to a judgement.
+
+    **One call for the whole plan.** A week with a side at dinner is seven of
+    these, and seven round trips inside one turn budget is how a plan stops
+    arriving. The options are batched, labelled, and matched back by label
+    rather than by position — a model that answers in a different order is
+    common and is not a reason to lose the answer.
+
+    Reasoning tier, like the strategist: this is a judgement about food, not a
+    span to pick out of a sentence.
+
+    Returns `{}` on any failure. The deterministic winner is already the first
+    option, so a judge that is down costs the plan its polish and never its
+    existence.
+    """
+
+    def __init__(self, model: str = None, temperature: float = None):
+        self.llm = GROQ_CHAT.get_client(
+            model=model or DEFAULT_MODEL,
+            temperature=(
+                temperature if temperature is not None else DEFAULT_TEMPERATURE
+            ),
+            format=MealCompositionSchema.model_json_schema(),
+        )
+
+    def choose(self, message: str, offers: list[dict]) -> dict:
+        """`{meal label: (index, reason)}` for the meals it ruled on.
+
+        `offers` is `[{"meal": label, "options": [text, …]}]`. A label the
+        caller did not ask about, or an index outside the options offered, is
+        dropped rather than corrected — the caller's fallback is the option the
+        arithmetic already chose, which is a good answer, so a confused reply
+        should cost nothing rather than land somewhere unintended.
+        """
+        usable = [o for o in offers if o.get("meal") and len(o.get("options") or []) > 1]
+        if not usable:
+            return {}
+
+        blocks = []
+        for offer in usable:
+            lines = [f"MEAL: {offer['meal']}"]
+            for index, text in enumerate(offer["options"]):
+                lines.append(f"  [{index}] {text}")
+            blocks.append("\n".join(lines))
+
+        try:
+            system_text = MEAL_COMPOSER_SYSTEM.compile()
+            user_text = MEAL_COMPOSER_USER.compile(
+                message=(message or "a meal plan")[:400],
+                meals="\n\n".join(blocks),
+            )
+            result = self.llm.invoke(as_json_messages([
+                SystemMessage(content=system_text),
+                HumanMessage(content=user_text),
+            ]), config=build_trace_config(run_name="meal_compose", tags=["planning"]))
+            payload = json.loads(result.content)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("MealJudge failed, keeping the measured order: %s", exc)
+            return {}
+
+        if not isinstance(payload, dict):
+            return {}
+        sizes = {o["meal"]: len(o["options"]) for o in usable}
+        chosen: dict[str, tuple[int, str]] = {}
+        for entry in payload.get("choices") or []:
+            if not isinstance(entry, dict):
+                continue
+            label = str(entry.get("meal") or "").strip()
+            if label not in sizes:
+                continue
+            try:
+                pick = int(entry.get("pick") or 0)
+            except (TypeError, ValueError):
+                continue
+            if not 0 <= pick < sizes[label]:
+                logger.info(
+                    "MealJudge chose option %d for %r, which was not offered",
+                    pick, label,
+                )
+                continue
+            chosen[label] = (pick, str(entry.get("reason") or ""))
+        if chosen:
+            logger.info(
+                "Meal judge: %s",
+                "; ".join(f"{k}->{v[0]}" for k, v in sorted(chosen.items())),
+            )
+        return chosen
+
+
+class SessionTitler:
+    """Names a planning conversation from its opening message.
+
+    Sessions were only ever named by an explicit rename, which almost nobody
+    does — so the picker showed a wall of timestamps, and a saved plan inherited
+    `undefined` as its name because the save path borrows the session title.
+
+    Plain text, not JSON: the whole answer IS the title, and a schema would only
+    add a wrapper to unwrap. Runs on the fast tier — naming a conversation is
+    not a reasoning task, and it happens once per session.
+    """
+
+    # Longer than any name this prompt should produce; the column allows 120.
+    _MAX_LEN = 60
+
+    def __init__(self, model: str = None, temperature: float = None):
+        self.llm = GROQ_CHAT.get_client(
+            model=model or FAST_MODEL,
+            temperature=(
+                temperature if temperature is not None else DEFAULT_TEMPERATURE
+            ),
+        )
+
+    @staticmethod
+    def _clean(raw: str) -> Optional[str]:
+        """The title, or None when the model declined or rambled.
+
+        None is the safe direction: the caller leaves the session untitled and
+        the client falls back to its timestamp, which is worse than a good name
+        but better than a wrong one — and a member rename still wins either way.
+        """
+        text = (raw or "").strip()
+        # A reasoning model with reasoning hidden still occasionally prefixes a
+        # line; the title is the last non-empty line in that case.
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if not lines:
+            return None
+        title = lines[-1].strip().strip('"').strip("'").rstrip(".").strip()
+        if not title or title.upper() == "NONE":
+            return None
+        if len(title) > SessionTitler._MAX_LEN:
+            return None  # a rambling answer is not a name
+        return title
+
+    def title(self, message: str) -> Optional[str]:
+        try:
+            result = self.llm.invoke([
+                SystemMessage(content=SESSION_TITLE_SYSTEM.compile()),
+                HumanMessage(content=SESSION_TITLE_USER.compile(message=message)),
+            ], config=build_trace_config(run_name="session_title", tags=["session"]))
+            return self._clean(result.content)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("SessionTitler failed: %s", exc)
+            return None
+
+
 class OrchestratorAgent:
     """Single intent classifier per turn — the ONLY router in the pipeline.
 
@@ -867,7 +1382,7 @@ class OrchestratorAgent:
         config = build_trace_config(run_name="orchestrate", tags=["router"])
         for attempt in range(MAX_RETRIES):
             try:
-                result = self.llm.invoke(messages, config=config)
+                result = self.llm.invoke(as_json_messages(messages), config=config)
                 parsed = json.loads(result.content)
                 intent = parsed.get("intent", "chat")
                 if intent in self.VALID_INTENTS:

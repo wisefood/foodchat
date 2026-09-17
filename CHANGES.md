@@ -2,6 +2,34 @@
 
 ---
 
+# Plan scorer: merged with three weeks of planning
+
+> **Date:** 2026-09-17
+> **Branch:** main
+> No API change beyond the plan scorer's own.
+
+The scorer was built on a main that had since moved 53 commits (the security
+model, turn guards, `plan_quality`, agent tools). What changed to fit it in:
+
+| What | Detail |
+|---|---|
+| `services/plan_scoring.py` | Main had hoisted the planner's metrics into `services/plan_quality.py` independently. The scorer's module no longer carries a copy: `ingredient_names` IS `plan_quality.extract_ingredient_names`, and `food_variety_score` counts the same items over any list of dishes. `compute_daily_metrics` and `plan_as_text` are gone; `chat_service` and `weekly_planner/explainability` are exactly main's. |
+| `POST /score-plan` | `_require_member` first (identity before service availability), and the turn returns through `_finalize_turn`, so turn extras persist like on every other turn endpoint. |
+| `OrchestratorService.score_plan` | The fifth turn entry point: one in-flight turn per session, a turn budget, and the intake memo cleared, like `process`, `apply_plan_parameters`, `regenerate` and `compose_plan`. |
+| `messages.plan_score` | Beside main's `messages.extras`; both columns migrate. |
+| `PlanJudge`, `PlanTextParser`, `DishIngredientEstimator` | Routed through `as_json_messages`, replacing their own "json" check, and added to `scripts/smoke_agents.py`. |
+| Tests | Main's structural tests now count five turn entry points and audit `score_plan` for identity and ownership; the scorer's non-regression tests compare against `plan_quality` instead of a verbatim copy of the old `ChatService`. |
+
+## Verification
+
+Full suite: 2,193 passed, 1 skipped, 1 failed — `test_platform_client`, which
+fails identically on a clean checkout of main (the installed WiseFood client
+does not take `telemetry`). Ruff: no findings beyond main's. Live after the
+merge: a daily plan over `/score-plan` and a 3-day week over chat scored as
+before the merge.
+
+---
+
 # Plan scorer: what a live battery of pasted plans got wrong
 
 > **Date:** 2026-09-17
@@ -1120,6 +1148,410 @@ Replayed over the plan that exposed the pantry bug, the two now read apart:
 chips naming bread, capsicum, zucchini, courgette, carrots, celery,
 aubergine, beans and almond — with `13 meal(s)` dropping to `8` once the
 unnameable shares stopped counting.
+
+---
+
+# A named dish obeys the same constraints as a plan (Phase 1d)
+
+> **Date:** 2026-08-21
+> **Branch:** fix/stated-diet-and-honest-constraints
+> Pairs with RecipeWrangler `fix(tools): find_recipes honours the favourites it
+> already accepted`. Independent of it — foodchat sending `favorite_recipe_ids`
+> to a RecipeWrangler that ignores them is harmless.
+
+`find_recipes` resolves "I want pancakes". It took the member's allergens and
+diet — added precisely so a seed the member cannot eat is never offered — but
+not the **Nutri-Score floor** or the **cooking-time slider**, both of which
+applied to every other fetch in the service. So a member with a 20-minute limit
+could have a 90-minute dish anchored into their plan, by a lookup that ignored
+the constraint the plan itself was built under. Now sent, along with the
+member's favourites and standing exclusions, at all three call sites: seed
+resolution, the edit path's named-dish lookup, and the pantry boost.
+
+**A test that read source instead of running it hid a NameError.** The first
+version asserted `min_nutri_score` appeared in `pantry_boost_ids`' source, and
+passed — while the function raised `NameError` on every call, because the local
+import block it needed was in a *different* function. `ruff` caught it (`F821
+Undefined name`), not the suite. The test now executes the path with a stubbed
+client and asserts the arguments that arrive; reverting the import makes it
+fail. A source assertion cannot see an undefined name.
+
+611 passing.
+
+---
+
+# The sliders and standing answers that did nothing (Phase 1c)
+
+> **Date:** 2026-08-21
+> **Branch:** fix/stated-diet-and-honest-constraints
+> No API change. `difficulty=easy` now narrows the search, so plans for members
+> with that setting will change.
+
+Four things the member had already told us, which reached nothing.
+
+**A goal accepted mid-conversation left the plan identical.** The session
+mirror set `dietary_goals`, `preferences` and `nutrition_profile` — but not
+`min_nutri_score`, which is the **only** goal-derived value that reaches
+`plan_meals` (`nutrition_profile` has no parameter to travel on). So accepting
+"lose weight" changed three fields, one of which nothing reads, and the next
+plan was the same plan. Now mirrored: accepting `lose_weight` sets the floor to
+`B` immediately.
+
+**"Not that one" was recorded, persisted, and ignored.**
+`state.excluded_recipe_ids` reached only the structured path. On the classic
+daily path — the default — and on the weekly path, a recipe the member had
+explicitly rejected came back on the next regeneration. Both now send it, the
+weekly path through the same `mark_selected` channel downvotes already used.
+
+**"No thanks" to the favourites offer held on daily only.** Weekly kept adding
+`+5` per favourite and putting them in the week. The code comment describing
+this exact bug as fixed was written for the daily path; the weekly path had
+never been connected. A member who says no and sees their favourite anyway has
+been told their answer does not matter.
+
+**The difficulty slider was a pure no-op.** `grep -ri difficulty` across
+RecipeWrangler's source returns **nothing** — no field, no tag, no vocabulary.
+So it was prose for a grader that two of the three planning paths never run.
+`easy` does have honest proxies in the corpus (`30_minutes_or_less` 2809
+recipes, `5_ingredients_or_less` 563) and now uses them. `medium` and `hard`
+map to nothing, deliberately: there is no "elaborate" annotation to ask for and
+inventing one would empty every slot. They stay selectable — removing an option
+is a UI contract change — but they apply nothing instead of pretending to.
+
+605 passing.
+
+---
+
+# Claim tags reach the search (Phase 1b)
+
+> **Date:** 2026-08-21
+> **Branch:** fix/stated-diet-and-honest-constraints
+> **Requires RecipeWrangler** to gain the `tags` parameter — but is safe to
+> deploy in either order: the key is only sent when the live manifest advertises
+> the vocabulary, so an older RecipeWrangler never sees it.
+
+Nutrition claims — "high protein", "low carb" — had nowhere to go. They are not
+diets (no recipe carries one as a `diet_tag`, so sending one as a diet filter
+empties every slot, which is the outage found yesterday), and the field they
+DO belong on did not exist upstream.
+
+**RecipeWrangler** now takes `tags` on `plan_meals`, filtering the corpus's
+human-authored claim field: `high_protein` (1676 recipes),
+`30_minutes_or_less` (2809), `healthy_and_nutritious` (2535), `low_fat` (1081),
+`5_ingredients_or_less` (563), `high_fibre` (457), `low_calorie` (184).
+
+The design decision worth keeping: **`tags` leads the relaxation ladder.** A
+claim is the softest thing a caller can ask for and the scarcest annotation in
+the corpus — `high_fibre` is on 10% of recipes, so two claims ANDed across 21
+slots would starve most of them. Dropping it first means "high protein and high
+fibre" narrows the search when it can and widens when it cannot, instead of
+returning an empty week. The vocabulary is published in the manifest so a caller
+can avoid asking for a claim nothing carries, and it is an *open* field, so an
+unlisted value is reported and still applied — it relaxes first, so it cannot
+strand a slot.
+
+**FoodChat** now sends them, from two sources:
+
+| Source | Example |
+|---|---|
+| The slider goal | `energy` → `high_protein` + `high_fibre`, alongside the `hearty` mood |
+| A claim stated in words | "high protein please" → `high_protein` |
+
+**This fixes a dead end I shipped yesterday.** Claims were routed to
+`PlanningState.notes` and described as reaching "the grader as soft signals".
+`notes` is **write-only** — read solely by `describe()`, which is only logged. So
+a claim was correctly saved from becoming an empty filter and then dropped on the
+floor. They now live in `PlanningState.claim_tags` and reach the request. The two
+tests that asserted the `notes` behaviour have been corrected, and one now
+asserts `notes == ()` so nothing is routed there again.
+
+**The capability gate.** RecipeWrangler's request model is `extra="forbid"` — an
+unknown field is a 422, not a shrug — so foodchat only adds `tags` to the payload
+when `GET /api/v2/tools` advertises the vocabulary. The vocabulary IS the
+capability flag, it is already cached, and it costs nothing per call. Verified
+both ways: advertised → sent, not advertised → withheld with the rest of the
+request untouched.
+
+Also on the RecipeWrangler side: `applied` now reports `tags` (it is the
+service's own account of what it filtered on, and a missing entry would make the
+plan unexplainable downstream), and `never_relaxed` no longer under-declares —
+it listed three constraints while `include_ingredients`, `min_nutri_score`,
+`sources`, `exclude_recipe_ids` and `course_types` were equally hard. A new test
+asserts the two lists cannot overlap, since together they are the whole contract.
+
+597 passing in foodchat, 19 new tests in RecipeWrangler.
+
+---
+
+# "Energy boost meal plan for today" now matches something (Phase 1a)
+
+> **Date:** 2026-08-21
+> **Branch:** fix/stated-diet-and-honest-constraints
+> No RecipeWrangler change — these are parameters it has always accepted.
+> Wire-compatible: the four facet tuples are additive on the planning-state
+> blob and absent on anything stored earlier.
+
+That request matched nothing, for three reasons stacked on top of each other:
+
+1. `plan_client.plan_meals` **declares** `moods`, `flavor_profiles` and
+   `food_groups`; RecipeWrangler accepts all three, describes them in its
+   manifest, and puts them **first in its relaxation ladder** so they degrade
+   gracefully. **No caller ever passed any of them.** `cuisines` was the only
+   facet ever sent, and only from the stored profile.
+2. There is **no cuisine extractor anywhere**. "Something Thai tonight" never
+   became a `cuisines` filter on any path.
+3. **"energy" is in no vocabulary at all** — not a mood, not a flavour, not a
+   food group. It is a `plan_parameters.goal` value that only ever became prose
+   for a grader that two of the three planning paths do not even run.
+
+So the words reached the grader as text over a pool that had never been shaped
+by them, and the plan came back indistinguishable from one with no request.
+
+| Piece | What it does |
+|---|---|
+| `CANDIDATES.split_preferences` | Generalises `split_cuisines` to all four families, keeping both properties that made it work: the vocabulary is fetched **live** from RW's manifest, and the sort happens at **read** time so existing profiles are fixed with no migration. A stored "comfort" now drives a mood instead of being searched for as an ingredient. |
+| `PlanningState.cuisines/moods/flavor_profiles/food_groups` | Standing session state, mirroring `diet_tags`: additive, never cleared by silence, with `facets_remove` for an explicit take-back — which is also what the UI's removable chips will call. |
+| `PlanIntentExtractor` | A **new** agent under **new** prompt names, because `DietaryIntentExtractor`'s prompt is Langfuse-managed and extending it would ship dead. The live vocabulary is injected into the prompt *and* re-validated after the model answers. |
+| `intent_facets.facet_kwargs` | One `**` replaces one `cuisines=` at every fetch site, so no site had to learn about the other three families. |
+| `GOAL_FACETS` / `GOAL_CLAIM_TAGS` | Slider goals map onto vocabulary that exists. **`energy` → the `hearty` mood + the `high_protein` and `high_fibre` claim tags** — read as sustaining food rather than inventing an "energising" facet the corpus does not carry. The judgement is written down in the table instead of buried in a prompt. |
+
+**The rule this is all built around:** never send a value the corpus does not
+carry. RecipeWrangler ANDs facet values and does not relax an unlisted one to
+nothing — it matches no recipe. So a hallucinated mood does not soften the
+search, it empties it, and the member is told no meals exist. That is the same
+failure shape as the `low-carb` outage found yesterday, and the reason the
+vocabulary is checked twice.
+
+Facets now reach the request on the classic daily pool, the structured path, the
+weekly pool, the pantry fan-out and slot candidates — verified by capturing the
+actual `plan_meals` kwargs.
+
+`tests/test_intent_facets.py` is new (25 tests, LLM-free), verified regressive:
+stopping the facet merge fails 3. 589 passing.
+
+**Not yet wired**: the claim tags. `plan_meals` has no `tags` parameter, so
+`claim_tags_for()` returns the right answer and nothing can send it — that is
+the RecipeWrangler half of Phase 1, and it deploys first because the request
+model is `extra="forbid"`.
+
+---
+
+# Never claim a constraint we did not enforce (P0)
+
+> **Date:** 2026-08-21
+> **Branch:** fix/stated-diet-and-honest-constraints
+> No API change. One UI-visible addition: `constraints_applied` rows can now
+> carry `status: "unsupported"`, which clients must render — an unknown status
+> falling through to "satisfied" styling would reinstate the bug.
+
+`normalize_diet_tags` drops **26 of the gateway's 37 dietary groups** — RecipeWrangler
+has no diet tag for `peanut_free`, `halal`, `kosher`, `keto`, `low_sodium` and
+the rest. `constraints_ledger` then rendered **every** raw profile diet value as
+`type: hard, status: satisfied`.
+
+So a member who selected `peanut_free` in their profile was shown a plan header
+asserting a peanut-free guarantee, with no filter behind it — and no allergen
+backstop either, because the backstop keys on plain-English allergen names and
+never saw the slug. Of everything found in the full-stack sweep this is the only
+item that is not merely a missing feature.
+
+| Fix | Detail |
+|---|---|
+| `classify_diet_tags` returns `(filterable, unsupported)` | Unsupported values are handed back to the caller instead of dying in a log line. `normalize_diet_tags` is now a thin wrapper, so every existing call site keeps working. |
+| A new `unsupported` ledger status | The row says the catalogue has no filter for this and it did not narrow the search. Never `satisfied`. |
+| Free-from slugs reach the ingredient backstop | `FREE_FROM_TO_ALLERGEN` maps `peanut_free → peanuts`, `egg_free → eggs`, `shellfish_free → shellfish` and six more onto the existing allergen synonyms, and `screening_allergens(profile)` unions them into the screen at all ten sites that already screen. It cannot invent an upstream filter; it can make the defence that exists cover the slug. |
+| Non-restrictive labels get no row at all | `omnivore` was listed as a *satisfied hard constraint* — claiming the plan honoured something never asked of it, on a row the member cannot act on. |
+| `unsupported` is in neither half of `split_ledger` | Calling it honoured is the lie this exists to stop; putting it in the reply as "couldn't honour peanut_free" would over-alarm a member whose peanuts **are** screened. The ledger row carries the nuance; prose does not flatten it. |
+
+**Two corrections to work shipped earlier today.**
+
+`GATEWAY_DIET_GROUPS` was limited to the five values the UI picker offers. The
+gateway enum also holds `gluten_free`, `dairy_free` and `nut_free` — *exactly*
+the three diets FoodChat can filter on. So "remember I'm gluten-free" was
+offered, accepted by the member, refused at the write, and returned
+`applied: false`: the three it could act on were the three it would not persist.
+The set now matches the gateway enum exactly, with a test asserting parity in
+both directions (a missing value silently refuses a legitimate memory; an extra
+one 422s at the boundary).
+
+The chatbot persona told the member *"You can steer by cuisine, mood, flavour,
+food group, cooking time, Nutri-Score and calorie or protein targets."* Four of
+those seven are not implemented — mood, flavour and food group are never sent to
+RecipeWrangler, and the endpoint has no macro parameter. I had earlier reported
+this promise as harmless because `describe_options()` has no callers; that was
+wrong. The same claim sits in the persona, which is the one place a member
+actually reads it. Corrected under a **new prompt name** (`chatbot_system_v2`) —
+a deploy never overwrites an existing Langfuse copy, so editing the in-code text
+would have left the false promise live in production forever.
+
+`tests/test_unenforced_constraints.py` is new (47 tests, LLM-free), verified
+regressive: restoring the always-satisfied behaviour fails 27 of them. Every
+mapped allergen is asserted expandable by the synonym table, because a mapping
+to a name the table does not know would screen nothing and silently reopen the
+hole. 564 passing.
+
+---
+
+# A local tool surface for the agent
+
+> **Date:** 2026-08-21
+> **Branch:** fix/stated-diet-and-honest-constraints
+> Additive: two new endpoints, no change to any existing one. No UI change
+> required — the UI can call a tool without a chat turn if it wants to.
+
+The agent was a fixed chain: one classification per turn picked one handler,
+and anything that handler could not do was unreachable. "Summarise my week"
+and "redo Thursday" had no path at all — the nearest available action was a
+full refinement, which regenerates all 21 slots and silently discards a slot
+edit the member had already approved.
+
+`src/tools/` is a declarative registry speaking **the same protocol FoodChat
+already consumes from RecipeWrangler** — `GET /foodchat/tools` for a manifest,
+`POST /foodchat/tools/{name}` to invoke. Rather than invent a second shape, the
+service now speaks the one it already understands, MCP-shaped so a model can be
+handed the manifest directly.
+
+| Tool | What it does |
+|---|---|
+| `summarize_week` | Every day with its meals and calories, week totals, the guideline checklist and variety metrics read back from the stored plan, and the ledger split into what held and what was relaxed. Read-only, no model call. |
+| `summarize_day` | One day in detail: ingredients, per-meal and whole-day nutrition, and the reason chips for each dish. |
+| `plan_totals` | Sums a plan's calories and macros — per plate, per day, per week. **This total did not exist before**: the daily path had no summation at all and the prose prompt asked the model to notice when a day "sums far outside a sensible intake". |
+| `replace_day` | Regenerates one day and pins the other eighteen slots, so the rest of the week survives byte for byte. The surgical alternative to refining the week. Excludes everything already in the plan, everything downvoted, and the day being replaced, so the new day is genuinely new. |
+| `swap_meal` | The existing verified slot edit, exposed as a callable tool on either canvas. |
+
+Every reader is LLM-free and every total reports how many meals actually
+carried nutrition data, rather than implying a complete figure.
+
+**The plan analyst now gets the arithmetic done for it.** It was handed 21
+per-meal nutrition strings and no total, so any question about a whole day or
+week made it add up numbers in prose — the one thing a model should not be
+trusted with here. `_summarize_active_plan` now appends the summed totals with
+an explicit "already summed — do not re-add", plus the coverage caveat. No new
+intent, no prompt change, no extra model call.
+
+Design notes worth keeping:
+
+- Ownership is enforced in the **router**, not the tool: a tool trusts that its
+  caller proved the member owns the session, the same contract every service
+  here follows. A session the caller cannot see returns 404, never 403.
+- `ToolError` is the member-facing failure — a bad day number, no plan yet —
+  and becomes a 400 carrying prose. Anything else is a 500 and a log line.
+- Argument validation lives in the registry, so a wrong day fails with a
+  readable sentence instead of surfacing from inside a planner.
+- `mutates` and `uses_model` are declared per tool, so a caller can decide
+  whether it can afford one inside a turn that has already spent grading.
+
+`tests/test_tools.py` is new (27 tests, LLM-free). The load-bearing one asserts
+the planner still bypasses selection for pinned slots — if that ever stops
+being true, `replace_day` silently becomes a full regeneration and starts
+eating approved edits. 515 passing.
+
+**Agent-side selection is deliberately not wired.** The orchestrator's intent
+list lives in a Langfuse-managed prompt, and a deploy never overwrites an
+existing copy — adding an intent there would work locally and ship dead to
+production. Reaching these tools from a chat turn needs either a new prompt
+name (the `PantryExtractor` pattern) or a manual Langfuse version push. Until
+then they are reachable from the API and from code, and the analyst already
+benefits.
+
+---
+
+# A diet you state in chat is a diet we plan with (Phase A)
+
+> **Date:** 2026-08-21
+> **Branch:** fix/stated-diet-and-honest-constraints
+> Ships with wisefood-api (`feat/foodchat-plan-library-proxy` branch gains the
+> gateway fixes below). No UI change. Wire-compatible: `diet_tags` is additive
+> on the planning-state blob and absent on anything stored earlier.
+
+The transcript that started this:
+
+    member    "i need something vegetarian"
+    assistant "The current plan includes chicken, pork, and meatballs, which
+               conflict with your request … adjust the plan to be fully
+               vegetarian?"
+    member    "yes please"
+    assistant "I couldn't find enough recipes … (diet: omnivore; allergens
+               excluded: nuts, peanuts; avoiding: mushrooms)."
+
+Three independent causes, all seams:
+
+| Cause | Fix |
+|---|---|
+| `DietaryIntentExtractor` was wired **only** into the weekly service, so a daily plan never read diet from the message. | New `services/diet_intent.py` runs it on the RAW message every planning turn; `PlanningState.diet_tags` makes it **standing** for the session (silence is not a retraction), and `candidates_client.effective_diet` unions it with the profile at **every** fetch site — base pool, pantry fan-out, seed lookup, edit swap. |
+| Nothing carried the resolved diet out of the conflict question: `merged = {**profile, **reconciliation}` merges four keys and none is `diet`, so "yes please" was discarded. | The tags were already captured from the original message, so "yes" needs no plumbing. Only a refusal has to act: `is_conflict_refusal` retracts them on "no" / "follow my profile". Deliberately narrow — an unrecognised answer KEEPS what the member said out loud. No reconciler prompt change (it is Langfuse-managed; an edit ships dead). |
+| No memory kind could set a diet — `constraint` lands in free-text history. | New `diet` kind writes `dietary_groups` through the one lossless gateway path, replacing a non-restrictive `omnivore` rather than sitting beside it. The nudge is built **deterministically** from planning state — no LLM call and no `preference_extractor` prompt edit — and carries the member's own sentence as `evidence`. |
+
+**A live outage found on the way.** `low-carb`, `low-fat` and `high-protein`
+were in `VALID_RW_DIET_TAGS` and mapped straight through as hard diet filters.
+Censused against the corpus dump (n=4500) they appear on **zero** recipes —
+they live on RecipeWrangler's separate claim field. RW ANDs diet tags and never
+relaxes them, so "I want a low-carb week" was not a narrow search, it was a
+guaranteed-empty one, and the member was told no recipes exist. Already live on
+the weekly path; threading diet into daily would have spread it. They are now
+routed to the grader as soft signals via `split_diet_intent`, and become real
+numeric targets when the planning surface grows nutrition targets.
+
+Also fixed:
+
+- **The apology named a constraint it never applied.** It listed the raw
+  profile, so the blocker read `diet: omnivore` — dropped before the request —
+  with no mention of the vegetarian filter. It now reports what was *sent*, and
+  says plainly when a stored value is not a restriction. With nothing to
+  contrast against, the note is omitted rather than accusing a setting that did
+  nothing.
+- **The weekly tracker budgeted a stated vegetarian three meat meals** and
+  counted every fish meal against it, because it read only the stored profile.
+- **Guest memory acceptance was a silent no-op**: a guest household has no
+  profile ROW, the gateway 404s, and the SDK swallows it — so the member said
+  yes, we agreed, and stored nothing. The row is now created first.
+- Deleted the fictions: the `.cypher` guideline read (the file is not in the
+  repo — every adherence score has come from an empty context, and had it
+  existed it would have pasted raw Cypher into a prompt; rules come from the
+  data catalog as faceted `rule_text`); `supports_macro_targets: True` and "hit
+  calorie or protein targets", which told the agent it could promise something
+  `plan_meals` has no parameter for; and `eat_healthier`, which sat in a
+  Nutri-Score map but is rejected at the write gate so could never arrive.
+- **wisefood-api**: `diabetic_friendly` added to the drifted `sql.py` enum (a
+  PATCH carrying it passed Pydantic then 500'd); `properties` — dietary goals,
+  standing seeds, memory log — no longer silently dropped when a profile row is
+  created; the member-PATCH path now invalidates the profile cache it mutates.
+
+`tests/test_stated_diet.py` is new (22 tests, LLM-free) and verified regressive:
+reverting `effective_diet` to profile-only fails 2. 488 passing.
+
+Deferred to the reasoning phase, on purpose: quality metrics still run only on
+the classic daily path. The structured path builds a `MealPlan` with no
+`ScoredPlan`, so a metrics adapter written now would be replaced by the
+verifier that unifies metrics across all three paths.
+
+---
+
+# Sessions name themselves
+
+> **Date:** 2026-08-21
+> **Branch:** main
+> Pairs with the gateway proxy (wisefood-api `feat/foodchat-plan-library-proxy`)
+> that makes rename reachable from the UI. Wire-compatible: `title` was already
+> nullable in every response.
+
+Sessions were only ever named by an explicit rename, which almost nobody does —
+so the session picker showed a wall of timestamps, and a saved plan inherited
+no name at all (the save path borrows the session title). The router comment
+even claimed the client falls back to the first user message; it never did —
+it falls back to `created_at`.
+
+| Piece | Behaviour |
+|---|---|
+| `SessionTitler` (agents.py) | Names the conversation from its opening message. Fast tier, plain text (the whole answer IS the title — a schema would only add a wrapper), 3–6 words, `NONE` sentinel for unnameable openings. A rambling or over-long answer is rejected rather than truncated into a half-name. |
+| Prompts | `session_title_system` / `session_title_user` — NEW managed-prompt names, per the standing rule: deploys never overwrite an existing Langfuse copy, so extending an existing prompt ships dead to production. |
+| Wiring (orchestrator `process()`) | Fires once, AFTER the turn completes, only when the session has no title and no prior user message — so it can never delay or break an answer, a member rename always wins, and it never re-fires. Failure is a log line, never a 500. |
+
+The first-turn signal is read BEFORE routing: handlers append the message, after
+which "no user messages yet" is no longer true.
+
+457 passing (LLM-free: the titler is constructed against the fake key like
+every agent; `_clean` is covered by direct calls).
 
 ---
 

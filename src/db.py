@@ -19,7 +19,6 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import (
-    Boolean,
     Column,
     DateTime,
     ForeignKey,
@@ -101,6 +100,11 @@ class MessageRow(Base):
     timestamp = Column(DateTime(timezone=True), default=utcnow)
     attribution = Column(Text, nullable=True)  # JSON Attribution (FoodScholar provenance) or NULL
     plan_score = Column(Text, nullable=True)   # JSON plan-scorer payload (score_plan replies) or NULL
+    # What the turn produced besides its text: memory nudges, slot-edit proofs,
+    # the plan-parameter card. Same precedent as `attribution` — the UI used to
+    # graft these onto the last assistant message client-side, so a reload
+    # silently erased every one of them.
+    extras = Column(Text, nullable=True)       # JSON {memory_suggestions, changed_slots, plan_parameters}
 
 
 class MealPlanRow(Base):
@@ -161,10 +165,9 @@ def _migrate_existing_db() -> None:
 
         # messages table migrations
         existing_message_cols = {c["name"] for c in inspector.get_columns("messages")}
-        if "attribution" not in existing_message_cols:
-            conn.execute(sa.text("ALTER TABLE messages ADD COLUMN attribution TEXT"))
-        if "plan_score" not in existing_message_cols:
-            conn.execute(sa.text("ALTER TABLE messages ADD COLUMN plan_score TEXT"))
+        for col_name, col_type in [("attribution", "TEXT"), ("extras", "TEXT"), ("plan_score", "TEXT")]:
+            if col_name not in existing_message_cols:
+                conn.execute(sa.text(f"ALTER TABLE messages ADD COLUMN {col_name} {col_type}"))
 
         # sessions backward compat: drop active_context if it exists (no data needed)
         # — we leave it in place to avoid destructive migration; it's simply ignored
@@ -347,6 +350,7 @@ def db_add_message(
     intent: Optional[str] = None,
     plan_id: Optional[str] = None,
     attribution: Optional[str] = None,
+    extras: Optional[str] = None,
     plan_score: Optional[str] = None,
 ) -> MessageRow:
     row = MessageRow(
@@ -356,12 +360,37 @@ def db_add_message(
         intent=intent,
         plan_id=plan_id,
         attribution=attribution,
+        extras=extras,
         plan_score=plan_score,
     )
     db.add(row)
     db.commit()
     db.refresh(row)
     return row
+
+
+def db_set_last_assistant_extras(
+    db: DBSession, session_id: str, extras: Optional[str],
+) -> bool:
+    """Attach a turn's extras to the assistant message it belongs to.
+
+    Written after the fact rather than at insert: the extras are assembled by
+    the orchestrator from what the handlers produced, and by then the message
+    row already exists. The newest assistant row of the session IS that message
+    — handlers add exactly one per turn, and the turn has not returned yet, so
+    nothing can have been appended after it.
+    """
+    row = (
+        db.query(MessageRow)
+        .filter(MessageRow.session_id == session_id, MessageRow.role == "assistant")
+        .order_by(MessageRow.id.desc())
+        .first()
+    )
+    if row is None:
+        return False
+    row.extras = extras
+    db.commit()
+    return True
 
 
 def db_get_messages(
@@ -526,6 +555,56 @@ def db_upsert_feedback(
 
 def db_get_feedback(db: DBSession, message_id: int) -> list[FeedbackRow]:
     return db.query(FeedbackRow).filter(FeedbackRow.message_id == message_id).all()
+
+
+def db_list_feedback(
+    db: DBSession,
+    *,
+    limit: int = 50,
+    offset: int = 0,
+    member_id: str | None = None,
+    rating: str | None = None,
+) -> tuple[int, list[dict]]:
+    """A page of feedback with the message it rates, newest first.
+
+    The table has been written since it was added and read only by the
+    personalisation loop — there was no listing, no export and no endpoint, so
+    a thumbs-down was invisible to anyone without a database shell. Returns
+    ``(total, rows)`` so a console can page without a second count query.
+    """
+    query = (
+        db.query(FeedbackRow, MessageRow)
+        .outerjoin(MessageRow, FeedbackRow.message_id == MessageRow.id)
+    )
+    if member_id:
+        query = query.filter(FeedbackRow.member_id == member_id)
+    if rating in ("up", "down"):
+        query = query.filter(FeedbackRow.rating == rating)
+
+    total = query.count()
+    rows = (
+        query.order_by(FeedbackRow.created_at.desc())
+        .limit(max(1, min(int(limit or 50), 200)))
+        .offset(max(0, int(offset or 0)))
+        .all()
+    )
+    return total, [
+        {
+            "message_id": fb.message_id,
+            "session_id": fb.session_id,
+            "member_id": fb.member_id,
+            "rating": fb.rating,
+            "comment": fb.comment,
+            "created_at": fb.created_at,
+            "intent": getattr(msg, "intent", None),
+            "plan_id": getattr(msg, "plan_id", None),
+            # Enough of the rated message to recognise it, not the whole thing.
+            "message_preview": (
+                " ".join((getattr(msg, "content", "") or "").split())[:240] or None
+            ),
+        }
+        for fb, msg in rows
+    ]
 
 
 def db_get_member_feedback_with_plans(db: DBSession, member_id: str, limit: int = 100) -> list[dict]:

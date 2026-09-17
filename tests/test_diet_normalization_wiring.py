@@ -44,11 +44,18 @@ def _calls_passing_diet(path: pathlib.Path) -> list[tuple[int, str]]:
 def _normalised(expr: str) -> bool:
     """Whether a `diet=` argument is guarded.
 
+    `effective_diet` is the preferred wrapper: it normalises AND unions the
+    diet the member stated in chat with the one on their profile. Reading the
+    profile alone was its own bug — a stated "vegetarian" never became a
+    filter, so the pool was never restricted and the apology then blamed the
+    profile's `omnivore`, a value normalisation had already dropped.
+
     A literal empty list is fine — it forwards no tags at all. So is a value
     already normalised upstream and named as such.
     """
     return (
-        "normalize_diet_tags" in expr
+        "effective_diet" in expr
+        or "normalize_diet_tags" in expr
         or expr in ("[]", "()", "None")
         or "normalized" in expr
     )
@@ -61,6 +68,8 @@ def _normalised(expr: str) -> bool:
         "services/candidates_client.py",
         "services/seed_service.py",
         "services/weekly_planner/action_adapter.py",
+        "services/pantry_service.py",
+        "services/edit_service.py",
     ],
 )
 def test_no_raw_diet_reaches_recipewrangler(relative):
@@ -95,3 +104,48 @@ class TestTheGuardItself:
         from services.candidates_client import normalize_diet_tags
 
         assert isinstance(normalize_diet_tags(junk), list)
+
+    def test_a_claim_tag_is_not_a_diet_filter(self):
+        """low-carb / low-fat / high-protein are carried on RecipeWrangler's
+        separate claim field. Censused against the corpus dump they appear on
+        ZERO recipes as diet tags, so forwarding one as a diet filter is not a
+        narrow search — it is a guaranteed-empty one, and the member is told no
+        recipes exist for a preference the corpus simply files elsewhere."""
+        from services.candidates_client import normalize_diet_tags
+
+        for claim in ("low-carb", "low_carb", "low-fat", "high-protein", "high_protein"):
+            assert normalize_diet_tags([claim]) == [], claim
+
+    def test_a_claim_is_still_reported_not_swallowed(self):
+        """Dropping it from the filter must not lose the request."""
+        from services.candidates_client import split_diet_intent
+
+        filterable, claims = split_diet_intent(["vegetarian", "low-carb"])
+        assert filterable == ["vegetarian"]
+        assert claims == ["low-carb"]
+
+
+class TestEffectiveDiet:
+    """The stated diet outranks the stored one, and never loses to it."""
+
+    def test_a_stated_diet_is_applied(self):
+        from services.candidates_client import effective_diet
+
+        assert effective_diet({"diet": ["omnivore"], "_diet_tags": ["vegetarian"]}) == ["vegetarian"]
+
+    def test_omnivore_alone_is_no_constraint(self):
+        from services.candidates_client import effective_diet
+
+        assert effective_diet({"diet": ["omnivore"]}) == []
+
+    def test_stated_and_stored_are_unioned_not_replaced(self):
+        """A vegetarian request from a coeliac member must satisfy both."""
+        from services.candidates_client import effective_diet
+
+        got = effective_diet({"diet": ["gluten_free"], "_diet_tags": ["vegetarian"]})
+        assert set(got) == {"gluten_free", "vegetarian"}
+
+    def test_absent_keys_are_fine(self):
+        from services.candidates_client import effective_diet
+
+        assert effective_diet({}) == []

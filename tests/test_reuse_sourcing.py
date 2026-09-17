@@ -101,7 +101,7 @@ def offline(monkeypatch):
     calls = {"pantry": [], "merges": []}
 
     def fake_pool(*, profile, allergens, diet, cuisines, exclude_recipe_ids,
-                  limit_per_slot):
+                  limit_per_slot, slots=None):
         excluded = set(exclude_recipe_ids or [])
         make = lambda rows: [  # noqa: E731
             CandidateRecipe(recipe_id=r[0], title=r[1], ingredients=r[2], directions="d")

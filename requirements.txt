@@ -6,12 +6,20 @@ pydantic>=2.0.0
 # LLM (Groq via LangChain message/client abstractions)
 langchain-core>=0.3.0
 langchain-groq>=1.0.0
+# `langfuse.langchain.CallbackHandler` does `import langchain` at load and
+# refuses without it — "Please install langchain to use the Langfuse langchain
+# integration". Nothing here imports it directly, so nothing else pulled it in,
+# and the production pod booted with the warning and no tracing at all. A dev
+# machine had it as a side effect of something else, so the suite never saw it.
+langchain>=1.0
 
 # Persistence
 sqlalchemy>=2.0.0
 
 # WiseFood platform client (member profiles)
-wisefood
+# Pinned: unpinned, a rebuild silently takes whatever is newest on PyPI, and
+# this package is one this team publishes.
+wisefood==0.0.26
 
 # HTTP client (RecipeWrangler, FoodScholar)
 httpx>=0.27.0

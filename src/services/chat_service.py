@@ -20,34 +20,39 @@ survives restarts and works across replicas (see ``services.clarification``).
 import logging
 from typing import Optional, Tuple
 
-from agents import GuidelineAdherenceGrader, MealDiversityGrader, ResponseWriter, SimpleChatBot
+from agents import (
+    GuidelineAdherenceGrader,
+    MealDiversityGrader,
+    PlanStrategist,
+    ResponseWriter,
+    SimpleChatBot,
+)
 from models.plan_spec import PlanSpec
 from models.recipe import CandidateRecipe, ScoredPlan
 from models.session import MealPlan
 from models.planning_state import PlanningStateDelta
 from services.adapted_recipes import overlay_plan
-from services import pantry_service
-from services.planning_delta import extract_state_delta
+from services import (
+    pantry_service,
+    plan_parameters,
+    plan_history,
+    plan_quality,
+    plan_repair,
+    plan_verifier,
+    turn_budget,
+    turn_intake,
+)
+from services import diet_intent
 from services.candidates_client import CANDIDATES
 from services.clarification import ClarificationManager, ClarificationState
 from services.feedback_service import FeedbackService
 from services.planning_pipeline import PlanningPipeline
-from services.plan_scoring import (  # noqa: F401 — GUIDELINES_PATH re-exported for existing importers
-    GUIDELINES_PATH,
-    compute_daily_metrics,
-    food_variety_score,
-    guidelines_text,
-    ingredient_names,
-    plan_as_text,
-)
 from services.seed_service import SeedService
+from services import transparency
 from services.transparency import apply_transparency, split_ledger
 from .session_service import SessionService
 
 logger = logging.getLogger(__name__)
-
-# The guideline text, the variety count and the plan text the judges read live
-# in services.plan_scoring, shared with the plan scorer (services.plan_scorer).
 
 def no_plan_message(profile: dict) -> str:
     """The empty-plan answer, naming what stood in the way.
@@ -57,12 +62,20 @@ def no_plan_message(profile: dict) -> str:
     nothing to adjust and nowhere to start. If we know the standing
     constraints, say them; an apology that teaches nothing is just a shrug
     with manners.
+
+    But it has to name the constraints that were APPLIED. It listed the raw
+    profile, so a member who asked for something vegetarian was told the
+    blocker was "diet: omnivore" — a value dropped before the request as
+    non-restrictive, and no mention of the vegetarian filter that actually
+    narrowed the search. Naming a constraint that was never sent points the
+    member at the wrong thing to relax.
     """
     constraints = []
-    diet = profile.get("diet") or []
-    if diet:
-        diet = [diet] if isinstance(diet, str) else list(diet)
-        constraints.append("diet: " + ", ".join(sorted(map(str, diet))))
+    diet_line = diet_intent.describe_applied(
+        profile.get("_diet_tags") or (), profile.get("diet")
+    )
+    if diet_line:
+        constraints.append("diet — " + diet_line)
     allergies = profile.get("allergies") or []
     if allergies:
         constraints.append("allergens excluded: " + ", ".join(sorted(map(str, allergies))))
@@ -98,18 +111,15 @@ def _format_plan_as_context(plan: MealPlan) -> str:
     return "\n".join(lines)
 
 
-def _extract_ingredient_names(ingredients_text: str) -> list[str]:
-    """Kept for existing importers — ``plan_scoring.ingredient_names``."""
-    return ingredient_names(ingredients_text)
-
-
-def _food_variety_score(plan: ScoredPlan) -> tuple[int, str]:
-    """FVS over a daily plan's three courses (``plan_scoring.food_variety_score``)."""
-    return food_variety_score(plan.courses)
-
-
-def _plan_as_text(plan: ScoredPlan) -> str:
-    return plan_as_text(plan)
+# These moved to `services/plan_quality.py` so the weekly service can reach
+# them too — it produces 21 meals and had no variety score, no diversity
+# judgement and no guideline adherence, because the graders were instance
+# attributes on this class. Kept as aliases: the names are used by tests and by
+# readers who know where they were.
+_extract_ingredient_names = plan_quality.extract_ingredient_names
+_food_variety_score = plan_quality.food_variety
+_plan_as_text = plan_quality.as_text
+scored_plan_from = plan_quality.scored_from_plan
 
 
 class ChatService:
@@ -125,6 +135,10 @@ class ChatService:
         # Used to re-resolve anchors carried from earlier turns.
         self.client = CANDIDATES
         self.response_writer = ResponseWriter()
+        # Decides HOW to search; the pipeline still executes and the
+        # verifier still checks. Constructed here rather than per turn
+        # so the pooled Groq client is shared like every other agent's.
+        self.strategist = PlanStrategist()
         self.diversity_grader = MealDiversityGrader()
         self.guideline_grader = GuidelineAdherenceGrader()
         logger.info("ChatService initialized.")
@@ -198,13 +212,23 @@ class ChatService:
         # and rebuilt the request from a rewritten query, so "no favourites",
         # an anchored dish and "salads on the side" all evaporated the moment
         # the next message arrived.
-        state = self.session_service.get_planning_state(session_id)
-        delta = extract_state_delta(effective_message)
-        state = state.merge(delta)
-        # Pantry statements ("I have zucchini and spinach") — read from the
-        # RAW message, not the refinement context, so ingredients quoted from
-        # the current plan are never mistaken for the member's fridge.
-        state = state.merge(pantry_service.extract_pantry_delta(message))
+        # Shape, pantry, diet and facets, all from the RAW message — never the
+        # refinement context, which quotes the plan on screen, and the chicken
+        # in a recipe the member is looking at is not a request for chicken.
+        #
+        # This lived here as four sequential extractions, which is why only the
+        # daily path heard all four. It is now one fanned-out pass that runs in
+        # front of the router, so every kind of turn records what was said; the
+        # call here is the same pass, memoised, and costs nothing the second
+        # time.
+        state = turn_intake.intake(
+            session_id, message, session_service=self.session_service,
+        )
+
+        # A fresh daily request is one day unless this turn said otherwise —
+        # a standing seven-day horizon from "plan my week" is not a request
+        # for seven days. The rule and its reasons live with the intake.
+        state = turn_intake.plan_horizon(state, is_refinement=is_refinement)
 
         if seeds:
             resolutions = self.seed_service.resolve_seeds(seeds, profile)
@@ -250,10 +274,28 @@ class ChatService:
         # exactly those turns — intermittently, since clarification is an LLM
         # decision. `_generate_and_store` coerces it back.
         profile["_plan_spec"] = state.spec.to_dict()
+        # "Keep it under 20 minutes" and the cooking-time slider are one
+        # constraint. This puts the spoken one where the slider's value already
+        # lives, so all seven fetch sites filter on it without a seventh place
+        # to remember.
+        plan_parameters.apply_state(profile, state)
         if state.pantry:
             # Rides the profile snapshot like the other underscore keys, so
             # the pantry survives an intervening clarification round-trip.
             profile["_pantry"] = list(state.pantry)
+        if state.diet_tags:
+            # Read by candidates_client.effective_diet at EVERY fetch site, so
+            # unlike "_pantry" it is never popped — the base pool, the pantry
+            # fan-out and a seed lookup all have to agree on the diet.
+            profile["_diet_tags"] = list(state.diet_tags)
+        if state.claim_tags:
+            # Read at every fetch site like the other underscore keys.
+            profile["_claim_tags"] = list(state.claim_tags)
+        facets = state.facets()
+        if facets:
+            # Same convention, same reason: read at every fetch site, never
+            # popped, so the pools cannot disagree about what was asked for.
+            profile["_facets"] = facets
         self.session_service.set_planning_state(session_id, state)
         logger.info("[%s] Standing plan state: %s", session_id, state.describe())
 
@@ -295,7 +337,24 @@ class ChatService:
 
         state = ClarificationState.from_dict(session.clarification)
         origin_intent = state.origin_intent
+        # Read before step() — it advances the phase, and only the conflict
+        # phase's answer can retract a stated diet.
+        was_conflict = state.phase == "conflict"
         outcome = self.clarifier.step(state, message)
+
+        if was_conflict and diet_intent.is_conflict_refusal(message):
+            # "No, follow my profile." Until now the answer to this question
+            # was recorded as prose and nothing acted on it, so the only
+            # reachable outcome was the one the member had just declined.
+            planning = self.session_service.get_planning_state(session_id)
+            if planning.diet_tags:
+                self.session_service.set_planning_state(
+                    session_id, planning.merge(PlanningStateDelta(diet_clear=True))
+                )
+                logger.info(
+                    "[%s] Dietary conflict declined — stated diet retracted.",
+                    session_id,
+                )
 
         if outcome.needs_clarification:
             self.session_service.set_clarification_state(session_id, outcome.state.to_dict())
@@ -350,6 +409,34 @@ class ChatService:
             }
         return pinned
 
+    def _avoid_for(self, session_id: str, is_refinement: bool) -> list[str]:
+        """Dishes this plan should not serve, because they were just served.
+
+        A soft preference the fetch gives up rather than empty a slot — see
+        `PlanningPipeline.generate`.
+
+        The two cases differ in WHICH plan to avoid, not in whether to:
+
+        * **Fresh plan** — the last few plans of the session. Without it, "plan
+          my day" twice returns the same day: RecipeWrangler's order is
+          deterministic and the grader runs at temperature 0.
+        * **Refinement** — the plan being refined. This used to pass nothing,
+          on the reasoning that "a refinement is a request to change the plan
+          on screen, so keeping its unchanged slots is the whole point". That
+          reasoning was wrong about this path: it regenerates every slot, and
+          slot preservation belongs to `edit_service`, which handles a
+          single-slot swap. So "make it lighter" refetched the same pool, took
+          the same head of it, and handed back the same three dishes.
+
+        Anchors need no special case. A pinned slot's pool is replaced by its
+        anchor outright, so excluding the anchor from the fetch cannot lose it.
+        """
+        session = self.session_service.get_session(session_id)
+        if not is_refinement:
+            return plan_history.recently_served(session)
+        current = session.get_current_daily_plan() if session else None
+        return plan_history.plan_recipe_ids(current) if current else []
+
     def _generate_and_store(
         self,
         session_id: str,
@@ -392,9 +479,33 @@ class ChatService:
                 signals, is_refinement,
             )
 
+        # A recipe the member rejected in conversation ("not that one") must not
+        # come back on a regeneration. `_excluded_recipe_ids` reached only the
+        # structured path, so on the classic path — the default — the standing
+        # exclusion was recorded, persisted, and then ignored at the fetch.
+        # The brief, on the path that actually gets used.
+        #
+        # `PlanBrief` -> `PlanStrategist` -> `plan_verifier` were wired into the
+        # structured path only — the one a member reaches by asking for an
+        # unusual SHAPE. A plain "plan my day" comes here, and here had no
+        # brief, no strategist, and not one measured constraint: it reported
+        # the request back as though it were a result, which is the whole
+        # failure the verifier was built to end.
+        brief = self._brief_for(final_query, profile)
+
         plans = self.pipeline.generate(
             final_query, profile, pinned=pinned,
-            exclude_recipe_ids=signals.downvoted_recipe_ids,
+            exclude_recipe_ids=list(signals.downvoted_recipe_ids or [])
+            + list(profile.get("_excluded_recipe_ids") or []),
+            # What the member was just served — the session's recent plans on a
+            # fresh request, the plan on screen on a refinement.
+            avoid_recent=self._avoid_for(session_id, is_refinement),
+            # Recipes come back in pages. Exclusion narrows the window; this
+            # MOVES it, which is what keeps the pool full instead of shrinking
+            # it toward empty as a session goes on.
+            window_offset=plan_history.window_offset(
+                self.session_service.get_session(session_id)
+            ),
             feedback_history=signals.history_text,
         )
         if not plans:
@@ -404,7 +515,13 @@ class ChatService:
             return apology, False, None
 
         best = plans[0]
-        metrics = self._compute_metrics(session_id, best)
+        # Scores describe a plan that has already been chosen — they make the
+        # card richer and change nothing about what the member eats. First
+        # thing to drop when the turn is running late.
+        metrics = (
+            {} if turn_budget.skip("quality metrics", turn_budget.COST_METRICS)
+            else self._compute_metrics(session_id, best)
+        )
 
         if is_refinement:
             meal_plan = self.session_service.refine_meal_plan(
@@ -452,6 +569,39 @@ class ChatService:
         # they persist.
         pantry_facts = pantry_service.annotate_daily_plan(meal_plan, pantry)
         pantry_note = pantry_service.describe_coverage(pantry_facts)
+
+        # Measure what came back, not what was asked for. The declarative rows
+        # above carry `source` — which diner a constraint is there for — which
+        # a measurement cannot know; these carry evidence, which a declaration
+        # cannot have. Both, in that order.
+        report = plan_verifier.verify(meal_plan, brief.to_requested(), enrichment)
+        logger.info("[%s] Verified: %s", session_id, plan_verifier.describe(report))
+        if report.checks:
+            meal_plan.constraints_applied = (
+                list(meal_plan.constraints_applied or []) + report.as_ledger_rows()
+            )
+
+        # One repair pass. The verifier names the plates that failed a hard
+        # check; until this existed `report.offenders` had no consumer anywhere
+        # in the codebase, so a plan that failed its own vegetarian check was
+        # rendered with a red chip and handed over. Bounded to one pass on
+        # purpose (see plan_repair), and it re-verifies — a repair that did not
+        # work must not be announced as one.
+        repair_note = None
+        if report.blocking and not turn_budget.skip("plan repair", turn_budget.COST_FETCH):
+            outcome = plan_repair.repair(meal_plan, brief, report, profile)
+            if outcome.changed:
+                report = outcome.report
+                # The measured rows describe the plan the member is GIVEN, so
+                # the pre-repair ones are replaced rather than appended to. The
+                # declarative rows stay: they carry `source`, which a
+                # measurement cannot know.
+                meal_plan.constraints_applied = [
+                    row for row in (meal_plan.constraints_applied or [])
+                    if row.get("source") != "measured on the plan"
+                ] + report.as_ledger_rows()
+            repair_note = plan_repair.describe(outcome)
+
         self.session_service.resave_meal_plan(meal_plan)
 
         # Grounded response writer (M4c): prose from facts, canned fallback.
@@ -472,6 +622,19 @@ class ChatService:
             "constraints_honored": honored,
             "constraints_not_honored": not_honored,
         }
+        # Why this plan is worth eating, alongside what it was allowed to be.
+        #
+        # Without this the facts were five parts constraint bookkeeping to zero
+        # parts health, so every reply came out as a compliance result: what was
+        # permitted, what was swapped, what fell short. The measurements were
+        # already being taken and shown as a collapsed panel of scores out of
+        # five.
+        facts["plan_value"] = transparency.plan_value(
+            meal_plan, profile,
+            metrics=metrics if isinstance(metrics, dict) else None,
+            kcal_target=brief.kcal_target,
+            pantry_facts=pantry_facts,
+        )
         if pantry_facts:
             # The writer may only phrase what the matcher measured — used
             # AND unused items both reach the member.
@@ -480,10 +643,27 @@ class ChatService:
                 "unused": pantry_facts["unused"],
                 "note": pantry_note,
             }
-        fallback_extras = " ".join(p for p in (seed_note, pantry_note) if p)
-        formatted = self.response_writer.write(
-            facts, final_query,
-            fallback=f"{fallback} {fallback_extras}".strip() if fallback_extras else fallback,
+        # A failed check the reply does not mention is a failure the member
+        # discovers by eating it.
+        if report.failed:
+            facts["verified_problems"] = [
+                {"constraint": c.name, "detail": c.detail} for c in report.failed
+            ]
+        if brief.rationale:
+            facts["strategy"] = brief.rationale
+        if repair_note:
+            facts["repair"] = repair_note
+        fallback_extras = " ".join(
+            p for p in (seed_note, pantry_note, repair_note) if p
+        )
+        canned = f"{fallback} {fallback_extras}".strip() if fallback_extras else fallback
+        # The writer phrases facts that are already a usable sentence. Last
+        # optional stage to go, because a plainer reply is a smaller loss than
+        # any of the others — and every caller already keeps this fallback for
+        # the case where the writer fails outright.
+        formatted = (
+            canned if turn_budget.skip("response writer", turn_budget.COST_WRITER)
+            else self.response_writer.write(facts, final_query, fallback=canned)
         )
 
         self.session_service.add_message(session_id, "assistant", formatted)
@@ -512,8 +692,24 @@ class ChatService:
         )
         # Before plan_structured pops "_pantry" — coverage badges need it.
         pantry = pantry_service.normalize_items(profile.get("_pantry") or [])
+
+        # The brief: what this plan is trying to do, written down before a
+        # single recipe is fetched. Deterministic on its own; the strategist
+        # only ever adds to it, and only values the corpus actually carries.
+        brief = self._brief_for(final_query, profile, spec)
+
         meal_plan = self.pipeline.plan_structured(
             profile, spec, exclude_recipe_ids=excluded, pinned=pinned,
+            avoid_recent=self._avoid_for(session_id, is_refinement),
+            # Same page walk as the classic path. A shaped plan has more plates
+            # to fill, so it exhausts a window sooner, not later.
+            window_offset=plan_history.window_offset(
+                self.session_service.get_session(session_id)
+            ),
+            # The member's words. This path had no query parameter at all, so
+            # the shape was honoured and the request was not — and the reply
+            # was then phrased around something that reached nothing.
+            query=final_query,
         )
         if meal_plan is None:
             logger.warning("[%s] Structured plan came back empty — apology.", session_id)
@@ -521,15 +717,116 @@ class ChatService:
             self.session_service.add_message(session_id, "assistant", apology)
             return apology, False, None
 
-        # Pantry coverage badges + ledger row, before the plan is stored.
+        # Everything below ran on the classic path and not on this one, so a
+        # multi-plate or multi-day plan arrived with no nutrition on any plate,
+        # no reason chips, an empty constraints ledger, no personalization
+        # summary, and the member's own adapted recipes ignored.
+        all_plates = [
+            plate
+            for day in meal_plan.day_plans
+            for meal in day.meals
+            for plate in meal.plates
+            if getattr(plate, "recipe_id", "")
+        ]
+        pinned_ids = {r.recipe_id for r in pinned.values()}
+        enrichment = CANDIDATES.fetch_details([p.recipe_id for p in all_plates])
+        apply_transparency(
+            meal_plan, profile, pinned_ids, enrichment,
+            downvoted_count=len(signals.downvoted_recipe_ids or []),
+            feedback_lines=(
+                len(signals.history_text.splitlines()) if signals.history_text else 0
+            ),
+        )
+        adapted_count = overlay_plan(meal_plan, profile)
+        if adapted_count:
+            logger.info(
+                "[%s] %d plate(s) use the member's adapted version.",
+                session_id, adapted_count,
+            )
+
+        # Pantry coverage badges + ledger row, AFTER transparency so the chips
+        # are appended to the ones it built rather than overwritten.
         pantry_facts = pantry_service.annotate_daily_plan(meal_plan, pantry)
         pantry_note = pantry_service.describe_coverage(pantry_facts)
 
-        meal_plan = self.session_service.add_prepared_meal_plan(session_id, meal_plan)
-        logger.info(
-            "[%s] Structured plan %s stored (%s).",
-            session_id, meal_plan.id, spec.describe(),
-        )
+        # Quality metrics, which this path has never had.
+        #
+        # `_compute_metrics` needed a `ScoredPlan` and a `ScoredPlan` could only
+        # be three named courses, so a multi-day or multi-plate plan arrived
+        # with every score at zero — indistinguishable, in the UI, from a plan
+        # that had been judged and found wanting.
+        #
+        # There is no `llm_score` here and there deliberately is not one:
+        # `plan_meals` returns ONE recipe per slot, not a pool, so there is no
+        # combination to rank and a fabricated ranking would be worse than an
+        # absent one. Variety, diversity and guideline adherence all judge a
+        # produced plan, which is exactly what this is.
+        if turn_budget.skip("quality metrics", turn_budget.COST_METRICS):
+            structured_metrics: dict = {}
+        else:
+            structured_metrics = self._compute_metrics(
+                session_id, scored_plan_from(meal_plan, reasoning=meal_plan.reasoning),
+            )
+            for key, value in structured_metrics.items():
+                # `llm_score`/`llm_reasoning` carry the plan's own reasoning
+                # through; the rest are measured here.
+                if key not in ("llm_score", "llm_reasoning"):
+                    setattr(meal_plan, key, value)
+
+        # Now measure. Everything above reports what was REQUESTED; this reads
+        # the plates that came back and says what is actually true of them.
+        report = plan_verifier.verify(meal_plan, brief.to_requested(), enrichment)
+        logger.info("[%s] Verified: %s", session_id, plan_verifier.describe(report))
+        if report.checks:
+            # Measured rows sit alongside the declarative ledger rather than
+            # replacing it: the declarative rows carry `source` (which diner a
+            # constraint is for), which a measurement cannot know, and the
+            # measured rows carry evidence, which a declaration cannot have.
+            meal_plan.constraints_applied = (
+                list(meal_plan.constraints_applied or []) + report.as_ledger_rows()
+            )
+
+        # One repair pass. The verifier names the plates that failed a hard
+        # check; until this existed `report.offenders` had no consumer anywhere
+        # in the codebase, so a plan that failed its own vegetarian check was
+        # rendered with a red chip and handed over. Bounded to one pass on
+        # purpose (see plan_repair), and it re-verifies — a repair that did not
+        # work must not be announced as one.
+        repair_note = None
+        if report.blocking and not turn_budget.skip("plan repair", turn_budget.COST_FETCH):
+            outcome = plan_repair.repair(meal_plan, brief, report, profile)
+            if outcome.changed:
+                report = outcome.report
+                # The measured rows describe the plan the member is GIVEN, so
+                # the pre-repair ones are replaced rather than appended to. The
+                # declarative rows stay: they carry `source`, which a
+                # measurement cannot know.
+                meal_plan.constraints_applied = [
+                    row for row in (meal_plan.constraints_applied or [])
+                    if row.get("source") != "measured on the plan"
+                ] + report.as_ledger_rows()
+            repair_note = plan_repair.describe(outcome)
+
+        if is_refinement:
+            # `is_refinement` was accepted and never used: every refinement
+            # called add_prepared_meal_plan, which starts a fresh canvas, so
+            # each "make it lighter" became version 1 of a new lineage and the
+            # member's history was silently discarded.
+            meal_plan = self.session_service.refine_prepared_meal_plan(
+                session_id, meal_plan
+            )
+            logger.info(
+                "[%s] Refined structured plan → %s (v%d, parent=%s).",
+                session_id, meal_plan.id, meal_plan.version, meal_plan.parent_id,
+            )
+        else:
+            meal_plan = self.session_service.add_prepared_meal_plan(
+                session_id, meal_plan
+            )
+            logger.info(
+                "[%s] Structured plan %s stored (%s).",
+                session_id, meal_plan.id, spec.describe(),
+            )
 
         concerns = spec.concerns()
         facts = {
@@ -546,35 +843,97 @@ class ChatService:
             "concerns": concerns,
             "notes": meal_plan.reasoning[:300],
         }
+        # The ledger this path now builds, split by status like the classic
+        # path — so a relaxed constraint cannot be announced as honoured, and
+        # the reply can say plainly what could not be met.
+        honored, not_honored = split_ledger(meal_plan.constraints_applied)
+        facts["constraints_honored"] = honored
+        facts["constraints_not_honored"] = not_honored
+        facts["plan_value"] = transparency.plan_value(
+            meal_plan, profile,
+            metrics=structured_metrics if isinstance(structured_metrics, dict) else None,
+            kcal_target=brief.kcal_target,
+            pantry_facts=pantry_facts,
+        )
+        # And the rating history, which this path dropped: the classic path
+        # feeds it to the grader, and with no grader here it belongs in the
+        # facts so the reply is at least written in light of it.
+        if signals.history_text:
+            facts["feedback_history"] = signals.history_text
+        # What the measurement found, as facts the writer may phrase. A failed
+        # check the reply does not mention is a failure the member discovers by
+        # eating it.
+        if report.failed:
+            facts["verified_problems"] = [
+                {"constraint": c.name, "detail": c.detail} for c in report.failed
+            ]
+        if brief.rationale:
+            facts["strategy"] = brief.rationale
         if pantry_facts:
             facts["pantry"] = {
                 "used": pantry_facts["used"],
                 "unused": pantry_facts["unused"],
                 "note": pantry_note,
             }
+        if repair_note:
+            facts["repair"] = repair_note
         fallback_parts = [f"Here's your plan — {spec.describe()}."]
         if seed_note:
             fallback_parts.append(seed_note)
         if pantry_note:
             fallback_parts.append(pantry_note)
+        if repair_note:
+            fallback_parts.append(repair_note)
         fallback_parts.extend(concerns)
-        formatted = self.response_writer.write(
-            facts, final_query, fallback=" ".join(fallback_parts),
+        canned = " ".join(fallback_parts)
+        formatted = (
+            canned if turn_budget.skip("response writer", turn_budget.COST_WRITER)
+            else self.response_writer.write(facts, final_query, fallback=canned)
         )
         self.session_service.add_message(session_id, "assistant", formatted)
         return formatted, False, meal_plan
 
+    def _brief_for(self, query: str, profile: dict, spec=None):
+        """The brief for this request: deterministic, then adjusted by reasoning.
+
+        The order is the safety property. `PlanBrief.build` produces a working
+        plan from the profile and the standing state with no model involved;
+        the strategist can only add facets and claim tags the corpus carries,
+        cannot touch allergens or diet, and a failure leaves the deterministic
+        brief untouched. The plan that used to be built is the floor.
+        """
+        from models.plan_brief import PlanBrief
+
+        state = None
+        try:
+            state = self.session_service.get_planning_state(
+                profile.get("_session_id") or ""
+            )
+        except Exception:  # noqa: BLE001 - the profile already carries the stash
+            state = None
+
+        brief = PlanBrief.build(profile, state, spec)
+        try:
+            vocab = CANDIDATES.vocabularies() or {}
+            if vocab:
+                brief = brief.with_strategy(
+                    self.strategist.propose(query, brief, vocab), vocab
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Strategy step skipped: %s", exc)
+        logger.info("Brief: %s", brief.describe())
+        return brief
+
     def _compute_metrics(self, session_id: str, plan: ScoredPlan) -> dict:
         """The four plan-quality metrics surfaced in the API response.
 
-        Delegates to ``plan_scoring.compute_daily_metrics``; the plan scorer
-        grades pasted plans with the same functions and the same judges.
+        Delegates to `plan_quality`, which the weekly service uses too — one
+        implementation, so a change to how a plan is scored cannot land on one
+        path and not the other.
         """
-        metrics = compute_daily_metrics(
-            plan, self.diversity_grader, self.guideline_grader, guidelines_text("daily"),
-        )
-        logger.info("[%s] FVS: %d unique ingredients.", session_id, metrics["fvs_count"])
-        return metrics
+        result = plan_quality.metrics(plan)
+        logger.info("[%s] FVS: %d unique ingredients.", session_id, result["fvs_count"])
+        return result
 
     # ------------------------------------------------------------------ #
     # Helpers                                                              #

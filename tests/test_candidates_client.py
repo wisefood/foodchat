@@ -15,7 +15,14 @@ from services.candidates_client import (
 
 class TestNormalizeDietTags:
     def test_maps_known_variants(self):
-        assert normalize_diet_tags(["Gluten-Free", "high_protein"]) == ["gluten_free", "high-protein"]
+        assert normalize_diet_tags(["Gluten-Free", "nut-free"]) == ["gluten_free", "nut_free"]
+
+    def test_drops_nutrition_claims_that_no_recipe_carries(self):
+        # high-protein/low-carb/low-fat live on RecipeWrangler's claim field,
+        # not diet_tags — zero recipes carry them, so as a filter they empty
+        # every slot. They were mapped straight through until the corpus was
+        # censused.
+        assert normalize_diet_tags(["high_protein", "low-carb", "low_fat"]) == []
 
     def test_drops_non_restrictive_labels(self):
         assert normalize_diet_tags(["omnivore", "mediterranean", "balanced"]) == []

@@ -194,7 +194,12 @@ def fetch_pantry_candidates(
     courgette got a 90-minute bake ranked first. The pantry is an input to
     search, never a way around what the member asked for.
     """
-    from services.candidates_client import normalize_diet_tags
+    from services import intent_facets
+    from services.candidates_client import (
+        effective_diet,
+        normalize_diet_tags,
+        screening_allergens,
+    )
     from services.plan_client import PLANNER
 
     items = list(normalize_items(pantry))[:PANTRY_ITEM_LIMIT]
@@ -203,8 +208,11 @@ def fetch_pantry_candidates(
     count = per_item if per_item is not None else PANTRY_PER_ITEM_CANDIDATES
     # A caller with a tightened diet (weekly action space: profile diet +
     # query-level tags) passes it explicitly; otherwise the profile's own.
-    diet_tags = normalize_diet_tags(
-        diet if diet is not None else profile.get("diet")
+    # Named for the guard in tests/test_diet_normalization_wiring.py: this
+    # value is normalised, and a bare `diet_tags` reads like raw input.
+    normalized_diet = (
+        normalize_diet_tags(diet) if diet is not None
+        else effective_diet(profile)
     )
 
     def fetch_one(item: str) -> dict[str, list[CandidateRecipe]]:
@@ -213,9 +221,9 @@ def fetch_pantry_candidates(
                 days=1,
                 slots=slots,
                 count_per_slot=count,
-                allergens=profile.get("allergies") or [],
-                diet=diet_tags,
-                cuisines=list(cuisines or []),
+                allergens=screening_allergens(profile),
+                diet=normalized_diet,
+                **intent_facets.facet_kwargs(profile, list(cuisines or [])),
                 include_ingredients=[item],
                 exclude_ingredients=profile.get("food_dislikes") or [],
                 exclude_recipe_ids=list(exclude_recipe_ids or []),
@@ -226,7 +234,7 @@ def fetch_pantry_candidates(
             logger.info("Pantry fetch for %r found nothing usable: %s", item, exc)
             return {}
         return PLANNER.to_candidates(
-            envelope, allergens=profile.get("allergies") or []
+            envelope, allergens=screening_allergens(profile)
         )
 
     merged: dict[str, list[CandidateRecipe]] = {slot: [] for slot in slots}
@@ -288,7 +296,8 @@ def pantry_boost_ids(
     `favorite_recipe_ids` float within their slot while hard filters still
     decide eligibility. These ids ride that signal.
     """
-    from services.candidates_client import normalize_diet_tags
+    from services import plan_parameters
+    from services.candidates_client import effective_diet, screening_allergens
     from services.plan_client import PLANNER
 
     ids: list[str] = []
@@ -297,9 +306,14 @@ def pantry_boost_ids(
             hits = PLANNER.find_recipes(
                 item,
                 limit=limit_per_item,
-                allergens=profile.get("allergies") or [],
-                diet=normalize_diet_tags(profile.get("diet")),
+                allergens=screening_allergens(profile),
+                diet=effective_diet(profile),
                 exclude_ingredients=profile.get("food_dislikes") or [],
+                max_minutes=plan_parameters.max_duration_minutes(
+                    profile.get("plan_parameters") or {}
+                ),
+                min_nutri_score=profile.get("min_nutri_score"),
+                favorite_recipe_ids=profile.get("favorite_recipe_ids") or [],
             )
         except Exception as exc:  # noqa: BLE001
             logger.info("Pantry boost lookup failed for %r: %s", item, exc)
@@ -313,6 +327,43 @@ def pantry_boost_ids(
 # --------------------------------------------------------------------------- #
 # Coverage + UI badges
 # --------------------------------------------------------------------------- #
+
+def best_covering_combo(pools: list, pantry: Iterable) -> Optional[tuple]:
+    """The one-per-slot combination that uses the most DISTINCT pantry items.
+
+    Coverage is a property of a COMBINATION, not of a plate: three dishes that
+    each use the tomatoes cover one item, and three that use tomatoes, feta and
+    basil cover three. Nothing on the daily path measured that. The pantry
+    reached the pool (coverage-first) and then the grader in prose — "prefer
+    combinations that together use as many of them as possible" — so whether
+    the member's aubergine was actually used came down to which combinations
+    the sampler happened to draw. This computes one that does, so the judge is
+    always shown it.
+
+    Greedy by slot, in the pool's own order, which is RecipeWrangler's ranking:
+    each slot takes the candidate adding the most items not already covered,
+    and ties fall to the better-ranked recipe. Not guaranteed optimal — the
+    optimum needs the full product — and it does not need to be: this earns a
+    place in the batch, the grader still chooses, and the coverage the member
+    is finally told about is measured from the plan that was served.
+    """
+    items = normalize_items(pantry)
+    if not items or not pools or any(not pool for pool in pools):
+        return None
+
+    covered: set[str] = set()
+    combo: list = []
+    for pool in pools:
+        best, best_gain = pool[0], -1
+        for candidate in pool:
+            text = getattr(candidate, "ingredients", "") or ""
+            gain = len(set(matched_items(text, items)) - covered)
+            if gain > best_gain:          # `>` keeps the first, best-ranked tie
+                best, best_gain = candidate, gain
+        combo.append(best)
+        covered |= set(matched_items(getattr(best, "ingredients", "") or "", items))
+    return tuple(combo)
+
 
 def coverage_facts(
     recipes: Iterable[tuple[str, str]], pantry: Iterable[str]

@@ -2,11 +2,10 @@
 
 LLM-free. Two halves:
 
-- non-regression: the metric functions hoisted out of ChatService return
-  exactly what the originals did (verbatim copies below are the oracle), the
-  planner's prompts are byte-identical, the planner's own judges send the same
-  messages they always did, and ordinary planner messages still reach the
-  classifier;
+- non-regression: the scorer counts ingredients with the planner's own
+  normaliser (``plan_quality``), the planner's prompts are byte-identical, the
+  planner's own judges send the same messages they always did, and ordinary
+  planner messages still reach the classifier;
 - the scorer: constraint rows re-measured per dish, daily and weekly metrics,
   the single judge call, caps, the summary, persistence and the endpoint.
 """
@@ -58,13 +57,13 @@ from services.plan_scorer.service import (
     ensure_calorie_caveat,
     summary_facts,
 )
-from services.plan_scoring import guidelines_text, ingredient_names
+from services.plan_scoring import food_variety_score, ingredient_names
 from services.session_service import SessionService
 from test_orchestrator_routing import QueuedClassifier, make_orchestrator
 from test_plan_scorer import EchoGrounder, FallbackWriter, ForbiddenParser, NoParser, RecordingScorer
 
 # --------------------------------------------------------------------- #
-# Oracle: the ChatService functions exactly as they were before the hoist #
+# Oracle: the ingredient normaliser as the daily FVS metric always had it #
 # --------------------------------------------------------------------- #
 
 
@@ -81,39 +80,6 @@ def _old_extract_ingredient_names(ingredients_text: str) -> list[str]:
         if t:
             cleaned.append(t)
     return cleaned
-
-
-def _old_food_variety_score(plan) -> tuple[int, str]:
-    items: list[str] = []
-    for course in plan.courses:
-        items.extend(_old_extract_ingredient_names(course.ingredients))
-    unique_items = sorted(set(items))
-    reasoning = (
-        f"Unique food items across meals: {len(unique_items)} "
-        f"(e.g., {', '.join(unique_items[:8])}{'...' if len(unique_items) > 8 else ''})"
-    )
-    return len(unique_items), reasoning
-
-
-def _old_plan_as_text(plan) -> str:
-    return "\n".join(
-        f"{name}: {course.title}\nIngredients: {course.ingredients}\nDirections: {course.directions}\n"
-        for name, course in (
-            ("Breakfast", plan.breakfast), ("Lunch", plan.lunch), ("Dinner", plan.dinner),
-        )
-    )
-
-
-class FakeGrader:
-    """One of the planner's single-metric judges."""
-
-    def __init__(self, score=4, reasoning="fine"):
-        self.result = {"score": score, "reasoning": reasoning}
-        self.calls = []
-
-    def score(self, *args, **kwargs):
-        self.calls.append((args, kwargs))
-        return dict(self.result)
 
 
 class FakeJudge:
@@ -214,44 +180,22 @@ SAMPLES = [
 ]
 
 
-class TestHoistedMetricsAreUnchanged:
+class TestTheScorerCountsLikeThePlanner:
     @pytest.mark.parametrize("text", SAMPLES)
     def test_ingredient_names(self, text):
         assert ingredient_names(text) == _old_extract_ingredient_names(text)
 
-    def test_one_normalizer_everywhere(self):
-        chat_service = importlib.import_module("services.chat_service")
-        explainability = importlib.import_module("services.weekly_planner.explainability")
+    def test_one_normalizer(self):
+        plan_quality = importlib.import_module("services.plan_quality")
 
-        assert explainability._ingredient_names is ingredient_names
-        assert chat_service._extract_ingredient_names(SAMPLES[1]) == _old_extract_ingredient_names(SAMPLES[1])
+        assert ingredient_names is plan_quality.extract_ingredient_names
 
-    def test_variety_count_and_plan_text(self):
-        chat_service = importlib.import_module("services.chat_service")
-        plan = ScoredPlan(*make_candidates("h"), 4, "because")
+    def test_variety_count_matches_the_planners(self):
+        plan_quality = importlib.import_module("services.plan_quality")
+        breakfast, lunch, dinner = make_candidates("h")
+        plan = ScoredPlan(4, "because", breakfast=breakfast, lunch=lunch, dinner=dinner)
 
-        assert chat_service._food_variety_score(plan) == _old_food_variety_score(plan)
-        assert chat_service._plan_as_text(plan) == _old_plan_as_text(plan)
-
-    def test_the_daily_metrics_dict_is_unchanged(self):
-        chat_service = importlib.import_module("services.chat_service")
-        svc = chat_service.ChatService.__new__(chat_service.ChatService)
-        svc.diversity_grader = FakeGrader(3, "varied enough")
-        svc.guideline_grader = FakeGrader(4, "mostly fine")
-        plan = ScoredPlan(*make_candidates("h"), 4, "because")
-
-        metrics = svc._compute_metrics("s-1", plan)
-
-        count, reasoning = _old_food_variety_score(plan)
-        assert list(metrics.items()) == [
-            ("llm_score", 4), ("llm_reasoning", "because"),
-            ("fvs_count", count), ("fvs_reasoning", reasoning),
-            ("diversity_llm_score", 3), ("diversity_llm_reasoning", "varied enough"),
-            ("guideline_adherence_score", 4), ("guideline_adherence_reasoning", "mostly fine"),
-        ]
-        text = _old_plan_as_text(plan)
-        assert svc.diversity_grader.calls == [((text,), {})]
-        assert svc.guideline_grader.calls == [((text, guidelines_text("daily")), {})]
+        assert food_variety_score(plan.courses) == plan_quality.food_variety(plan)
 
 
 PLANNER_PROMPTS = {
@@ -260,7 +204,7 @@ PLANNER_PROMPTS = {
     "BATCH_GRADER_USER_INSTRUCTIONS": "0f803dcf4f3014c37983f359b3cbbe51ce52f2ec310b8c2edb063424f0db2cec",
     "MEAL_DIVERSITY_SYSTEM_INSTRUCTIONS": "b5373b2f6fd46ab98f2680c70d5e4a28496004c18a3b1ec3bd3656f6c85e2164",
     "GUIDELINE_ADHERENCE_SYSTEM_INSTRUCTIONS": "8ee8697411adbae6f21ae8006599fd9ba4ec37f65ad372ab5bc772380fc678a6",
-    "RESPONSE_WRITER_SYSTEM_INSTRUCTIONS": "58e003b8844de4e2c9f817f755b43214f7a1fbce753c8d7b3339d7e4504daf91",
+    "RESPONSE_WRITER_SYSTEM_INSTRUCTIONS": "2693902eec50881c56977d599683c78156fd8debd4e10411aca916309b105e0f",
     "RESPONSE_WRITER_USER_INSTRUCTIONS": "fd6f19679401c6bc0cb8cd061564751d806559937114a3598c2f81cd1dc0cde8",
 }
 

@@ -11,7 +11,7 @@ Consumers: agents.py, services/clarification.py.
 
 from typing import Literal, Optional
 
-from pydantic import BaseModel, conint
+from pydantic import BaseModel, conint, constr
 
 
 class ScoringSchema(BaseModel):
@@ -188,6 +188,103 @@ class PantryExtractionSchema(BaseModel):
     have: list[str] = []
     # Ingredients the user declared spent ("I used up the zucchini").
     used_up: list[str] = []
+
+
+class PlanIntentSchema(BaseModel):
+    """Recipe qualities asked for in one message, as RecipeWrangler facets.
+
+    Every value must come from the live vocabulary handed to the extractor: an
+    unlisted value becomes a hard filter matching zero recipes, which the member
+    experiences as "no meals exist" rather than as a narrower search.
+    """
+    cuisines: list[str] = []
+    moods: list[str] = []
+    flavor_profiles: list[str] = []
+    food_groups: list[str] = []
+
+
+class ToolChoiceSchema(BaseModel):
+    """Which capability answers this message, if any.
+
+    `tool` is empty when nothing fits, and empty is the expected answer most of
+    the time: the great majority of messages are plan requests, refinements or
+    conversation, and forcing a choice would turn "thanks, that looks great"
+    into a week summary nobody asked for.
+
+    Arguments are NOT free-form. The registry validates them (`tools._validate`)
+    and a bad day number is a member-facing error rather than something the
+    planner has to survive — so this only names the tool and the handful of
+    arguments a member can state in a sentence. Anything a tool needs beyond
+    these it derives itself from the session.
+    """
+    tool: str = ""
+    # 1-based, and only for a tool that is about one day. Null otherwise.
+    day: Optional[conint(ge=1, le=14)] = None
+    plan_type: Optional[Literal["daily", "weekly"]] = None
+    # A name the member gave the thing — "save this as Meatless Monday".
+    # Capped here rather than trusted: it is member text on its way to a
+    # database column, and the column is 120 wide.
+    title: Optional[constr(max_length=120)] = None
+    # False only for taking something back off a list. Null means "not stated",
+    # which the caller reads as the tool's own default.
+    saved: Optional[bool] = None
+    # One short sentence, for the log and for the reply's grounding.
+    reason: str = ""
+
+
+class MealChoiceSchema(BaseModel):
+    """Which composition fills one meal, and why."""
+
+    # Position in the list this meal was offered, 0-based. Out of range is
+    # treated as "no preference" by the caller rather than an error: a judge
+    # that miscounts must not cost the meal its deterministic winner.
+    pick: conint(ge=0, le=9) = 0
+    # Echoed back so a caller can tell whether the model answered about the
+    # meal it was asked about. Ordering is not trusted — the label is.
+    meal: str = ""
+    reason: str = ""
+
+
+class MealCompositionSchema(BaseModel):
+    """One choice per multi-plate meal in the plan.
+
+    A single call for the whole plan rather than one per meal: a week with a
+    side at dinner is seven judgements, and seven round trips inside one turn
+    budget is how a plan stops arriving.
+    """
+
+    choices: list[MealChoiceSchema] = []
+
+
+class PlanStrategySchema(BaseModel):
+    """How to approach ONE planning request, before any recipe is fetched.
+
+    A proposal, not a decision: `PlanBrief.with_strategy` validates every value
+    against the live vocabulary and the corpus's claim tags before any of it
+    reaches a search. A strategist is allowed to be wrong; it is not allowed to
+    be wrong in a way that empties the result set and offers no explanation.
+
+    Notice what is absent. There is no allergen field and no diet field — a
+    reasoning step may decide HOW to search, and may not decide to drop a
+    safety constraint. Those come from the profile and the member's own words,
+    deterministically, and the verifier checks them on the way back.
+    """
+    cuisines: list[str] = []
+    moods: list[str] = []
+    flavor_profiles: list[str] = []
+    food_groups: list[str] = []
+    # Corpus claim tags — high_protein, low_calorie, 30_minutes_or_less …
+    claim_tags: list[str] = []
+    # A daily calorie budget, when the request implies one and the profile has
+    # none. Ignored outside 1200-4000: outside that range it is an arithmetic
+    # error, not a plan.
+    kcal_target: Optional[int] = None
+    # What to give up first if a slot cannot be filled. May REORDER the known
+    # steps; anything unknown is dropped.
+    relaxation_order: list[str] = []
+    # One sentence on why. Shown to nobody by default, logged always, and
+    # available to the reply writer as grounded fact.
+    rationale: str = ""
 
 
 class MealPlateSchema(BaseModel):

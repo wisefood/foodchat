@@ -27,7 +27,14 @@ from typing import Optional
 from agents import SeedExtractor
 from models.recipe import CandidateRecipe, ResolvedRecipe
 from services.adapted_recipes import overlay_resolved
-from services.candidates_client import normalize_diet_tags, CANDIDATES, RecipeCandidatesClient, allergen_conflict
+from services import plan_parameters
+from services.candidates_client import (
+    CANDIDATES,
+    RecipeCandidatesClient,
+    allergen_conflict,
+    effective_diet,
+    screening_allergens,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -178,12 +185,17 @@ class SeedService:
         return PLANNER.find_recipes(
             name,
             limit=5,
-            allergens=profile.get("allergies") or [],
+            allergens=screening_allergens(profile),
             # Normalised for the same reason as everywhere else: an
             # unrecognised tag ANDs a name search down to nothing, so a
             # member's named dish would silently fail to resolve.
-            diet=normalize_diet_tags(profile.get("diet")),
+            diet=effective_diet(profile),
             exclude_ingredients=profile.get("food_dislikes") or [],
+            max_minutes=plan_parameters.max_duration_minutes(
+                profile.get("plan_parameters") or {}
+            ),
+            min_nutri_score=profile.get("min_nutri_score"),
+            favorite_recipe_ids=profile.get("favorite_recipe_ids") or [],
         )
 
     def _autocomplete_tolerant(self, name: str) -> list[tuple[str, str]]:

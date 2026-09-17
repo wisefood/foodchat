@@ -33,7 +33,11 @@ from .reward_logic import apply_hard_constraints, constraint_score
 
 logger = logging.getLogger(__name__)
 
-TOTAL_SLOTS = 21  # 7 days x 3 meals
+# The old fixed shape, kept only as the fallback for an environment that does
+# not report its own size. The env computes `total_slots` from the plan spec it
+# was given, so a 3-day plan or a week with snacks no longer walks 21 steps
+# regardless of what was asked for.
+TOTAL_SLOTS = 21  # 7 days x 3 meals — the default shape
 
 
 class PlanGenerationError(RuntimeError):
@@ -550,7 +554,7 @@ def build_preference_scorer(
     default setting the weight is 0.0 and nothing about the week changes.
     """
     favorites = {str(f) for f in (user_profile.get("favorite_recipe_ids") or [])}
-    likes = [str(l).lower() for l in (user_profile.get("food_likes") or [])]
+    likes = [str(like).lower() for like in (user_profile.get("food_likes") or [])]
 
     from services import plan_parameters  # local import; avoids a cycle at module load
     from services.pantry_service import matched_items, normalize_items
@@ -687,7 +691,11 @@ class WeeklyPlanner:
         scorer: Optional[Callable] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Run the 21-step (7 days × 3 meals) planning loop.
+        Run the planning loop, one step per slot of the plan's shape.
+
+        21 steps for the default week; fewer for a shorter plan, more for one
+        with a snack. The step count comes from the environment, which gets it
+        from the plan spec — it used to be the literal 21.
 
         Args:
             user_query: Optional user query to guide reward evaluation.
@@ -697,7 +705,7 @@ class WeeklyPlanner:
                     Without it, selection is uniformly random.
 
         Returns:
-            The 21 generated entries with day, meal type, recipe, and reward.
+            One entry per slot, with day, meal type, recipe, and reward.
         """
         pinned = pinned or {}
         # Scorers written before the food-waste axis take (candidate, titles);
@@ -783,7 +791,14 @@ class WeeklyPlanner:
                 # rank the pool; random tiebreak among equals keeps variety.
                 # Without a scorer and without nutrition data every score is
                 # 0.0 and selection stays uniformly random, as before.
-                slots_remaining = TOTAL_SLOTS - len(self.env.plan)
+                # Meals left, not rows left. `env.plan` holds one row per
+                # PLATE now, so `len(plan)` counts a two-plate dinner twice and
+                # the remaining-budget divisor would run to zero and then
+                # negative halfway through a composed week.
+                slots_remaining = (
+                    getattr(self.env, "total_slots", TOTAL_SLOTS)
+                    - getattr(self.env, "slots_filled", len(self.env.plan))
+                )
                 scored = [
                     (
                         score_candidate(c)
@@ -796,7 +811,19 @@ class WeeklyPlanner:
                 top = [c for s, c in scored if s == best_score]
                 chosen_recipe = random.choice(top)
 
-            chosen_titles.append(str(chosen_recipe.get("recipe_title", "")))
+            # Variety and food waste are about everything on the table, so a
+            # composed meal contributes every plate's title and every plate's
+            # perishables. Counting the main alone would let the same salad
+            # reappear as a side all week without the variety penalty noticing.
+            for plate in (chosen_recipe.get("plates") or [chosen_recipe]):
+                chosen_titles.append(str(plate.get("recipe_title", "")))
+            meal_ingredients = (
+                chosen_recipe.get("meal_ingredients")
+                or chosen_recipe.get("recipe_ingredients", "")
+            )
+            # The flat `chosen_perishables` set this used to feed is gone —
+            # `basket` replaced it with a day-aware one, and it is fed below
+            # with the same whole-meal ingredient text.
             # Recorded against the day it is eaten, before the environment
             # advances the clock — pinned slots included, since a member's
             # anchor puts food in the basket like any other meal.
@@ -811,7 +838,7 @@ class WeeklyPlanner:
             # deliberately asked to eat twice. The source dinner already put
             # all of it in the basket on its own day.
             if not chosen_recipe.get("leftover_of"):
-                basket.add(chosen_recipe.get("recipe_ingredients", ""), state["day"])
+                basket.add(meal_ingredients, state["day"])
             # Advance the environment (updates tracker, computes reward).
             state, reward, done, info = self.env.step(chosen_recipe)
 

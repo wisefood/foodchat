@@ -73,7 +73,7 @@ def offline(monkeypatch):
     calls = {"fetches": 0, "exclusions": []}
 
     def fake_pool(*, profile, allergens, diet, cuisines, exclude_recipe_ids,
-                  limit_per_slot):
+                  limit_per_slot, slots=None):
         excluded = set(exclude_recipe_ids or [])
         calls["fetches"] += 1
         calls["exclusions"].append(sorted(excluded))
@@ -995,7 +995,7 @@ def stingy(monkeypatch):
     }
 
     def fake_pool(*, profile, allergens, diet, cuisines, exclude_recipe_ids,
-                  limit_per_slot):
+                  limit_per_slot, slots=None):
         excluded = set(exclude_recipe_ids or [])
         state["fetches"] += 1
         return {

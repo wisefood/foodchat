@@ -97,7 +97,7 @@ class TestSilenceIsNotRetraction:
                 anchors={"breakfast": "r-pie"},
                 excluded_recipe_ids=("r-1",),
                 spec=PlanSpec.from_spec({"num_days": 3}),
-                notes=("nothing heavy in the evening",),
+                max_minutes=25,
             )
         )
 
@@ -153,7 +153,7 @@ class TestPersistence:
                 anchors={"breakfast": "r-pie"},
                 excluded_recipe_ids=("r-1",),
                 spec=PlanSpec.from_spec({"num_days": 2, "plates": {"dinner": ["main", "salad"]}}),
-                notes=("no heavy dinners",),
+                max_minutes=30,
             )
         )
 

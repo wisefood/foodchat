@@ -239,7 +239,8 @@ class TestPipelineFallback:
     def test_the_pool_always_comes_from_the_planning_endpoint(self, pipeline):
         """No second source exists — this is the point of the switch."""
         class Good:
-            def grade_daily_plans(self, query, candidates, profile, history):
+            def grade_daily_plans(self, query, candidates, profile, history,
+                                  prefer_items=()):
                 return [ScoredPlan(
                     breakfast=candidates["breakfast"][0],
                     lunch=candidates["lunch"][0],
@@ -254,7 +255,8 @@ class TestPipelineFallback:
 
     def test_a_working_grader_result_is_used_unchanged(self, pipeline):
         class Good:
-            def grade_daily_plans(self, query, candidates, profile, history):
+            def grade_daily_plans(self, query, candidates, profile, history,
+                                  prefer_items=()):
                 return [ScoredPlan(
                     breakfast=candidates["breakfast"][1],   # not the pool's first
                     lunch=candidates["lunch"][0],
@@ -326,7 +328,8 @@ class TestPipelineFallback:
 
     def test_hard_constraints_reach_the_pool(self, pipeline):
         class Good:
-            def grade_daily_plans(self, query, candidates, profile, history):
+            def grade_daily_plans(self, query, candidates, profile, history,
+                                  prefer_items=()):
                 return [ScoredPlan(
                     breakfast=candidates["breakfast"][0],
                     lunch=candidates["lunch"][0],
@@ -348,7 +351,8 @@ class TestPipelineFallback:
         """`plan_meals` requires every `include_ingredient`, so forwarding a
         member's likes would demand chickpeas in every breakfast."""
         class Good:
-            def grade_daily_plans(self, query, candidates, profile, history):
+            def grade_daily_plans(self, query, candidates, profile, history,
+                                  prefer_items=()):
                 return [ScoredPlan(
                     breakfast=candidates["breakfast"][0],
                     lunch=candidates["lunch"][0],
@@ -406,6 +410,10 @@ class TestStructuredPlan:
         class FakePlanner:
             plan_meals = staticmethod(fake_plan_meals)
             describe_relaxations = staticmethod(PlanClient.describe_relaxations)
+            # The real reader, not a stub: pairing the response's slot entries
+            # back to FoodChat's roles is the part that used to be wrong, so a
+            # test that fakes it away tests nothing.
+            to_role_pools = staticmethod(PlanClient.to_role_pools)
 
         import services.plan_client as plan_module
         monkeypatch.setattr(plan_module, "PLANNER", FakePlanner())
@@ -472,6 +480,7 @@ class TestStructuredPlan:
         class Empty:
             plan_meals = staticmethod(lambda **k: {"days": []})
             describe_relaxations = staticmethod(lambda e: [])
+            to_role_pools = staticmethod(PlanClient.to_role_pools)
 
         monkeypatch.setattr(plan_module, "PLANNER", Empty())
 

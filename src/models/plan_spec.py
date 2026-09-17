@@ -32,7 +32,7 @@ plans forever.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Iterable
 
 # Roles a plate can have. `MealCourse.role` stores exactly these.
@@ -51,6 +51,7 @@ ROLES: tuple[str, ...] = ("main", "side", "salad", "soup", "dessert", "drink")
 # semantics here — unlike a *multi-course meal*, where each course needs its own
 # request because the courses must all be present.
 ROLE_COURSE_TYPES: dict[str, tuple[str, ...]] = {
+    # See `request_course_types` — a main is NOT asked for by this name.
     "main": ("main-dish",),
     # Broad on purpose: a generic side can be any of these, and asking for only
     # one would empty the plate on a corpus that annotated it as another.
@@ -61,6 +62,31 @@ ROLE_COURSE_TYPES: dict[str, tuple[str, ...]] = {
     "dessert": ("desserts",),
     "drink": ("beverages",),
 }
+
+def request_course_types(role: str) -> tuple[str, ...]:
+    """The course types to ASK RecipeWrangler for, for a plate in this role.
+
+    Empty for `main`, on purpose, and this is the whole point of the function.
+
+    "main" is FoodChat's word for *the principal plate of this slot*. It is not
+    the corpus's `main-dish`, and what a main IS depends on the slot: a
+    breakfast main is a breakfast, a snack main is a snack, a dessert main is a
+    dessert. RecipeWrangler owns that map — `SLOT_COURSE_TYPES` in its
+    `plan_meals` — and applies it to any slot whose request carries no
+    `course_types` override.
+
+    Sending `main-dish` for every main overrode that map on every shaped plan,
+    so breakfast was a literal request for a main dish and came back with
+    pasta. The classic single-plate path never had the bug because it sends no
+    override at all; only the path that knows about roles did.
+
+    Every other role means the same thing wherever it sits — a salad is a
+    salad at lunch and at dinner — so those keep their own course types.
+    """
+    if role == "main":
+        return ()
+    return ROLE_COURSE_TYPES.get(role, ())
+
 
 # How a meal's calorie budget divides across its plates — the honest-nutrition
 # rule from §4.2: "main + side ≈ one meal, not two".
@@ -143,6 +169,69 @@ class PlanSpec:
         day_word = "1 day" if self.num_days == 1 else f"{self.num_days} days"
         return f"{day_word} — " + "; ".join(parts)
 
+    def with_meal(self, slot: str) -> "PlanSpec":
+        """This shape plus one more meal, in eating order.
+
+        Adding is not the same as saying. "Add breakfast" used to reach nothing
+        that could act on it: an edit can only REPLACE a slot, so the edit path
+        answered "this plan has lunch, dinner — which of those should I change?"
+        and the member said "I don't have a breakfast" again. There was no way
+        out of that loop, because nothing in the system could add a meal.
+        """
+        name = str(slot or "").strip().lower()
+        if not name or name in self.meals:
+            return self
+        # EATING order, from `slot_sort_key` — the order the graders, the
+        # quality metrics and the UI all display meals in.
+        #
+        # `KNOWN_SLOTS` is a different order (it lists snack after dinner) and
+        # it is not a claim about when people eat — it is the set of slots
+        # RecipeWrangler can fill. Sorting by it put a snack after dinner on the
+        # plan while every other surface showed it before, which is two answers
+        # to "what order is this day".
+        from models.recipe import slot_sort_key
+
+        meals = tuple(sorted((*self.meals, name), key=slot_sort_key))
+        return replace(self, meals=meals)
+
+    def with_days(self, num_days: int) -> "PlanSpec":
+        """This shape over a different number of days. Meals and plates stay.
+
+        The horizon is a property of a REQUEST; the shape is standing. "Salads
+        on the side" should survive from one plan to the next — that is what a
+        standing shape is for. "For the week" should not: a member who planned
+        a week on Monday and asks for "a plan for today" on Tuesday has said
+        how many days they want, and it is one.
+        """
+        days = max(1, min(int(num_days), MAX_DAYS))
+        if days == self.num_days:
+            return self
+        return replace(self, num_days=days)
+
+    def with_plate(self, slot: str, role: str) -> "PlanSpec":
+        """This shape with one more plate on one meal.
+
+        "Add a salad to lunch" is a change to the SHAPE of lunch, not a swap of
+        the dish on it — so it belongs here rather than in the edit path, which
+        would have replaced the main with a salad or done nothing at all.
+        """
+        name = str(slot or "").strip().lower()
+        plate = str(role or "").strip().lower()
+        if not name or plate not in ROLES:
+            return self
+        current = self.roles_for(name)
+        if plate in current:
+            return self
+        if len(current) >= MAX_PLATES_PER_MEAL:
+            # Refusing beats silently dropping it: the caller can say why.
+            return self
+        order = list(ROLES)
+        roles = tuple(sorted((*current, plate), key=lambda r: order.index(r)))
+        plates = {**self.plates, name: roles}
+        spec = replace(self, plates=plates)
+        # A plate on a meal the plan does not serve implies the meal.
+        return spec if name in spec.meals else spec.with_meal(name)
+
     def kcal_split(self, slot: str) -> dict[str, float]:
         """A meal's calorie budget divided across its plates.
 
@@ -207,7 +296,9 @@ class PlanSpec:
 
         return notes
 
-    def to_request_slots(self) -> list[dict[str, Any]]:
+    def to_request_slots(
+        self, count: int = 1, *, only_multiplate: bool = False,
+    ) -> list[dict[str, Any]]:
         """The `slots` payload `/api/v2/tools/plan_meals` expects.
 
         **One entry per plate**, not one per meal. RecipeWrangler treats a
@@ -218,15 +309,30 @@ class PlanSpec:
 
         Entries keep the same slot name, which the service echoes back, so the
         plates regroup into one `Meal` on the way home.
+
+        `count` is recipes per PLATE, and it defaults to one because that is
+        what a plan needs. More than one is what a composer needs: choosing
+        which side goes with which main is not possible when the service was
+        only ever asked for one of each.
+
+        `only_multiplate` spends that depth where it can be used. A single-plate
+        meal in a shaped spec has nothing to compose — there is no second dish
+        for it to sit beside — so four candidates for it are three recipes
+        fetched, enriched and ranked by RecipeWrangler's own order to arrive at
+        the one that was first anyway. On a week of three meals with a side at
+        dinner it is the difference between 112 recipes and 70.
         """
         out: list[dict[str, Any]] = []
+        depth = max(1, int(count))
         for slot in self.meals:
-            for role in self.roles_for(slot):
+            roles = self.roles_for(slot)
+            wanted = depth if (len(roles) > 1 or not only_multiplate) else 1
+            for role in roles:
                 out.append(
                     {
                         "slot": slot,
-                        "count": 1,
-                        "course_types": list(ROLE_COURSE_TYPES.get(role, ())),
+                        "count": wanted,
+                        "course_types": list(request_course_types(role)),
                     }
                 )
         return out

@@ -58,7 +58,7 @@ def offline(monkeypatch):
     calls = {"exclusions": [], "pantry": []}
 
     def fake_pool(*, profile, allergens, diet, cuisines, exclude_recipe_ids,
-                  limit_per_slot):
+                  limit_per_slot, slots=None):
         excluded = set(exclude_recipe_ids or [])
         calls["exclusions"].append(sorted(excluded))
         return {
@@ -194,7 +194,7 @@ class TestWhenTheSourceIgnoresTheExclusion:
     @pytest.fixture
     def stubborn(self, monkeypatch, offline):
         def fake_pool(*, profile, allergens, diet, cuisines, exclude_recipe_ids,
-                      limit_per_slot):
+                      limit_per_slot, slots=None):
             return {
                 "breakfast": [_cand(p) for p in BREAKFASTS],
                 "lunch": [_cand(p) for p in LUNCHES],

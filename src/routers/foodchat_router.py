@@ -7,11 +7,23 @@ server-side and routes internally (see services/orchestrator_service.py).
 The remaining endpoints are session lifecycle, plan/canvas reads,
 paginated conversation history, and message feedback.
 
-Authorization model: FoodChat sits behind the wisefood-api gateway, which
-authenticates the Keycloak user and passes the household member's
-``member_id`` as data. Every session-scoped endpoint therefore REQUIRES the
-member_id and verifies it matches the session owner — this is the only
-access control at this layer, so never make it optional.
+Authorization model — two layers, and neither is optional.
+
+The gateway authenticates the Keycloak user and checks that they own the
+household member they name. It then SIGNS that answer into an
+``X-WiseFood-Member`` assertion (see auth.py), because only the gateway can
+answer "does this user own this member" — the household tables live there.
+
+FoodChat verifies the signature on every member-scoped request and requires the
+``member_id`` in the request to match the member the gateway vouched for. That
+is what makes reaching this service's port insufficient to act as someone else.
+Then, as before, every session-scoped endpoint checks that the member owns the
+session, returning 404 on a mismatch — never 403, which would confirm that a
+session id is real.
+
+Both checks live in ``_require_session``. A new session-scoped route that skips
+it fails ``tests/test_route_authorization.py``, which is parameterised over the
+router's own route table.
 
 Removed in M0 (see CHANGES.md): the legacy pre-orchestrator endpoints
 ``POST/GET /sessions/{id}/messages`` and ``POST/GET /sessions/{id}/weekly``.
@@ -22,11 +34,18 @@ import logging
 from datetime import datetime
 from typing import Dict, List, Literal, Optional
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, HTTPException, Query, Response, status
+from sqlalchemy import text as sa_text
 from pydantic import BaseModel, Field
 
+import auth
 import services
-from db import SessionLocal, db_upsert_feedback, db_get_message_by_id
+from db import (
+    SessionLocal,
+    db_upsert_feedback,
+    db_get_message_by_id,
+    db_list_feedback,
+)
 from models.session import MealCourse
 from services import plan_parameters
 from services.candidates_client import MEAL_SLOTS
@@ -60,7 +79,11 @@ class SessionResponse(BaseModel):
     state: str
     message_count: int
     created_at: datetime
-    # None = never titled; the client falls back to the first user message.
+    # Auto-named from the opening message on the first turn, and renamable
+    # thereafter (PATCH /sessions/{id}) — a member name always wins. None
+    # only when titling declined or failed; the client then falls back to
+    # the created_at timestamp. It never fell back to the first user
+    # message, which is what this comment used to claim.
     title: Optional[str] = None
 
 
@@ -199,6 +222,15 @@ class WeeklyMealPlanEntryResponse(BaseModel):
     meal_type: str
     recipe: dict
     reward: float
+    # Which plate of the meal this is. Two entries share a day, a slot and a
+    # `meal_idx` when a dinner is served as a main and a salad; this is the only
+    # thing that says which is which, and without it the field would be dropped
+    # here by pydantic's default extra='ignore' and the UI would label the
+    # plates "Dinner 1" and "Dinner 2".
+    #
+    # "main" for every plan made before meals could have plates, which is what
+    # a single-dish entry is.
+    role: str = "main"
 
 
 class WeeklyMealPlanResponse(BaseModel):
@@ -242,8 +274,15 @@ class WeeklyMealPlanResponse(BaseModel):
         )
 
 
+# What a person types, with room to paste a recipe or describe a week — and a
+# ceiling, because every one of these is stored, replayed into a prompt, and
+# billed by the token. Unbounded, one paste could carry a megabyte into the
+# conversation history and into every subsequent turn's context.
+MAX_MESSAGE_CHARS = 4000
+
+
 class ChatRequest(BaseModel):
-    content: str
+    content: str = Field(..., min_length=1, max_length=MAX_MESSAGE_CHARS)
     member_id: str
 
 
@@ -422,8 +461,10 @@ class ConversationPage(BaseModel):
 
 class FeedbackRequest(BaseModel):
     member_id: str
-    rating: str          # "up" | "down"
-    comment: Optional[str] = None
+    # Declared rather than checked in the handler: an unknown rating was a
+    # value that reached the database and skewed the feedback the grader reads.
+    rating: Literal["up", "down"]
+    comment: Optional[str] = Field(None, max_length=1000)
 
 
 class MemoryDecisionRequest(BaseModel):
@@ -456,11 +497,13 @@ class ComposePick(BaseModel):
 
 class ComposeRequest(BaseModel):
     member_id: str
-    picks: List[ComposePick]
+    # One pick per addressed slot. 21 is a full week; a longer list is not a
+    # compose, and each pick is resolved against the corpus one at a time.
+    picks: List[ComposePick] = Field(..., max_length=21)
     plan_type: Literal["daily", "weekly"] = "daily"
     # Optional chat text sent alongside ("fill out the rest, keep it light");
     # empty → a canonical completion query
-    message: Optional[str] = None
+    message: Optional[str] = Field(None, max_length=MAX_MESSAGE_CHARS)
 
 
 MAX_PASTED_PLAN_CHARS = 8000
@@ -496,6 +539,27 @@ class FeedbackResponse(BaseModel):
     comment: Optional[str] = None
 
 
+class FeedbackEntry(BaseModel):
+    """One rating, with enough of the message to know what was rated."""
+
+    message_id: int
+    session_id: str
+    member_id: str
+    rating: str
+    comment: Optional[str] = None
+    created_at: datetime
+    intent: Optional[str] = None
+    plan_id: Optional[str] = None
+    message_preview: Optional[str] = None
+
+
+class FeedbackListResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    items: List[FeedbackEntry] = Field(default_factory=list)
+
+
 # ---------------------------------------------------------------------------
 # Service guard
 # ---------------------------------------------------------------------------
@@ -513,9 +577,38 @@ def _require_orchestrator_service():
     return services.orchestrator_service
 
 
+def _require_member(member_id: str) -> str:
+    """Refuse a request that claims to be someone the gateway did not vouch for.
+
+    The first of the two checks. It answers "are you who you say you are",
+    which `_require_session` below cannot: that one only knows whether the
+    member it was handed owns the session, and a caller free to name any member
+    can always satisfy it.
+
+    401, not 404: this is not "you may not see that", it is "I do not know who
+    you are" — and unlike session ownership there is nothing to leak, because
+    the answer does not depend on any session existing.
+    """
+    try:
+        auth.check_member(member_id)
+    except auth.AssertionError_ as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)
+        ) from None
+    return member_id
+
+
 def _require_session(session_id: str, member_id: str):
-    """Load a session and enforce owner access (404 on mismatch, never 403 —
-    a mismatched member must not learn that the session exists)."""
+    """Both checks, in the order they have to happen.
+
+    First that the caller IS this member (the gateway's signed assertion), then
+    that this member owns the session. Ownership alone was never enough: a
+    caller who can name any member can name the owner.
+
+    404 on an ownership mismatch, never 403 — a member who does not own a
+    session must not learn that it exists.
+    """
+    _require_member(member_id)
     session = services.session_service.get_session(session_id, member_id=member_id)
     if not session:
         raise HTTPException(
@@ -534,6 +627,10 @@ def _require_session(session_id: str, member_id: str):
 )
 def create_session(request: CreateSessionRequest):
     """Create a new chat session; fetches the member's profile from WiseFood."""
+    # There is no session to own yet, so ownership cannot be the check here —
+    # identity is. Without it, anyone reachable could open a session AS another
+    # member and then legitimately own everything they did in it.
+    _require_member(request.member_id)
     try:
         user_profile = services.profile_service.get_member_profile(request.member_id)
         # Favorites ride in the profile snapshot: RecipeWrangler boosts them
@@ -599,6 +696,7 @@ def delete_session(
     member_id: str = Query(..., description="Must match session owner"),
 ):
     """Delete a session. Only the owning member may delete it."""
+    _require_member(member_id)
     if not services.session_service.delete_session(session_id, member_id):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Session not found or access denied"
@@ -640,6 +738,9 @@ def save_meal_plan(session_id: str, plan_id: str, request: SavePlanRequest):
 @router.get("/members/{member_id}/saved-plans", response_model=List[SavedPlanResponse])
 def get_member_saved_plans(member_id: str):
     """Every plan the member saved, across all their sessions, newest first."""
+    # Member-scoped rather than session-scoped: the id in the path IS the thing
+    # being authorized, so the assertion is the only check there is.
+    _require_member(member_id)
     return [
         SavedPlanResponse(**row)
         for row in services.session_service.get_member_saved_plans(member_id)
@@ -648,7 +749,12 @@ def get_member_saved_plans(member_id: str):
 
 @router.get("/members/{member_id}/sessions", response_model=List[SessionResponse])
 def get_member_sessions(member_id: str):
-    """Get all sessions for a specific member."""
+    """Get all sessions for a specific member.
+
+    The route the isolation requirement is really about: it lists someone's
+    whole conversation history from their id alone.
+    """
+    _require_member(member_id)
     sessions = services.session_service.get_member_sessions(member_id)
     return [
         SessionResponse(
@@ -685,6 +791,7 @@ class MemberCurrentPlansResponse(BaseModel):
 )
 def get_member_current_plans(member_id: str):
     """Most recent daily/weekly plans for a member (dashboard widget)."""
+    _require_member(member_id)
     session = services.session_service.get_member_current_plans(member_id)
     if session is None:
         return MemberCurrentPlansResponse()
@@ -730,6 +837,10 @@ def unified_chat(session_id: str, request: ChatRequest):
     Response includes plan_version and plan_parent_id so the UI can track
     which canvas version was just produced.
     """
+    # Identity BEFORE service availability: an unauthenticated caller should
+    # not learn whether the orchestrator is up, and authorization that runs
+    # second is authorization that a 503 can skip.
+    _require_member(request.member_id)
     orch_svc = _require_orchestrator_service()
 
     logger.info("[%s] /chat from member %s: %.120s", session_id, request.member_id, request.content)
@@ -751,6 +862,40 @@ def unified_chat(session_id: str, request: ChatRequest):
         logger.error("[%s] /chat 500: %s", session_id, e, exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
+    return _finalize_turn(session_id, turn)
+
+
+def _turn_extras(turn) -> dict:
+    """What this turn produced besides its text.
+
+    Exactly the three things the UI used to graft onto the last assistant
+    message client-side — and therefore lost on every reload: the memory nudge,
+    the slot-edit proof, and the plan-parameter card. Empty when the turn
+    produced none, so a plain answer stores nothing.
+    """
+    extras = {}
+    if turn.memory_suggestions:
+        extras["memory_suggestions"] = turn.memory_suggestions
+    if turn.changed_slots:
+        extras["changed_slots"] = turn.changed_slots
+    if turn.plan_parameters:
+        extras["plan_parameters"] = turn.plan_parameters
+    return extras
+
+
+def _finalize_turn(session_id: str, turn) -> ChatTurnResponse:
+    """Persist the turn's extras, then return it on the wire.
+
+    The single funnel for every turn-shaped endpoint — /chat, /compose,
+    /plan-parameters, /replan — because the alternative is four places that
+    each have to remember, and the one that forgets loses a memory nudge with
+    no error anywhere.
+
+    The write is best-effort inside `attach_turn_extras`: the turn has already
+    happened and its plan is already stored, so failing to record the nudge
+    must not turn a successful turn into a 500.
+    """
+    services.session_service.attach_turn_extras(session_id, _turn_extras(turn))
     return _chat_turn_response(turn)
 
 
@@ -801,6 +946,10 @@ def compose_plan(session_id: str, request: ComposeRequest):
     Pick shape is enforced by ``ComposePick`` (422 on a bad meal type or an
     out-of-range day), so this only resolves slot collisions.
     """
+    # Identity BEFORE service availability: an unauthenticated caller should
+    # not learn whether the orchestrator is up, and authorization that runs
+    # second is authorization that a 503 can skip.
+    _require_member(request.member_id)
     orch_svc = _require_orchestrator_service()
     plan_type = request.plan_type
 
@@ -846,7 +995,7 @@ def compose_plan(session_id: str, request: ComposeRequest):
         logger.error("[%s] /compose 500: %s", session_id, e, exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
-    return _chat_turn_response(turn)
+    return _finalize_turn(session_id, turn)
 
 
 @router.post("/sessions/{session_id}/score-plan", response_model=ChatTurnResponse)
@@ -865,6 +1014,8 @@ def score_plan(session_id: str, request: ScorePlanRequest):
     ``needs_clarification`` is true when FoodChat has to ask what the text is
     (no meals found, or an unclear number of days) — the member answers in chat.
     """
+    # Identity before service availability, as on every turn endpoint.
+    _require_member(request.member_id)
     orch_svc = _require_orchestrator_service()
     if not request.plan_text.strip():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="plan_text is empty")
@@ -888,7 +1039,7 @@ def score_plan(session_id: str, request: ScorePlanRequest):
         logger.error("[%s] /score-plan 500: %s", session_id, e, exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
-    return _chat_turn_response(turn)
+    return _finalize_turn(session_id, turn)
 
 
 @router.post("/sessions/{session_id}/plan-parameters", response_model=ChatTurnResponse)
@@ -900,6 +1051,10 @@ def apply_plan_parameters(session_id: str, request: PlanParametersRequest):
     plan the card was rendered with (``plan_type``), or the active canvas
     when the client didn't say.
     """
+    # Identity BEFORE service availability: an unauthenticated caller should
+    # not learn whether the orchestrator is up, and authorization that runs
+    # second is authorization that a 503 can skip.
+    _require_member(request.member_id)
     orch_svc = _require_orchestrator_service()
 
     sanitized = plan_parameters.sanitize(request.values)
@@ -924,7 +1079,7 @@ def apply_plan_parameters(session_id: str, request: PlanParametersRequest):
         logger.error("[%s] /plan-parameters 500: %s", session_id, e, exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
-    return _chat_turn_response(turn)
+    return _finalize_turn(session_id, turn)
 
 
 @router.get("/sessions/{session_id}/conversation", response_model=ConversationPage)
@@ -959,6 +1114,10 @@ def get_conversation(
                 "intent": m["intent"],
                 "plan_id": m["plan_id"],
                 "attribution": m.get("attribution"),
+                # The nudge, the edit proof and the settings card that went with
+                # this message. Client-side grafting meant a reload showed the
+                # plan with none of the explanation that came with it.
+                "extras": m.get("extras"),
                 "plan_score": m.get("plan_score"),
                 "timestamp": m["timestamp"].isoformat(),
             }
@@ -1082,7 +1241,56 @@ def submit_feedback(session_id: str, message_id: int, request: FeedbackRequest):
             rating=request.rating,
             comment=request.comment,
         )
+        # Mirrored to the gateway's shared inbox. The row above stays: it is
+        # what feeds personalisation, and that must not depend on a network
+        # call to another service succeeding.
+        try:
+            import activity
+
+            activity.report_feedback(
+                message_id=str(message_id),
+                rating=request.rating,
+                comment=request.comment,
+                member_id=request.member_id,
+            )
+        except Exception:  # pragma: no cover - never fail the write
+            logger.debug("Feedback mirroring failed", exc_info=True)
         return FeedbackResponse(message_id=fb.message_id, rating=fb.rating, comment=fb.comment)
+    finally:
+        db.close()
+
+
+@router.get("/members/{member_id}/feedback", response_model=FeedbackListResponse)
+def get_member_feedback(
+    member_id: str,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    rating: Optional[str] = Query(None, pattern="^(up|down)$"),
+):
+    """One member's ratings, newest first, with the message each one rates.
+
+    The read side of a table that has been filling since it was added and read
+    only by the personalisation loop — a thumbs-down was previously invisible
+    without a database shell.
+
+    Deliberately member-scoped, like every other route that names a member: the
+    id in the path IS the thing being authorized, and the assertion is the only
+    check there is. An unscoped "all feedback" listing was the obvious thing to
+    write here and would have handed every member's comments to anything that
+    can reach this port, since FoodChat authenticates nobody. Experts get the
+    cross-member view from the gateway's feedback inbox instead, which is fed
+    by the mirror in `submit_feedback` and carries FoodScholar's and the
+    platform widget's feedback alongside this.
+    """
+    _require_member(member_id)
+    db = SessionLocal()
+    try:
+        total, items = db_list_feedback(
+            db, limit=limit, offset=offset, member_id=member_id, rating=rating
+        )
+        return FeedbackListResponse(
+            total=total, limit=limit, offset=offset, items=items
+        )
     finally:
         db.close()
 
@@ -1159,7 +1367,438 @@ def set_diners(session_id: str, request: SetDinersRequest):
     return DinersResponse(cooking_for=profile["cooking_for"], cooking_for_names=names)
 
 
+# --------------------------------------------------------------------------- #
+# Standing planning state — the pantry panel and the facet chips              #
+# --------------------------------------------------------------------------- #
+# Everything the member has said that outlives a turn lives in `PlanningState`
+# and, until now, was reachable only by saying it again. So the pantry was
+# invisible ("did it hear me?"), a facet inferred from a sentence could not be
+# taken back except by arguing with the assistant, and a page reload showed a
+# plan whose constraints had no explanation on screen.
+#
+# Reading and changing that state is deliberately separate from re-planning:
+# a member ticking off three pantry items should not trigger three
+# regenerations, and a tick-off is not always a request for a new plan.
+
+
+class PlanningStateResponse(BaseModel):
+    """What is currently in force for this session."""
+
+    pantry: List[str]
+    facets: Dict[str, List[str]]
+    diet_tags: List[str]
+    claim_tags: List[str]
+    anchors: Dict[str, str]
+    excluded_recipe_ids: List[str]
+    # None means never offered, False means offered and declined. The
+    # distinction is the whole reason the field is tri-state.
+    use_favorites: Optional[bool]
+    # The shape of plan standing for this session, and whether it is the
+    # default — the UI shows the ribbon only when the member changed something.
+    plan_shape: Dict
+    plan_shape_is_default: bool
+    # The same shape as a sentence — "3 days — breakfast; lunch; dinner: main +
+    # side". `plan_shape` is the machine form; reconstructing this description
+    # client-side would mean a second implementation of `PlanSpec.describe()`
+    # that drifts from the one the planner actually builds from.
+    plan_shape_summary: str
+    # A cooking-time ceiling in force, in minutes, whether it came from the
+    # slider or from a sentence. Surfaced so the ribbon can show one constraint
+    # once — the card would otherwise render the slider's own value and say
+    # nothing about a limit the member spoke.
+    max_minutes: Optional[int]
+    # The query a regeneration would run, so the UI can show what it is about
+    # to ask for rather than describing the button.
+    query: str
+
+    @classmethod
+    def from_state(cls, state) -> "PlanningStateResponse":
+        return cls(
+            pantry=list(state.pantry),
+            # Every family, including the empty ones: `state.facets()` omits
+            # empties because a fetch should not send an empty filter, but a
+            # client that has to check whether a key exists is a client that
+            # will forget to.
+            facets={
+                family: list(getattr(state, family))
+                for family in type(state).FACET_FIELDS
+            },
+            diet_tags=list(state.diet_tags),
+            claim_tags=list(state.claim_tags),
+            anchors=dict(state.anchors),
+            excluded_recipe_ids=list(state.excluded_recipe_ids),
+            use_favorites=state.use_favorites,
+            plan_shape=state.spec.to_dict(),
+            plan_shape_is_default=state.spec.is_default,
+            plan_shape_summary=state.spec.describe(),
+            max_minutes=state.max_minutes,
+            query=state.as_query(),
+        )
+
+
+class PantryRequest(BaseModel):
+    """Pantry items, as the member typed them. Normalized server-side."""
+    member_id: str
+    items: List[str] = Field(default_factory=list)
+
+
+class RegenerateRequest(BaseModel):
+    member_id: str
+    # The canvas to re-plan, for the same reason /plan-parameters takes one:
+    # without it the target is whichever canvas is newest at click time.
+    plan_type: Optional[Literal["daily", "weekly"]] = None
+
+
+def _state_response(session_id: str, delta) -> PlanningStateResponse:
+    """Apply a delta to the standing state and return the result.
+
+    One funnel for every mutation below, so no endpoint can write the state
+    without returning it — a client that has to re-fetch to find out what its
+    own write did is a client that will render a stale chip.
+    """
+    state = services.session_service.get_planning_state(session_id)
+    if not delta.is_empty:
+        state = state.merge(delta)
+        services.session_service.set_planning_state(session_id, state)
+    return PlanningStateResponse.from_state(state)
+
+
+@router.get("/sessions/{session_id}/planning-state", response_model=PlanningStateResponse)
+def get_planning_state(
+    session_id: str,
+    member_id: str = Query(..., description="WiseFood member ID — must match session owner"),
+):
+    """Everything standing for this session: pantry, facets, stated diet, claims.
+
+    This is what makes the constraints on a plan survive a reload. The plan's
+    own ledger says what was applied to THAT plan; this says what is still in
+    force for the next one.
+    """
+    _require_session(session_id, member_id)
+    return PlanningStateResponse.from_state(
+        services.session_service.get_planning_state(session_id)
+    )
+
+
+@router.put("/sessions/{session_id}/pantry", response_model=PlanningStateResponse)
+def set_pantry(session_id: str, request: PantryRequest):
+    """Replace the pantry with exactly these items.
+
+    The whole list, not a delta: this is the panel's save, and a member who
+    cleared the last item means the pantry is empty — which an additive-only
+    write could never express.
+    """
+    from models.planning_state import PlanningStateDelta
+    from services import pantry_service
+
+    _require_session(session_id, request.member_id)
+    wanted = pantry_service.normalize_items(request.items)
+    current = services.session_service.get_planning_state(session_id).pantry
+    delta = PlanningStateDelta(
+        pantry_add=tuple(i for i in wanted if i not in current),
+        pantry_remove=tuple(i for i in current if i not in wanted),
+    )
+    logger.info("[%s] Pantry set to %s", session_id, list(wanted))
+    return _state_response(session_id, delta)
+
+
+@router.post("/sessions/{session_id}/pantry", response_model=PlanningStateResponse)
+def add_pantry_items(session_id: str, request: PantryRequest):
+    """Add items, leaving the rest of the pantry alone."""
+    from models.planning_state import PlanningStateDelta
+    from services import pantry_service
+
+    _require_session(session_id, request.member_id)
+    items = pantry_service.normalize_items(request.items)
+    if not items:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No usable pantry items provided",
+        )
+    logger.info("[%s] Pantry += %s", session_id, list(items))
+    return _state_response(session_id, PlanningStateDelta(pantry_add=items))
+
+
+@router.delete("/sessions/{session_id}/pantry/{item}", response_model=PlanningStateResponse)
+def remove_pantry_item(
+    session_id: str,
+    item: str,
+    member_id: str = Query(..., description="WiseFood member ID — must match session owner"),
+):
+    """Take one item out — "used up the zucchini", or heard wrong."""
+    from models.planning_state import PlanningStateDelta
+    from services import pantry_service
+
+    _require_session(session_id, member_id)
+    names = pantry_service.normalize_items([item])
+    logger.info("[%s] Pantry -= %s", session_id, list(names))
+    return _state_response(session_id, PlanningStateDelta(pantry_remove=names))
+
+
+class FacetRequest(BaseModel):
+    """Facet values to add, from the live vocabulary."""
+    member_id: str
+    values: List[str] = Field(default_factory=list, max_length=12)
+
+
+@router.post("/sessions/{session_id}/facets", response_model=PlanningStateResponse)
+def add_facets(session_id: str, request: FacetRequest):
+    """Ask for a taste the assistant did not infer.
+
+    The other half of the removable chip. Without it the member could take back
+    what FoodChat heard and never state something it missed — and `/vocabularies`
+    existed with nothing able to act on what it returned.
+
+    Values are matched against the LIVE vocabulary and anything unlisted is
+    dropped, reported in the log, and left out of the state. Not tidiness:
+    RecipeWrangler ANDs facet values and never relaxes an unlisted one, so
+    accepting an invented mood would not narrow the next plan — it would empty
+    it, and the member would be told no meals exist because of a word this
+    endpoint agreed to.
+    """
+    from models.planning_state import PlanningStateDelta
+    from services.candidates_client import CANDIDATES
+
+    _require_session(session_id, request.member_id)
+
+    try:
+        vocab = CANDIDATES.vocabularies() or {}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Vocabulary unavailable, refusing facet add: %s", exc)
+        vocab = {}
+    if not vocab:
+        # With no live list there is no value that is safe to accept. 503
+        # rather than a silent no-op: the member asked for something and is
+        # entitled to know it did not land.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="The recipe vocabulary is unavailable, so this can't be applied yet",
+        )
+
+    families = ("cuisines", "moods", "flavor_profiles", "food_groups")
+    allowed = {
+        family: {str(v).strip().lower() for v in (vocab.get(family) or ())}
+        for family in families
+    }
+    accepted: dict[str, list[str]] = {family: [] for family in families}
+    rejected: list[str] = []
+    for raw in request.values:
+        slug = str(raw).strip().lower().replace("-", "_").replace(" ", "_")
+        if not slug:
+            continue
+        # By value, not by family — symmetric with removal, and the member
+        # does not know which family a word belongs to either.
+        family = next((f for f in families if slug in allowed[f]), None)
+        if family is None:
+            rejected.append(slug)
+        elif slug not in accepted[family]:
+            accepted[family].append(slug)
+
+    if rejected:
+        logger.info("[%s] Dropped facets not in the vocabulary: %s", session_id, rejected)
+    if not any(accepted.values()):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="None of those are things the recipe collection is tagged with",
+        )
+
+    logger.info("[%s] Facets added: %s", session_id, accepted)
+    return _state_response(session_id, PlanningStateDelta(
+        **{family: tuple(values) for family, values in accepted.items()}
+    ))
+
+
+@router.delete("/sessions/{session_id}/facets/{value}", response_model=PlanningStateResponse)
+def remove_facet(
+    session_id: str,
+    value: str,
+    member_id: str = Query(..., description="WiseFood member ID — must match session owner"),
+):
+    """Take back one inferred facet — the removable chip on the plan header.
+
+    Matched across all four families rather than addressed by family: a member
+    removing "light" does not know or care whether it was read as a mood or a
+    flavour, and requiring the client to know would make the chip's own
+    rendering the source of truth for what it deletes.
+    """
+    from models.planning_state import PlanningStateDelta
+
+    _require_session(session_id, member_id)
+    slug = str(value or "").strip().lower()
+    if not slug:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="No facet value given"
+        )
+    logger.info("[%s] Facet removed: %s", session_id, slug)
+    return _state_response(session_id, PlanningStateDelta(facets_remove=(slug,)))
+
+
+@router.post("/sessions/{session_id}/replan", response_model=ChatTurnResponse)
+def replan(session_id: str, request: RegenerateRequest):
+    """Re-plan from the standing state — no new message, no classification.
+
+    What a facet chip removal or a pantry edit calls once the member is done
+    changing things. Spends model calls, so it is a separate request from the
+    state writes above rather than a side effect of them.
+    """
+    # Identity BEFORE service availability: an unauthenticated caller should
+    # not learn whether the orchestrator is up, and authorization that runs
+    # second is authorization that a 503 can skip.
+    _require_member(request.member_id)
+    orch_svc = _require_orchestrator_service()
+    logger.info(
+        "[%s] /replan (%s) from member %s",
+        session_id, request.plan_type or "active", request.member_id,
+    )
+    try:
+        turn = orch_svc.regenerate(
+            session_id, request.member_id, plan_type=request.plan_type,
+        )
+    except SessionAccessError as e:
+        logger.warning("[%s] /replan 404: %s", session_id, e)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        logger.error("[%s] /replan 500: %s", session_id, e, exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+    return _finalize_turn(session_id, turn)
+
+
+@router.get("/vocabularies")
+def get_vocabularies():
+    """The live facet vocabulary RecipeWrangler actually annotates.
+
+    Exposed so the UI can offer real values instead of a hardcoded list that
+    drifts. It matters more than a convenience: RecipeWrangler ANDs facet
+    values and never relaxes an unlisted one to nothing, so an invented mood
+    does not soften a search — it empties it, and the member is told no meals
+    exist. Empty when the vocabulary is unreachable, which is the signal to
+    offer nothing rather than to guess.
+    """
+    from services.candidates_client import CANDIDATES
+
+    try:
+        vocab = CANDIDATES.vocabularies() or {}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Vocabulary fetch failed: %s", exc)
+        vocab = {}
+    return {"vocabularies": {k: list(v) for k, v in vocab.items()}}
+
+
+# --------------------------------------------------------------------------- #
+# Tool surface                                                                 #
+# --------------------------------------------------------------------------- #
+# The same protocol FoodChat already consumes from RecipeWrangler: a manifest
+# to discover what exists, and one POST to invoke by name. A model can be
+# handed the manifest directly; the UI can call a tool without a chat turn.
+
+
+class ToolInvokeRequest(BaseModel):
+    """Invoke one tool. `member_id` proves ownership of the session it names."""
+    member_id: str
+    arguments: Dict = Field(default_factory=dict)
+
+
+@router.get("/tools")
+def list_tools():
+    """Every tool the agent can call, with its schema.
+
+    Discovery, not documentation: the manifest is generated from the registry,
+    so a tool that exists is listed and a tool that is listed exists.
+    """
+    import tools
+
+    return {"tools": tools.manifest()}
+
+
+@router.post("/tools/{tool_name}")
+def invoke_tool(tool_name: str, request: ToolInvokeRequest):
+    """Run one tool.
+
+    Ownership is enforced HERE rather than inside the tool: a tool trusts that
+    its caller proved the member owns the session, which is the same contract
+    every service in this codebase follows. A tool naming a session it was not
+    given access to gets the same 404 as a missing one — a mismatched member
+    must not learn the session exists.
+    """
+    import tools
+
+    arguments = dict(request.arguments or {})
+    session_id = arguments.get("session_id")
+    if session_id:
+        _require_session(str(session_id), request.member_id)
+
+    try:
+        result = tools.invoke(tool_name, arguments)
+    except tools.ToolError as exc:
+        # Something the caller can fix — a bad day number, no plan yet — so it
+        # is a 400 carrying member-facing prose, never a 500.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from None
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Tool %s failed: %s", tool_name, exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Tool {tool_name} failed",
+        ) from None
+
+    return {"tool": tool_name, "result": result}
+
+
 @router.get("/health")
 def health_check():
-    """Health check endpoint."""
+    """Liveness: is this process running and able to answer.
+
+    Deliberately shallow and deliberately dependency-free. A liveness probe
+    that fails when Groq or RecipeWrangler is down restarts a pod that is
+    working perfectly — and restarting it does not bring the dependency back.
+    Use `/ready` to decide whether to send traffic.
+    """
     return {"status": "ok", "service": "foodchat"}
+
+
+@router.get("/ready")
+def readiness_check(response: Response):
+    """Readiness: can this process actually serve a request.
+
+    Two classes of dependency, and only one of them can say no.
+
+    REQUIRED is the database and the orchestrator. Without either, every
+    session-scoped route 500s, so the pod should not be in the load balancer —
+    503, and Kubernetes takes it out until it recovers.
+
+    OPTIONAL is everything the app degrades around: RecipeWrangler, the data
+    catalog, Groq. FoodChat is built to answer without them — an unreachable
+    catalog costs regional guidelines, an unreachable RecipeWrangler costs a
+    plan and produces an apology. Reporting them keeps the check useful for a
+    human reading it, and NOT failing on them keeps a recipe-service blip from
+    taking the whole chat offline.
+    """
+    checks: Dict[str, str] = {}
+
+    try:
+        db = SessionLocal()
+        try:
+            db.execute(sa_text("SELECT 1"))
+            checks["database"] = "ok"
+        finally:
+            db.close()
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Readiness: database unreachable: %s", exc)
+        checks["database"] = "unavailable"
+
+    checks["orchestrator"] = (
+        "ok" if services.orchestrator_service is not None else "unavailable"
+    )
+    # Reported, never fatal. `available()` is a config check, not a call.
+    from backend.catalog import CATALOG
+
+    checks["catalog"] = "configured" if CATALOG.available() else "not configured"
+    checks["member_assertions"] = "enforced" if auth.enforcing() else "not configured"
+
+    required = ("database", "orchestrator")
+    ready = all(checks[name] == "ok" for name in required)
+    if not ready:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    return {"ready": ready, "checks": checks}

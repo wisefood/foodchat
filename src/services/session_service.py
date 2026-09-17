@@ -19,14 +19,6 @@ import uuid
 from datetime import datetime as dt, timezone as _tz
 from typing import Dict, List, Optional
 
-
-def _aware(value):
-    """Coerce pre-M5 naive timestamps (assumed UTC) to aware — mixing naive
-    and aware datetimes in sort keys raises TypeError."""
-    if value is not None and value.tzinfo is None:
-        return value.replace(tzinfo=_tz.utc)
-    return value
-
 from db import (
     db_update_session_title,
     db_set_plan_saved,
@@ -45,6 +37,7 @@ from db import (
     db_save_meal_plan,
     db_get_session_meal_plans,
     db_get_meal_plan,
+    db_set_last_assistant_extras,
     db_update_meal_plan_payload,
 )
 from models.recipe import CandidateRecipe
@@ -60,7 +53,89 @@ from models.session import (
     MAX_MESSAGES_PER_SESSION,
 )
 
+
+def _aware(value):
+    """Coerce pre-M5 naive timestamps (assumed UTC) to aware — mixing naive
+    and aware datetimes in sort keys raises TypeError."""
+    if value is not None and value.tzinfo is None:
+        return value.replace(tzinfo=_tz.utc)
+    return value
+
+
 logger = logging.getLogger(__name__)
+
+
+def _report_plan_generated(
+    session_id: str,
+    plan_id: str,
+    plan_type: str,
+    version: int,
+    parent_id: Optional[str],
+    item_count: Optional[int] = None,
+) -> None:
+    """Report that a plan came out of a turn. Never raises, never blocks.
+
+    The console counts generated plans against saved ones — how many of the
+    plans FoodChat produces a member actually keeps is the one number that says
+    whether planning is working — and that tile read zero because nothing ever
+    emitted the event. Reported here rather than at the pipeline, because six
+    entry points (daily, weekly, structured, and a refinement of each) converge
+    on these methods and reporting from the pipeline missed the other five.
+
+    Ids, counts and a version number only. The plan's reasoning, its titles and
+    the constraints behind it are the member's own dietary situation and stay
+    out of analytics.
+    """
+    try:
+        import activity
+
+        activity.report_event(
+            "chat.plan_generated",
+            props={
+                "session_id": session_id,
+                "plan_id": plan_id,
+                "plan_type": plan_type,
+                "version": version,
+                # A refinement, not a first plan. Derived rather than reported
+                # as a version test, because a structured plan can arrive
+                # already versioned.
+                "refinement": bool(parent_id),
+                "item_count": item_count,
+            },
+        )
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("Plan reporting failed", exc_info=True)
+
+
+def _report_plan_saved(session_id: str, plan_id: str) -> None:
+    """Report that a member kept a plan. Never raises, never blocks.
+
+    "Saved" is the member's explicit act of keeping a plan past its
+    conversation, not the row write that every generated plan already gets —
+    reporting the latter would make the saved count identical to the generated
+    one and tell nobody anything.
+    """
+    try:
+        import activity
+
+        activity.report_event(
+            "chat.plan_saved",
+            props={"session_id": session_id, "plan_id": plan_id},
+        )
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("Plan reporting failed", exc_info=True)
+
+
+def _daily_plan_size(meal_plan) -> Optional[int]:
+    """How many plates a daily plan holds, across every day it covers."""
+    try:
+        return sum(
+            len(getattr(meal, "plates", None) or [])
+            for day in meal_plan.day_plans
+            for meal in getattr(day, "meals", None) or []
+        )
+    except Exception:  # pragma: no cover - defensive
+        return None
 
 
 class SessionService:
@@ -206,9 +281,16 @@ class SessionService:
             return False
         db = SessionLocal()
         try:
-            return db_set_plan_saved(db, session_id, plan_id, saved, title)
+            updated = db_set_plan_saved(db, session_id, plan_id, saved, title)
         finally:
             db.close()
+        if updated and saved:
+            # Only the keeping, not the unkeeping: the console tile compares
+            # plans generated with plans kept, and counting an unsave as a save
+            # would make a member who changed their mind look twice as
+            # satisfied. The title the member typed is never reported.
+            _report_plan_saved(session_id, plan_id)
+        return updated
 
     def get_member_saved_plans(self, member_id: str) -> list[dict]:
         """Saved plans across the member's sessions, newest saved first.
@@ -323,6 +405,35 @@ class SessionService:
 
         return message
 
+    def attach_turn_extras(self, session_id: str, extras: Optional[dict]) -> bool:
+        """Persist what a turn produced besides its text, on its own message.
+
+        Best-effort by design: the turn has already happened and its plan is
+        already stored, so failing to record the nudge that went with it must
+        not turn a successful turn into an error. It costs the nudge on reload,
+        which is what happened on every turn before this existed.
+        """
+        if not extras:
+            return False
+        db = SessionLocal()
+        try:
+            ok = db_set_last_assistant_extras(db, session_id, json.dumps(extras))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[%s] Could not persist turn extras: %s", session_id, exc)
+            return False
+        finally:
+            db.close()
+
+        # Mirror onto the in-memory message so a caller reading the session
+        # without a round trip sees the same thing the database now holds.
+        session = self._sessions.get(session_id)
+        if session:
+            for message in reversed(session.conversation):
+                if message.role == "assistant":
+                    message.extras = extras
+                    break
+        return ok
+
     def get_messages_page(
         self,
         session_id: str,
@@ -343,6 +454,7 @@ class SessionService:
                 "intent": r.intent,
                 "plan_id": r.plan_id,
                 "attribution": json.loads(r.attribution) if getattr(r, "attribution", None) else None,
+                "extras": json.loads(r.extras) if getattr(r, "extras", None) else None,
                 "plan_score": json.loads(r.plan_score) if getattr(r, "plan_score", None) else None,
                 "timestamp": r.timestamp,
             }
@@ -386,6 +498,10 @@ class SessionService:
         )
         self._persist_canvases(session_id, session)
 
+        _report_plan_generated(
+            session_id, meal_plan.id, "daily", 1, None,
+            _daily_plan_size(meal_plan),
+        )
         return meal_plan
 
     def add_prepared_meal_plan(self, session_id: str, meal_plan: MealPlan) -> MealPlan:
@@ -418,6 +534,63 @@ class SessionService:
             root_id=meal_plan.id,
         )
         self._persist_canvases(session_id, session)
+        _report_plan_generated(
+            session_id, meal_plan.id, "daily",
+            meal_plan.version, meal_plan.parent_id,
+            _daily_plan_size(meal_plan),
+        )
+        return meal_plan
+
+    def refine_prepared_meal_plan(
+        self, session_id: str, meal_plan: MealPlan
+    ) -> MealPlan:
+        """Store an already-assembled plan as the NEXT version of the canvas.
+
+        `refine_meal_plan` rebuilds from three courses, which flattens `days`
+        back into single-plate slots — the exact shape the structured path
+        exists to escape. So a refinement on that path had no lossless option
+        and used `add_prepared_meal_plan` instead, which starts a fresh canvas:
+        every "make it lighter" on a multi-day plan silently became version 1
+        of a new lineage, and the history the member could scroll back through
+        was gone.
+        """
+        session = self.get_session(session_id)
+        if not session:
+            raise ValueError(f"Session {session_id} not found")
+
+        canvas = session.daily_canvas
+        current = session.get_current_daily_plan()
+        if canvas is None or current is None:
+            # Nothing to refine from — this is a first plan by any other name.
+            return self.add_prepared_meal_plan(session_id, meal_plan)
+
+        meal_plan.version = current.version + 1
+        meal_plan.parent_id = current.id
+        session.meal_plans.append(meal_plan)
+
+        db = SessionLocal()
+        try:
+            db_save_meal_plan(
+                db, meal_plan.id, session_id, "daily",
+                _serialize_meal_plan(meal_plan),
+                version=meal_plan.version, parent_id=meal_plan.parent_id,
+            )
+        finally:
+            db.close()
+
+        # Same canvas, new head: the root is preserved so version history
+        # stays walkable.
+        session.daily_canvas = PlanCanvas(
+            plan_type="daily",
+            current_id=meal_plan.id,
+            root_id=canvas.root_id,
+        )
+        self._persist_canvases(session_id, session)
+        _report_plan_generated(
+            session_id, meal_plan.id, "daily",
+            meal_plan.version, meal_plan.parent_id,
+            _daily_plan_size(meal_plan),
+        )
         return meal_plan
 
     def refine_meal_plan(
@@ -464,6 +637,10 @@ class SessionService:
         )
         self._persist_canvases(session_id, session)
 
+        _report_plan_generated(
+            session_id, meal_plan.id, "daily", next_version, parent_id,
+            _daily_plan_size(meal_plan),
+        )
         return meal_plan
 
     def add_weekly_meal_plan(
@@ -508,6 +685,9 @@ class SessionService:
         )
         self._persist_canvases(session_id, session)
 
+        _report_plan_generated(
+            session_id, weekly_plan.id, "weekly", 1, None, len(plan_entries or []),
+        )
         return weekly_plan
 
     def refine_weekly_meal_plan(
@@ -562,6 +742,10 @@ class SessionService:
         )
         self._persist_canvases(session_id, session)
 
+        _report_plan_generated(
+            session_id, weekly_plan.id, "weekly", next_version, parent_id,
+            len(plan_entries or []),
+        )
         return weekly_plan
 
     # ------------------------------------------------------------------ #

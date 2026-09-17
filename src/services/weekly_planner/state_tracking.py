@@ -29,13 +29,22 @@ class WeeklyNutritionalTracker:
     Relies on existing user profile schemas and MealCourse models.
     """
 
-    def __init__(self, user_profile: Dict[str, Any]):
+    def __init__(
+        self,
+        user_profile: Dict[str, Any],
+        stated_diet: Optional[List[str]] = None,
+        num_days: int = 7,
+    ):
         """
         Initialize the tracker with user preferences and constraints.
 
         Args:
             user_profile: Dict containing 'diet', 'allergies', 'preferences', etc.
                          Expected to follow the structure from ProfileService._map_profile.
+            stated_diet: Diet stated in chat, which outranks the stored profile.
+            num_days: How many days this plan covers. Defaults to 7 — the only
+                horizon that existed when this was written — so every existing
+                caller is unchanged.
         """
         self.user_profile = user_profile
         self.weekly_calories = 0.0
@@ -44,12 +53,24 @@ class WeeklyNutritionalTracker:
         self.weekly_fat = 0.0
         self.meat_meals_count = 0
 
+        # A diet the member stated in chat counts as much as a stored one. It
+        # used to be invisible here, so someone who said "vegetarian" this
+        # session still got a meat budget of 3 and had every fish meal counted
+        # against it — the tracker was reading a profile that disagreed with
+        # the plan being built from it.
         diet = user_profile.get("diet") or []
         if isinstance(diet, str):
             diet = [diet]
         diet_set = {str(d).lower() for d in diet}
+        diet_set |= {str(d).lower() for d in (stated_diet or [])}
         # Pescatarians would have every fish meal counted as "meat" otherwise.
         self.counts_fish_as_meat = not (diet_set & {"pescatarian", "pescatarian_safe"})
+
+        # How many days this plan covers. Every target below is a DAILY figure
+        # multiplied by it — a 3-day plan given a 7-day budget would never
+        # think it was near the limit, so the tracker's calorie and meat
+        # steering would do nothing at all for the whole plan.
+        self.num_days = max(1, int(num_days or 7))
 
         self.targets = self._extract_targets(
             user_profile.get("preferences", []) or [], diet_set
@@ -57,12 +78,22 @@ class WeeklyNutritionalTracker:
 
     def _extract_targets(self, preferences: List[str], diet: set) -> Dict[str, float]:
         """Extract numeric targets from preference strings + diet."""
+        days = self.num_days
         targets = {
-            "calories": 2000.0 * 7,  # Default weekly
+            "calories": 2000.0 * days,
             "protein": 0.0,
             "carbs": 0.0,
             "fat": 0.0,
-            "meat_limit": 0 if diet & {"vegetarian", "vegan"} else DEFAULT_WEEKLY_MEAT_LIMIT,
+            # The meat limit is a WEEKLY figure, so it scales with the horizon
+            # rather than being handed whole to a shorter plan: three meat
+            # meals across three days is every dinner, which is not the limit
+            # anyone meant. Never below 1 for a diet that allows any at all —
+            # rounding a short plan down to zero would silently turn it
+            # vegetarian.
+            "meat_limit": (
+                0 if diet & {"vegetarian", "vegan"}
+                else max(1, round(DEFAULT_WEEKLY_MEAT_LIMIT * days / 7))
+            ),
         }
 
         for pref in preferences:
@@ -70,22 +101,22 @@ class WeeklyNutritionalTracker:
             if "calories target" in pref_lower:
                 try:
                     val = float(pref_lower.split()[0])
-                    targets["calories"] = val * 7
+                    targets["calories"] = val * days
                 except ValueError:
                     pass
             elif "high protein" in pref_lower:
                 # e.g., "high protein (150g)"
                 match = re.search(r"\((\d+)g\)", pref_lower)
                 if match:
-                    targets["protein"] = float(match.group(1)) * 7
+                    targets["protein"] = float(match.group(1)) * days
             elif "g carbs" in pref_lower:
                 try:
-                    targets["carbs"] = float(pref_lower.split("g")[0].strip()) * 7
+                    targets["carbs"] = float(pref_lower.split("g")[0].strip()) * days
                 except ValueError:
                     pass
             elif "g fat" in pref_lower:
                 try:
-                    targets["fat"] = float(pref_lower.split("g")[0].strip()) * 7
+                    targets["fat"] = float(pref_lower.split("g")[0].strip()) * days
                 except ValueError:
                     pass
             elif "meat" in pref_lower:

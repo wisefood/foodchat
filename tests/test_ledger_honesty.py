@@ -77,21 +77,35 @@ class TestADietRowSaysWhatHappenedToIt:
 
         assert row["type"] == "hard" and row["status"] == "satisfied"
 
-    def test_a_diet_it_has_never_heard_of_is_relaxed(self):
-        row = self._row("flexitarian")
+    def test_a_diet_nothing_can_filter_on_is_never_satisfied(self):
+        """`halal` is a real restriction with no RecipeWrangler tag behind it.
 
-        assert row["type"] == "hard" and row["status"] == "relaxed"
-        assert "no dishes were excluded for it" in row["detail"]
+        Was written against `flexitarian`, which is now CLASSIFIED rather than
+        unknown — it excludes nothing, so reporting it as a request we failed
+        to honour would apologise for doing nothing wrong. The status is
+        `unsupported` rather than `relaxed`: nothing was loosened, there was
+        never anything to loosen, and the UI has a chip that says exactly that.
+        """
+        row = self._row("halal")
+
+        assert row["type"] == "hard" and row["status"] == "unsupported"
+        assert "no filter for this" in row["detail"]
 
     def test_and_that_reaches_the_reply(self):
-        """`relaxed` puts it in constraints_not_honored, so the writer has to
-        say so instead of listing it as an honoured request."""
+        """It lands in constraints_not_honored, so the writer has to say so
+        instead of listing it as an honoured request.
+
+        The one exception is a value something ELSE covers: `peanut_free` has
+        no filter either, but every plate is screened for peanuts by
+        ingredient name, and reporting that as a failure would alarm a member
+        who is in fact protected."""
         honored, not_honored = split_ledger(
-            constraints_ledger({"diet": ["flexitarian"], "preferences": []})
+            constraints_ledger({"diet": ["halal", "peanut_free"],
+                                "preferences": []})
         )
 
-        assert not_honored == ["flexitarian"]
-        assert "flexitarian" not in honored
+        assert not_honored == ["halal"]
+        assert "halal" not in honored and "peanut_free" not in honored
 
     def test_a_non_restrictive_label_is_reported_as_the_label_it_is(self):
         """"mediterranean" is deliberately not forwarded — as a hard filter it
@@ -140,7 +154,11 @@ class TestDietTagStatus:
         assert diet_tag_status("vegetarian") == (DIET_FILTER, "vegetarian")
         assert diet_tag_status("gluten-free") == (DIET_FILTER, "gluten_free")
         assert diet_tag_status("mediterranean") == (DIET_NOT_RESTRICTIVE, None)
-        assert diet_tag_status("flexitarian") == (DIET_UNKNOWN, None)
+        # `flexitarian` moved into NON_RESTRICTIVE: it excludes nothing, so
+        # "unknown" would report a failure where none happened. `halal` is the
+        # real third case — a restriction with nothing behind it.
+        assert diet_tag_status("flexitarian") == (DIET_NOT_RESTRICTIVE, None)
+        assert diet_tag_status("halal") == (DIET_UNKNOWN, None)
 
     def test_it_is_case_and_space_tolerant(self):
         from services.candidates_client import DIET_FILTER, diet_tag_status

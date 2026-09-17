@@ -51,17 +51,20 @@ quantities, so the wording is "again", never "the rest of it", and the ledger
 row says outright that the plan does not track portions.
 """
 
+import logging
+import re
 from collections import Counter
 from typing import Any, Dict, List, Optional
 
 from services.adapted_recipes import ADAPTED_REASON
-from services.plan_scoring import ingredient_names as _ingredient_names
 from services.transparency import constraints_ledger, match_reasons, personalization_summary
 
 from .day_summary import classify_meal, is_meat_meal
 from .planner import nameable_phrases
 from .reward_logic import candidate_kcal
 from .state_tracking import WeeklyNutritionalTracker
+
+logger = logging.getLogger(__name__)
 
 DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
@@ -100,6 +103,22 @@ def _day_name(day: Any) -> str:
 
 def _slot_name(event: dict) -> str:
     return f"{_day_name(event.get('day'))} {event.get('meal_type', '')}".strip()
+
+
+def _ingredient_names(ingredients_text: str) -> List[str]:
+    """Normalize an ingredients blob into comparable item names (same
+    normalization as the daily FVS metric in ``chat_service``)."""
+    if not isinstance(ingredients_text, str):
+        return []
+    cleaned = []
+    for part in re.split(r"[\n,;•\-]+", ingredients_text):
+        t = part.strip().lower()
+        t = re.sub(r"\([^\)]*\)", "", t)
+        t = re.sub(r"[^a-zA-Z\s]", " ", t)
+        t = re.sub(r"\s+", " ", t).strip()
+        if t:
+            cleaned.append(t)
+    return cleaned
 
 
 # --------------------------------------------------------------------- #
@@ -539,9 +558,40 @@ def _category_line(categories: Dict[str, int]) -> str:
     return ", ".join(f"{n} {cat}" for cat, n in ordered) or "no meals"
 
 
-def guideline_checklist(category_counts: Dict[str, int], total_meals: int) -> List[dict]:
-    """Weekly frequency rules from food-based dietary guidelines (the kind a
-    single day can't be graded against), checked from category counts."""
+def guideline_checklist(
+    category_counts: Dict[str, int],
+    total_meals: int,
+    profile: Optional[dict] = None,
+) -> List[dict]:
+    """Weekly frequency rules, checked from category counts.
+
+    Prefers the member's OWN guidance — their region, their life stage — from
+    the data catalog. The three rules below are the fallback, and they were the
+    only thing here: real guidance, and the same three for a member in Ireland,
+    Slovenia, Hungary or Greece, and the same three for a pregnant member, a
+    teenager and a 70-year-old.
+
+    Falls back rather than fails. A catalog that is unreachable, unconfigured,
+    or simply has no countable rule for this member costs the plan its regional
+    detail and nothing else.
+    """
+    if profile:
+        try:
+            from services import guidelines_service
+
+            rules = guidelines_service.fetch(profile)
+            checkable, _prose = guidelines_service.split(rules)
+            rows = guidelines_service.checklist(
+                checkable, category_counts, total_meals,
+            )
+            if rows:
+                logger.info(
+                    "Guideline checklist: %d rule(s) from the catalog", len(rows),
+                )
+                return rows
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Catalog guidelines unavailable, using defaults: %s", exc)
+
     fish = int(category_counts.get("fish", 0))
     red_meat = int(category_counts.get("red meat", 0))
     plant = int(category_counts.get("vegetarian", 0)) + int(category_counts.get("vegan", 0))
@@ -1015,7 +1065,9 @@ def build_weekly_explainability(
     attach_repeat_reasons(plan_entries, repeats)
 
     variety = variety_metrics(plan_entries, repeats)
-    checklist = guideline_checklist(variety["category_distribution"], variety["total_meals"])
+    checklist = guideline_checklist(
+        variety["category_distribution"], variety["total_meals"], profile,
+    )
     nutrition = nutrition_metrics(plan_entries, targets)
     days = day_breakdown(plan_entries, day_summaries or {})
 

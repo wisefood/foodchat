@@ -115,7 +115,7 @@ class TestCardAndText:
     def test_history_line_names_every_value(self):
         line = plan_parameters.history_line({"cooking_time": 20, "difficulty": "easy"})
         assert "Cooking time: 20 min" in line
-        assert "Difficulty: Easy" in line
+        assert "Effort: Simple" in line
 
 
 # --------------------------------------------------------------------- #

@@ -173,7 +173,8 @@ class TestPipelinePinning:
                 return {"breakfast": slot("b"), "lunch": slot("l"), "dinner": slot("d")}
 
         class PassGrader:
-            def grade_daily_plans(self, query, candidates, profile, feedback_history=""):
+            def grade_daily_plans(self, query, candidates, profile, feedback_history="",
+                          prefer_items=()):
                 from models.recipe import ScoredPlan
                 return [ScoredPlan(
                     breakfast=candidates["breakfast"][0], lunch=candidates["lunch"][0],

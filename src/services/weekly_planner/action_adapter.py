@@ -56,7 +56,8 @@ neutral, never blocking the plan.
 import logging
 from typing import Any, Dict, List, Optional, Union
 
-from services.candidates_client import CANDIDATES, normalize_diet_tags
+from services import intent_facets
+from services.candidates_client import CANDIDATES, MEAL_SLOTS, normalize_diet_tags
 
 # The failure path below logs; without this the except clause itself raised
 # NameError, turning a degradable fetch failure into a crashed plan.
@@ -176,9 +177,30 @@ class RecipeActionSpace:
         user_profile: Dict[str, Any],
         additional_diet: List[str] = None,
         pantry: tuple = (),
+        spec: Optional[object] = None,
+        avoid_recent: Optional[List[str]] = None,
     ):
         self.user_profile = user_profile
         self.allergens = user_profile.get("allergies", [])
+        # The plan's shape, and the reason this class can now produce a meal
+        # rather than a dish.
+        #
+        # A weekly dinner served as a main and a salad had no producer: this
+        # fetched ONE pool per meal slot and handed back single recipes, so the
+        # concept of a plate did not exist here at all. The renderer has been
+        # plate-aware for a while and had nothing to render.
+        #
+        # None, or a spec whose meals are all single-plate, keeps the old
+        # single-dish path exactly — including the request it sends — so a
+        # normal week is unaffected by any of this.
+        self.spec = spec
+        self.multi_plate = bool(
+            spec is not None
+            and any(
+                len(spec.roles_for(slot)) > 1
+                for slot in (getattr(spec, "meals", ()) or ())
+            )
+        )
 
         profile_diet = user_profile.get("diet", [])
         if isinstance(profile_diet, str):
@@ -193,6 +215,9 @@ class RecipeActionSpace:
 
         # Per-day candidate pool cache, keyed by day index.
         self._day_cache: Dict[int, Dict[str, list]] = {}
+        # Per-day ROLE-scoped pools, keyed by day — `{(slot, role): [...]}`.
+        # Only populated on the multi-plate path.
+        self._role_cache: Dict[int, Dict[tuple, list]] = {}
         # Recipes that may never appear (again): member-pinned anchors and
         # downvoted dishes, registered by the service through `mark_selected`.
         # Distinct from `_commitments` below — this list has no way back.
@@ -212,6 +237,14 @@ class RecipeActionSpace:
         self._favorites = {
             str(f) for f in (user_profile.get("favorite_recipe_ids") or [])
         }
+        # What the member was served on their LAST few plans. A soft ask: it
+        # rides the same exclusion list, and is dropped for the whole plan if
+        # the first day cannot be filled with it. Without it, a second "plan my
+        # week" returned the same week — RecipeWrangler's order is
+        # deterministic and this loop has no model to vary the pick.
+        self._avoid_recent: List[str] = [
+            r for r in (avoid_recent or []) if r
+        ]
         # recipe_id -> RecipeEnrichment for every fetched pool (M6).
         self._enrichment: Dict[str, Any] = {}
         # Ingredients the week has already bought, offered by the planner
@@ -251,8 +284,18 @@ class RecipeActionSpace:
     def get_candidate_actions(
         self, meal_type: Union[str, int], current_state: Dict[str, Any]
     ) -> List[Dict[str, Any]]:
-        """Return candidate action dicts for the given meal slot and state."""
+        """Return candidate action dicts for the given meal slot and state.
+
+        On a multi-plate spec an "action" is a whole MEAL — a list of plates —
+        rather than a dish. The MDP still steps once per meal, which is what
+        keeps this change small: the loop, the tracker, the reward and the
+        preference scorer all see one action per slot exactly as before, and the
+        action simply describes more of the table.
+        """
         current_day = current_state.get("day", 1)
+
+        if self.multi_plate:
+            return self._composed_actions(str(meal_type).lower(), current_day)
 
         if current_day not in self._day_cache:
             # Same preference split as the daily pipeline. The weekly planner
@@ -279,7 +322,27 @@ class RecipeActionSpace:
                 cuisines=cuisines,
                 exclude_recipe_ids=self._fetch_exclusions(current_day),
                 limit_per_slot=DAILY_POOL_LIMIT,
+                slots=tuple(self._slots()),
             )
+            if self._avoid_recent and not all(pool.get(s) for s in self._slots()):
+                # Nothing new left for some slot. Give the history up for the
+                # whole plan rather than per slot: a week is 21 picks, and
+                # dropping it once keeps the pools consistent across days
+                # instead of a different exclusion set on every fetch.
+                logger.info(
+                    "Nothing new left for every slot — planning this week "
+                    "without the recently-served exclusion",
+                )
+                self._avoid_recent = []
+                pool = _fetch_candidate_pool(
+                    profile=self.user_profile,
+                    allergens=self.allergens,
+                    diet=normalize_diet_tags(self.diet),
+                    cuisines=cuisines,
+                    exclude_recipe_ids=self._fetch_exclusions(current_day),
+                    limit_per_slot=DAILY_POOL_LIMIT,
+                    slots=tuple(self._slots()),
+                )
             # Cross-day reuse, sourcing half (M9). Merged BEFORE the member's
             # own pantry below, deliberately: `merge_pantry_pool` sorts
             # coverage-first, so whichever merge runs last decides the top of
@@ -365,7 +428,12 @@ class RecipeActionSpace:
             self._enrichment.update(CANDIDATES.fetch_details(day_ids))
 
         if isinstance(meal_type, int):
-            meal_type = {0: "breakfast", 1: "lunch", 2: "dinner"}.get(meal_type, "lunch")
+            # Indexed into the plan's OWN slots. The literal map here was the
+            # default three, so on a four-meal day index 3 answered "lunch".
+            slots = self._slots()
+            meal_type = (
+                slots[meal_type] if 0 <= meal_type < len(slots) else slots[0]
+            )
 
         meal_type = str(meal_type).lower()
         candidates = self._day_cache[current_day].get(meal_type, [])
@@ -452,6 +520,12 @@ class RecipeActionSpace:
                 event["injected"] = len(injected)
             self.selection_events.append(event)
         return actions
+
+    def _slots(self) -> List[str]:
+        """The meal slots this plan needs a pool for."""
+        return [
+            str(m).lower() for m in (getattr(self.spec, "meals", None) or ())
+        ] or ["breakfast", "lunch", "dinner"]
 
     def mark_selected(self, recipe_id: str) -> None:
         """Bar a recipe from the plan entirely — no slot, no day, no cooldown.
@@ -716,13 +790,171 @@ class RecipeActionSpace:
         The per-slot rule is applied afterwards in `get_candidate_actions`,
         which is why this costs no extra requests.
         """
-        excluded = list(self._selected_ids)
+        # `_avoid_recent` rides here too — what the member was served on their
+        # LAST few plans, which is what stops a second "plan my week" returning
+        # the same week. It is a SOFT ask and the caller drops it wholesale
+        # when a slot cannot be filled with it, so it belongs in the same list
+        # rather than at one of the two call sites.
+        excluded = list(self._selected_ids) + list(self._avoid_recent)
         for recipe_id in self._commitments:
             if recipe_id in excluded:
                 continue
             if self._repeatable_from(recipe_id, day) is None:
                 excluded.append(recipe_id)
         return excluded
+
+    # ------------------------------------------------------------------ #
+    # Multi-plate: a pool per plate, composed into whole meals             #
+    # ------------------------------------------------------------------ #
+
+    def _composed_actions(self, slot: str, day: int) -> List[Dict[str, Any]]:
+        """Whole meals for this slot, best composition first.
+
+        Deliberately LLM-free, and that is a decision rather than an omission.
+        This loop used to make one Groq call per committed slot — 21 per week —
+        to grade a recipe that was already locked in: pure cost with no effect
+        on the output, and it was removed for that reason. Composition here is
+        the arithmetic half only: no duplicate dish, no repeated ingredient
+        across plates, and each plate near its share of the meal. The judgement
+        half — whether a side SUITS a main — runs on the structured path, which
+        is where a fresh multi-plate request is routed, and it runs once for the
+        whole plan rather than once per meal.
+
+        What this path exists for is the case the structured path cannot serve:
+        a multi-plate week that already exists and is being refined. Before
+        this, a refinement flattened it back to single dishes and the member
+        watched the shape they asked for disappear.
+        """
+        from services import meal_composer
+
+        if day not in self._role_cache:
+            pools, notes = meal_composer.role_pools(
+                self.user_profile, self.spec,
+                exclude_recipe_ids=self._fetch_exclusions(day),
+                boost_ids=(
+                    list(self.user_profile.get("favorite_recipe_ids") or [])
+                    if self.user_profile.get("use_favorites") is not False else []
+                ),
+                # One day at a time, because the exclusion list is what stops a
+                # week repeating a dish and it only exists once earlier days are
+                # committed.
+                days=1,
+            )
+            if notes:
+                logger.info("day %s pool relaxations: %s", day, "; ".join(notes))
+            # `role_pools` asks for a single day, so the response has one.
+            self._role_cache[day] = next(iter(pools.values()), {})
+            ids = [
+                c.recipe_id
+                for pool in self._role_cache[day].values() for c in pool
+            ]
+            self._enrichment.update(CANDIDATES.fetch_details(ids))
+
+        roles = tuple(self.spec.roles_for(slot))
+        compositions = meal_composer.compose(
+            slot, roles, self._role_cache[day],
+            kcal_split=self.spec.kcal_split(slot),
+            meal_kcal_target=self._meal_kcal_target(),
+            exclude_ids=set(self._selected_ids),
+            enrichment=self._enrichment,
+            # Every viable composition, not the top three: the MDP's own scorer
+            # (favourites, likes, variety, pantry, calorie budget) has to rank
+            # them, and handing it three would silently overrule preferences
+            # this module knows nothing about.
+            limit=DAILY_POOL_LIMIT,
+        )
+        return [self._as_action(slot, c) for c in compositions]
+
+    def _meal_kcal_target(self) -> Optional[float]:
+        """One meal's share of the day's budget, or None when nobody set one."""
+        from models.plan_brief import PlanBrief
+
+        target = PlanBrief.build(self.user_profile).kcal_target
+        if not target:
+            return None
+        meals = len(getattr(self.spec, "meals", ()) or ()) or 1
+        return float(target) / meals
+
+    def _as_action(self, slot: str, composition) -> Dict[str, Any]:
+        """One composition as the action dict the MDP already understands.
+
+        The top-level `recipe_*` fields are the MAIN plate, so every existing
+        consumer — the preference scorer, the pinning check, the stored entry —
+        reads what it always read. What is added is the rest of the table:
+
+        * `nutrition` totals the WHOLE meal, because that is what the member
+          eats and what the weekly calorie tracker is counting. Scoring a
+          main-plus-side meal on the main alone would let every side through
+          the budget unmeasured.
+        * `meal_ingredients` concatenates every plate, so the meat-limit check
+          sees the bacon in the salad. A meat limit that only looks at mains is
+          a meat limit with a hole in it.
+        """
+        plates = composition.plates
+        main = next((p for p in plates if p.role == "main"), plates[0])
+        totals: Dict[str, float] = {}
+        counted = 0
+        for plate in plates:
+            nutrition = getattr(plate.candidate, "nutrition", None) or {}
+            rich = self._enrichment.get(plate.recipe_id)
+            if not nutrition and rich is not None:
+                nutrition = rich.nutrition_dict() or {}
+            if not nutrition:
+                continue
+            counted += 1
+            for key in ("kcal", "calories", "protein_g", "carbs_g", "fat_g"):
+                value = nutrition.get(key)
+                if isinstance(value, (int, float)):
+                    totals[key] = totals.get(key, 0.0) + float(value)
+
+        tags: List[str] = []
+        for plate in plates:
+            rich = self._enrichment.get(plate.recipe_id)
+            for tag in (getattr(rich, "tags", None) or []):
+                if tag not in tags:
+                    tags.append(tag)
+
+        action: Dict[str, Any] = {
+            "recipe_id": main.recipe_id,
+            "recipe_title": main.title,
+            "recipe_ingredients": str(getattr(main.candidate, "ingredients", "") or ""),
+            "recipe_directions": str(getattr(main.candidate, "directions", "") or ""),
+            "meal_ingredients": " ; ".join(
+                str(getattr(p.candidate, "ingredients", "") or "") for p in plates
+            ),
+            "tags": tags,
+            "composition_score": composition.score,
+            "composition_findings": list(composition.findings),
+            "plates": [
+                {
+                    "role": plate.role,
+                    "recipe_id": plate.recipe_id,
+                    "recipe_title": plate.title,
+                    "recipe_ingredients": str(
+                        getattr(plate.candidate, "ingredients", "") or ""
+                    ),
+                    "recipe_directions": str(
+                        getattr(plate.candidate, "directions", "") or ""
+                    ),
+                    "nutrition": (
+                        getattr(plate.candidate, "nutrition", None)
+                        or (
+                            self._enrichment[plate.recipe_id].nutrition_dict()
+                            if plate.recipe_id in self._enrichment else None
+                        )
+                    ),
+                    "image_url": getattr(plate.candidate, "image_url", None),
+                }
+                for plate in plates
+            ],
+        }
+        if totals:
+            # Said explicitly, like every other total in this codebase: a meal
+            # whose side carries no macros must not report a figure that looks
+            # like the whole meal.
+            totals["complete"] = counted == len(plates)
+            action["nutrition"] = totals
+        return action
 
 
 def _fetch_candidate_pool(
@@ -733,8 +965,16 @@ def _fetch_candidate_pool(
     cuisines: list,
     exclude_recipe_ids: list,
     limit_per_slot: int,
+    slots: tuple = MEAL_SLOTS,
 ) -> dict:
     """A per-slot candidate pool from the planning endpoint.
+
+    `slots` is the plan's own shape, and it used to be absent — so this always
+    fetched breakfast, lunch and dinner. The environment honours a spec's meals
+    (`self.meal_types = slots`), so a week with a snack stepped through a snack
+    slot whose pool had never been asked for: `get_candidate_actions` returned
+    nothing and the planner raised `PlanGenerationError("snack")`. The member
+    asked for a week with a snack and got told the week could not be built.
 
     Shares the daily pipeline's reasoning: `plan_meals` asked for N recipes per
     slot is a candidate source whose pool already respects the member's
@@ -753,10 +993,14 @@ def _fetch_candidate_pool(
     try:
         envelope = PLANNER.plan_meals(
             days=1,
+            # No `course_types` override: RecipeWrangler maps each slot to its
+            # own courses (snack → snacks, dessert → desserts), which is what
+            # keeps a snack slot from filling with main dishes.
+            slots=tuple(slots) or MEAL_SLOTS,
             count_per_slot=limit_per_slot,
             allergens=allergens,
             diet=normalize_diet_tags(diet),
-            cuisines=cuisines,
+            **intent_facets.facet_kwargs(profile, cuisines),
             exclude_ingredients=profile.get("food_dislikes") or [],
             exclude_recipe_ids=exclude_recipe_ids,
             favorite_recipe_ids=profile.get("favorite_recipe_ids") or [],

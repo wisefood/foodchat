@@ -48,16 +48,22 @@ preference stated while answering a question is never silently dropped.
 Returns a unified ChatTurn so the router needs one response model.
 """
 
+import contextvars
+import json
 import logging
 import re
+import threading
+import time
+import uuid as _uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from agents import DishIngredientEstimator, OrchestratorAgent, PlanAnalyst
+from agents import DishIngredientEstimator, OrchestratorAgent, PlanAnalyst, ToolSelector
 from backend.observability import trace_context
 from models.attribution import Attribution
 from models.session import MealPlan, WeeklyMealPlan
-from . import plan_parameters
+from . import plan_parameters, turn_budget, turn_intake
 from .edit_service import EditService
 from .foodscholar_service import FoodScholarService
 from .plan_scorer import CLARIFICATION_KIND as SCORE_CLARIFICATION_KIND
@@ -69,6 +75,14 @@ from .session_service import SessionService
 
 logger = logging.getLogger(__name__)
 
+#: What a turn handler learned, for the guard to attach when it reports. A
+#: ContextVar rather than an attribute: two turns on two sessions run
+#: concurrently in the same process, and an attribute would let one describe
+#: the other.
+_turn_detail: contextvars.ContextVar = contextvars.ContextVar(
+    "foodchat_turn_detail", default=None
+)
+
 # Words that count as accepting the favorites offer. Kept deliberately simple
 # for M2 — anything else is treated as a decline and the original request
 # proceeds unchanged, so a misread costs nothing but the boost.
@@ -78,6 +92,13 @@ _AFFIRMATIVE = re.compile(
 )
 # Favorites shown by title in the offer message (each needs a detail fetch).
 MAX_OFFERED_FAVORITES = 3
+
+
+# A turn is abandoned this long after it started. The turn budget is 70s, so
+# this is that plus room for storage and serialisation: long enough that a slow
+# turn is never treated as dead, short enough that a crash frees the session
+# before the member gives up on it.
+_TURN_GUARD_TTL = 120.0
 
 
 class SessionAccessError(ValueError):
@@ -117,6 +138,19 @@ class ChatTurn:
 
 
 class OrchestratorService:
+
+    # Sessions with a turn currently running, and when it started. Guarded by
+    # its own lock so checking and claiming is one step — two threads checking
+    # an unguarded dict would both find it free.
+    #
+    # Class-level, not per instance, for two reasons. The damage it prevents is
+    # per PROCESS — the in-memory session cache and the canvas write both live
+    # there — so two service instances in one process must still not run two
+    # turns on one session. And an instance built without `__init__` (which the
+    # test suite does routinely) would otherwise have no guard at all, which is
+    # a failure mode that only shows up under load.
+    _turns_in_flight: dict[str, float] = {}
+    _turn_lock = threading.Lock()
 
     def __init__(
         self,
@@ -167,6 +201,68 @@ class OrchestratorService:
             at_message_limit=True,
         )
 
+    @contextmanager
+    def _one_turn_at_a_time(self, session_id: str):
+        """Refuse a second turn on a session while the first is still running.
+
+        Two turns on one session both load it, both plan, and both write the
+        canvas pointer. Last write wins and the loser's plan is orphaned —
+        stored, paid for, and unreachable. A single tab cannot do this (the
+        composer disables while sending), but a second tab, or a slider apply
+        landing on top of a chat turn, can.
+
+        Refused rather than queued. Queueing would hold a worker for the length
+        of the first turn and then run a plan the member asked for a minute
+        ago; saying "still working" is both cheaper and truer.
+
+        The guard is per process, which matches where the damage is: the
+        in-memory session cache and the canvas write both live here. Across
+        replicas the same member would need two tabs on two pods, and the
+        database write is still atomic.
+        """
+        now = time.monotonic()
+        with self._turn_lock:
+            started = self._turns_in_flight.get(session_id)
+            # A stale entry means a turn died without unwinding. Bounded by the
+            # budget plus slack, so a crash cannot lock a session out for good.
+            busy = started is not None and (now - started) < _TURN_GUARD_TTL
+            if not busy:
+                self._turns_in_flight[session_id] = now
+        try:
+            # A boolean rather than an exception: `@contextmanager` runs this
+            # body at `__enter__`, so a `try/except` around the CALL would never
+            # fire and the exception would escape to the router as a 500. The
+            # check and the claim still happen together under the lock, so this
+            # is not check-then-act.
+            yield not busy
+            outcome = "ok" if not busy else "busy"
+        except BaseException:
+            outcome = "error"
+            raise
+        finally:
+            if not busy:
+                with self._turn_lock:
+                    self._turns_in_flight.pop(session_id, None)
+            # Reported here, not at the four entry points, because this is the
+            # one thing all four share — and because it is the only place that
+            # also sees a refused turn, a turn that hit the message cap, and a
+            # turn that raised. An earlier version reported from `process()`
+            # alone, so three of the four entry points and every failed turn
+            # were missing from the record.
+            self._report_turn(session_id, outcome, now)
+
+    @staticmethod
+    def _busy_turn() -> ChatTurn:
+        """What the member sees when they send twice."""
+        return ChatTurn(
+            role="assistant",
+            content=(
+                "I'm still working on your last message — give me a moment and "
+                "then try again."
+            ),
+            intent="chat",
+        )
+
     def _attach_memory_suggestions(self, session, turn: ChatTurn, message: str) -> ChatTurn:
         """Consent nudges (M3): detect durable preferences in the user's turn
         and ATTACH suggestions — durable writes happen only when the user
@@ -181,11 +277,58 @@ class OrchestratorService:
             return turn
         try:
             suggestions = self.memory_service.suggest(session, message)
+            diet_nudge = self._diet_memory_nudge(session, message)
+            if diet_nudge:
+                # Ahead of the extractor's own candidates: a stated diet is the
+                # highest-value thing to remember, and the per-turn cap would
+                # otherwise let two likes crowd it out.
+                suggestions = [diet_nudge] + [
+                    s for s in suggestions if s.get("kind") != "diet"
+                ]
             if suggestions:
                 turn.memory_suggestions = suggestions
         except Exception as e:
             logger.warning("[%s] Memory suggestion failed: %s", session.session_id, e)
         return turn
+
+    def _diet_memory_nudge(self, session, message: str):
+        """A consent nudge for a diet stated in chat but not on the profile.
+
+        Built deterministically from the standing planning state rather than by
+        the preference extractor. Two reasons, and the second is the binding
+        one: it costs no extra LLM call, and it needs no edit to the
+        `preference_extractor` managed prompt — a deploy never overwrites an
+        existing Langfuse copy, so adding a kind there would work locally and
+        ship dead to production.
+
+        The evidence is the member's own sentence, so the memory panel can
+        answer "why am I seeing this?" with something true.
+        """
+        try:
+            from services import diet_intent
+
+            state = self.session_service.get_planning_state(session.session_id)
+            if not state.diet_tags:
+                return None
+            nudge = diet_intent.suggest_diet_memory(
+                state.diet_tags, message, session.user_profile
+            )
+            if not nudge:
+                return None
+            # Respect the same never-ask-twice ledger as every other nudge.
+            optouts = {
+                str(v).strip().lower()
+                for v in (session.user_profile.get("memory_optouts") or [])
+            }
+            if nudge["value"] in optouts:
+                return None
+            nudge["id"] = str(_uuid.uuid4())
+            return nudge
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[%s] Diet nudge failed: %s", session.session_id, exc
+            )
+            return None
 
     def process(self, session_id: str, member_id: str, message: str) -> ChatTurn:
         """Validate ownership, check the message cap, classify, and route.
@@ -194,11 +337,29 @@ class OrchestratorService:
         call (classify, clarify, plan grading, response writing, …) groups
         under one Langfuse Session (session_id) and User (member_id).
         """
-        with trace_context(session_id=session_id, user_id=member_id):
+        # One budget and one in-flight claim per turn, at the only four
+        # places a turn begins. Nested calls keep the outermost deadline, so a
+        # slider apply that routes into the chat handlers does not hand the
+        # inner stage a fresh full allowance.
+        with self._one_turn_at_a_time(session_id) as claimed, \
+                trace_context(session_id=session_id, user_id=member_id), \
+                turn_budget.start():
+            if not claimed:
+                return self._busy_turn()
+            # A new turn hears the message fresh. The intake memo exists to stop
+            # one turn extracting twice, not to carry an answer into the next.
+            turn_intake.forget()
             session = self._owned_session(session_id, member_id)
             limit_turn = self._limit_turn(session)
             if limit_turn is not None:
                 return limit_turn
+
+            # Read BEFORE routing: the handlers append this message, after
+            # which "no user messages yet" is no longer true and the
+            # opening-turn signal is gone.
+            opening_turn = session.title is None and not any(
+                m.role == "user" for m in session.conversation
+            )
 
             # An explicit "rate this: <listing>" is unambiguous — no classifier
             # call, and it supersedes a pending question the member has moved on
@@ -216,7 +377,64 @@ class OrchestratorService:
             else:
                 turn = self._classify_and_route(session, session_id, message)
 
-            return self._attach_memory_suggestions(session, turn, message)
+            result = self._attach_memory_suggestions(session, turn, message)
+            if opening_turn:
+                self._autotitle_session(session_id, member_id, message)
+            # What only this path knows. The turn itself is reported by the
+            # guard above, which also catches the paths that never get here.
+            _turn_detail.set({
+                "intent": getattr(result, "intent", None),
+                "plan_id": getattr(result, "plan_id", None),
+                "opening_turn": bool(opening_turn),
+                "has_attribution": bool(getattr(result, "attribution", None)),
+            })
+            return result
+
+    @staticmethod
+    def _report_turn(session_id: str, outcome: str, started: float) -> None:
+        """Report one turn. Never raises: analytics must not cost an answer."""
+        try:
+            import activity
+
+            detail = _turn_detail.get() or {}
+            activity.report_turn(
+                session_id=session_id,
+                intent=detail.get("intent"),
+                plan_id=detail.get("plan_id"),
+                latency_ms=(time.monotonic() - started) * 1000.0,
+                extra={
+                    "outcome": outcome,
+                    "opening_turn": bool(detail.get("opening_turn")),
+                    "has_attribution": bool(detail.get("has_attribution")),
+                },
+            )
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("Turn reporting failed", exc_info=True)
+        finally:
+            _turn_detail.set(None)
+
+    def _autotitle_session(self, session_id: str, member_id: str, message: str) -> None:
+        """Name a session from its opening message. Best-effort, never fatal.
+
+        Sessions were only ever named by an explicit rename, which almost nobody
+        does — so the picker showed a wall of timestamps, and a saved plan
+        inherited no name at all, because the save path borrows the session
+        title. Same idea as foodscholar's SESSION_TITLE_MODEL, on the fast tier.
+
+        Runs AFTER the turn so a title can never delay or break the answer, and
+        only when the session has no title — a member rename always wins, and
+        this never fires again once one exists.
+        """
+        try:
+            from agents import SessionTitler
+
+            title = SessionTitler().title(message)
+            if not title:
+                return
+            self.session_service.rename_session(session_id, member_id, title)
+            logger.info("[%s] Auto-titled session: %r", session_id, title)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[%s] Auto-title failed: %s", session_id, exc)
 
     # Explicit FoodScholar consults bypass classification entirely: "can you
     # check with food scholar?" is a request to ask the expert, and the
@@ -305,12 +523,36 @@ class OrchestratorService:
     def _classify_and_route(self, session, session_id: str, message: str,
                             score_may_ask: bool = True) -> ChatTurn:
         """One classifier call, then dispatch — the only intent decision per turn."""
+        # Hear the member BEFORE deciding what kind of turn this is.
+        #
+        # The four extractors used to live inside the handlers, so what got
+        # heard depended on where the turn was routed: the daily path ran all
+        # four, weekly ran two, and an edit, a question, a tool call or plain
+        # conversation ran none. "Swap Tuesday's dinner — by the way I'm coeliac
+        # now" recorded the swap and lost the coeliac. Standing here, in front
+        # of the routing, the statement lands whatever the turn turns out to be.
+        #
+        # Memoised per turn, so the handlers below still call intake where they
+        # always extracted and neither pays twice.
+        turn_intake.intake(session_id, message, session_service=self.session_service)
+
         if self._SCHOLAR_CONSULT_RE.search(message):
             logger.info("Explicit FoodScholar consult — routing to the M1 bridge")
             return self._handle_nutrition_question(
                 session_id, message, session=session,
                 question=self._compose_scholar_question(session, message),
             )
+
+        # The agent's own capabilities, offered to the model on the same
+        # pre-classification seam. `manifest()` and `describe_tools()` have been
+        # generated from the registry since the tools were written and neither
+        # reached a prompt, so "summarise my week" and "redo Thursday" had no
+        # path at all — the closest available action was a full refinement,
+        # which regenerates every slot and throws away a swap the member had
+        # already approved.
+        tool_turn = self._maybe_use_tool(session, session_id, message)
+        if tool_turn is not None:
+            return tool_turn
 
         history = [
             {"role": m.role, "content": m.content}
@@ -331,6 +573,233 @@ class OrchestratorService:
         logger.info("[%s] intent=%s target=%s", session_id, intent, target_plan_type)
         return self._route(session, session_id, message, intent, target_plan_type,
                            score_may_ask=score_may_ask)
+
+    # Chooses one of FoodChat's own capabilities, or none. Fast tier: routing
+    # over a handful of named tools, running before the intent classifier on
+    # every eligible turn.
+    #
+    # Lazily built and held on the CLASS, not assigned in `__init__`. An
+    # instance constructed without `__init__` — which this test suite does
+    # routinely — would otherwise have no selector at all, and the first turn
+    # through it would raise `AttributeError` where it used to route fine. Same
+    # reason the in-flight guard is class-level.
+    _tool_selector = None
+
+    @property
+    def tool_selector(self) -> ToolSelector:
+        if OrchestratorService._tool_selector is None:
+            OrchestratorService._tool_selector = ToolSelector()
+        return OrchestratorService._tool_selector
+
+    def _maybe_use_tool(self, session, session_id: str, message: str):
+        """Run one of FoodChat's capabilities, or return None to route normally.
+
+        Gated before the model is asked anything, because the selector runs on
+        every eligible turn and a question nobody needed is still a question
+        that was paid for:
+
+        * **A plan must be on the canvas.** Every tool acts on one, so with no
+          plan there is nothing to summarise, total or replace, and the answer
+          is known without asking.
+        * **The turn must not be mid-clarification.** Handled earlier, but
+          stated here because a tool firing on "yes please" would answer a
+          question the member was not asking.
+
+        Returns None on anything unexpected. A tool surface that can break an
+        ordinary turn is worse than no tool surface.
+        """
+        canvas = session.active_canvas
+        if canvas is None:
+            return None
+        plan_type = canvas.plan_type
+        plan = (
+            session.get_current_weekly_plan() if plan_type == "weekly"
+            else session.get_current_daily_plan()
+        )
+        if plan is None:
+            return None
+
+        try:
+            import tools
+
+            # Only what this canvas can actually serve — which is what this
+            # comment always claimed and the line below did not do: every tool
+            # was offered on every canvas, so a member on a daily plan could
+            # have `replace_day` chosen for them and be told there is no weekly
+            # plan. The registry declares which canvases each tool works on.
+            available = {t.name for t in tools.for_canvas(plan_type)}
+            manifest = tools.describe_tools(plan_type)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Tool registry unavailable: %s", exc)
+            return None
+
+        shape = self._describe_canvas_shape(plan, plan_type)
+        choice = self.tool_selector.choose(
+            message, plan_type=plan_type, plan_shape=shape,
+            manifest=manifest, allowed=available,
+        )
+        # Re-checked here, not just inside the selector. `_maybe_use_tool` is
+        # the thing that spends the tool call, so it verifies its own
+        # precondition rather than trusting a caller's discipline: a choice of
+        # `{"tool": ""}` is a truthy dict, and an unchecked one would reach
+        # `tools.invoke("")` and turn an ordinary message into a 400-flavoured
+        # reply instead of routing it normally.
+        name = str((choice or {}).get("tool") or "").strip()
+        if not name or name not in available:
+            if name:
+                logger.info(
+                    "[%s] Ignoring tool choice %r — not available here",
+                    session_id, name,
+                )
+            return None
+        spec = tools.get(name)
+        # Only the arguments the chosen tool actually declares. The selector
+        # answers one schema for every tool, so it can name a title for a tool
+        # that has no title — and the registry rejects an unknown key as a
+        # member-facing error, which would turn a routable message into a
+        # complaint about a field the member never mentioned.
+        props = (spec.parameters.get("properties") or {}) if spec is not None else {}
+        arguments: dict = {"session_id": session_id}
+        if "day" in props and choice.get("day") is not None:
+            arguments["day"] = int(choice["day"])
+        if "plan_type" in props:
+            # Defaulted to the canvas rather than left out: a tool that takes a
+            # plan type should act on what the member is looking at.
+            arguments["plan_type"] = choice.get("plan_type") or plan_type
+        if "title" in props and str(choice.get("title") or "").strip():
+            arguments["title"] = str(choice["title"]).strip()
+        if "saved" in props and choice.get("saved") is not None:
+            # The registry's enum is a string, so the boolean the selector
+            # answers is converted here rather than widening the tool's schema.
+            arguments["saved"] = "true" if choice["saved"] else "false"
+
+        try:
+            result = tools.invoke(name, arguments)
+        except tools.ToolError as exc:
+            # Member-facing prose from the registry — "this plan covers Monday
+            # to Wednesday". Worth saying verbatim rather than routing on and
+            # answering a different question.
+            logger.info("[%s] Tool %s declined: %s", session_id, name, exc)
+            self.session_service.add_message(session_id, "user", message)
+            self.session_service.add_message(session_id, "assistant", str(exc))
+            return ChatTurn(role="assistant", content=str(exc), intent="chat")
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[%s] Tool %s failed: %s", session_id, name, exc, exc_info=True)
+            return None
+
+        return self._answer_from_tool(
+            session, session_id, message, name, spec, result, choice,
+        )
+
+    @staticmethod
+    def _describe_canvas_shape(plan, plan_type: str) -> str:
+        """The plan's shape, so the selector knows which days exist."""
+        if plan_type == "weekly":
+            days = sorted({int(e.get("day") or 0) for e in (plan.entries or [])})
+            return f"{len(days)} day(s), {len(plan.entries or [])} meals"
+        groups = plan.day_plans
+        slots = ", ".join(m.meal_type for m in groups[0].meals) if groups else ""
+        return f"{len(groups)} day(s): {slots}"
+
+    def _answer_from_tool(self, session, session_id: str, message: str,
+                          name: str, spec, result: dict, choice: dict) -> ChatTurn:
+        """Turn a tool result into a reply, and a plan change into a canvas.
+
+        A read is answered from the tool's own numbers — it summed them, so the
+        model must not re-add them. A mutation reloads the canvas so the member
+        sees the plan the tool produced rather than the one before it.
+        """
+        self.session_service.add_message(session_id, "user", message)
+
+        canned = self._tool_fallback(name, result)
+        if turn_budget.skip("tool reply", turn_budget.COST_WRITER):
+            answer = canned
+        else:
+            # The PlanAnalyst, not the ResponseWriter: this is a question ABOUT
+            # the plan, which is exactly what the analyst is for, and it is the
+            # agent this service already owns. The tool's own output is the
+            # entire grounding — it summed the numbers, so the model is told
+            # not to re-add them.
+            summary = (
+                f"{name} returned:\n{json.dumps(result, default=str)[:2500]}\n\n"
+                "These figures are already computed. Report them; do not "
+                "recalculate or add anything to them."
+            )
+            history = [(m.role, m.content) for m in session.conversation[-6:]]
+            try:
+                answer = self.plan_analyst.answer(message, summary, history)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[%s] Tool reply failed: %s", session_id, exc)
+                answer = canned
+            if not (answer or "").strip():
+                answer = canned
+
+        turn = ChatTurn(role="assistant", content=answer, intent="chat")
+        if spec is not None and spec.mutates:
+            # The tool rewrote part of the plan. Reload the canvas so the
+            # response carries what the member is now looking at — whichever
+            # canvas it was. Only the weekly one was reloaded, so a swap on a
+            # daily plan answered with prose and left the old plan attached.
+            canvas = session.active_canvas
+            if canvas is not None and canvas.plan_type == "daily":
+                refreshed = session.get_current_daily_plan()
+                if refreshed is not None:
+                    turn.meal_plan = refreshed
+                    turn.plan_version = refreshed.version
+                    turn.plan_parent_id = refreshed.parent_id
+            else:
+                refreshed = session.get_current_weekly_plan()
+                if refreshed is not None:
+                    turn.weekly_meal_plan = refreshed
+                    turn.plan_version = refreshed.version
+                    turn.plan_parent_id = refreshed.parent_id
+        self.session_service.add_message(
+            session_id, "assistant", answer, intent="chat",
+        )
+        return turn
+
+    @staticmethod
+    def _tool_fallback(name: str, result: dict) -> str:
+        """A usable sentence without the writer, from the tool's own numbers."""
+        total = result.get("week_totals") or result.get("total") or result.get("totals")
+        if isinstance(total, dict) and total.get("calories"):
+            line = f"That comes to about {round(float(total['calories'])):,} kcal"
+            if result.get("daily_average_kcal"):
+                line += f" — roughly {round(float(result['daily_average_kcal']))} a day"
+            if total.get("complete") is False:
+                line += (
+                    f" (counted {total.get('meals_counted')} of "
+                    f"{total.get('meals_total')} meals; the rest carry no "
+                    "nutrition data)"
+                )
+            return line + "."
+        if result.get("name") and result.get("meals"):
+            dishes = ", ".join(
+                str(m.get("title")) for m in result["meals"] if m.get("title")
+            )
+            return f"{result['name']}: {dishes}." if dishes else f"Here's {result['name']}."
+        if result.get("days"):
+            days = len(result["days"])
+            if result.get("plan_type") == "daily":
+                return f"Here's the plan — {days} day(s) on it."
+            return f"Here's the week — {days} days on the plan."
+        if result.get("items") and result.get("item_count") is not None:
+            # A shopping list, and the sentence must not imply amounts: the
+            # corpus stores ingredients as text, so the tool reports what each
+            # item is FOR rather than how much of it to buy.
+            head = ", ".join(str(row["item"]) for row in result["items"][:6])
+            return (
+                f"{result['item_count']} things to buy across "
+                f"{result.get('dishes', 0)} dishes — {head}"
+                f"{'…' if result['item_count'] > 6 else ''}. "
+                "No quantities: the recipes list ingredients as text."
+            )
+        if "saved" in result and result.get("plan_type"):
+            if not result["saved"]:
+                return "Taken off your saved plans."
+            name = result.get("title")
+            return f"Saved as “{name}”." if name else "Saved to your plans."
+        return "Done."
 
     def _route(self, session, session_id: str, message: str, intent: str,
                target_plan_type: Optional[str], score_may_ask: bool = True) -> ChatTurn:
@@ -366,13 +835,18 @@ class OrchestratorService:
                 # natively without reusing a recipe. Route the request there;
                 # the spec extractor reads "week" as num_days=7, and the plan
                 # lands on the plan canvas with every day rendered.
-                from services.planning_delta import extract_state_delta
-                delta = extract_state_delta(message)
-                if delta.spec is not None and delta.spec.plates:
+                # The shape intake already read, not a second extraction of
+                # the same sentence — this branch used to pay its own
+                # `extract_state_delta` call and then throw the result away
+                # except for this one boolean.
+                spec = turn_intake.intake(
+                    session_id, message, session_service=self.session_service,
+                ).spec
+                if spec is not None and spec.plates:
                     logger.info(
                         "[%s] Weekly request carries a multi-plate shape (%s) — "
                         "routing through the structured path",
-                        session_id, delta.spec.describe(),
+                        session_id, spec.describe(),
                     )
                     return self._handle_plan(
                         session_id, message, "daily_plan", is_refinement=False, seeds=seeds
@@ -391,6 +865,33 @@ class OrchestratorService:
             return self._handle_plan(session_id, message, intent, is_refinement=True)
 
         if intent == "edit_plan_slot":
+            # A turn that GREW the shape is a re-plan, not a swap.
+            #
+            # "Add breakfast" and "add a salad as well there for side" classify
+            # as slot edits, and an edit can only replace the dish on a slot
+            # that exists. So the first got "this plan has lunch, dinner — which
+            # of those should I change?" in a loop, and the second had its swap
+            # executed and its addition heard by nobody: the member read a
+            # confident answer to half of what they asked.
+            #
+            # The shape reader has already updated the standing spec by the
+            # time this runs, so re-planning honours BOTH halves — the new plate
+            # and the "lighter" — where the edit path could only ever do one.
+            grew = turn_intake.added_shape()
+            if grew:
+                logger.info(
+                    "[%s] %s — re-planning rather than swapping a slot",
+                    session_id, "; ".join(grew),
+                )
+                canvas = session.active_canvas
+                if canvas is not None and canvas.plan_type == "weekly":
+                    return self._handle_weekly(
+                        session_id, message, "refine_plan", is_refinement=True,
+                    )
+                return self._handle_plan(
+                    session_id, message, "refine_plan", is_refinement=True,
+                    seeds=self.seed_service.extract_seeds(message),
+                )
             if session.active_canvas is None:
                 # "get me a side salad as well" with nothing on the canvas is
                 # not an error to bounce — it is a plan request wearing edit
@@ -780,6 +1281,9 @@ class OrchestratorService:
                         f"  {entry.get('meal_type', 'meal')}: {recipe.get('title', '?')} "
                         f"{fmt_nutrition(recipe.get('nutrition'))}"
                     )
+            totals = self._totals_line(session.session_id, "weekly")
+            if totals:
+                lines.append(totals)
             return "\n".join(lines)
 
         plan = session.get_current_daily_plan()
@@ -789,7 +1293,46 @@ class OrchestratorService:
         for slot in ("breakfast", "lunch", "dinner"):
             course = getattr(plan, slot)
             lines.append(f"  {slot}: {course.title} {fmt_nutrition(course.nutrition)}")
+        totals = self._totals_line(session.session_id, "daily")
+        if totals:
+            lines.append(totals)
         return "\n".join(lines)
+
+    @staticmethod
+    def _totals_line(session_id: str, plan_type: str) -> str:
+        """Summed totals for the analyst, so it never has to add up 21 numbers.
+
+        The analyst was handed per-meal nutrition and nothing else, so any
+        question about a whole day or week made it do arithmetic in prose —
+        the one thing a language model should not be trusted with here. The
+        `plan_totals` tool sums the stored plan and says how many meals it
+        could actually see; both facts belong in the context.
+        """
+        try:
+            import tools
+
+            result = tools.invoke(
+                "plan_totals", {"session_id": session_id, "plan_type": plan_type}
+            )
+        except Exception:  # noqa: BLE001
+            return ""
+        total = result.get("total") or {}
+        if not total.get("meals_total"):
+            return ""
+        bits = [f"{total.get('calories', 0):.0f} kcal total"]
+        for key, unit in (("protein_g", "g protein"), ("carbs_g", "g carbs"),
+                          ("fat_g", "g fat")):
+            if total.get(key):
+                bits.append(f"{total[key]:.0f}{unit}")
+        line = "COMPUTED TOTALS (already summed — do not re-add): " + ", ".join(bits)
+        if not total.get("complete"):
+            line += (
+                f" — counted {total.get('meals_counted')} of "
+                f"{total.get('meals_total')} meals; the rest carry no nutrition data"
+            )
+        if plan_type == "weekly" and result.get("daily_average_kcal"):
+            line += f". Daily average {result['daily_average_kcal']:.0f} kcal"
+        return line
 
     def _handle_smalltalk(self, session_id: str, message: str) -> ChatTurn:
         response_text, _, _ = self.chat_service.process_smalltalk(session_id, message)
@@ -1065,7 +1608,18 @@ class OrchestratorService:
         regenerate a weekly plan created since. Omitted (older clients) →
         the active canvas, as before.
         """
-        with trace_context(session_id=session_id, user_id=member_id):
+        # One budget and one in-flight claim per turn, at the only four
+        # places a turn begins. Nested calls keep the outermost deadline, so a
+        # slider apply that routes into the chat handlers does not hand the
+        # inner stage a fresh full allowance.
+        with self._one_turn_at_a_time(session_id) as claimed, \
+                trace_context(session_id=session_id, user_id=member_id), \
+                turn_budget.start():
+            if not claimed:
+                return self._busy_turn()
+            # A new turn hears the message fresh. The intake memo exists to stop
+            # one turn extracting twice, not to carry an answer into the next.
+            turn_intake.forget()
             session = self._owned_session(session_id, member_id)
             limit_turn = self._limit_turn(session)
             if limit_turn is not None:
@@ -1074,6 +1628,20 @@ class OrchestratorService:
             applied = dict(session.user_profile.get("plan_parameters") or {})
             applied.update(values)
             session.user_profile["plan_parameters"] = applied
+            if values.get("cooking_time") is not None:
+                # The slider and a spoken "under 20 minutes" are one
+                # constraint, so moving the knob is a NEW statement of it and
+                # has to update the standing state. Without this the planning
+                # paths would re-apply the older spoken value over the newer
+                # slider one and the member would watch their drag undo itself.
+                from models.planning_state import PlanningStateDelta
+
+                self.session_service.set_planning_state(
+                    session_id,
+                    self.session_service.get_planning_state(session_id).merge(
+                        PlanningStateDelta(max_minutes=int(values["cooking_time"])),
+                    ),
+                )
             history = session.user_profile.get("history", "") or ""
             line = plan_parameters.history_line(values)
             session.user_profile["history"] = f"{history}\n{line}" if history else line
@@ -1103,6 +1671,58 @@ class OrchestratorService:
             turn.plan_parameters = plan_parameters.build_card(session.user_profile, target)
             return turn
 
+    def regenerate(self, session_id: str, member_id: str,
+                   plan_type: Optional[str] = None) -> ChatTurn:
+        """Re-plan from the standing state, with no new member statement.
+
+        The deterministic counterpart of `apply_plan_parameters` for state the
+        member changed by hand rather than by talking: a facet chip removed, a
+        pantry item ticked off. Both write `PlanningState` and then need the
+        plan on screen to reflect it — and neither has a sentence to classify,
+        so routing them through /chat would mean inventing one and having the
+        classifier guess at it.
+
+        The query comes from `PlanningState.as_query()`, so it describes what
+        is still wanted rather than what was just taken away.
+        """
+        # One budget and one in-flight claim per turn, at the only four
+        # places a turn begins. Nested calls keep the outermost deadline, so a
+        # slider apply that routes into the chat handlers does not hand the
+        # inner stage a fresh full allowance.
+        with self._one_turn_at_a_time(session_id) as claimed, \
+                trace_context(session_id=session_id, user_id=member_id), \
+                turn_budget.start():
+            if not claimed:
+                return self._busy_turn()
+            # A new turn hears the message fresh. The intake memo exists to stop
+            # one turn extracting twice, not to carry an answer into the next.
+            turn_intake.forget()
+            session = self._owned_session(session_id, member_id)
+            limit_turn = self._limit_turn(session)
+            if limit_turn is not None:
+                return limit_turn
+
+            state = self.session_service.get_planning_state(session_id)
+            message = state.as_query()
+
+            target = plan_type if plan_type in ("daily", "weekly") else None
+            if target is None:
+                canvas = session.active_canvas
+                target = canvas.plan_type if canvas is not None else "daily"
+
+            if target == "weekly" and session.get_current_weekly_plan() is not None:
+                logger.info("[%s] Regenerating weekly plan: %s", session_id, message)
+                return self._handle_weekly(
+                    session_id, message, "refine_plan", is_refinement=True,
+                )
+            is_refinement = session.get_current_daily_plan() is not None
+            logger.info("[%s] Regenerating daily plan: %s", session_id, message)
+            return self._handle_plan(
+                session_id, message,
+                "refine_plan" if is_refinement else "daily_plan",
+                is_refinement=is_refinement, skip_clarification=True,
+            )
+
     def score_plan(
         self, session_id: str, member_id: str, plan_text: str,
         plan_type: str = "auto", context: Optional[str] = None,
@@ -1115,7 +1735,14 @@ class OrchestratorService:
         ``plan_type`` "daily"/"weekly" settles the shape instead of asking;
         ``context`` is what the member is aiming for, read by the fit judge.
         """
-        with trace_context(session_id=session_id, user_id=member_id):
+        # The same guard as every other place a turn begins: one budget and
+        # one in-flight claim per turn.
+        with self._one_turn_at_a_time(session_id) as claimed, \
+                trace_context(session_id=session_id, user_id=member_id), \
+                turn_budget.start():
+            if not claimed:
+                return self._busy_turn()
+            turn_intake.forget()
             session = self._owned_session(session_id, member_id)
             limit_turn = self._limit_turn(session)
             if limit_turn is not None:
@@ -1142,7 +1769,18 @@ class OrchestratorService:
         generation composes the rest deterministically: no intent
         classification, no clarification round.
         """
-        with trace_context(session_id=session_id, user_id=member_id):
+        # One budget and one in-flight claim per turn, at the only four
+        # places a turn begins. Nested calls keep the outermost deadline, so a
+        # slider apply that routes into the chat handlers does not hand the
+        # inner stage a fresh full allowance.
+        with self._one_turn_at_a_time(session_id) as claimed, \
+                trace_context(session_id=session_id, user_id=member_id), \
+                turn_budget.start():
+            if not claimed:
+                return self._busy_turn()
+            # A new turn hears the message fresh. The intake memo exists to stop
+            # one turn extracting twice, not to carry an answer into the next.
+            turn_intake.forget()
             session = self._owned_session(session_id, member_id)
             limit_turn = self._limit_turn(session)
             if limit_turn is not None:

@@ -48,10 +48,19 @@ class TestDefault:
         assert spec.is_default
 
     def test_default_asks_for_one_main_per_meal(self):
+        """And asks for it WITHOUT naming a course type.
+
+        This assertion used to read `["main-dish"]` for all three slots, which
+        is the bug it was pinning: a main is the principal plate of its slot,
+        and what that is depends on the slot. Sending `main-dish` for breakfast
+        overrode RecipeWrangler's own per-slot map and asked, in the corpus's
+        vocabulary, for a main dish at breakfast — which is why breakfast came
+        back as fettuccine.
+        """
         assert PlanSpec.default().to_request_slots() == [
-            {"slot": "breakfast", "count": 1, "course_types": ["main-dish"]},
-            {"slot": "lunch", "count": 1, "course_types": ["main-dish"]},
-            {"slot": "dinner", "count": 1, "course_types": ["main-dish"]},
+            {"slot": "breakfast", "count": 1, "course_types": []},
+            {"slot": "lunch", "count": 1, "course_types": []},
+            {"slot": "dinner", "count": 1, "course_types": []},
         ]
 
     @pytest.mark.parametrize(
@@ -77,7 +86,7 @@ class TestMultiPlate:
         spec = PlanSpec(meals=("dinner",), plates={"dinner": ("main", "side")})
 
         assert spec.to_request_slots() == [
-            {"slot": "dinner", "count": 1, "course_types": ["main-dish"]},
+            {"slot": "dinner", "count": 1, "course_types": []},
             {"slot": "dinner", "count": 1, "course_types": ["side", "salad", "soup"]},
         ]
 
@@ -229,3 +238,70 @@ class TestVocabularyBoundary:
         spec = PlanSpec.from_spec({"plates": {"dinner": ["main", "main-dish"]}})
 
         assert spec.roles_for("dinner") == ("main",)
+
+
+# ── what a "main" is depends on the slot ─────────────────────────────────
+
+class TestAMainIsWhateverTheSlotServes:
+    """Reported from the canvas: "I keep getting main dishes like fettucine
+    for breakfast."
+
+    `main` is FoodChat's word for the principal plate of a slot. `main-dish` is
+    one of the corpus's course types. They are not the same thing, and sending
+    the second for the first asked RecipeWrangler — literally — for a main dish
+    at breakfast. RecipeWrangler's own `SLOT_COURSE_TYPES` maps breakfast to
+    `breakfast`, snack to `snacks`, dessert to `desserts`, and it applies that
+    map to any slot whose request carries no override. So the fix is to send
+    none, and let the slot decide.
+    """
+
+    def test_breakfast_does_not_ask_for_a_main_dish(self):
+        spec = PlanSpec(meals=("breakfast",))
+        assert spec.to_request_slots() == [
+            {"slot": "breakfast", "count": 1, "course_types": []},
+        ]
+
+    @pytest.mark.parametrize("slot", ["breakfast", "snack", "dessert", "lunch",
+                                      "dinner"])
+    def test_no_slot_has_its_main_overridden(self, slot):
+        """Every one of these has its own idea of a main course, and the
+        override was the same three words for all of them."""
+        spec = PlanSpec(meals=(slot,))
+        assert spec.to_request_slots()[0]["course_types"] == []
+
+    def test_the_other_roles_still_name_their_courses(self):
+        """A salad is a salad at lunch and at dinner — those roles mean the
+        same thing wherever they sit, so they keep their own course types."""
+        spec = PlanSpec(
+            meals=("dinner",),
+            plates={"dinner": ("main", "salad", "dessert", "drink")},
+        )
+        assert [e["course_types"] for e in spec.to_request_slots()] == [
+            [], ["salad"], ["desserts"], ["beverages"],
+        ]
+
+    def test_the_helper_says_so_directly(self):
+        from models.plan_spec import request_course_types
+
+        assert request_course_types("main") == ()
+        assert request_course_types("salad") == ("salad",)
+        assert request_course_types("side") == ("side", "salad", "soup")
+        # An unknown role asks for nothing rather than guessing.
+        assert request_course_types("garnish") == ()
+
+
+class TestWithDays:
+    def test_it_moves_only_the_horizon(self):
+        spec = PlanSpec(num_days=7, meals=("lunch", "dinner"),
+                        plates={"dinner": ("main", "salad")})
+        day = spec.with_days(1)
+        assert day.num_days == 1
+        assert day.meals == spec.meals and day.plates == spec.plates
+
+    def test_it_clamps_to_what_a_plan_can_be(self):
+        assert PlanSpec().with_days(0).num_days == 1
+        assert PlanSpec().with_days(99).num_days == MAX_DAYS
+
+    def test_unchanged_is_the_same_object(self):
+        spec = PlanSpec(num_days=3)
+        assert spec.with_days(3) is spec

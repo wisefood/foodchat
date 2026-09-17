@@ -20,10 +20,109 @@ from .weekly_planner.planner import (
 )
 from .adapted_recipes import overlay_weekly_entries
 from .candidates_client import CANDIDATES
-from agents import DietaryIntentExtractor, ResponseWriter
+from agents import ResponseWriter
 from models.session import WeeklyMealPlan
 
 logger = logging.getLogger(__name__)
+
+
+def _as_meal_plan(plan_entries: list[dict]):
+    """Weekly entries in the shape `plan_verifier` reads.
+
+    The verifier walks `day_plans` -> meals -> plates, which every daily plan
+    already is. Weekly is a flat list of `{day, meal_idx, meal_type, recipe}`
+    dicts, so rather than teach the verifier a second shape — and have two
+    definitions of "every plate in a plan" drift apart — the entries are
+    adapted into the one it knows.
+
+    Nothing is stored from this. It exists to be measured.
+    """
+    from models.session import DayPlan, Meal, MealCourse, MealPlan
+
+    by_day: dict[int, dict[str, list]] = {}
+    for entry in sorted(plan_entries, key=lambda e: (e.get("day", 0), e.get("meal_idx", 0))):
+        recipe = entry.get("recipe") or {}
+        recipe_id = str(recipe.get("recipe_id") or "").strip()
+        if not recipe_id:
+            continue
+        day = int(entry.get("day") or 1)
+        slot = str(entry.get("meal_type") or "meal")
+        by_day.setdefault(day, {}).setdefault(slot, []).append(MealCourse(
+            recipe_id=recipe_id,
+            title=str(recipe.get("recipe_title") or recipe.get("title") or ""),
+            ingredients=str(
+                recipe.get("recipe_ingredients") or recipe.get("ingredients") or ""
+            ),
+            directions=str(
+                recipe.get("recipe_directions") or recipe.get("directions") or ""
+            ),
+            nutrition=recipe.get("nutrition"),
+            # Carried so the verifier and the repair pass keep a side a side.
+            # Two entries sharing a slot already became two plates here; what
+            # they lacked was which plate each one was.
+            role=str(entry.get("role") or "main"),
+        ))
+
+    days = [
+        DayPlan(day=day, meals=[Meal(slot, plates) for slot, plates in slots.items()])
+        for day, slots in sorted(by_day.items())
+    ]
+    return MealPlan.from_days(days, "weekly") if days else None
+
+
+def _apply_repairs(plan_entries: list[dict], adapted, outcome) -> int:
+    """Write a repair made on the adapted plan back into the weekly entries.
+
+    The repair runs against a `MealPlan` because that is the one shape the
+    verifier and the repair both understand. Weekly stores entry dicts, so the
+    swap has to be carried across — and it is carried by RECIPE ID, not by
+    title or position: two dishes in a week can share a title, and an entry's
+    index shifts if anything upstream ever reorders.
+
+    Returns how many entries were rewritten, so a mismatch is visible rather
+    than a plan that silently kept the dish the repair thought it removed.
+    """
+    replacements = {
+        row["was_id"]: row["now_id"]
+        for row in outcome.repaired
+        if row.get("was_id") and row.get("now_id")
+    }
+    if not replacements:
+        return 0
+
+    # The repaired plates, by their new id, so the entry can be rebuilt from
+    # the same MealCourse the verifier just re-measured.
+    fresh = {
+        plate.recipe_id: plate
+        for day in adapted.day_plans for meal in day.meals for plate in meal.plates
+        if plate.recipe_id
+    }
+
+    applied = 0
+    for entry in plan_entries:
+        recipe = entry.get("recipe") or {}
+        old_id = str(recipe.get("recipe_id") or "")
+        new_id = replacements.get(old_id)
+        plate = fresh.get(new_id) if new_id else None
+        if plate is None:
+            continue
+        recipe["recipe_id"] = plate.recipe_id
+        recipe["recipe_title"] = plate.title
+        recipe["recipe_ingredients"] = plate.ingredients
+        recipe["recipe_directions"] = plate.directions
+        # The old nutrition and image belonged to the dish that was removed.
+        recipe["nutrition"] = plate.nutrition
+        recipe["image_url"] = plate.image_url
+        recipe["match_reasons"] = list(plate.match_reasons or [])
+        entry["recipe"] = recipe
+        applied += 1
+
+    if applied != len(replacements):
+        logger.warning(
+            "Repair wrote back %d of %d swaps — an entry could not be matched",
+            applied, len(replacements),
+        )
+    return applied
 
 DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
@@ -52,7 +151,6 @@ class WeeklyPlanService:
     def __init__(self, session_service: SessionService):
         self.session_service = session_service
         self.reward_calculator = RewardCalculator()
-        self.diet_extractor = DietaryIntentExtractor()
         self.seed_service = SeedService()
         self.feedback_service = FeedbackService()
         self.response_writer = ResponseWriter()
@@ -90,26 +188,35 @@ class WeeklyPlanService:
                     session_id, current_plan.version,
                 )
 
-        # Extract dietary requirements from the user query to filter recipes correctly
-        query_diet_tags = self.diet_extractor.extract(content)
-        if query_diet_tags:
-            logger.info("[%s] Extracted diet tags from query: %s", session_id, query_diet_tags)
+        # What the member said, on the same pass every other kind of turn now
+        # runs. This path used to extract two of the four things — pantry, and
+        # its own copy of the diet extraction — and it filed nutrition claims
+        # under `notes`, which is read only by `describe()` and only logged. So
+        # "a high-protein week" was heard, stored, and dropped. Intake puts the
+        # claim on `claim_tags`, which every fetch site reads, and adds the two
+        # extractions weekly never had: facets ("a Thai week") and shape.
+        from services import (
+            pantry_service, plan_history, plan_parameters, turn_intake,
+        )
 
-        # Pantry (food waste): merge this turn's "I have …" statements into the
-        # standing planning state, then plan with the accumulated list. Read
-        # from the RAW message so recipe text in the refinement context is
-        # never mistaken for the member's fridge. The daily flow does the same
-        # merge; whichever horizon hears about the zucchini, both honour it.
-        from services import pantry_service
+        state = turn_intake.intake(
+            session_id, content, session_service=self.session_service,
+        )
+        # A cooking-time ceiling stated in words belongs where the slider's
+        # value lives — `RecipeActionSpace`, the pantry fan-out and the brief
+        # all read it from there.
+        session.user_profile = plan_parameters.apply_state(
+            dict(session.user_profile or {}), state,
+        )
 
-        state = self.session_service.get_planning_state(session_id)
-        pantry_delta = pantry_service.extract_pantry_delta(content)
-        if not pantry_delta.is_empty:
-            state = state.merge(pantry_delta)
-            self.session_service.set_planning_state(session_id, state)
         pantry = state.pantry
         if pantry:
             logger.info("[%s] Pantry to use up: %s", session_id, ", ".join(pantry))
+        # Union of every diet stated this session, plus the profile's own inside
+        # RecipeActionSpace.
+        standing_diet = list(state.diet_tags)
+        if standing_diet:
+            logger.info("[%s] Diet in force: %s", session_id, ", ".join(standing_diet))
 
         # Standing seeds (M3): dishes the user consented to "always include"
         # auto-anchor into fresh weekly plans when no explicit seeds compete.
@@ -134,9 +241,31 @@ class WeeklyPlanService:
             }
             seed_note = self.seed_service.describe(resolutions, dropped)
 
+        # "No thanks" to the favourites offer is a standing answer, and it was
+        # honoured on the daily path only — weekly kept adding +5 per favourite
+        # and putting them in the plan. A member who says no and sees their
+        # favourite anyway has been told their answer does not matter.
+        if state.use_favorites is False and session.user_profile.get("favorite_recipe_ids"):
+            session.user_profile = {
+                **session.user_profile, "favorite_recipe_ids": [],
+            }
+            logger.info("[%s] Favourites declined — not used for this week.", session_id)
+
         logger.info("[%s] Initializing action space and environment.", session_id)
         action_space = RecipeActionSpace(
-            session.user_profile, additional_diet=query_diet_tags, pantry=pantry,
+            session.user_profile, additional_diet=standing_diet, pantry=pantry,
+            # The standing shape, so a week that was asked for with a salad
+            # beside dinner keeps it through a refinement. Without this the
+            # action space had no notion of a plate and every refinement
+            # flattened a multi-plate week back to single dishes.
+            spec=state.spec,
+            # What the member was served on their last few plans, so a second
+            # "plan my week" is a different week. Fresh plans only: a
+            # refinement is a request to change the week on screen.
+            avoid_recent=(
+                [] if is_refinement
+                else plan_history.recently_served(session)
+            ),
         )
         # Anchored recipes must never repeat elsewhere in the week.
         for entry in pinned.values():
@@ -145,16 +274,30 @@ class WeeklyPlanService:
         signals = self.feedback_service.get_signals(session.member_id)
         for recipe_id in signals.downvoted_recipe_ids:
             action_space.mark_selected(recipe_id)
+        # Nor does anything the member rejected in conversation. This used the
+        # same channel as downvotes and simply was not connected to it, so
+        # "not that one" held on the daily canvas and not the weekly one.
+        for recipe_id in state.excluded_recipe_ids:
+            if recipe_id:
+                action_space.mark_selected(recipe_id)
+        # The shape the member asked for, if they asked for one. The weekly
+        # walk was a hardcoded 7 days x three meals, so "two weeks" and "a week
+        # with a snack" were both unbuildable here — `PlanSpec` expresses
+        # exactly that and never reached this path.
         env = WeeklyMealPlanEnv(
             user_profile=session.user_profile,
             action_space=action_space,
             reward_calculator=self.reward_calculator,
             user_query=effective_query,
+            stated_diet=standing_diet,
+            spec=state.spec,
         )
         planner = WeeklyPlanner(env)
 
         logger.info(
-            "[%s] Generating 7-day plan (21 meals, %d pinned).", session_id, len(pinned)
+            "[%s] Generating %d-day plan (%d meals: %s, %d pinned).",
+            session_id, env.num_days, env.total_slots,
+            ", ".join(env.meal_types), len(pinned),
         )
         try:
             plan_entries = planner.generate_full_plan(
@@ -235,11 +378,76 @@ class WeeklyPlanService:
         )
         pantry_note = pantry_service.describe_coverage(pantry_facts)
 
+        # Measure the week, the same way the daily paths measure a day.
+        #
+        # Weekly reported the declarative ledger and nothing else: `vegetarian`
+        # rendered as satisfied because the word had been sent, across 21 meals
+        # rather than three. The verifier reads the plates that came back.
+        report = None
+        repair_note = None
+        try:
+            from models.plan_brief import PlanBrief
+            from services import plan_quality, plan_repair, plan_verifier, turn_budget
+
+            adapted = _as_meal_plan(plan_entries)
+            if adapted is not None:
+                brief = PlanBrief.build(session.user_profile)
+                report = plan_verifier.verify(
+                    adapted, brief.to_requested(), enrichment,
+                )
+                logger.info(
+                    "[%s] Weekly verified: %s",
+                    session_id, plan_verifier.describe(report),
+                )
+
+                # One repair pass, same as the daily paths. Across 21 meals a
+                # hard-constraint failure is more likely than on three, and
+                # weekly was the path where nothing acted on it.
+                if report.blocking and not turn_budget.skip(
+                    "weekly repair", turn_budget.COST_FETCH,
+                ):
+                    outcome = plan_repair.repair(
+                        adapted, brief, report, session.user_profile,
+                    )
+                    if outcome.changed:
+                        applied = _apply_repairs(plan_entries, adapted, outcome)
+                        if applied:
+                            report = outcome.report
+                            repair_note = plan_repair.describe(outcome)
+                            logger.info(
+                                "[%s] Weekly repair: %d entry(ies) rewritten",
+                                session_id, applied,
+                            )
+
+                if report.checks:
+                    explainability["constraints_applied"] = (
+                        list(explainability.get("constraints_applied") or [])
+                        + report.as_ledger_rows()
+                    )
+
+                # Quality metrics, which weekly has never had: the graders were
+                # instance attributes on ChatService, so the path that produces
+                # 21 meals said the least about them. Measured across the whole
+                # week — judging it on Monday reports the variety of a Monday.
+                if not turn_budget.skip("weekly quality", turn_budget.COST_METRICS):
+                    explainability.setdefault("metrics", {})
+                    explainability["metrics"]["quality"] = plan_quality.metrics(
+                        plan_quality.scored_from_plan(_as_meal_plan(plan_entries)),
+                    )
+        except Exception as exc:  # noqa: BLE001
+            # All of this describes a plan that already exists. Losing any of
+            # it costs the measured rows or the scores, never the week.
+            logger.warning("[%s] Weekly verification failed: %s", session_id, exc)
+
         # Cross-day reuse the PLAN introduced, chipped separately from the
         # member's own pantry and worded so the two cannot be confused
         # ("also uses Monday's cabbage" vs "uses your tomatoes"). Runs last,
         # and runs whether or not a pantry was stated — the member said
         # nothing about these ingredients, which is the point.
+        #
+        # AFTER the repair pass above, not before: a repair swaps a plate, and
+        # a chip computed before it would name an ingredient shared with a dish
+        # that is no longer on the plan.
         shared_facts = annotate_shared_ingredients(
             plan_entries, pantry, explainability=explainability,
         )
@@ -273,9 +481,19 @@ class WeeklyPlanService:
         weekly_honored, weekly_not_honored = split_ledger(
             explainability["constraints_applied"]
         )
+        # A failed check the reply does not mention is a failure the member
+        # discovers by eating it — 21 chances of that on a week.
+        if repair_note:
+            explainability.setdefault("metrics", {})["repair"] = repair_note
+        weekly_problems = (
+            [{"constraint": c.name, "detail": c.detail} for c in report.failed]
+            if report is not None else []
+        )
         facts = {
             "action": "refined_weekly_plan" if is_refinement else "new_weekly_plan",
             "days": 7, "meals": 21,
+            "verified_problems": weekly_problems,
+            "repair": repair_note,
             "anchored_dishes": pinned_titles,
             "seed_note": seed_note,
             "cooking_for": session.user_profile.get("cooking_for_names") or [],
