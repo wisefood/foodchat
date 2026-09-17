@@ -163,15 +163,15 @@ class TestTheStagesAreActuallyWired:
         assert f'turn_budget.skip("{stage}"' in src
 
     def test_every_turn_entry_point_opens_one(self):
-        """Four places a turn begins. One that forgets runs unbounded, which is
-        the state this replaced."""
+        """Five places a turn begins (the fifth is /score-plan). One that
+        forgets runs unbounded, which is the state this replaced."""
         import inspect
 
         # `services.orchestrator_service` is the SINGLETON, not the module —
         # the package rebinds the name.
         src = inspect.getsource(sys.modules["services.orchestrator_service"])
-        assert src.count("turn_budget.start()") == 4
-        assert src.count("trace_context(session_id=session_id, user_id=member_id)") == 4
+        assert src.count("turn_budget.start()") == 5
+        assert src.count("trace_context(session_id=session_id, user_id=member_id)") == 5
 
     def test_shedding_grading_still_returns_a_plan(self):
         """The load-bearing property. Skipping must degrade the plan, never

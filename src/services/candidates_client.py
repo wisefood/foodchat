@@ -23,7 +23,7 @@ from typing import Optional
 
 import httpx
 
-from models.recipe import CandidateRecipe, RecipeEnrichment, ResolvedRecipe
+from models.recipe import CandidateRecipe, ProfiledNutrition, RecipeEnrichment, ResolvedRecipe
 
 logger = logging.getLogger(__name__)
 
@@ -527,6 +527,40 @@ class RecipeCandidatesClient:
         )
 
 
+    def profile_recipe(
+        self, raw_recipe: str, region: Optional[str] = None, timeout: Optional[float] = None,
+    ) -> Optional[ProfiledNutrition]:
+        """Per-serving nutrition for recipe text, via RecipeWrangler's profiler.
+
+        Wraps ``POST /api/v1/recipes/profile`` ("Run parsing + profiling
+        pipeline on raw recipe text"), which matches each ingredient line in
+        food composition tables. The plan scorer sends it a typical serving's
+        ingredients, with quantities, for a pasted dish no recipe matched: a
+        bare dish name makes the pipeline invent its own recipe, which once
+        weighed the pasta in "pasta with zucchini" at 0 g.
+
+        Raises ``ProfilingTimeout`` when the call outlasts ``timeout`` — a
+        stalled pipeline, which a caller with more dishes should stop asking.
+        Returns None on any other failure or when there are no calorie figures.
+        """
+        text = (raw_recipe or "").strip()
+        if not text:
+            return None
+        payload: dict = {"raw_recipe": text[:2000], "persist_trace": False}
+        if region:
+            payload["region"] = region
+        try:
+            with httpx.Client(timeout=timeout or REQUEST_TIMEOUT_SECONDS) as client:
+                response = client.post(f"{self.base_url}/api/v1/recipes/profile", json=payload)
+                response.raise_for_status()
+                data = response.json()
+        except httpx.TimeoutException as e:
+            raise ProfilingTimeout(f"profiling timed out for {text[:60]!r}: {e}") from e
+        except (httpx.HTTPError, ValueError) as e:
+            logger.warning("Recipe profiling failed for %.60r: %s", text, e)
+            return None
+        return profile_nutrition(data)
+
     def fetch_details(self, recipe_ids: list[str]) -> dict[str, RecipeEnrichment]:
         """Batch nutrition/image/tag details (M4 enrichment + edit predicates).
 
@@ -567,6 +601,91 @@ class RecipeCandidatesClient:
                 allergens=[str(a).lower() for a in (r.get("allergens") or [])],
             )
         return enriched
+
+
+class ProfilingTimeout(Exception):
+    """The profiling pipeline did not answer in time.
+
+    Raised rather than returned as None because it means something different
+    from "no figures for this dish": the pipeline is stalled, and a caller with
+    more dishes to profile should stop asking instead of waiting on each one.
+    """
+
+
+# Per-serving totals in a profiling response, by the prefix of their key. The
+# suffix names the composition table used ("..._irish"), given by
+# `nutrition_source_key`. The whole-recipe totals sit right beside these
+# ("total_energy_kcal_irish"), and reading them doubled a two-serving dish.
+_PROFILE_PER_SERVING = {
+    "kcal": "total_energy_kcal_per_serving",
+    "protein_g": "total_protein_g_per_serving",
+    "carbs_g": "total_carbohydrate_g_per_serving",
+    "fat_g": "total_fat_g_per_serving",
+}
+
+
+def _number(value) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _per_serving_total(totals: dict, prefix: str, table: str) -> Optional[float]:
+    if table:
+        value = _number(totals.get(f"{prefix}_{table}"))
+        if value is not None:
+            return value
+    for key, value in totals.items():
+        if str(key).startswith(prefix):
+            number = _number(value)
+            if number is not None:
+                return number
+    return None
+
+
+def profile_nutrition(payload) -> Optional[ProfiledNutrition]:
+    """Per-serving nutrition and coverage from a profiling response.
+
+    Reads ``profiling_totals.total_energy_kcal_per_serving_<table>`` and its
+    protein, carbohydrate and fat siblings, falling back to
+    ``full_profile.nutrition_summary.energy_kcal_per_serving`` for calories.
+    Always per serving. Accepts the gateway's ``{success, result}`` envelope
+    or the bare result. None when there is no calorie figure; zero is unknown.
+    """
+    if not isinstance(payload, dict):
+        return None
+    result = payload["result"] if isinstance(payload.get("result"), dict) else payload
+    totals = result.get("profiling_totals")
+    totals = totals if isinstance(totals, dict) else {}
+    table = str(result.get("nutrition_source_key") or "")
+
+    nutrition: dict = {}
+    for name, prefix in _PROFILE_PER_SERVING.items():
+        value = _per_serving_total(totals, prefix, table)
+        if value is not None:
+            nutrition[name] = value
+    if not nutrition.get("kcal"):
+        full = result.get("full_profile")
+        summary = full.get("nutrition_summary") if isinstance(full, dict) else None
+        kcal = _number(summary.get("energy_kcal_per_serving")) if isinstance(summary, dict) else None
+        if kcal:
+            nutrition["kcal"] = kcal
+
+    kcal = nutrition.get("kcal")
+    if not kcal or kcal <= 0:
+        return None
+    return ProfiledNutrition(
+        nutrition=nutrition,
+        coverage=_number(result.get("nutrition_coverage")),
+        low_coverage=bool(result.get("nutrition_low_coverage")),
+    )
 
 
 # Module-level singleton — the client is stateless, so sharing is safe.

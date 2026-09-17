@@ -197,3 +197,28 @@ class ScoredPlan:
     def is_classic(self) -> bool:
         """The three-slot shape `MealPlan.from_courses` can store directly."""
         return self.slot_names == ["breakfast", "lunch", "dinner"]
+
+
+# Below this share of ingredients matched in the composition tables, the
+# profiler's figures describe part of a dish, not the dish.
+MIN_PROFILE_COVERAGE = 0.6
+
+
+@dataclass(frozen=True)
+class ProfiledNutrition:
+    """Per-serving nutrition RecipeWrangler's profiler computed for free text.
+
+    ``nutrition`` holds ``kcal`` and whichever of ``protein_g``, ``carbs_g``
+    and ``fat_g`` it reported, always per serving. ``coverage`` is the share of
+    ingredients it matched in its composition tables.
+    """
+
+    nutrition: dict
+    coverage: Optional[float] = None
+    low_coverage: bool = False
+
+    @property
+    def reliable(self) -> bool:
+        if self.low_coverage:
+            return False
+        return self.coverage is None or self.coverage >= MIN_PROFILE_COVERAGE

@@ -152,12 +152,13 @@ class TestWhatTheMemberSees:
 
 
 class TestEveryEntryPointIsGuarded:
-    def test_all_four_claim_the_session(self):
+    def test_all_five_claim_the_session(self):
+        """process, apply_plan_parameters, regenerate, compose_plan, score_plan."""
         import inspect
 
         src = inspect.getsource(sys.modules["services.orchestrator_service"])
-        assert src.count("_one_turn_at_a_time(session_id) as claimed") == 4
-        assert src.count("return self._busy_turn()") == 4
+        assert src.count("_one_turn_at_a_time(session_id) as claimed") == 5
+        assert src.count("return self._busy_turn()") == 5
 
     def test_the_guard_wraps_the_work_not_just_the_check(self):
         """Claiming and releasing without holding it across the turn would be
@@ -165,7 +166,7 @@ class TestEveryEntryPointIsGuarded:
         import inspect
 
         src = inspect.getsource(sys.modules["services.orchestrator_service"])
-        assert src.count("if not claimed:") == 4
+        assert src.count("if not claimed:") == 5
 
 
 class TestAgainstARealTurn:

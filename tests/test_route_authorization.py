@@ -176,6 +176,10 @@ def _routes(session_id: str):
             "session_id": session_id,
             "request": api.RegenerateRequest(member_id=m),
         }),
+        "score_plan": lambda m: (api.score_plan, {
+            "session_id": session_id,
+            "request": api.ScorePlanRequest(member_id=m, plan_text="breakfast: oats, lunch: soup"),
+        }),
         "get_conversation": lambda m: (api.get_conversation, {
             "session_id": session_id, "member_id": m, "before_id": None, "limit": 20,
         }),
@@ -251,11 +255,11 @@ SESSION_SCOPED = sorted(
 )
 
 
-# The four routes whose ownership check lives one layer down, in the
+# The five routes whose ownership check lives one layer down, in the
 # orchestrator. The router only maps the refusal; the refusal itself is tested
 # against the real `_owned_session` below.
 ORCHESTRATOR_ROUTED = {
-    "unified_chat", "compose_plan", "apply_plan_parameters", "replan",
+    "unified_chat", "compose_plan", "apply_plan_parameters", "replan", "score_plan",
 }
 
 

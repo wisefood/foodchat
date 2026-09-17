@@ -239,6 +239,7 @@ class SessionService:
                         intent=m.intent,
                         plan_id=m.plan_id,
                         attribution=json.loads(m.attribution) if getattr(m, "attribution", None) else None,
+                        plan_score=json.loads(m.plan_score) if getattr(m, "plan_score", None) else None,
                     )
                 )
 
@@ -380,6 +381,7 @@ class SessionService:
         intent: Optional[str] = None,
         plan_id: Optional[str] = None,
         attribution: Optional[dict] = None,
+        plan_score: Optional[dict] = None,
     ) -> Message:
         session = self.get_session(session_id)  # load-through (replica-safe)
         if not session:
@@ -391,13 +393,14 @@ class SessionService:
             )
 
         message = Message(role=role, content=content, intent=intent, plan_id=plan_id,
-                          attribution=attribution)
+                          attribution=attribution, plan_score=plan_score)
         session.conversation.append(message)
 
         db = SessionLocal()
         try:
             db_add_message(db, session_id, role, content, intent, plan_id,
-                           attribution=json.dumps(attribution) if attribution else None)
+                           attribution=json.dumps(attribution) if attribution else None,
+                           plan_score=json.dumps(plan_score) if plan_score else None)
         finally:
             db.close()
 
@@ -453,6 +456,7 @@ class SessionService:
                 "plan_id": r.plan_id,
                 "attribution": json.loads(r.attribution) if getattr(r, "attribution", None) else None,
                 "extras": json.loads(r.extras) if getattr(r, "extras", None) else None,
+                "plan_score": json.loads(r.plan_score) if getattr(r, "plan_score", None) else None,
                 "timestamp": r.timestamp,
             }
             for r in rows

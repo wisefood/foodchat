@@ -11,8 +11,13 @@ Agents and their consumers:
     DocumentGrader           — daily-plan combo scoring  (planning_pipeline)
     MealDiversityGrader      — plan diversity metric     (chat_service)
     GuidelineAdherenceGrader — guideline metric          (chat_service)
+    PlanJudge                — pasted plan: diversity + guidelines + fit
+                               in one call                (plan_scorer.scoring)
     QueryReconciler          — query/profile conflicts   (planning_pipeline, clarification)
     DietaryIntentExtractor   — diet tags from a query    (weekly_plan_service)
+    PlanTextParser           — pasted plan → days/slots  (plan_scorer.parsing)
+    DishIngredientEstimator  — typical servings for dishes no recipe matched
+                                                          (plan_scorer.grounding)
     SimpleChatBot            — small-talk fallback       (chat_service)
 
 Removed in M0 (see CHANGES.md): QueryClassifier (superseded by
@@ -44,6 +49,9 @@ from prompts import (
     PLAN_STRATEGIST_SYSTEM,
     PLAN_STRATEGIST_USER,
     PLAN_ANALYST_SYSTEM,
+    PLAN_JUDGE_DAILY_SYSTEM,
+    PLAN_JUDGE_USER,
+    PLAN_JUDGE_WEEKLY_SYSTEM,
     MEAL_DIVERSITY_SYSTEM,
     GUIDELINE_ADHERENCE_SYSTEM,
     QUERY_RECONCILER_SYSTEM,
@@ -53,6 +61,11 @@ from prompts import (
     DIETARY_INTENT_EXTRACTOR_SYSTEM,
     PLAN_SPEC_EXTRACTOR_SYSTEM,
     PLAN_SPEC_EXTRACTOR_USER,
+    PLAN_TEXT_PARSER_SYSTEM,
+    DISH_ESTIMATOR_SYSTEM,
+    DISH_ESTIMATOR_USER,
+    PLAN_TEXT_PARSER_USER,
+    SCORE_PLAN_INTENT_ADDENDUM,
     DIETARY_INTENT_EXTRACTOR_USER,
     SEED_EXTRACTOR_SYSTEM,
     SEED_EXTRACTOR_USER,
@@ -82,6 +95,9 @@ from schemas import (
     OrchestratorSchema,
     DietaryTagsSchema,
     PlanSpecSchema,
+    ParsedPlanSchema,
+    DishEstimatesSchema,
+    PlanJudgementSchema,
     SeedExtractionSchema,
     PantryExtractionSchema,
     PreferenceExtractionSchema,
@@ -429,6 +445,54 @@ class GuidelineAdherenceGrader:
             return {"reasoning": "Could not parse guideline adherence score", "score": 0}
 
 
+class PlanJudge:
+    """The plan scorer's judge: diversity, guideline adherence and fit in ONE call.
+
+    The planner's own judges above are untouched and still grade generated
+    daily plans one metric at a time. This one exists because a pasted plan
+    needs three judgements over the SAME text: sending that text (and the
+    member's profile) three times cost three prompts and three reasoning
+    passes, which is most of a minute's token allowance on the on-demand tier.
+
+    The fit half shares ``prompts.PLAN_SCORING_RUBRIC`` with the planner's
+    batch grader, and ``plan_scorer.scoring`` still caps the fit score in code,
+    so a model that under-weights an allergen cannot out-vote the check.
+
+    Raises on a failed call or unparseable content; the scorer retries once and
+    then reports every judged metric as ungraded.
+    """
+
+    def __init__(self, model: str = None, temperature: float = None):
+        self.client = GROQ_CHAT.get_client(
+            model=model or DEFAULT_MODEL,
+            temperature=temperature if temperature is not None else DEFAULT_TEMPERATURE,
+            format=PlanJudgementSchema.model_json_schema(),
+        )
+
+    def judge(
+        self, *, weekly: bool, plan_text: str, plan_shape: str, hard_constraints: str,
+        conflicts: str, preferences: str, aim: str, guidelines: str, facts: str,
+    ) -> dict:
+        system = PLAN_JUDGE_WEEKLY_SYSTEM if weekly else PLAN_JUDGE_DAILY_SYSTEM
+        result = self.client.invoke(as_json_messages([
+            SystemMessage(content=system.compile()),
+            HumanMessage(content=PLAN_JUDGE_USER.compile(
+                hard_constraints=hard_constraints,
+                conflicts=conflicts,
+                preferences=preferences,
+                aim=aim,
+                guidelines=guidelines or "(none available)",
+                facts=facts or "(none)",
+                plan_shape=plan_shape,
+                plan=plan_text,
+            )),
+        ]), config=build_trace_config(
+            run_name="plan_judge_weekly" if weekly else "plan_judge",
+            tags=["metrics", "scoring"],
+        ))
+        return json.loads(result.content)
+
+
 class SimpleChatBot:
     """Small-talk / out-of-scope fallback.
 
@@ -581,6 +645,120 @@ class PlanSpecExtractor:
         })
         logger.info("Plan shape requested: %s", spec.describe())
         return spec
+
+
+class PlanTextParser:
+    """Reads a meal plan the MEMBER wrote into days, slots and dishes (plan scorer).
+
+    Span-picking, not judgment, so it runs on the fast model like the other
+    extractors. Only called when the deterministic line scanner in
+    ``services.plan_scorer.parsing`` could not read the text from structure
+    alone. Returns the raw ``ParsedPlanSchema`` payload, or None on any
+    failure — the caller checks every title, ingredient list and unparsed
+    line against the pasted text, so an invented ingredient never survives a
+    prompt that drifted in Langfuse.
+    """
+
+    def __init__(self, model: str = None, temperature: float = None):
+        self.llm = GROQ_CHAT.get_client(
+            model=model or FAST_MODEL,
+            temperature=(
+                temperature if temperature is not None else DEFAULT_TEMPERATURE
+            ),
+            format=ParsedPlanSchema.model_json_schema(),
+        )
+
+    def parse(self, text: str, structure_hint: str = "") -> Optional[dict]:
+        try:
+            system_text = PLAN_TEXT_PARSER_SYSTEM.compile()
+            user_text = PLAN_TEXT_PARSER_USER.compile(
+                plan_text=text, structure_hint=structure_hint or "(none)",
+            )
+            result = self.llm.invoke(as_json_messages([
+                SystemMessage(content=system_text),
+                HumanMessage(content=user_text),
+            ]), config=build_trace_config(run_name="plan_text_parse", tags=["extract", "scoring"]))
+            payload = json.loads(result.content)
+        except Exception as e:
+            logger.warning("PlanTextParser failed: %s", e)
+            return None
+        return payload if isinstance(payload, dict) else None
+
+
+class DishIngredientEstimator:
+    """Typical single-serving ingredients for dishes no recipe matched (plan scorer).
+
+    One batched call per pasted plan, on the fast model: ingredient lines with
+    quantities, which ``plan_scorer.grounding`` hands to RecipeWrangler's
+    profiler so the nutrition comes from composition tables rather than from
+    the model. The model's own calorie guess rides along and is used only when
+    the profiler cannot give reliable figures.
+
+    ``estimate`` takes ``[{title, ingredients?, quantity?}]`` and returns
+    ``{index: {"ingredients": [(quantity, name)], "kcal": float | None}}`` —
+    ``{}`` on any failure. A wrong or missing entry for one dish never
+    affects another.
+    """
+
+    MAX_INGREDIENTS = 15
+
+    def __init__(self, model: str = None, temperature: float = None):
+        self.llm = GROQ_CHAT.get_client(
+            model=model or FAST_MODEL,
+            temperature=(
+                temperature if temperature is not None else DEFAULT_TEMPERATURE
+            ),
+            format=DishEstimatesSchema.model_json_schema(),
+        )
+
+    def estimate(self, dishes: list[dict]) -> dict[int, dict]:
+        if not dishes:
+            return {}
+        listing = []
+        for index, dish in enumerate(dishes):
+            line = f"{index}. {dish.get('title', '')}"
+            if dish.get("ingredients"):
+                line += f" (the user's ingredients: {dish['ingredients']})"
+            if dish.get("quantity"):
+                line += f" [amount: {dish['quantity']}]"
+            listing.append(line)
+        try:
+            system_text = DISH_ESTIMATOR_SYSTEM.compile()
+            user_text = DISH_ESTIMATOR_USER.compile(dishes="\n".join(listing))
+            result = self.llm.invoke(as_json_messages([
+                SystemMessage(content=system_text),
+                HumanMessage(content=user_text),
+            ]), config=build_trace_config(run_name="dish_estimate", tags=["extract", "scoring"]))
+            payload = json.loads(result.content)
+        except Exception as e:
+            logger.warning("DishIngredientEstimator failed: %s", e)
+            return {}
+
+        estimates: dict[int, dict] = {}
+        items = payload.get("dishes") if isinstance(payload, dict) else None
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                index = int(item.get("index"))
+            except (TypeError, ValueError):
+                continue
+            if not 0 <= index < len(dishes):
+                continue
+            ingredients, seen = [], set()
+            for line in item.get("ingredients") or []:
+                if not isinstance(line, dict):
+                    continue
+                name = str(line.get("name") or "").strip()
+                if name and name.lower() not in seen:
+                    seen.add(name.lower())
+                    ingredients.append((str(line.get("quantity") or "").strip(), name))
+            kcal = item.get("kcal_per_serving")
+            estimates[index] = {
+                "ingredients": ingredients[:self.MAX_INGREDIENTS],
+                "kcal": float(kcal) if isinstance(kcal, (int, float)) and not isinstance(kcal, bool) else None,
+            }
+        return estimates
 
 
 class PreferenceExtractor:
@@ -1150,19 +1328,21 @@ class OrchestratorAgent:
 
     Valid intents: daily_plan | weekly_plan | refine_plan | edit_plan_slot
     | switch_plan_type | nutrition_question | plan_question
-    | preference_update | chat.
+    | preference_update | score_plan | chat.
     ``target_plan_type`` is populated only for switch_plan_type;
     nutrition_question turns are delegated to FoodScholar; plan_question
     turns are answered by the PlanAnalyst grounded in the active canvas;
     edit_plan_slot targets ONE slot of the active canvas with a verified
     directive; preference_update is a stated durable preference — it is
-    acknowledged, never interrogated (the write stays behind the M3 nudge).
+    acknowledged, never interrogated (the write stays behind the M3 nudge);
+    score_plan is a plan the member wrote and pasted, handed to the plan
+    scorer — it never touches a canvas.
     """
 
     VALID_INTENTS = {
         "daily_plan", "weekly_plan", "refine_plan", "edit_plan_slot",
         "switch_plan_type", "nutrition_question", "plan_question",
-        "preference_update", "chat",
+        "preference_update", "score_plan", "chat",
     }
 
     def __init__(self, model: str = None, temperature: float = None):
@@ -1172,6 +1352,19 @@ class OrchestratorAgent:
             format=OrchestratorSchema.model_json_schema(),
         )
 
+    @staticmethod
+    def system_prompt() -> str:
+        """The router prompt, guaranteed to know every routed intent.
+
+        A managed Langfuse copy that predates score_plan is never overwritten
+        by a deploy, so the intent is appended when the compiled text lacks it
+        — otherwise production could never classify a pasted plan.
+        """
+        text = ORCHESTRATOR_SYSTEM.compile()
+        if "score_plan" not in text:
+            text += SCORE_PLAN_INTENT_ADDENDUM
+        return text
+
     def classify(self, message: str, history: list[dict]) -> dict:
         """Classify intent given the last turns ({"role", "content"} dicts, recent last)."""
         history_text = "\n".join(
@@ -1180,7 +1373,7 @@ class OrchestratorAgent:
         ) or "(no prior conversation)"
 
         messages = [
-            SystemMessage(content=ORCHESTRATOR_SYSTEM.compile()),
+            SystemMessage(content=self.system_prompt()),
             HumanMessage(content=ORCHESTRATOR_USER.compile(
                 history=history_text, message=message,
             )),
@@ -1202,5 +1395,8 @@ class OrchestratorAgent:
             except Exception as e:
                 logger.warning("Orchestrator attempt %d failed: %s", attempt + 1, e)
 
+        # `failed` is the difference between "the member is chatting" and "we
+        # could not ask": on a rate-limited key every turn looked like small
+        # talk, including pasted plans. The caller decides what to do about it.
         logger.error("Orchestrator failed after retries, defaulting to chat")
-        return {"intent": "chat", "target_plan_type": None}
+        return {"intent": "chat", "target_plan_type": None, "failed": True}

@@ -26,17 +26,34 @@ Client (wisefood-api gateway)
          +--> session.is_at_message_limit ?
          |      +--> yes -> ChatTurn(at_message_limit=True)
          |
+         +--> explicit score request ?  (a scoring word — "rate", "score", "how
+         |      |                         does this look" — plus a meal listing in
+         |      |                         at least two slots, prose included
+         |      |                         ("eggs for breakfast, pasta for lunch");
+         |      |                         no request to make or change a plan; no
+         |      |                         FoodScholar mention)
+         |      +--> yes -> clear any pending clarification,
+         |                  PlanScorerService.process  (NO classification, section 5b)
+         |
          +--> session.state == "clarifying" ?
          |      |
          |      +--> yes -> route by persisted clarification kind
          |      |          (NO intent classification — the user is answering
          |      |           our question)
          |      |          +--> kind == "foodscholar" -> FoodScholarService.continue_clarification
+         |      |          +--> kind == "score_plan"  -> PlanScorerService.continue_clarification
+         |      |                                        (a reply that answers nothing -> state
+         |      |                                         cleared, routed as a fresh turn, and a
+         |      |                                         score_plan there never asks again)
          |      |          +--> else (plan flow)      -> ChatService.continue_clarification
          |      |                                        (origin intent restored from state)
          |      |
          |      +--> no  -> OrchestratorAgent.classify(message, last 12 turns)
          |                  (the ONLY intent classification in the pipeline)
+         |                  classify failed (outage, spent API budget)? it
+         |                  returns {"intent": "chat", "failed": True} — and a
+         |                  message that lists meals in two slots is scored
+         |                  instead, rather than answered as small talk
          |
          +--> route by intent
                 |
@@ -50,6 +67,9 @@ Client (wisefood-api gateway)
                 |                             (old canvas frozen, history retained)
                 +--> "nutrition_question"  -> FoodScholarService.process_question
                 |                             (see section 5a — cited answer + attribution)
+                +--> "score_plan"          -> PlanScorerService.process (checked first;
+                |                             section 5b — a plan the member wrote,
+                |                             never written to a canvas)
                 +--> "chat" / fallback     -> ChatService.process_smalltalk
 ```
 
@@ -176,6 +196,148 @@ correctly after a process restart or on a different replica.
   |                  { source: "foodscholar", confidence,
   |                    citations[{title, source_type, url, label}],
   |                    learn_more_url: "/foodscholar?q=<question>" }
+```
+
+## 5b. Plan scorer branch (score_plan)
+
+A plan the member WROTE — pasted into the chat, or into the text box that
+posts to `POST /foodchat/sessions/{session_id}/score-plan`. Scored, never
+adopted: no canvas, no plan version, and refine/edit turns keep targeting the
+member's own plan.
+
+```text
+POST /sessions/{id}/score-plan                 chat message classified (or
+{ member_id, plan_text (<= 8000 chars),        explicitly detected) as
+  plan_type: auto|daily|weekly, context? }     score_plan — section 1
+        |                                              |
+[foodchat_router.score_plan]                           |
+  _require_member (identity) -> 401                    |
+  blank text -> 400                                    |
+[OrchestratorService.score_plan]                       |
+  one turn per session (busy turn) + turn_budget       |
+  ownership -> 404 | message cap -> limit turn         |
+  pending clarification -> cleared (superseded)        |
+  NO classification                                    |
+        +----------------------+-----------------------+
+                               v
+[PlanScorerService.process]   (services/plan_scorer/service.py)
+  |
+  +--> add user message
+  |
+  +--> 1. parse_plan_text  (parsing.py)
+  |      scan(): day headings ("Monday", "Day 2", "Tue:"), "slot:" prefixes,
+  |      bullets under a slot heading, trailing "(ingredients)", "oats for
+  |      breakfast" prose; lines around the listing are kept as notes (the
+  |      member's own words about the plan). A structure-only reading that
+  |      placed every line is used as is -> NO model call. Otherwise
+  |      PlanTextParser (FAST_MODEL) with the scan as a hint; its titles,
+  |      ingredient lists and unparsed lines are checked against the text.
+  |
+  +--> nothing read ?          -> clarification {kind: "score_plan", reason:
+  |                                "no_meals", pasted_text, plan_type, context}
+  +--> auto, one block, no day
+  |    names, 2+ meals repeat ? -> clarification {..., reason: "shape", plan}
+  |      (plan_type daily/weekly from the text box settles it without asking;
+  |       "3 days" / "just one day" / a re-pasted listing continues; anything
+  |       else is unresolved -> routed as a fresh turn, never asked twice)
+  |
+  +--> 2. DishGrounder.ground  (grounding.py)
+  |      SeedService.find_dish once per distinct title: search, then tolerant
+  |      autocomplete, NOT filtered by the member's allergens, diet or
+  |      dislikes, and no allergy gate (the dish was already eaten; filtering
+  |      would hide the allergen the score must report). When nothing scores
+  |      as a match, the title's other spellings are searched too
+  |      ("lasagne" for "lasagna" — parsing.SPELLING_VARIANTS, which also
+  |      normalises both sides before comparison, accents folded).
+  |      Dice title similarity, measured on the recipe actually fetched:
+  |        >= 0.75 and same_dish  matched: recipe nutrition and image; its
+  |                              ingredients and tags only when the member
+  |                              wrote none (what they wrote is the dish).
+  |                              same_dish: the name keeps every part the
+  |                              member named (parsing.dish_heads — "roast
+  |                              chicken WITH potatoes" needs chicken and
+  |                              potato) and adds only DESCRIPTIVE_WORDS
+  |                              ("Roasted", "Smoked"; never a food, diet or
+  |                              cuisine word — "Vegan caesar salad" is cashews)
+  |        >= 0.40  approximate  the member's words only; the recipe's
+  |                              calories only when its name is a more
+  |                              generic form of theirs keeping every part
+  |                              ("Lasagna" for "vegetable lasagna", not
+  |                              "Hummus" for "houmous and pitta")
+  |        else     unresolved   the member's words only
+  |      Recipe calories under MIN_MEAL_KCAL (120, main meals) or
+  |      MIN_SNACK_KCAL (40) are set aside (rejected_recipe_kcal) and the dish
+  |      is estimated instead.
+  |      allergen_conflicts per dish {allergen, evidence: as_written |
+  |      recipe | closest_recipe}; closest_recipe is a warning, never a
+  |      verdict; plant milks and nut butters are not dairy (PLANT_DAIRY).
+  |      One fetch_details batch fills what the search did not carry.
+  |      Calories or ingredients still missing -> ONE
+  |      agents.DishIngredientEstimator call (fast model) writes a typical
+  |      single serving with quantities for every such dish (those missing
+  |      calories first), keeping the member's own ingredients and amount,
+  |      kept as typical_ingredients. A dish missing calories is profiled:
+  |      each list goes to RecipeWrangler's profiler (POST
+  |      /api/v1/recipes/profile) in parallel, PROFILE_TIMEOUT_SECONDS each,
+  |      no new calls after the first timeout. Per-serving totals with
+  |      coverage >= 0.6 and within 2x of the model's guess ->
+  |      typical_ingredients; otherwise the model's own calorie guess
+  |      (20-2,500 kcal) -> model_estimate, calories only. The model call
+  |      covers up to MAX_ESTIMATED_DISHES (21); profiling is capped at
+  |      MAX_PROFILE_CALLS (10) and the rest keep the guess. Best-effort.
+  |      nutrition_source (recipe | closest_recipe | typical_ingredients |
+  |      model_estimate | "") keeps an estimate from reading as a measurement.
+  |      Each grounding row carries kcal (per serving, rounded),
+  |      typical_ingredients and guess_remarks — a sentence for each thing in
+  |      the row that is a guess.
+  |
+  +--> 3. build_scoring_input  (building.py)
+  |      daily  -> course lists per slot (+ extras); entry_dicts for measuring
+  |      weekly -> entry dicts {day, meal_idx, meal_type, recipe, reward};
+  |                snack/other in extras; a dish on an earlier day is
+  |                repeat_source "author" ("repeats are your own choice")
+  |      matched: catalogue id, tags, image; approximate/unresolved: stable
+  |      "pasted:<title words>" id and no catalogue tags
+  |
+  +--> 4. PastedPlanScorer.score  (scoring.py)
+  |      constraint rows: transparency.constraints_ledger(profile), each row
+  |        re-measured dish by dish — allergy, checkable diet (vegetarian,
+  |        vegan, pescatarian, gluten/dairy/nut free), dislike -> violated |
+  |        satisfied; goals and other diets -> unchecked
+  |      measured in code, no model:
+  |        (a dish with no ingredient list counts its typical serving, and
+  |        the sentence names those dishes as guesses; allergy, diet and
+  |        dislike rows never read a guess)
+  |        daily : fvs (plan_scoring.food_variety_score) | daily_nutrition
+  |                (nutrition_metrics, one-day target)
+  |        weekly: weekly_variety (variety_metrics over main meals) |
+  |                weekly_guidelines (guideline_checklist; "eat fish" is not
+  |                applicable under 7 days) | weekly_nutrition (targets
+  |                scaled to the days pasted, snacks counted) | measured
+  |                ledger rows (meat limit, calories, repeats)
+  |      ONE PlanJudge call returns diversity + guideline_adherence + fit
+  |        (agents.PlanJudge, daily or weekly system prompt, the guideline
+  |        text and the measured checklist as facts). Three separate calls
+  |        sent the same plan three times and reasoned over it three times —
+  |        most of a minute's token allowance on the on-demand tier.
+  |        Retried once; a call that still fails leaves those three scores
+  |        None, never 0, and the measured metrics stand.
+  |      fit shares PLAN_SCORING_RUBRIC with the planner's grader and is
+  |        capped in code: allergen -> 1 (even with no judge), broken diet
+  |        -> 2; the reasoning names the dish
+  |      guideline text = plan_scoring.guidelines_text(scope): "" today (the
+  |        file is absent), an external endpoint later
+  |
+  +--> 5. reply: ResponseWriter over facts (scores, broken constraints, dishes
+  |       not found, close matches) with a deterministic fallback; then
+  |       ensure_calorie_caveat (a reply quoting kcal without saying they are
+  |       partly known or estimated gets that sentence) and
+  |       ensure_allergen_warnings (one sentence per allergen set, naming every
+  |       dish that has it, for any allergen the reply does not name)
+  |
+  +--> assistant message (intent score_plan) with messages.plan_score = payload
+  |       (the endpoint returns through _finalize_turn, like every turn endpoint)
+       -> returned on ChatTurn.plan_score and on /conversation messages
 ```
 
 ## 5. Weekly plan branch
@@ -338,7 +500,22 @@ ChatTurnResponse {
                            reasoning,
                            version, parent_id),
   at_message_limit,
-  plan_version, plan_parent_id
+  plan_version, plan_parent_id,
+  plan_score?             (score_plan only: plan_type, days_scored,
+                           meals_scored, metrics[{key, label, score, kind:
+                           likert5|count|percent|checklist, reasoning,
+                           detail}], constraints_applied[{constraint, type,
+                           status: satisfied|violated|unchecked, source,
+                           detail, members}], grounding[{day, slot,
+                           title_given, title_matched, recipe_id, state,
+                           ingredients_source, has_nutrition,
+                           allergen_conflicts}], unparsed[], warnings[],
+                           scored_plan{origin: "pasted", plan_type,
+                           days[DayPlanResponse], entries[] (weekly)},
+                           context)
+
+GET /sessions/{id}/conversation -> messages[{..., attribution, plan_score}]
+  (plan_score is stored with the score_plan reply, so the card survives reloads)
 }
 ```
 
@@ -361,6 +538,8 @@ Exception    -> HTTP 500
 - [src/services/pantry_service.py](src/services/pantry_service.py)
 - [src/services/candidates_client.py](src/services/candidates_client.py)
 - [src/services/weekly_plan_service.py](src/services/weekly_plan_service.py)
+- [src/services/plan_scorer/](src/services/plan_scorer/) · [src/models/pasted_plan.py](src/models/pasted_plan.py)
+- [src/services/plan_scoring.py](src/services/plan_scoring.py) (metrics shared by the daily planner and the scorer)
 - [src/services/session_service.py](src/services/session_service.py)
 - [src/models/session.py](src/models/session.py) · [src/models/recipe.py](src/models/recipe.py)
 - [src/agents.py](src/agents.py)

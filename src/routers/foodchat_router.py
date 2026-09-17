@@ -360,6 +360,75 @@ class PlanParameterCardModel(BaseModel):
     plan_type: Literal["daily", "weekly"] = "daily"
 
 
+class PlanScoreGroundingRow(BaseModel):
+    """How one pasted dish was read (score_plan turns)."""
+    day: Optional[int] = None                 # 1-7; None for a one-day plan
+    slot: str                                 # breakfast | lunch | dinner | snack | other
+    title_given: str                          # the member's words
+    title_matched: Optional[str] = None       # the catalogue recipe it was read as
+    recipe_id: Optional[str] = None
+    state: str                                # matched | approximate | unresolved
+    ingredients_source: str                   # recipe | as_written | unknown
+    has_nutrition: bool = False
+    kcal: Optional[int] = None                # per serving, rounded; None when unknown
+    # An approximate dish whose figures are its closest recipe's (a more generic name)
+    borrows_nutrition: bool = False
+    # recipe | closest_recipe | typical_ingredients (a small model's typical
+    # serving, profiled in composition tables) | model_estimate (the model's
+    # calorie guess, calories only) | "" when nothing is known
+    nutrition_source: str = ""
+    # A small model's typical serving [{name, quantity}] — a guess. Present for
+    # dishes missing calories or ingredients; counted towards food variety when
+    # the dish has no other ingredient list; never checked against allergies.
+    typical_ingredients: List[dict] = []
+    # Plain sentences naming what in this row is a guess (calories, ingredients)
+    guess_remarks: List[str] = []
+    # [{allergen, evidence: as_written | recipe | closest_recipe}] — closest_recipe is a warning
+    allergen_conflicts: List[dict] = []
+
+
+class PlanScoreMetric(BaseModel):
+    """One row of the score card. Every metric has this shape, so the UI can
+    render rows without knowing metric names."""
+    # daily:  fvs | daily_nutrition | diversity | guideline_adherence | fit
+    # weekly: weekly_variety | weekly_guidelines | weekly_nutrition | diversity
+    #         | guideline_adherence | fit
+    key: str
+    label: str
+    score: Optional[float] = None             # None = not measured / not graded
+    kind: str                                 # likert5 | count | percent | checklist
+    reasoning: str = ""
+    detail: dict = {}                         # checklist rows, totals, coverage, cap applied
+
+
+class PastedPlanView(BaseModel):
+    """The pasted plan in the plan-card shapes (``origin: "pasted"`` — no
+    refine or edit controls). ``days`` is the plates-as-list view, which can
+    show a partial or two-plate day; ``entries`` is filled for weekly plans."""
+    origin: str = "pasted"
+    plan_type: str
+    days: List[DayPlanResponse] = []
+    entries: List[WeeklyMealPlanEntryResponse] = []
+
+
+class PlanScoreResponse(BaseModel):
+    """A plan the member wrote, scored with FoodChat's plan metrics.
+
+    ``constraints_applied`` uses the ledger row shape of the plan endpoints;
+    status is satisfied | violated | unchecked (treat unknown as informational).
+    """
+    plan_type: str                            # daily | weekly
+    days_scored: int
+    meals_scored: int
+    metrics: List[PlanScoreMetric] = []
+    constraints_applied: List[dict] = []
+    grounding: List[PlanScoreGroundingRow] = []
+    unparsed: List[str] = []                  # lines that could not be read, verbatim
+    warnings: List[str] = []
+    scored_plan: Optional[PastedPlanView] = None
+    context: Optional[str] = None             # the member's stated aim, if given
+
+
 class ChatTurnResponse(BaseModel):
     role: str
     content: str
@@ -380,6 +449,8 @@ class ChatTurnResponse(BaseModel):
     changed_slots: Optional[List[dict]] = None
     # Interactive plan-parameter card (time/difficulty/goal sliders)
     plan_parameters: Optional[PlanParameterCardModel] = None
+    # A pasted plan as the scorer read it (intent == "score_plan" only)
+    plan_score: Optional[PlanScoreResponse] = None
 
 
 class ConversationPage(BaseModel):
@@ -433,6 +504,19 @@ class ComposeRequest(BaseModel):
     # Optional chat text sent alongside ("fill out the rest, keep it light");
     # empty → a canonical completion query
     message: Optional[str] = Field(None, max_length=MAX_MESSAGE_CHARS)
+
+
+MAX_PASTED_PLAN_CHARS = 8000
+
+
+class ScorePlanRequest(BaseModel):
+    """The text box: a meal plan the member wrote, pasted as free text."""
+    member_id: str
+    plan_text: str = Field(min_length=1, max_length=MAX_PASTED_PLAN_CHARS)
+    # "auto" reads the shape from the text; "daily"/"weekly" settles it
+    plan_type: Literal["auto", "daily", "weekly"] = "auto"
+    # What the member is aiming for ("trying to eat less meat"); read by the fit score
+    context: Optional[str] = Field(default=None, max_length=500)
 
 
 class MemoryDecisionResponse(BaseModel):
@@ -744,6 +828,8 @@ def unified_chat(session_id: str, request: ChatRequest):
       - nutrition_question → evidence-based answer via FoodScholar (with attribution)
       - preference_update  → acknowledge a stated durable preference (write stays
                              consent-gated behind the memory nudge)
+      - score_plan         → read a meal plan the member wrote and pasted
+                             (parsed and matched to recipes; no canvas change)
       - chat               → general conversation
 
     The caller must supply member_id to prove session ownership.
@@ -842,6 +928,10 @@ def _chat_turn_response(turn) -> ChatTurnResponse:
             PlanParameterCardModel(**turn.plan_parameters)
             if turn.plan_parameters else None
         ),
+        plan_score=(
+            PlanScoreResponse(**turn.plan_score)
+            if getattr(turn, "plan_score", None) else None
+        ),
     )
 
 
@@ -903,6 +993,50 @@ def compose_plan(session_id: str, request: ComposeRequest):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
         logger.error("[%s] /compose 500: %s", session_id, e, exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+    return _finalize_turn(session_id, turn)
+
+
+@router.post("/sessions/{session_id}/score-plan", response_model=ChatTurnResponse)
+def score_plan(session_id: str, request: ScorePlanRequest):
+    """
+    Score a meal plan the member wrote — the text box beside the plan cards.
+
+    The same turn as a ``score_plan`` chat message, without intent
+    classification: the text is parsed, matched to recipes, measured and
+    graded with FoodChat's plan metrics, and answered with a summary. The
+    member's text and the reply are stored in the conversation, the score
+    payload with the reply. No canvas changes; a pending clarification is
+    superseded.
+
+    Returns the ChatTurnResponse shape; ``plan_score`` carries the card.
+    ``needs_clarification`` is true when FoodChat has to ask what the text is
+    (no meals found, or an unclear number of days) — the member answers in chat.
+    """
+    # Identity before service availability, as on every turn endpoint.
+    _require_member(request.member_id)
+    orch_svc = _require_orchestrator_service()
+    if not request.plan_text.strip():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="plan_text is empty")
+
+    logger.info(
+        "[%s] /score-plan (%s) from member %s: %d chars",
+        session_id, request.plan_type, request.member_id, len(request.plan_text),
+    )
+    try:
+        turn = orch_svc.score_plan(
+            session_id, request.member_id, request.plan_text,
+            plan_type=request.plan_type, context=request.context,
+        )
+    except SessionAccessError as e:
+        logger.warning("[%s] /score-plan 404: %s", session_id, e)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except RuntimeError as e:
+        logger.warning("[%s] /score-plan 429 (message limit): %s", session_id, e)
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
+    except Exception as e:
+        logger.error("[%s] /score-plan 500: %s", session_id, e, exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
     return _finalize_turn(session_id, turn)
@@ -984,6 +1118,7 @@ def get_conversation(
                 # this message. Client-side grafting meant a reload showed the
                 # plan with none of the explanation that came with it.
                 "extras": m.get("extras"),
+                "plan_score": m.get("plan_score"),
                 "timestamp": m["timestamp"].isoformat(),
             }
             for m in page

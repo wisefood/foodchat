@@ -132,6 +132,19 @@ def _checks() -> list[tuple[str, callable]]:
         ("session_title", lambda: agents.SessionTitler().title(
             "plan me a week of vegetarian dinners",
         )),
+        # The plan scorer's three: a pasted plan read, typical servings
+        # written, and the one judge call over a scored day.
+        ("plan_text_parser", lambda: agents.PlanTextParser().parse(
+            "breakfast: porridge with banana\nlunch: lentil soup (lentils, carrot)",
+        )),
+        ("dish_ingredient_estimator", lambda: agents.DishIngredientEstimator().estimate(
+            [{"title": "pasta with zucchini"}],
+        )),
+        ("plan_judge", lambda: agents.PlanJudge().judge(
+            weekly=False, plan_text=_plan_text(), plan_shape="1 day, 3 meals",
+            hard_constraints="Diet: vegetarian", conflicts="None found.",
+            preferences="(none)", aim="(none)", guidelines="", facts="(none)",
+        )),
     ]
 
 

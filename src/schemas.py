@@ -20,6 +20,36 @@ class ScoringSchema(BaseModel):
     score: conint(ge=1, le=5)
 
 
+class PlanJudgementSchema(BaseModel):
+    """The plan scorer's three judgements, returned by ONE call.
+
+    Separate calls per judgement sent the plan and the profile three times and
+    reasoned over them three times; on the on-demand tier that is most of a
+    minute's token allowance for a single pasted plan.
+    """
+    diversity: ScoringSchema
+    guideline_adherence: ScoringSchema
+    fit: ScoringSchema
+
+
+class EstimatedIngredientSchema(BaseModel):
+    """One ingredient line of a typical serving (DishIngredientEstimator)."""
+    name: str
+    quantity: str = ""
+
+
+class DishEstimateSchema(BaseModel):
+    """A typical single serving of one numbered dish, and a calorie guess."""
+    index: int
+    ingredients: list[EstimatedIngredientSchema] = []
+    kcal_per_serving: Optional[float] = None
+
+
+class DishEstimatesSchema(BaseModel):
+    """Typical servings for dishes no recipe matched (plan scorer)."""
+    dishes: list[DishEstimateSchema] = []
+
+
 class PlanGradeSchema(BaseModel):
     """One graded plan inside a batch."""
     plan_index: int
@@ -67,11 +97,39 @@ class OrchestratorSchema(BaseModel):
     intent: Literal[
         "daily_plan", "weekly_plan", "refine_plan", "edit_plan_slot",
         "switch_plan_type", "nutrition_question", "plan_question",
-        "preference_update", "chat",
+        "preference_update", "score_plan", "chat",
     ]
     reasoning: str
     # Populated only when intent == "switch_plan_type"
     target_plan_type: Optional[Literal["daily", "weekly"]] = None
+
+
+class ParsedMealSchema(BaseModel):
+    """One dish in a plan the user wrote (plan scorer)."""
+    slot: Literal["breakfast", "lunch", "dinner", "snack", "other"]
+    title: str
+    # Only ingredients the user wrote — services.plan_scorer.parsing drops a
+    # list that is not in the text.
+    ingredients: Optional[str] = None
+    quantity_note: Optional[str] = None
+
+
+class ParsedDaySchema(BaseModel):
+    """The dishes under one day heading; ``day`` is null with no heading."""
+    day: Optional[conint(ge=1, le=7)] = None   # 1 = Monday / "Day 1" … 7
+    label: Optional[str] = None
+    meals: list[ParsedMealSchema] = []
+
+
+class ParsedPlanSchema(BaseModel):
+    """A pasted meal plan read into days, slots and dishes (PlanTextParser).
+
+    Structure only — no judgment, no additions. ``unparsed`` holds lines that
+    name food but could not be placed, copied verbatim so the member sees them.
+    """
+    plan_type: Literal["daily", "weekly"] = "daily"
+    days: list[ParsedDaySchema] = []
+    unparsed: list[str] = []
 
 
 class DietaryTagsSchema(BaseModel):

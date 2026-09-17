@@ -205,7 +205,7 @@ class TestItNeverBreaksTheTurn:
 
 
 class TestEveryTurnShapedEndpointGoesThroughTheFunnel:
-    """Four endpoints return a turn. The one that forgets loses a memory nudge
+    """Five endpoints return a turn. The one that forgets loses a memory nudge
     with no error anywhere, so assert none of them can."""
 
     def test_no_endpoint_bypasses_it(self):
@@ -220,7 +220,7 @@ class TestEveryTurnShapedEndpointGoesThroughTheFunnel:
         assert len(calls) == 1, f"a turn endpoint bypasses the funnel: {calls}"
 
     @pytest.mark.parametrize("endpoint", [
-        "unified_chat", "compose_plan", "apply_plan_parameters", "replan",
+        "unified_chat", "compose_plan", "apply_plan_parameters", "replan", "score_plan",
     ])
     def test_the_endpoint_finalizes(self, endpoint):
         import inspect
