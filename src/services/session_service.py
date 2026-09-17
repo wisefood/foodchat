@@ -13,6 +13,7 @@ switch plan types (e.g. "forget daily, let's do weekly"), the old canvas
 is frozen and a fresh canvas for the new type is started.
 """
 
+import copy
 import json
 import logging
 import uuid
@@ -869,6 +870,57 @@ class SessionService:
             "[%s] Restored %s plan v%d (%s)", session_id, plan_type, wanted, plan.id,
         )
         return plan
+
+    def reorder_current_plan(self, session_id: str, order, plan_type: str = "daily"):
+        """Re-arrange the meals of the current plan into `order`. The new version.
+
+        A patch, not a regeneration: the member likes the food and wants it at
+        a different time of day, so re-planning would answer a question they
+        did not ask and lose the dishes they just approved.
+
+        Meals the order does not mention keep their relative places at the end,
+        so a partial order ("snack before lunch") cannot drop a meal.
+        """
+        from models.session import MealPlan
+
+        session = self.get_session(session_id)
+        if session is None or plan_type != "daily":
+            return None
+        plan = session.get_current_daily_plan()
+        if plan is None:
+            return None
+
+        wanted = [str(s).strip().lower() for s in (order or []) if str(s).strip()]
+        if not wanted:
+            return None
+
+        days = copy.deepcopy(plan.day_plans)
+        moved = False
+        for day in days:
+            def rank(meal, _wanted=wanted):
+                name = str(getattr(meal, "meal_type", "")).lower()
+                return (wanted.index(name) if name in _wanted else len(_wanted))
+            before = [getattr(m, "meal_type", "") for m in day.meals]
+            day.meals = sorted(day.meals, key=rank)
+            if [getattr(m, "meal_type", "") for m in day.meals] != before:
+                moved = True
+        if not moved:
+            return plan
+
+        new_plan = MealPlan.from_days(
+            days, plan.reasoning,
+            metrics={
+                "llm_score": plan.llm_score, "llm_reasoning": plan.llm_reasoning,
+                "fvs_count": plan.fvs_count, "fvs_reasoning": plan.fvs_reasoning,
+                "diversity_llm_score": plan.diversity_llm_score,
+                "diversity_llm_reasoning": plan.diversity_llm_reasoning,
+                "guideline_adherence_score": plan.guideline_adherence_score,
+                "guideline_adherence_reasoning": plan.guideline_adherence_reasoning,
+            },
+        )
+        new_plan.constraints_applied = plan.constraints_applied
+        new_plan.personalization_summary = plan.personalization_summary
+        return self.refine_prepared_meal_plan(session_id, new_plan)
 
     def _persist_canvases(self, session_id: str, session: Session) -> None:
         daily_data = None

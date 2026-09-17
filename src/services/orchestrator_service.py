@@ -611,6 +611,7 @@ class OrchestratorService:
 
     def _maybe_navigate(self, session, session_id: str, message: str):
         """Restore a version, or decline an order we cannot serve. None to route on."""
+        from models.planning_state import PlanningStateDelta
         from services import plan_navigation
 
         canvas = session.active_canvas
@@ -655,18 +656,48 @@ class OrchestratorService:
             turn.plan_parent_id = getattr(plan, "parent_id", None)
             return turn
 
-        # A reorder is only declined when nothing else in the sentence can be
+        # A reorder is only handled when nothing else in the sentence can be
         # served: "add a salad before lunch" is an addition that happens to
-        # mention an order, and re-planning it is a better answer than a no.
-        if (
-            plan_navigation.asks_to_reorder(message)
-            and canvas is not None
-            and not turn_intake.added_shape()
-        ):
-            self._say(session_id, message, plan_navigation.CANNOT_REORDER)
-            return ChatTurn(
-                role="assistant", content=plan_navigation.CANNOT_REORDER, intent="chat",
+        # mention an order, and re-planning it is a better answer.
+        if canvas is None or turn_intake.added_shape():
+            return None
+
+        state = self.session_service.get_planning_state(session_id)
+        move = plan_navigation.reorder_request(message)
+        if move is not None:
+            slot, where, anchor = move
+            spec = state.spec.reorder(slot, **{where: anchor})
+            if spec is state.spec:
+                text = (
+                    f"I can't put the {slot} {where} the {anchor} — "
+                    f"this plan has {', '.join(state.spec.meals)}."
+                )
+                self._say(session_id, message, text)
+                return ChatTurn(role="assistant", content=text, intent="chat")
+
+            # The standing shape, so the NEXT plan keeps the arrangement too.
+            self.session_service.set_planning_state(
+                session_id, state.merge(PlanningStateDelta(spec=spec)),
             )
+            plan = self.session_service.reorder_current_plan(
+                session_id, list(spec.meals), canvas.plan_type,
+            )
+            text = f"Moved the {slot} {where} the {anchor} — {', '.join(spec.meals)}."
+            self._say(session_id, message, text)
+            turn = ChatTurn(role="assistant", content=text, intent="chat")
+            if plan is not None:
+                turn.meal_plan = plan
+                turn.plan_version = getattr(plan, "version", None)
+                turn.plan_parent_id = getattr(plan, "parent_id", None)
+            return turn
+
+        if plan_navigation.asks_to_reorder(message):
+            # An order was asked for but not a whole one. Asking beats guessing
+            # which meal they meant, and it beats declining something we can do.
+            question = plan_navigation.reorder_question(message, state.spec.meals)
+            if question:
+                self._say(session_id, message, question)
+                return ChatTurn(role="assistant", content=question, intent="chat")
         return None
 
     def _say(self, session_id: str, message: str, text: str) -> None:

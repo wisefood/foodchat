@@ -55,6 +55,31 @@ def planned(session_service, sample_profile):
 
 
 @pytest.fixture
+def four_meals(session_service, sample_profile):
+    """A four-meal day — the shape the reorder reports came from."""
+    from models.plan_spec import PlanSpec
+    from models.planning_state import PlanningStateDelta
+    from models.session import DayPlan, Meal, MealCourse, MealPlan
+
+    session = session_service.create_session(f"member-{uuid.uuid4()}", sample_profile)
+    session_service.set_planning_state(
+        session.session_id,
+        session_service.get_planning_state(session.session_id).merge(
+            PlanningStateDelta(spec=PlanSpec(
+                meals=("breakfast", "lunch", "snack", "dinner"),
+            )),
+        ),
+    )
+    session_service.add_prepared_meal_plan(session.session_id, MealPlan.from_days([
+        DayPlan(day=1, meals=[
+            Meal(slot, [MealCourse(f"{slot}-r", f"{slot.title()} dish", "i", "d")])
+            for slot in ("breakfast", "lunch", "snack", "dinner")
+        ]),
+    ], "four meals"))
+    return session.session_id
+
+
+@pytest.fixture
 def orch(session_service):
     svc = OrchestratorService.__new__(OrchestratorService)
     svc.session_service = session_service
@@ -164,27 +189,61 @@ class TestReorder:
     def test_ordinary_edits_are_not_reorders(self, message):
         assert nav.asks_to_reorder(message) is False
 
-    def test_it_declines_instead_of_swapping_a_dish(self, orch, session_service, planned):
-        turn = _navigate(orch, session_service, planned,
+    def test_half_a_request_is_asked_about_rather_than_guessed(self, orch,
+                                                               session_service, four_meals):
+        """The member's own words name one meal and a direction. Which meal
+        MOVES is the part that matters, and guessing it is how somebody's
+        breakfast gets moved when they meant their snack."""
+        turn = _navigate(orch, session_service, four_meals,
                          "hmmm better before lunch, i will have lunch later today")
 
         assert isinstance(turn, ChatTurn)
-        assert turn.meal_plan is None, "it changed the plan anyway"
-        assert "can't move meals around" in turn.content
-        assert "add one, take one out" in turn.content, "it should say what it CAN do"
+        assert turn.meal_plan is None, "it changed the plan on half a request"
+        assert "before the lunch" in turn.content
+        assert "?" in turn.content
 
-    def test_the_plan_is_left_exactly_as_it_was(self, orch, session_service, planned):
-        before = session_service.get_session(planned).get_current_daily_plan()
-        _navigate(orch, session_service, planned, "move the snack before lunch")
-        after = session_service.get_session(planned).get_current_daily_plan()
+    def test_a_whole_request_is_carried_out(self, orch, session_service, four_meals):
+        turn = _navigate(orch, session_service, four_meals, "put the snack before lunch")
 
-        assert after.id == before.id and after.version == before.version
+        assert turn.meal_plan is not None
+        order = [m.meal_type for m in turn.meal_plan.day_plans[0].meals]
+        assert order.index("snack") < order.index("lunch")
+
+    def test_it_rearranges_rather_than_regenerates(self, orch, session_service, four_meals):
+        """The member likes the food and wants it at another time of day.
+        Re-planning would answer a question they did not ask."""
+        before = session_service.get_session(four_meals).get_current_daily_plan()
+        titles_before = {
+            p.title for m in before.day_plans[0].meals for p in m.plates
+        }
+        turn = _navigate(orch, session_service, four_meals, "put the snack before lunch")
+        titles_after = {
+            p.title for m in turn.meal_plan.day_plans[0].meals for p in m.plates
+        }
+
+        assert titles_after == titles_before, "it changed the food"
+        assert turn.meal_plan.version > before.version, "it should be a new version"
+
+    def test_the_arrangement_is_standing(self, orch, session_service, four_meals):
+        """The NEXT plan keeps it too — otherwise the member re-orders their
+        day after every single request."""
+        _navigate(orch, session_service, four_meals, "put the snack before lunch")
+        spec = session_service.get_planning_state(four_meals).spec
+
+        assert spec.meals.index("snack") < spec.meals.index("lunch")
+
+    def test_a_move_the_plan_cannot_make_says_what_it_has(self, orch, session_service,
+                                                          four_meals):
+        turn = _navigate(orch, session_service, four_meals, "put the brunch before lunch")
+
+        assert turn.meal_plan is None
+        assert "brunch" in turn.content
 
     def test_an_addition_that_mentions_order_still_plans(self, orch, session_service,
-                                                         planned, monkeypatch):
+                                                         four_meals, monkeypatch):
         """"Add a salad before lunch" is an addition that happens to mention an
         order. Declining it would refuse a request we can serve."""
         monkeypatch.setattr(turn_intake, "added_shape", lambda: ["added snack"])
 
-        assert _navigate(orch, session_service, planned,
+        assert _navigate(orch, session_service, four_meals,
                          "add a snack before lunch") is None

@@ -104,8 +104,63 @@ def asks_to_reorder(message: str) -> bool:
     return bool(_REORDER.search(message or ""))
 
 
-CANNOT_REORDER = (
-    "I can't move meals around in the day yet — the order comes from the meal "
-    "itself, so a snack always sits between lunch and dinner. What I can do is "
-    "add one, take one out, or swap what's on any of them."
+# "the snack before lunch", "move dinner after the snack", "lunch first".
+_MOVE = re.compile(
+    r"\b(?:move|shift|put|have|take|bring|make)?\s*(?:the\s+|my\s+)?"
+    r"(?P<slot>breakfast|brunch|lunch|dinner|snack|dessert|supper)\b"
+    r"[^.!?]{0,40}?"
+    r"\b(?P<where>before|after|ahead of|earlier than|later than)\s+"
+    r"(?:the\s+|my\s+)?(?P<anchor>breakfast|brunch|lunch|dinner|snack|dessert|supper)\b",
+    re.IGNORECASE,
 )
+_BEFORE_WORDS = {"before", "ahead of", "earlier than"}
+
+
+def reorder_request(message: str) -> Optional[tuple]:
+    """`(slot, "before"|"after", anchor)`, or None.
+
+    Reads only what it can act on: two named meals and a direction between
+    them. "Better before lunch" names one meal and a direction, and the meal it
+    means is whatever the turn was already about — that ambiguity is the
+    caller's to resolve with a focus slot, not this reader's to guess.
+    """
+    match = _MOVE.search(message or "")
+    if match is None:
+        return None
+    slot = match.group("slot").lower()
+    anchor = match.group("anchor").lower()
+    if slot == anchor:
+        return None
+    where = "before" if match.group("where").lower() in _BEFORE_WORDS else "after"
+    return slot, where, anchor
+
+
+# The direction and the anchor, when the meal to MOVE was left implied —
+# "hmmm better before lunch" is the member's own phrasing and it names one meal,
+# not two.
+_HALF_MOVE = re.compile(
+    r"\b(?P<where>before|after|ahead of|earlier than|later than)\s+"
+    r"(?:the\s+|my\s+)?(?P<anchor>breakfast|brunch|lunch|dinner|snack|dessert|supper)\b",
+    re.IGNORECASE,
+)
+
+
+def reorder_question(message: str, meals) -> Optional[str]:
+    """What to ask when the member asked for an order but not a whole one.
+
+    Asking beats guessing and it beats declining. The meal they mean is usually
+    the one they were just talking about, and "usually" is how a member's
+    breakfast gets moved when they meant their snack.
+    """
+    match = _HALF_MOVE.search(message or "")
+    if match is None:
+        return "Which meal should move, and where should it go?"
+    anchor = match.group("anchor").lower()
+    where = "before" if match.group("where").lower() in _BEFORE_WORDS else "after"
+    movable = [m for m in (meals or ()) if m != anchor]
+    if not movable:
+        return None
+    if len(movable) == 1:
+        return f"Shall I move the {movable[0]} {where} the {anchor}?"
+    listed = ", ".join(movable[:-1]) + f" or {movable[-1]}"
+    return f"Which one should go {where} the {anchor} — the {listed}?"

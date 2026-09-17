@@ -191,8 +191,43 @@ class PlanSpec:
         # to "what order is this day".
         from models.recipe import slot_sort_key
 
-        meals = tuple(sorted((*self.meals, name), key=slot_sort_key))
-        return replace(self, meals=meals)
+        # INSERTED at its eating-order position, not sorted into the whole
+        # tuple. For a shape in the usual order the two are identical — but a
+        # member who has moved their snack before lunch keeps that arrangement
+        # when they later add a dessert, where a re-sort would silently undo it.
+        key = slot_sort_key(name)
+        meals = list(self.meals)
+        index = next(
+            (i for i, meal in enumerate(meals) if slot_sort_key(meal) > key),
+            len(meals),
+        )
+        meals.insert(index, name)
+        return replace(self, meals=tuple(meals))
+
+    def reorder(self, slot: str, *, before: str = "", after: str = "") -> "PlanSpec":
+        """Move one meal to sit before or after another. `(self)` when it cannot.
+
+        The order used to be a property of the meal's NAME — `slot_sort_key`
+        here, and an independent `SLOT_ORDER` in the UI — so a snack sat
+        between lunch and dinner whatever the member's day looked like, and
+        "put the snack before lunch" reached the edit path and swapped a dish.
+
+        A day is not a taxonomy. Somebody who works nights eats their
+        "breakfast" last, and the plan should be able to say so.
+        """
+        name = str(slot or "").strip().lower()
+        anchor = str(before or after or "").strip().lower()
+        if not name or not anchor or name == anchor:
+            return self
+        if name not in self.meals or anchor not in self.meals:
+            return self
+
+        meals = [m for m in self.meals if m != name]
+        at = meals.index(anchor)
+        meals.insert(at if before else at + 1, name)
+        if tuple(meals) == self.meals:
+            return self
+        return replace(self, meals=tuple(meals))
 
     def without_meal(self, slot: str) -> "PlanSpec":
         """This shape minus one meal, or unchanged when it never had it.
