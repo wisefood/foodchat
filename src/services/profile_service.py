@@ -1,5 +1,6 @@
 import datetime as _dt
 import logging
+import time
 from typing import Any
 
 from backend.platform import WISEFOOD, WiseFoodPool
@@ -139,6 +140,15 @@ class ProfileService:
             with self.client_pool.client() as client:
                 member = client.members.get(member_id)
                 profile = self._map_profile(member.profile)
+                # WHO this member is, not only what they eat.
+                #
+                # `age_group` is a first-class field on the member and
+                # `region` belongs to their household; neither reached
+                # FoodChat, so `guidelines_service.resolve_scope` — which
+                # reads both — fell back to the deployment default for
+                # everybody. Regional guidelines were applied, and an Irish
+                # household and a Hungarian one were judged by the same rules.
+                self._attach_context(client, member, profile)
             logger.info(
                 "Profile fetched for member %s — diet=%s allergies=%s food_likes=%d food_dislikes=%d.",
                 member_id,
@@ -537,6 +547,46 @@ class ProfileService:
         merged["goal_reconciliation"] = reconciliation
         merged["cooking_for_names"] = diner_names
         return merged
+
+    # household_id -> (region, fetched_at). A household's country does not
+    # change between turns, and this lookup sits on the profile fetch, which is
+    # on the path of every plan.
+    _region_cache: dict = {}
+    _REGION_TTL_SECONDS = 3600
+
+    def _attach_context(self, client, member, profile: dict) -> None:
+        """Add the member's age group and their household's region.
+
+        Best-effort by construction, like everything else the catalog feeds: a
+        household lookup that fails costs the plan its regional guidelines and
+        nothing else — `resolve_scope` falls back to the deployment default,
+        which is exactly what happened for every member before this.
+        """
+        age_group = str(getattr(member, "age_group", "") or "").strip().lower()
+        if age_group:
+            profile["age_group"] = age_group
+
+        household_id = str(getattr(member, "household_id", "") or "").strip()
+        if not household_id:
+            return
+        profile["household_id"] = household_id
+
+        cached = self._region_cache.get(household_id)
+        if cached and (time.time() - cached[1]) < self._REGION_TTL_SECONDS:
+            if cached[0]:
+                profile["region"] = cached[0]
+            return
+        try:
+            household = client.households.get(household_id)
+            region = str(getattr(household, "region", "") or "").strip()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Could not read the household region for %s: %s", household_id, exc,
+            )
+            return
+        self._region_cache[household_id] = (region, time.time())
+        if region:
+            profile["region"] = region
 
     def _map_profile(self, wisefood_profile: Any) -> dict:
         """Map WiseFood profile structure to FoodChat format.

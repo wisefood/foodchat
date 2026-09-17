@@ -515,3 +515,46 @@ class TestDegradation:
 
         monkeypatch.setattr(gs, "fetch", boom)
         assert len(guideline_checklist({"fish": 1}, 21)) == 3
+
+
+class TestTheCatalogClientIsThePlatformTalkingToItself:
+    """Two clients, one contract: a lookup FoodChat makes on a member's behalf
+    is not that member using the platform.
+
+    `backend.platform` has passed `telemetry=False` since the SDK grew the
+    flag; the catalog client is the same call to the same platform with the
+    same credentials, and it was reporting. Every guideline lookup would have
+    put a second request behind it.
+    """
+
+    def test_it_does_not_report_its_own_traffic(self, monkeypatch):
+        import backend.catalog as catalog
+
+        seen = {}
+
+        class _FakeClient:
+            def __init__(self, base_url, credentials, **kwargs):
+                seen.update(kwargs)
+                seen["base_url"] = base_url
+
+        import wisefood
+
+        monkeypatch.setattr(wisefood, "Client", _FakeClient)
+        monkeypatch.setattr(catalog, "DATA_API_URL", "http://data-catalog:8000")
+        monkeypatch.setattr(catalog.CatalogClient, "_client", None)
+        monkeypatch.setattr(
+            "backend.platform.credentials_from_env", lambda: object(),
+        )
+
+        catalog.CatalogClient._get_client()
+
+        assert seen.get("telemetry") is False
+        assert seen["base_url"] == "http://data-catalog:8000"
+
+    def test_no_url_means_no_client_and_no_request(self, monkeypatch):
+        """The deliberate off switch: a catalog that is not configured costs
+        the plan its guideline text and nothing else."""
+        import backend.catalog as catalog
+
+        monkeypatch.setattr(catalog, "DATA_API_URL", None)
+        assert catalog.CatalogClient.available() is False

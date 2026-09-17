@@ -10,11 +10,19 @@ this module only runs the query.
     POST {DATA_API_URL}/api/v1/guidelines/search
          {"limit", "offset", "fq": scope.fq(), "sort", "fields"}
 
-Not proxied by the gateway: the data API is its own service (on the demo,
-``https://demo.wisefood-project.eu/dc``) with its own ``/system/login`` and
-``/system/mtm``, so FoodChat talks to it directly with the SDK and the SAME
-credentials it uses for member profiles (`backend.platform.credentials_from_env`
-— client credentials if set, else username/password).
+Not proxied by the gateway: the data API is its own service with its own
+``/system/login`` and ``/system/mtm``, so FoodChat talks to it directly with the
+SDK and the SAME credentials it uses for member profiles
+(`backend.platform.credentials_from_env` — client credentials if set, else
+username/password).
+
+**In the cluster this is the INTERNAL address**, which is what
+`platform-deployment` sets: ``http://data-catalog:8000``. The public one
+(``https://demo.wisefood-project.eu/dc``) is the same service through the
+ingress, and reaching it from inside would leave the cluster, cross TLS and
+come back for a lookup between two pods on the same network — slower, and
+dependent on the ingress being up for a plan that is not being served through
+it. Point `DATA_API_URL` at the public host only from outside the cluster.
 
 What the API does that a caller would not guess (probed 2026-09-17):
 
@@ -96,7 +104,14 @@ class CatalogClient:
             from backend.platform import credentials_from_env
 
             cls._client = Client(
-                DATA_API_URL, credentials_from_env(), default_timeout=DATA_API_TIMEOUT,
+                DATA_API_URL, credentials_from_env(),
+                default_timeout=DATA_API_TIMEOUT,
+                # The platform talking to itself, not a user — the same call
+                # `backend.platform` makes for member profiles. A guideline
+                # lookup on behalf of a plan is not platform usage worth
+                # reporting, and reporting it puts a second request behind
+                # every one of these.
+                telemetry=False,
             )
             logger.info("Data catalog client ready (%s)", DATA_API_URL)
             return cls._client
