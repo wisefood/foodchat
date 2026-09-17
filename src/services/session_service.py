@@ -565,7 +565,7 @@ class SessionService:
             # Nothing to refine from — this is a first plan by any other name.
             return self.add_prepared_meal_plan(session_id, meal_plan)
 
-        meal_plan.version = current.version + 1
+        meal_plan.version = self._next_version(session_id, "daily", current)
         meal_plan.parent_id = current.id
         session.meal_plans.append(meal_plan)
 
@@ -612,7 +612,7 @@ class SessionService:
 
         parent = session.get_current_daily_plan()
         parent_id = parent.id if parent else None
-        next_version = (parent.version + 1) if parent else 1
+        next_version = self._next_version(session_id, "daily", parent)
 
         meal_plan = MealPlan.from_courses(
             courses, reasoning, metrics,
@@ -709,7 +709,7 @@ class SessionService:
 
         parent = session.get_current_weekly_plan()
         parent_id = parent.id if parent else None
-        next_version = (parent.version + 1) if parent else 1
+        next_version = self._next_version(session_id, "weekly", parent)
 
         explainability = explainability or {}
         weekly_plan = WeeklyMealPlan(
@@ -792,6 +792,23 @@ class SessionService:
     # ------------------------------------------------------------------ #
     # Version lineage: going back to one the member liked                  #
     # ------------------------------------------------------------------ #
+
+    def _next_version(self, session_id: str, plan_type: str, parent) -> int:
+        """The next version number on this canvas — unique, and monotonic.
+
+        `parent.version + 1` was right while a canvas was a straight line. It
+        stopped being one the moment a member could go BACK: restoring v1 and
+        then changing something produced "version 2" a second time, so a
+        session ended up with two v2s and "go back to v2" had no single answer.
+
+        The highest number on the canvas plus one, so a number is only ever
+        used once. The parent link still records which version it grew from,
+        which is what makes the lineage a tree rather than a list.
+        """
+        versions = [v for v, _id, _cur in self.plan_versions(session_id, plan_type)]
+        if versions:
+            return max(versions) + 1
+        return (int(getattr(parent, "version", 0) or 0) + 1) if parent else 1
 
     def _canvas_and_plans(self, session, plan_type: str):
         if plan_type == "weekly":

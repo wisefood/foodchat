@@ -708,6 +708,13 @@ class OrchestratorService:
         from models.planning_state import PlanningStateDelta
         from services import plan_navigation
 
+        # A plan the member PASTED is not a navigation request, whatever words
+        # it happens to contain. "Snack before lunch" is a line in somebody's
+        # own plan far more often than it is an instruction about ours, and
+        # this bypass runs ahead of the scorer that the paste is for.
+        if self.looks_like_a_pasted_plan(message):
+            return None
+
         canvas = session.active_canvas
         wanted = plan_navigation.restore_request(message)
 

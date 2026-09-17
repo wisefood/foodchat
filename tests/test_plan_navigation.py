@@ -247,3 +247,106 @@ class TestReorder:
 
         assert _navigate(orch, session_service, four_meals,
                          "add a snack before lunch") is None
+
+
+class TestAPastedPlanIsNotNavigation:
+    """This bypass runs ahead of the scorer a paste is meant for.
+
+    "Snack before lunch" is a line in somebody's own plan far more often than
+    it is an instruction about ours — and without a guard, a member pasting
+    their week to be scored would have had OUR plan rearranged instead, around
+    a meal the regex picked out of their text.
+    """
+
+    PASTE = (
+        "Here's my plan, score it:\n"
+        "Breakfast: porridge\n"
+        "Snack before lunch: apple\n"
+        "Lunch: soup\n"
+        "Dinner: salmon"
+    )
+
+    def test_the_reader_alone_cannot_tell(self):
+        """Stated so the guard below is not mistaken for belt and braces."""
+        assert nav.reorder_request(self.PASTE) is not None
+
+    def test_the_turn_routes_on_to_the_scorer(self, orch, session_service, four_meals):
+        assert _navigate(orch, session_service, four_meals, self.PASTE) is None
+
+    def test_the_plan_is_untouched(self, orch, session_service, four_meals):
+        before = session_service.get_session(four_meals).get_current_daily_plan()
+        _navigate(orch, session_service, four_meals, self.PASTE)
+        after = session_service.get_session(four_meals).get_current_daily_plan()
+
+        assert after.id == before.id
+
+    def test_a_real_request_still_gets_through(self, orch, session_service, four_meals):
+        turn = _navigate(orch, session_service, four_meals, "put the snack before lunch")
+        assert turn is not None and turn.meal_plan is not None
+
+
+class TestVersionNumbersStayUnique:
+    """Reported: "it began counting again from the beginning and now i have two v2s."
+
+    `parent.version + 1` was right while a canvas was a straight line. It stopped
+    being one the moment a member could go BACK: restoring v1 and editing made a
+    second "version 2", and then "go back to v2" had no single answer.
+    """
+
+    def test_editing_after_a_restore_does_not_reuse_a_number(self, orch,
+                                                             session_service, planned):
+        _navigate(orch, session_service, planned, "go back to the first version")
+        session_service.refine_meal_plan(
+            planned, _cand("v4"), reasoning="after the restore", metrics={},
+        )
+        versions = [v for v, _id, _cur in session_service.plan_versions(planned)]
+
+        assert versions == [1, 2, 3, 4]
+        assert len(versions) == len(set(versions)), "two plans wear the same number"
+
+    def test_the_branch_still_records_where_it_grew_from(self, orch, session_service,
+                                                         planned):
+        """Unique numbering is not a flattening — the parent link is what makes
+        the lineage a tree, and going back is the whole reason it is one."""
+        _navigate(orch, session_service, planned, "go back to the first version")
+        restored = session_service.get_session(planned).get_current_daily_plan()
+        session_service.refine_meal_plan(
+            planned, _cand("v4"), reasoning="branch", metrics={},
+        )
+        newest = session_service.get_session(planned).get_current_daily_plan()
+
+        assert newest.version == 4
+        assert newest.parent_id == restored.id
+
+    def test_a_named_version_still_resolves_after_branching(self, orch, session_service,
+                                                            planned):
+        _navigate(orch, session_service, planned, "go back to the first version")
+        session_service.refine_meal_plan(planned, _cand("v4"), reasoning="b", metrics={})
+        turn = _navigate(orch, session_service, planned, "to v3 now")
+
+        assert turn.meal_plan is not None and turn.meal_plan.version == 3
+
+
+class TestABareVersionIsARestore:
+    """"To v5 now" is the follow-up to "go back to the first version" — exactly
+    when a member stops repeating the verb. It reached the planner instead and
+    produced a brand new v5, which is the opposite of the request."""
+
+    @pytest.mark.parametrize("message,expected", [
+        ("to v5 now", 5), ("v2", 2), ("version 3 please", 3), ("to version 1", 1),
+    ])
+    def test_it_is_read_as_one(self, message, expected):
+        assert nav.restore_request(message) == expected
+
+    @pytest.mark.parametrize("message", [
+        "add v8 protein powder", "give me 5 dinners",
+        "i want version 2 of the plan and also a snack",
+    ])
+    def test_a_version_inside_a_sentence_is_not(self, message):
+        """Anchored at both ends: a bare number mid-sentence is far more often
+        a quantity than a version."""
+        assert nav.restore_request(message) is None
+
+    def test_it_restores_rather_than_plans(self, orch, session_service, planned):
+        turn = _navigate(orch, session_service, planned, "to v1 now")
+        assert turn is not None and turn.meal_plan.version == 1

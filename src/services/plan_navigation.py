@@ -68,7 +68,24 @@ def restore_request(message: str) -> Optional[object]:
     match = _ORDINAL.search(text)
     if match:
         return _ORDINALS[match.group(1).lower()]
+    match = _BARE_VERSION.match(text)
+    if match:
+        return int(match.group(1))
     return None
+
+
+# "to v5 now", "v2", "version 3 please" — a whole message that is nothing but a
+# version. The follow-up to "go back to the first version", which is exactly
+# when a member stops repeating the verb; without it, "to v5 now" reached the
+# planner and produced a BRAND NEW v5, which is the opposite of the request.
+#
+# Anchored at both ends on purpose: "add v8 protein powder" is not navigation,
+# and a bare number inside a longer sentence is far more likely to be a
+# quantity than a version.
+_BARE_VERSION = re.compile(
+    r"^\s*(?:to\s+|the\s+)?(?:version|v)\s*(\d{1,2})\s*(?:now|please|instead)?\s*[.!]?\s*$",
+    re.IGNORECASE,
+)
 
 
 # "before lunch", "after dinner", "move the snack", "swap them round".
@@ -108,7 +125,9 @@ def asks_to_reorder(message: str) -> bool:
 _MOVE = re.compile(
     r"\b(?:move|shift|put|have|take|bring|make)?\s*(?:the\s+|my\s+)?"
     r"(?P<slot>breakfast|brunch|lunch|dinner|snack|dessert|supper)\b"
-    r"[^.!?]{0,40}?"
+    # No newlines in the gap: a pasted plan is a LIST, and "Snack" on one line
+    # with "Lunch" on the next is not a request to move anything.
+    r"[^.!?\n]{0,40}?"
     r"\b(?P<where>before|after|ahead of|earlier than|later than)\s+"
     r"(?:the\s+|my\s+)?(?P<anchor>breakfast|brunch|lunch|dinner|snack|dessert|supper)\b",
     re.IGNORECASE,
