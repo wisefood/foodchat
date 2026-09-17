@@ -387,7 +387,9 @@ class WeeklyPlanService:
         repair_note = None
         try:
             from models.plan_brief import PlanBrief
-            from services import plan_quality, plan_repair, plan_verifier, turn_budget
+            from services import (
+                guidelines_service, plan_quality, plan_repair, plan_verifier, turn_budget,
+            )
 
             adapted = _as_meal_plan(plan_entries)
             if adapted is not None:
@@ -433,6 +435,9 @@ class WeeklyPlanService:
                     explainability.setdefault("metrics", {})
                     explainability["metrics"]["quality"] = plan_quality.metrics(
                         plan_quality.scored_from_plan(_as_meal_plan(plan_entries)),
+                        guidelines=guidelines_service.guidelines_text(
+                            "weekly", session.user_profile,
+                        ),
                     )
         except Exception as exc:  # noqa: BLE001
             # All of this describes a plan that already exists. Losing any of

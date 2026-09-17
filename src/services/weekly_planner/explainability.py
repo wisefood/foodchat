@@ -565,11 +565,11 @@ def guideline_checklist(
 ) -> List[dict]:
     """Weekly frequency rules, checked from category counts.
 
-    Prefers the member's OWN guidance — their region, their life stage — from
-    the data catalog. The three rules below are the fallback, and they were the
-    only thing here: real guidance, and the same three for a member in Ireland,
-    Slovenia, Hungary or Greece, and the same three for a pregnant member, a
-    teenager and a 70-year-old.
+    Prefers guidance from the data catalog — the member's region and life
+    stage once the profile carries them, Ireland/adults until then — keeping
+    only the rules a meal-category count can check (fish, red meat, poultry,
+    with a weekly floor, ceiling or range). The three rules below are the fallback, and they were
+    the only thing here: real guidance, and the same three for everyone.
 
     Falls back rather than fails. A catalog that is unreachable, unconfigured,
     or simply has no countable rule for this member costs the plan its regional
@@ -579,7 +579,7 @@ def guideline_checklist(
         try:
             from services import guidelines_service
 
-            rules = guidelines_service.fetch(profile)
+            rules = guidelines_service.fetch(profile, "weekly")
             checkable, _prose = guidelines_service.split(rules)
             rows = guidelines_service.checklist(
                 checkable, category_counts, total_meals,

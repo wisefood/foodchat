@@ -17,6 +17,36 @@ WISEFOOD_CLIENT_SECRET = os.getenv("WISEFOOD_CLIENT_SECRET")
 WISEFOOD_POOL_SIZE = int(os.getenv("WISEFOOD_POOL_SIZE", "5"))
 
 
+def credentials_from_env() -> Credentials:
+    """
+    WiseFood credentials from environment variables.
+
+    Supports two auth methods, client credentials preferred:
+    1. Client credentials auth (WISEFOOD_CLIENT_ID, WISEFOOD_CLIENT_SECRET)
+    2. Username/password auth (WISEFOOD_USERNAME, WISEFOOD_PASSWORD)
+
+    Shared with `backend.catalog`, which authenticates against the data API
+    with the same identity.
+    """
+    if WISEFOOD_CLIENT_ID and WISEFOOD_CLIENT_SECRET:
+        return Credentials(
+            client_id=WISEFOOD_CLIENT_ID,
+            client_secret=WISEFOOD_CLIENT_SECRET
+        )
+
+    if WISEFOOD_USERNAME and WISEFOOD_PASSWORD:
+        return Credentials(
+            username=WISEFOOD_USERNAME,
+            password=WISEFOOD_PASSWORD
+        )
+
+    raise ValueError(
+        "Missing WiseFood credentials. Set either:\n"
+        "  - WISEFOOD_USERNAME and WISEFOOD_PASSWORD, or\n"
+        "  - WISEFOOD_CLIENT_ID and WISEFOOD_CLIENT_SECRET"
+    )
+
+
 class WiseFoodPool:
     """
     Connection pool for WiseFood Client instances.
@@ -51,32 +81,8 @@ class WiseFoodPool:
             self._initialize_pool()
 
     def _get_credentials(self) -> Credentials:
-        """
-        Build credentials from environment variables.
-
-        Supports two auth methods:
-        1. Username/password auth (WISEFOOD_USERNAME, WISEFOOD_PASSWORD)
-        2. Client credentials auth (WISEFOOD_CLIENT_ID, WISEFOOD_CLIENT_SECRET)
-        """
-        # Prefer client credentials if available
-        if WISEFOOD_CLIENT_ID and WISEFOOD_CLIENT_SECRET:
-            return Credentials(
-                client_id=WISEFOOD_CLIENT_ID,
-                client_secret=WISEFOOD_CLIENT_SECRET
-            )
-
-        # Fall back to username/password
-        if WISEFOOD_USERNAME and WISEFOOD_PASSWORD:
-            return Credentials(
-                username=WISEFOOD_USERNAME,
-                password=WISEFOOD_PASSWORD
-            )
-
-        raise ValueError(
-            "Missing WiseFood credentials. Set either:\n"
-            "  - WISEFOOD_USERNAME and WISEFOOD_PASSWORD, or\n"
-            "  - WISEFOOD_CLIENT_ID and WISEFOOD_CLIENT_SECRET"
-        )
+        """Build credentials from environment variables (see `credentials_from_env`)."""
+        return credentials_from_env()
 
     def _create_client(self) -> Client:
         """Create a new WiseFood client instance."""

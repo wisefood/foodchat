@@ -33,6 +33,7 @@ from models.session import MealPlan
 from models.planning_state import PlanningStateDelta
 from services.adapted_recipes import overlay_plan
 from services import (
+    guidelines_service,
     pantry_service,
     plan_parameters,
     plan_history,
@@ -548,7 +549,7 @@ class ChatService:
         # thing to drop when the turn is running late.
         metrics = (
             {} if turn_budget.skip("quality metrics", turn_budget.COST_METRICS)
-            else self._compute_metrics(session_id, best)
+            else self._compute_metrics(session_id, best, profile)
         )
 
         if is_refinement:
@@ -794,6 +795,9 @@ class ChatService:
         else:
             structured_metrics = self._compute_metrics(
                 session_id, scored_plan_from(meal_plan, reasoning=meal_plan.reasoning),
+                profile,
+                # An N-day plan is judged by the rules a week of meals can show.
+                plan_type="weekly" if len(meal_plan.day_plans) > 1 else "daily",
             )
             for key, value in structured_metrics.items():
                 # `llm_score`/`llm_reasoning` carry the plan's own reasoning
@@ -952,14 +956,19 @@ class ChatService:
         logger.info("Brief: %s", brief.describe())
         return brief
 
-    def _compute_metrics(self, session_id: str, plan: ScoredPlan) -> dict:
+    def _compute_metrics(
+        self, session_id: str, plan: ScoredPlan, profile: dict, plan_type: str = "daily",
+    ) -> dict:
         """The four plan-quality metrics surfaced in the API response.
 
         Delegates to `plan_quality`, which the weekly service uses too — one
         implementation, so a change to how a plan is scored cannot land on one
-        path and not the other.
+        path and not the other. Guideline adherence is judged against the
+        member's rules from the data catalog for this `plan_type`.
         """
-        result = plan_quality.metrics(plan)
+        result = plan_quality.metrics(
+            plan, guidelines=guidelines_service.guidelines_text(plan_type, profile),
+        )
         logger.info("[%s] FVS: %d unique ingredients.", session_id, result["fvs_count"])
         return result
 

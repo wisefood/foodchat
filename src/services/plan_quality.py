@@ -108,9 +108,9 @@ def metrics(scored, guidelines: str = "", *, llm_score: Optional[int] = None,
     fvs_count, fvs_reasoning = food_variety(scored)
 
     diversity = _Graders.diversity().score(plan_text)
-    # `guidelines` is the prose context from the data catalog when there is
-    # any; without it the judge grades on its own rubric, which is what it did
-    # before the catalog was wired at all.
+    # `guidelines` is the member's numbered rules from the data catalog
+    # (`guidelines_service.guidelines_text`); empty when the catalog cannot
+    # answer, and the judge then grades on its own rubric.
     adherence = _Graders.guideline().score(plan_text, guidelines)
 
     return {
