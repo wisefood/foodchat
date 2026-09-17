@@ -107,11 +107,13 @@ def metrics(scored, guidelines: str = "", *, llm_score: Optional[int] = None,
     plan_text = as_text(scored)
     fvs_count, fvs_reasoning = food_variety(scored)
 
-    diversity = _Graders.diversity().score(plan_text)
+    diversity = _judged("diversity", lambda: _Graders.diversity().score(plan_text))
     # `guidelines` is the member's numbered rules from the data catalog
     # (`guidelines_service.guidelines_text`); empty when the catalog cannot
     # answer, and the judge then grades on its own rubric.
-    adherence = _Graders.guideline().score(plan_text, guidelines)
+    adherence = _judged(
+        "guideline adherence", lambda: _Graders.guideline().score(plan_text, guidelines),
+    )
 
     return {
         "llm_score": int(llm_score if llm_score is not None else getattr(scored, "score", 0)),
@@ -123,6 +125,22 @@ def metrics(scored, guidelines: str = "", *, llm_score: Optional[int] = None,
         "guideline_adherence_score": int(adherence.get("score", 0)),
         "guideline_adherence_reasoning": str(adherence.get("reasoning", "")),
     }
+
+
+def _judged(name: str, judge) -> dict:
+    """One judge's `{score, reasoning}`, or an unscored `0` if the call fails.
+
+    These scores describe a plan that has already been chosen. A judge that is
+    rate-limited (the on-demand tier allows 8,000 tokens a minute, and grading
+    the candidate days spends most of it) used to raise through the whole turn,
+    and the member lost a finished plan over a score. `0` is what the judges
+    already return for a reply they cannot parse: not scored.
+    """
+    try:
+        return judge()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Quality metric '%s' unavailable: %s: %s", name, type(exc).__name__, exc)
+        return {"score": 0, "reasoning": ""}
 
 
 def scored_from_plan(meal_plan, score: int = 0, reasoning: str = ""):

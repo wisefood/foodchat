@@ -18,16 +18,18 @@ passes an ``override`` scope. Rules tagged for nobody in particular are
 ordinary rules for everyone, including the untagged ones that were plainly
 written for children ("Offer red meat 3 times a week").
 
-**The judges get all of them** (`guidelines_text`): a numbered list the LLM can
-cite, capped so a prompt stays inside the on-demand token budget.
+**The judges get the rules** (`guidelines_text`): a numbered list the LLM can
+cite, rules that state a frequency first, capped (`GUIDELINES_MAX_CHARS`) so the
+judge fits in the same minute as the candidate grading on Groq's on-demand
+tier.
 
 **The checklist gets very few.** Most rules cannot be counted from a plan —
 "choose wholegrain varieties where possible" is advice, not an assertion with a
 truth value. A rule becomes a checklist row only when it is food-based, names a
 meal category the weekly planner actually counts (fish, red meat, poultry), and
 states a weekly floor, ceiling or range. In the default Irish adult set no rule
-does, so the checklist keeps its three built-in rules there. Everything else is prose. Inventing a target for a
-prose rule — or counting "vegetables" against a category counter that never
+does, so the checklist keeps its three built-in rules there. Everything else is
+prose. Inventing a target for a prose rule — or counting "vegetables" against a category counter that never
 counts vegetables — would render a number with nothing behind it as if it were
 a measurement.
 
@@ -74,11 +76,22 @@ _AGE_GROUP_STAGE = {
     "senior": "older_adulthood",
 }
 
-# What the judge is handed. The whole default set fits (Ireland, adults: 81
-# rules, ~6k characters, ~1.5k tokens); a larger one — Hungary is 162 — is cut
-# to its most checkable rules.
+# What the judge is handed, in characters of rule text (~4 per token). The
+# adherence judge runs in the same minute as the candidate grading, and on
+# Groq's on-demand tier (8,000 tokens a minute) the whole Irish adult set —
+# 77 rules, ~6k characters — pushed it past the limit on a live daily plan, so
+# the score came back empty. 3,500 keeps 45 of those 77 — every rule that
+# states a frequency, portion definitions last; a deployment on a larger tier
+# can raise it.
 MAX_RULES = 90
-MAX_CHARS = 7000
+MAX_CHARS = int(os.getenv("GUIDELINES_MAX_CHARS", "3500"))
+
+# A rule that states how often ("5-7 servings a day", "at each meal") says
+# something a plan can be judged against, whatever its type.
+_STATES_AN_AMOUNT = re.compile(
+    r"\b(?:a|per|each|every)\s+(?:day|week|meal)\b|\b(?:daily|weekly|once|twice)\b",
+    re.IGNORECASE,
+)
 
 # The catalog's classifier for what KIND of rule this is. `action_type` is
 # "eat" on 2,765 of 2,790 rules and says nothing.
@@ -218,8 +231,10 @@ def render(rules: list[dict], scope: Optional[GuidelineScope] = None) -> str:
         [G1] (weekly) Offer oily fish such as mackerel, ... once a week.
 
     Stable ids so a reasoning line can point at a rule. Ordered so the cap cuts
-    the least checkable rules first: food-based before nutrient-based before
-    untyped before behavioural, and rules with a stated frequency first.
+    the least checkable rules first: rules that state an amount or frequency
+    before those that do not, then food-based before nutrient-based before
+    untyped before behavioural. A rule too long for what is left of the budget
+    is skipped, not the end of the list.
     """
     rules = [r for r in rules or [] if _rule_text(r)]
     if not rules:
@@ -230,8 +245,10 @@ def render(rules: list[dict], scope: Optional[GuidelineScope] = None) -> str:
     chars = 0
     for rule in ordered:
         text = _rule_text(rule)
-        if len(kept) >= MAX_RULES or chars + len(text) > MAX_CHARS:
+        if len(kept) >= MAX_RULES:
             break
+        if chars + len(text) > MAX_CHARS:
+            continue
         kept.append(rule)
         chars += len(text)
 
@@ -257,9 +274,12 @@ _TYPE_RANK = {"food_based": 0, "nutrient_based": 1, None: 2, "behavioral": 3}
 
 
 def _judge_priority(rule: dict):
+    states_amount = bool(rule.get("frequency")) or bool(
+        _STATES_AN_AMOUNT.search(_rule_text(rule))
+    )
     return (
+        0 if states_amount else 1,
         _TYPE_RANK.get(rule.get("guideline_type"), 2),
-        0 if rule.get("frequency") else 1,
     )
 
 

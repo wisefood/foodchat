@@ -2,6 +2,43 @@
 
 ---
 
+# Guideline adherence: a judge that fits the minute, and scores that cannot fail a plan
+
+> **Date:** 2026-09-17
+> **Branch:** main
+> No API change. New optional env var `GUIDELINES_MAX_CHARS` (default 3500).
+> A quality score whose judge call fails is now `0` (not scored) instead of the
+> whole turn answering 500.
+
+Found by running the previous change through the app end to end, on the demo
+gateway and Groq's on-demand tier.
+
+| What | Detail |
+|---|---|
+| `plan_quality.metrics` → `_judged` | Each judge call (diversity, guideline adherence) is caught on its own. Before, a rate-limited judge raised through `_compute_metrics` and the member got a 500 for a plan that had already been chosen and graded. Now a failed judge's score is `0` with empty reasoning, which is what the judges already return for a reply they cannot parse, and the other scores and the plan stand. Weekly already caught this around its whole verification block; daily and structured did not. |
+| `guidelines_service.render` | Budget `GUIDELINES_MAX_CHARS` = 3,500 characters of rule text (was 7,000). Live, the 77-rule Irish daily set made the adherence request 3,930 tokens, on top of 4,321 already spent grading candidates, against an 8,000-per-minute limit, and the score came back empty after ~30 s of retries. Rules that state a frequency ("a day", "each meal", "once", `frequency` set) now come before those that do not, then by type. A rule too long for the remaining budget is skipped rather than ending the list. The Irish daily list is now 45 rules (~4.3k characters): the frequency rules for grains, dairy, protein, vegetables and fruit, fluids and treats first, and portion definitions last. |
+| `.gitignore` | `.wisefood_demo_token` (a live bearer token) and `.idea/`. |
+
+## Verification
+
+New tests: a failed judge leaves the other scores; a frequency-stating untyped
+rule outranks a typed one that states none; an over-long rule is skipped, not
+the end of the list. Full suite, rebased on main: 2,325 passed, 1 skipped. `test_platform_client` passes on wisefood
+0.0.26, the version `requirements.txt` pins; its earlier failure here was a
+local install of 0.0.8/0.0.9. Ruff clean.
+
+**Live** (local demo harness, demo data API, on-demand Groq): a daily plan
+returned 200 with FVS 40 and guideline adherence 2, citing G1–G4, G8, G5/G11
+and G16. The diversity judge was rate-limited that turn and scored 0 instead
+of failing the turn. A 7-day weekly plan returned 200 with the three built-in
+checklist rows (all met), FVS 146, diversity 4, and guideline adherence 2
+against the 81 weekly Irish rules, citing them. The harness's own stand-in
+client was brought level with `PlanClient` (`tags`, `offset`,
+`deepen_multiplate_only`, and `find_recipes` filters) so plans could be
+generated at all. It is untracked and not part of this commit.
+
+---
+
 # Guideline adherence reads the WiseFood data catalog
 
 > **Date:** 2026-09-17

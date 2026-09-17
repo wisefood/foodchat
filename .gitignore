@@ -18,3 +18,7 @@ foodchat.db
 # here it drops a 300KB directory of throwaway sessions next to the source,
 # where it shows up as untracked and makes a clean tree look dirty.
 foodchat-tests-*/
+
+# Local only: the demo gateway's cached bearer token, and IDE settings.
+.wisefood_demo_token
+.idea/
