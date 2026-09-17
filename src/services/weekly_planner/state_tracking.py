@@ -94,6 +94,13 @@ class WeeklyNutritionalTracker:
                 0 if diet & {"vegetarian", "vegan"}
                 else max(1, round(DEFAULT_WEEKLY_MEAT_LIMIT * days / 7))
             ),
+            # Whether the number above is the MEMBER's or ours.
+            #
+            # The plan reported it either way as `source: "dietary preference"`
+            # and apologised — "Your weekly meat limit (3) couldn't be fully
+            # honored" — to a member who never set one. A default is a fine
+            # thing to have and a lie to attribute.
+            "meat_limit_explicit": False,
         }
 
         for pref in preferences:
@@ -124,6 +131,7 @@ class WeeklyNutritionalTracker:
                 match = re.search(r"(\d+)\s*meat|meat[^\d]{0,12}(\d+)", pref_lower)
                 if match:
                     targets["meat_limit"] = int(match.group(1) or match.group(2))
+                    targets["meat_limit_explicit"] = True
 
         return targets
 

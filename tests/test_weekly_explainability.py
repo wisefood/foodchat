@@ -400,7 +400,10 @@ class TestBuildWeeklyExplainability:
 
         reasoning = result["reasoning"]
         assert "All 21 meals this week are distinct recipes" in reasoning
-        assert "Stayed within your weekly meat limit (1 of 3 meat meals)" in reasoning
+        # "the default", not "your": this profile sets no meat limit, and 3 is
+        # `DEFAULT_WEEKLY_MEAT_LIMIT`. Calling it theirs is what had the plan
+        # apologise to a member for missing a number they never chose.
+        assert "Stayed within the default weekly meat limit (1 of 3 meat meals)" in reasoning
         assert "12,600 of your 14,000 kcal weekly budget (90%)" in reasoning
 
     def test_pescatarian_fish_not_counted_as_meat(self):

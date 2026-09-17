@@ -183,3 +183,122 @@ class TestDeterministicReward:
         tracker.update_tracker(MealCourse("b", "Pork Chops", "pork", "d"))
         # One over the limit -> -15
         assert calc.calculate_step_reward(_meat(1, 0), tracker, []) == -15.0
+
+
+def _entries(meat_days=(1, 2, 3)):
+    """A stored week — plan ENTRIES, not the action dicts above."""
+    out = []
+    for day in range(1, 8):
+        for idx, slot in enumerate(("breakfast", "lunch", "dinner")):
+            recipe = _meat(day, idx) if (day in meat_days and idx == 2) else _veg(day, idx)
+            out.append({
+                "day": day, "meal_idx": idx, "meal_type": slot,
+                "recipe": dict(recipe), "reward": 1.0,
+            })
+    return out
+
+
+class TestTheMeatLimitSaysWhoseItIs:
+    """The plan told a member "at most 3 meat meal(s) this week", sourced to
+    their "dietary preference", and then apologised: "Your weekly meat limit (3)
+    couldn't be fully honored."
+
+    Nobody set 3. It is `DEFAULT_WEEKLY_MEAT_LIMIT`, scaled to the horizon. A
+    default is a fine thing to have and a lie to attribute — and apologising for
+    missing a number the member never chose invents a disappointment.
+    """
+
+    @staticmethod
+    def _targets(preferences, days=7):
+        from services.weekly_planner.state_tracking import WeeklyNutritionalTracker
+
+        tracker = WeeklyNutritionalTracker(
+            {"preferences": preferences, "diet": []}, [], num_days=days,
+        )
+        return tracker.targets
+
+    def test_the_default_is_marked_as_ours(self):
+        targets = self._targets([])
+        assert targets["meat_limit"] == 3
+        assert targets["meat_limit_explicit"] is False
+
+    def test_a_number_the_member_gave_is_marked_as_theirs(self):
+        targets = self._targets(["meat limit 2"])
+        assert targets["meat_limit"] == 2
+        assert targets["meat_limit_explicit"] is True
+
+    def _row(self, preferences, entries):
+        from services.weekly_planner.explainability import build_weekly_explainability
+
+        built = build_weekly_explainability(
+            entries, {"preferences": preferences, "diet": [], "allergies": []},
+        )
+        return next(
+            r for r in built["constraints_applied"] if "meat meal" in r["constraint"]
+        ), built.get("reasoning", "")
+
+    def test_our_default_is_soft_and_named_as_ours(self):
+        row, _prose = self._row([], _entries())
+
+        assert row["type"] == "soft"
+        assert row["source"] == "FoodChat default"
+        assert "not something you asked for" in row["detail"]
+
+    def test_the_members_own_limit_is_hard_and_theirs(self):
+        row, _prose = self._row(["meat limit 2"], _entries())
+
+        assert row["type"] == "hard"
+        assert row["source"] == "dietary preference"
+        assert "not something you asked for" not in row["detail"]
+
+    def test_the_prose_does_not_call_our_default_theirs(self):
+        _row, prose = self._row([], _entries())
+
+        assert "your weekly meat limit" not in prose.lower()
+        assert "your meat limit" not in prose.lower()
+
+
+class TestItNamesEverySlotItGaveWayAt:
+    """Observed: "6 of 3 meat meal(s) planned; … every available candidate for
+    Saturday lunch contained meat, so the limit was relaxed there".
+
+    Three meals over the limit, explained by one slot and the word "there". A
+    reader counts one exception; the plan had several.
+    """
+
+    def test_all_the_slots_are_named(self):
+        from services.weekly_planner.explainability import _slot_list
+
+        events = [
+            {"type": "meat_limit_relaxed", "day": 3, "meal_type": "lunch"},
+            {"type": "meat_limit_relaxed", "day": 5, "meal_type": "dinner"},
+            {"type": "meat_limit_relaxed", "day": 6, "meal_type": "lunch"},
+        ]
+        named = _slot_list(events)
+
+        assert "and" in named
+        assert named.count(",") == 1, named
+
+    def test_one_slot_reads_as_one(self):
+        from services.weekly_planner.explainability import _slot_list
+
+        named = _slot_list([{"type": "meat_limit_relaxed", "day": 6, "meal_type": "lunch"}])
+        assert "and" not in named and "," not in named
+
+    def test_the_detail_does_not_say_there_about_several(self):
+        from services.weekly_planner.explainability import build_weekly_explainability
+
+        events = [
+            {"type": "meat_limit_relaxed", "day": 3, "meal_type": "lunch"},
+            {"type": "meat_limit_relaxed", "day": 6, "meal_type": "lunch"},
+        ]
+        built = build_weekly_explainability(
+            _entries(meat_days=(1, 2, 3, 4, 5, 6)),
+            {"preferences": [], "diet": [], "allergies": []},
+            selection_events=events,
+        )
+        row = next(r for r in built["constraints_applied"] if "meat meal" in r["constraint"])
+
+        assert "Wednesday lunch and Saturday lunch" in row["detail"]
+        assert "relaxed at each" in row["detail"]
+        assert "relaxed there" not in row["detail"]

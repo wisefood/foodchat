@@ -880,6 +880,7 @@ def weekly_constraints_ledger(
         })
 
     meat_limit = int(targets.get("meat_limit") or 0)
+    meat_limit_chosen = bool(targets.get("meat_limit_explicit"))
     if meat_limit > 0 or meat_count > 0:
         relaxed = [e for e in selection_events if e.get("type") == "meat_limit_relaxed"]
         pruned = [e for e in selection_events if e.get("type") == "meat_pool_pruned"]
@@ -888,19 +889,28 @@ def weekly_constraints_ledger(
             detail += f"; meat dishes left the candidate pool from {_slot_name(pruned[0])} on"
         if relaxed:
             status = "relaxed"
+            # EVERY slot it gave way at. Naming the first read as a single
+            # exception — "6 of 3 meat meal(s) planned … so the limit was
+            # relaxed there" describes one slot and three extra meals.
+            where = _slot_list(relaxed)
             detail += (
-                f"; every available candidate for {_slot_name(relaxed[0])} "
-                "contained meat, so the limit was relaxed there"
+                f"; every available candidate for {where} contained meat, so "
+                f"the limit was relaxed {'there' if len(relaxed) == 1 else 'at each'}"
             )
         elif meat_count > meat_limit:
-            status = "violated"
+            # Only a limit the MEMBER set can be violated. Ours being exceeded
+            # is our default giving way, which is what a default is for.
+            status = "violated" if meat_limit_chosen else "relaxed"
         else:
             status = "satisfied"
+        if not meat_limit_chosen:
+            detail += " — FoodChat's own default, not something you asked for"
         ledger.append({
             "constraint": f"at most {meat_limit} meat meal(s) this week",
-            "type": "hard",
+            # A default is a soft house rule; only the member's is hard.
+            "type": "hard" if meat_limit_chosen else "soft",
             "status": status,
-            "source": "dietary preference",
+            "source": "dietary preference" if meat_limit_chosen else "FoodChat default",
             "detail": detail,
         })
 
@@ -943,6 +953,20 @@ def weekly_constraints_ledger(
 # Whole-week justification (deterministic prose)                          #
 # --------------------------------------------------------------------- #
 
+def _slot_list(events: list) -> str:
+    """"Wednesday lunch, Friday dinner and Saturday lunch" — all of them.
+
+    A count of relaxations that names one slot invites the reading that there
+    was one, which is how "6 of 3 meat meal(s)" came with a single-slot excuse.
+    """
+    names = list(dict.fromkeys(_slot_name(e) for e in events if _slot_name(e)))
+    if not names:
+        return "some slots"
+    if len(names) == 1:
+        return names[0]
+    return ", ".join(names[:-1]) + f" and {names[-1]}"
+
+
 def _compose_reasoning(
     variety: dict,
     meat_count: int,
@@ -952,6 +976,7 @@ def _compose_reasoning(
     pinned_count: int,
     adapted_count: int,
     repeats: Optional[dict] = None,
+    meat_limit_chosen: bool = False,
 ) -> str:
     parts = []
     total = variety["total_meals"]
@@ -963,18 +988,24 @@ def _compose_reasoning(
         parts.append(f"{distinct} distinct recipes across {total} meals — {cat_line}.")
 
     if meat_limit > 0:
+        # "Your limit" only when it IS theirs. Apologising to a member for
+        # missing a number they never chose invents a disappointment.
+        whose = "your" if meat_limit_chosen else "the default"
         if relaxed_slot:
             parts.append(
-                f"Your weekly meat limit ({meat_limit}) couldn't be fully honored — "
-                f"every available candidate for {relaxed_slot} contained meat."
+                f"The week goes over {whose} weekly meat limit "
+                f"({meat_count} of {meat_limit}) — every available candidate "
+                f"for {relaxed_slot} contained meat."
             )
         elif meat_count > meat_limit:
             parts.append(
-                f"The week exceeds your meat limit ({meat_count} of {meat_limit} meat meals)."
+                f"The week goes over {whose} meat limit "
+                f"({meat_count} of {meat_limit} meat meals)."
             )
         else:
             parts.append(
-                f"Stayed within your weekly meat limit ({meat_count} of {meat_limit} meat meals)."
+                f"Stayed within {whose} weekly meat limit "
+                f"({meat_count} of {meat_limit} meat meals)."
             )
 
     pct = nutrition.get("budget_used_pct")
@@ -1091,11 +1122,12 @@ def build_weekly_explainability(
         variety,
         meat_count,
         int(targets.get("meat_limit") or 0),
-        _slot_name(relaxed[0]) if relaxed else "",
+        _slot_list(relaxed) if relaxed else "",
         nutrition,
         pinned_count,
         adapted_count,
         repeats=repeats,
+        meat_limit_chosen=bool(targets.get("meat_limit_explicit")),
     )
 
     return {
