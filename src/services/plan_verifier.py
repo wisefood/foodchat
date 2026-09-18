@@ -358,14 +358,55 @@ def _measured(plate, enrichment, attribute: str, nutrition_key: str):
     return (getattr(plate, "nutrition", None) or {}).get(nutrition_key)
 
 
+def _heaviest_plate(plan, enrichment, day_number: int):
+    """`(title, kcal)` of the biggest single plate on a day, or None.
+
+    What makes an overshoot actionable. "Day 1 is 470 kcal over" is a fact the
+    member can do nothing with; naming the plate carrying most of it is the
+    difference between a report and a suggestion.
+    """
+    best = None
+    for day in plan.day_plans:
+        if int(getattr(day, "day", 1) or 1) != day_number:
+            continue
+        for meal in day.meals:
+            for plate in meal.plates:
+                if not plate.recipe_id:
+                    continue
+                kcal = _measured(plate, enrichment, "kcal", "kcal")
+                if not isinstance(kcal, (int, float)):
+                    continue
+                if best is None or float(kcal) > best[1]:
+                    best = (str(getattr(plate, "title", "") or ""), float(kcal))
+    return best
+
+
 def _check_kcal(plan, requested, enrichment) -> Optional[Check]:
     """Per DAY, because that is the unit a calorie target is set in.
 
     A day whose plates carry no macros is not scored — reporting "0 kcal, 100%
     under target" for missing data would be a measurement of nothing presented
     as a measurement of the plan.
+
+    Two numbers can be measured against, and which one it is changes what this
+    check is allowed to say:
+
+    * **the member's own target** — a miss is a FAILURE, because they asked to
+      be planned against it;
+    * **a population reference**, used only when they set no target. A day over
+      it is worth telling them ("three snacks and a dinner add up"), and it is
+      NOT a broken rule — nobody set one. So it reports as PARTIAL under its
+      own name, and every sentence says whose number it is.
+
+    That distinction is the weekly meat limit's lesson applied here in advance:
+    FoodChat's own default rendered as the member's "dietary preference", with
+    an apology addressed to somebody who never asked for it.
     """
     target = requested.get("kcal_target")
+    reference = requested.get("kcal_reference")
+    chosen = bool(target)
+    if not chosen:
+        target = reference
     if not target:
         return None
     try:
@@ -374,6 +415,17 @@ def _check_kcal(plan, requested, enrichment) -> Optional[Check]:
         return None
     if target <= 0:
         return None
+
+    # The name is what `transparency.split_ledger` hands the reply, on its own
+    # and without the detail — so it has to read as a sentence in both "was
+    # honoured" and "could not be honoured". "calorie reference" does not; "a
+    # 2000 kcal daily reference" does.
+    name = "calories" if chosen else f"a {int(target)} kcal daily reference"
+    basis = "" if chosen else str(requested.get("kcal_reference_basis") or "")
+    against = (
+        f"your {int(target)} kcal target" if chosen
+        else f"a {int(target)} kcal reference"
+    )
 
     per_day: list[tuple[int, float, int, int]] = []
     for day in plan.day_plans:
@@ -390,8 +442,8 @@ def _check_kcal(plan, requested, enrichment) -> Optional[Check]:
             per_day.append((day.day, total, counted, len(plates)))
 
     if not per_day:
-        return Check(name="calories", status=UNKNOWN,
-                     detail=f"Target {int(target)} kcal a day; no dish has "
+        return Check(name=name, status=UNKNOWN,
+                     detail=f"Nothing to compare against {against}: no dish has "
                             "nutrition data to add up")
 
     low, high = target * (1 - KCAL_TOLERANCE), target * (1 + KCAL_TOLERANCE)
@@ -401,21 +453,38 @@ def _check_kcal(plan, requested, enrichment) -> Optional[Check]:
 
     if not misses:
         average = sum(t for _, t, _, _ in per_day) / len(per_day)
+        detail = f"Averaging {int(average)} kcal a day against {against}{caveat}"
+        if basis:
+            detail += f" — {basis}"
         return Check(
-            name="calories", status=PASSED,
-            detail=f"Averaging {int(average)} kcal a day against a {int(target)} "
-                   f"target{caveat}",
+            name=name, status=PASSED, detail=detail,
             observed=len(per_day), of=len(plan.day_plans),
         )
+
     worst = max(misses, key=lambda item: abs(item[1] - target))
     direction = "over" if worst[1] > target else "under"
+    detail = (
+        f"{len(misses)} of {len(per_day)} days miss {against} — day {worst[0]} "
+        f"is {int(abs(worst[1] - target))} kcal {direction}{caveat}"
+    )
+    # Only when the day is OVER, and only the plate that would move it most.
+    # Under-target is a different conversation and naming its lightest dish
+    # would be telling somebody to eat more of something.
+    if direction == "over":
+        heaviest = _heaviest_plate(plan, enrichment, worst[0])
+        if heaviest and heaviest[0]:
+            detail += (
+                f". The heaviest plate is “{heaviest[0]}” at {int(heaviest[1])} "
+                "kcal — ask me for a lighter one there and I will re-plan it"
+            )
+    if basis:
+        detail += f". {basis[0].upper()}{basis[1:]}"
     return Check(
-        name="calories", status=FAILED,
-        detail=(
-            f"{len(misses)} of {len(per_day)} days miss the {int(target)} kcal "
-            f"target — day {worst[0]} is {int(abs(worst[1] - target))} kcal "
-            f"{direction}{caveat}"
-        ),
+        name=name,
+        # A population reference is not a rule the member broke. It reports as
+        # partial — worth reading, not a red mark for a number nobody set.
+        status=FAILED if chosen else PARTIAL,
+        detail=detail,
         observed=len(per_day), of=len(plan.day_plans),
     )
 

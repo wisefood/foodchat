@@ -211,6 +211,15 @@ class TestTheCalorieBudgetHasTwoSides:
         assert calorie_budget_status(6531.0, 0.0, 21, 21) is None
 
     def test_the_ledger_row_reports_the_shortfall(self):
+        """Both directions of the budget are still reported — but WHOSE number
+        the week fell short of now depends on who set it.
+
+        This case sets none (`{"preferences": []}`, and `calories_explicit`
+        absent), so the 14,000 is FoodChat's reference. It used to read
+        "short of your target" with status `violated`, which is the weekly
+        meat limit's bug on the row beside it: a default attributed to the
+        member and apologised for. The member's own target is asserted below.
+        """
         nutrition = {"weekly_totals": {"kcal": 6531.0},
                      "coverage": {"meals_with_data": 21, "total_meals": 21},
                      "budget_status": "under", "note": ""}
@@ -221,8 +230,25 @@ class TestTheCalorieBudgetHasTwoSides:
         )
         row = next(r for r in ledger if "calorie" in r["constraint"])
 
+        assert row["status"] == "relaxed"
+        assert "short of that reference" in row["detail"]
+        assert "your target" not in row["detail"]
+
+    def test_a_target_the_member_set_is_still_theirs(self):
+        nutrition = {"weekly_totals": {"kcal": 6531.0},
+                     "coverage": {"meals_with_data": 21, "total_meals": 21},
+                     "budget_status": "under", "note": ""}
+        ledger = weekly_constraints_ledger(
+            {"preferences": ["2000 calories target"]}, meat_count=0,
+            targets={"calories": 14000.0, "meat_limit": 0,
+                     "calories_explicit": True},
+            selection_events=[], downvoted_count=0, nutrition=nutrition,
+        )
+        row = next(r for r in ledger if "calorie" in r["constraint"])
+
         assert row["status"] == "violated"
         assert "short of your target" in row["detail"]
+        assert row["source"] == "calorie target"
 
     def test_a_payload_with_no_status_is_not_read_as_a_violation(self):
         """Pre-M10 stored plans and hand-built dicts carry no `budget_status`.
@@ -305,12 +331,28 @@ class TestWeeklyConstraintsLedger:
         assert row["status"] == "satisfied" and row["type"] == "soft"
         assert "13,450 of 14,000 kcal planned (96%)" in row["detail"]
 
-    def test_calorie_overshoot_is_violated(self):
+    def test_calorie_overshoot_against_a_reference_is_not_a_violation(self):
+        """`{"preferences": []}` — nobody set 14,000 kcal, so going over it is
+        worth reading and is not a rule the plan broke. `violated` here was
+        FoodChat marking a week red against its own default."""
         nutrition = {"weekly_totals": {"kcal": 16000.0},
                      "coverage": {"meals_with_data": 21, "total_meals": 21},
                      "note": ""}
         ledger = weekly_constraints_ledger(
             {"preferences": []}, meat_count=0, targets={"calories": 14000.0, "meat_limit": 0},
+            selection_events=[], downvoted_count=0, nutrition=nutrition,
+        )
+        row = next(r for r in ledger if "calorie" in r["constraint"])
+        assert row["status"] == "relaxed"
+        assert row["source"] == "a population reference"
+
+    def test_calorie_overshoot_against_the_members_target_is(self):
+        nutrition = {"weekly_totals": {"kcal": 16000.0},
+                     "coverage": {"meals_with_data": 21, "total_meals": 21},
+                     "note": ""}
+        ledger = weekly_constraints_ledger(
+            {"preferences": ["2000 calories target"]}, meat_count=0,
+            targets={"calories": 14000.0, "meat_limit": 0, "calories_explicit": True},
             selection_events=[], downvoted_count=0, nutrition=nutrition,
         )
         row = next(r for r in ledger if "calorie" in r["constraint"])

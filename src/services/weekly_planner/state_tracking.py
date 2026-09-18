@@ -17,6 +17,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from models.session import MealCourse
+from services import reference_intake
 
 from .day_summary import is_meat_meal
 
@@ -76,11 +77,30 @@ class WeeklyNutritionalTracker:
             user_profile.get("preferences", []) or [], diet_set
         )
 
-    def _extract_targets(self, preferences: List[str], diet: set) -> Dict[str, float]:
+    def _extract_targets(self, preferences: List[str], diet: set) -> Dict[str, Any]:
         """Extract numeric targets from preference strings + diet."""
         days = self.num_days
+        # The daily figure this week is measured against, and whose it is.
+        #
+        # It was a flat 2000, reported by the ledger as `source: "calorie
+        # target"` with the words "over your target" — the meat limit's bug
+        # exactly, on the row beside it. `reference_for` returns the number
+        # AND its provenance, so a member who stated a sex gets the reference
+        # for an adult of that sex rather than the label figure, and nobody is
+        # told a number is theirs when it is not.
+        # `None` — nobody for whom a single figure would mean anything, which
+        # today is anyone who is not an adult. The week is still STEERED by the
+        # label figure, as it always was, because the planner needs some
+        # per-meal sense of size; what changes is that `calories_basis` stays
+        # empty and the ledger then says nothing rather than measuring a child
+        # against an adult's day.
+        reference = reference_intake.reference_for(self.user_profile)
+        daily = reference.kcal if reference else reference_intake.EU_REFERENCE_INTAKE
         targets = {
-            "calories": 2000.0 * days,
+            "calories": daily * days,
+            # Whether the number above is the MEMBER's or a population figure.
+            "calories_explicit": bool(reference and reference.chosen),
+            "calories_basis": reference.basis if reference else "",
             "protein": 0.0,
             "carbs": 0.0,
             "fat": 0.0,
@@ -106,9 +126,17 @@ class WeeklyNutritionalTracker:
         for pref in preferences:
             pref_lower = pref.lower()
             if "calories target" in pref_lower:
+                # `reference_for` already read this — it parses the same
+                # string — but a profile may carry a form this loop handles
+                # and that parser does not, so the explicit reading still
+                # wins where it finds one.
                 try:
                     val = float(pref_lower.split()[0])
                     targets["calories"] = val * days
+                    targets["calories_explicit"] = True
+                    targets["calories_basis"] = (
+                        "the daily calorie target on your profile"
+                    )
                 except ValueError:
                     pass
             elif "high protein" in pref_lower:

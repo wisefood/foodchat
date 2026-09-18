@@ -654,6 +654,24 @@ class ProfileService:
             "preferences": self._build_preferences(nutritional_preferences, properties)
             + goal_preference_strings(dietary_goals),
             "history": properties.get("feedback_history", "") or "",
+            # The member's own daily calorie target as a NUMBER, beside the
+            # prose string `_build_preferences` writes.
+            #
+            # The prose was the only form, and `PlanBrief._kcal_target` reads
+            # `calorie_target` — a key nothing ever set. So the weekly tracker
+            # and the plan scorer both saw the member's target (they parse the
+            # string) and the daily planner saw None: no calorie ranking, no
+            # per-meal budget, and `plan_verifier._check_kcal` returning before
+            # it measured anything. A day could land 900 kcal over the member's
+            # own target without a word.
+            "calorie_target": nutritional_preferences.get("calories") or None,
+            # Only what an energy reference can use, and only from what the
+            # member already put on their profile. `nutritional_preferences` is
+            # a free-form blob; carrying it whole would put arbitrary gateway
+            # keys into every prompt and log that renders a profile.
+            "sex": nutritional_preferences.get("sex")
+            or nutritional_preferences.get("gender")
+            or None,
             "food_likes": list(nutritional_preferences.get("food_likes", []) or []),
             "food_dislikes": list(nutritional_preferences.get("food_dislikes", []) or []),
             "dietary_goals": dietary_goals,

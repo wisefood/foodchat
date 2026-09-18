@@ -394,9 +394,13 @@ class WeeklyPlanService:
             adapted = _as_meal_plan(plan_entries)
             if adapted is not None:
                 brief = PlanBrief.build(session.user_profile)
-                report = plan_verifier.verify(
-                    adapted, brief.to_requested(), enrichment,
-                )
+                requested = brief.to_requested()
+                # The weekly ledger already carries a calorie row of its own,
+                # built by the tracker from the same reference. Passing this
+                # would put two calorie rows on one plan, and a member reading
+                # both would have to work out whether they disagree.
+                requested.pop("kcal_reference", None)
+                report = plan_verifier.verify(adapted, requested, enrichment)
                 logger.info(
                     "[%s] Weekly verified: %s",
                     session_id, plan_verifier.describe(report),

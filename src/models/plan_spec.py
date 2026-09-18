@@ -112,6 +112,11 @@ _NON_MEAL_SLOTS: frozenset[str] = frozenset({"snack", "dessert", "side", "drink"
 # something rather than silently comply.
 _MAX_DESSERTS_PER_DAY = 1
 
+# Instances of one repeatable slot above which an assistant should say
+# something before building. Two snacks is a normal day; three is a choice
+# worth acknowledging, and four is most of the day's eating.
+_MAX_REPEATS_BEFORE_ASKING = 2
+
 # Slots RecipeWrangler can fill. Mirrored so a spec can be validated without a
 # network call; `PlanClient.planning_options()` reconciles against the live list.
 KNOWN_SLOTS: tuple[str, ...] = (
@@ -487,6 +492,25 @@ class PlanSpec:
             notes.append(
                 "That is only " + ", ".join(self.meals) + " — no actual meal in "
                 "the day. I can plan it, but shall I add a lunch or a dinner?"
+            )
+
+        # A day can now hold several of one meal, and three snacks around three
+        # meals is six eating occasions. Not a nutrition standard — `concerns`
+        # catches SHAPES that are wrong before a single recipe is chosen, and
+        # this is one: the calories cannot be known yet, but the number of
+        # times somebody is being asked to eat can.
+        #
+        # Snacks only. A repeated dessert is already answered by the rule
+        # above, and two notes about one slot is the plan nagging.
+        snacks = len(self.instances_of("snack"))
+        if snacks > _MAX_REPEATS_BEFORE_ASKING:
+            proper = len(
+                [m for m in self.meals if slot_kind(m) not in _NON_MEAL_SLOTS]
+            )
+            notes.append(
+                f"That is {snacks} snacks in one day on top of {proper} meals. "
+                "I can plan it — shall I keep them light so the day still "
+                "adds up?"
             )
 
         if len(self.meals) == 1 and self.num_days > 1:

@@ -826,12 +826,11 @@ class PastedPlanScorer:
             constraint = str(row.get("constraint") or "")
             if days < 7 and constraint.endswith(" this week"):
                 row["constraint"] = constraint[: -len(" this week")] + f" over these {days} days"
-            if constraint == "weekly calorie target" and not explicit:
-                row["source"] = "default target"
-                row["detail"] = (
-                    f"{row.get('detail', '')}; your profile has no calorie target, so "
-                    f"{DEFAULT_DAILY_KCAL:,} kcal a day was used"
-                ).lstrip("; ")
+            # The row used to arrive claiming a default was the member's, and
+            # this rewrote it here — one module correcting another's
+            # attribution after the fact. `weekly_constraints_ledger` now says
+            # whose number it is when it builds the row, and names the
+            # reference it used, so the correction has nothing left to correct.
             measured_rows.append(row)
 
         metrics = [

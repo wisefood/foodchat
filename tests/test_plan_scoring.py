@@ -762,7 +762,11 @@ class TestWeeklyScoring:
         constraints = {r["constraint"]: r for r in result.constraints}
 
         assert constraints["at most 2 meat meal(s) over these 3 days"]["status"] == "satisfied"
-        assert constraints["weekly calorie target"]["source"] == "default target"
+        # The row now arrives correctly attributed instead of being rewritten
+        # here: `weekly_constraints_ledger` names the reference it used and
+        # calls it one. `_weekly_measured` used to patch `source` to "default
+        # target" afterwards — one module correcting another's claim.
+        assert constraints["weekly calorie reference"]["source"] == "a population reference"
         assert constraints["repeats are your own choice"]["status"] == "satisfied"
 
     def test_the_judge_is_told_it_is_a_week_and_given_the_measured_facts(self):

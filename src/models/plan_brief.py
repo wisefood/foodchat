@@ -83,6 +83,16 @@ class PlanBrief:
 
     # ── numeric ─────────────────────────────────────────────────────────
     kcal_target: Optional[float] = None
+    # A figure the day may be REPORTED against when the member set no target
+    # of their own — and never one the plan may be ranked, filtered or
+    # apportioned by. Separate from `kcal_target` precisely so that cannot
+    # happen by accident: `kcal_by_slot` and the plate critic read the one
+    # above, which stays None until somebody chooses a number.
+    kcal_reference: Optional[float] = None
+    # Where `kcal_reference` came from, in words the member can read. Empty
+    # when there is no reference. A number on a plan with no stated origin is
+    # how the weekly meat limit came to apologise for a rule nobody set.
+    kcal_reference_basis: str = ""
     # The day's budget divided across a meal's plates, per slot. Resurrects
     # `PlanSpec.kcal_split`, which has been correct and unused since it was
     # written: a main-plus-dessert dinner is one meal's calories split two
@@ -118,6 +128,7 @@ class PlanBrief:
             effective_diet,
             screening_allergens,
         )
+        from services import reference_intake
         from services.intent_facets import claim_tags_for, effective_facets
 
         profile = profile or {}
@@ -132,6 +143,7 @@ class PlanBrief:
         )
 
         kcal_target = _kcal_target(profile, params)
+        reference = reference_intake.reference_for(profile)
         return cls(
             allergens=tuple(screening_allergens(profile)),
             diet=tuple(effective_diet(profile)),
@@ -141,6 +153,10 @@ class PlanBrief:
             food_groups=tuple(facets.get("food_groups") or ()),
             claim_tags=tuple(claims),
             kcal_target=kcal_target,
+            # Reporting only — never `kcal_by_slot`, which apportions a budget
+            # and must therefore be the member's own number or nothing.
+            kcal_reference=reference.kcal if reference else None,
+            kcal_reference_basis=reference.basis if reference else "",
             kcal_by_slot=_kcal_by_slot(spec, kcal_target),
             max_minutes=_as_int(params.get("cooking_time")),
             min_nutri_score=_nutri_floor(profile, params),
@@ -249,6 +265,8 @@ class PlanBrief:
             "food_groups": list(self.food_groups),
             "tags": list(self.claim_tags),
             "kcal_target": self.kcal_target,
+            "kcal_reference": self.kcal_reference,
+            "kcal_reference_basis": self.kcal_reference_basis,
             "max_minutes": self.max_minutes,
             "min_nutri_score": self.min_nutri_score,
             "pantry": list(self.pantry),
@@ -301,16 +319,20 @@ def _kcal_target(profile: dict, params: dict) -> Optional[float]:
     """The day's calorie budget, or None when nobody set one.
 
     None rather than the default is deliberate at this level: a target the
-    member never set must not be reported as theirs. The default only applies
-    when a GOAL is set, because a goal is the member asking to be planned
-    against something.
+    member never set must not be reported as theirs, and must not rank their
+    plates either. The default only applies when a GOAL is set, because a goal
+    is the member asking to be planned against something.
+
+    The stated target now comes from `reference_intake.stated_target`, which
+    reads BOTH the structured key and the prose string the gateway mapping
+    writes into `preferences`. Reading only the key — which nothing sets — is
+    why this returned None for every member who had set a target.
     """
-    stated = profile.get("calorie_target") or profile.get("daily_kcal_target")
-    try:
-        if stated and float(stated) > 0:
-            return float(stated)
-    except (TypeError, ValueError):
-        pass
+    from services import reference_intake
+
+    stated = reference_intake.stated_target(profile)
+    if stated:
+        return stated
     goal = str(params.get("goal") or "").strip().lower()
     return DEFAULT_DAILY_KCAL if goal in {"weight_loss", "balanced", "high_protein", "energy"} else None
 

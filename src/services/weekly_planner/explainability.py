@@ -934,17 +934,41 @@ def weekly_constraints_ledger(
             planned, target_kcal, covered,
             int((nutrition.get("coverage") or {}).get("total_meals") or 0),
         )
+        # Whose number this week was measured against.
+        #
+        # It was always "your target", `source: "calorie target"`, and
+        # `violated` — for a flat 2000 kcal a day that nobody set. The meat
+        # limit's bug, on the row beside it, and fixed the same way: a default
+        # is a fine thing to have and a lie to attribute.
+        chosen = bool(targets.get("calories_explicit"))
+        basis = str(targets.get("calories_basis") or "")
+        whose = "your target" if chosen else "that reference"
         if budget_status == "under":
-            detail += "; short of your target for the meals we have data for"
+            detail += f"; short of {whose} for the meals we have data for"
         elif budget_status == "over":
-            detail += "; over your target"
-        ledger.append({
-            "constraint": "weekly calorie target",
-            "type": "soft",
-            "status": "satisfied" if budget_status == "on_track" else "violated",
-            "source": "calorie target",
-            "detail": detail,
-        })
+            detail += f"; over {whose}"
+        if not chosen and basis:
+            detail += f" — {basis}"
+        # No row at all when there is no figure it would be honest to measure
+        # against — a child, on today's rules, for whom one number spanning
+        # childhood means nothing. The week is still planned and still steered
+        # by a size; it is simply not reported against an adult's day, which is
+        # what a flat 2000 did for everybody.
+        if chosen or basis or "calories_basis" not in targets:
+            ledger.append({
+                "constraint": (
+                    "weekly calorie target" if chosen else "weekly calorie reference"
+                ),
+                "type": "soft",
+                "status": (
+                    "satisfied" if budget_status == "on_track"
+                    # Missing a number nobody set is not a rule broken. Worth
+                    # reading, not a red mark.
+                    else ("violated" if chosen else "relaxed")
+                ),
+                "source": "calorie target" if chosen else "a population reference",
+                "detail": detail,
+            })
 
     return ledger
 
