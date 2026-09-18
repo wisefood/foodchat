@@ -124,7 +124,13 @@ def slot_sort_key(slot: str) -> int:
     SLOT_ORDER, and sorting those alphabetically would put every day 2 dinner
     before its lunch.
     """
-    name = str(slot or "").lower()
+    from models.plan_spec import slot_kind
+
+    # By KIND, so a second snack sorts beside the first rather than after the
+    # drinks. Instances tie, and Python's sort is stable, so the order they
+    # were placed in is the order they keep — which is the day the member
+    # asked for.
+    name = slot_kind(slot)
     try:
         return SLOT_ORDER.index(name)
     except ValueError:

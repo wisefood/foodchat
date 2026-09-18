@@ -32,6 +32,7 @@ plans forever.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field, replace
 from typing import Any, Iterable
 
@@ -119,6 +120,53 @@ KNOWN_SLOTS: tuple[str, ...] = (
 
 DEFAULT_MEALS: tuple[str, ...] = ("breakfast", "lunch", "dinner")
 
+# A slot name in `meals` may be an INSTANCE of a slot kind: `snack_2` is the
+# second snack of the day. The suffix is FoodChat's alone — RecipeWrangler is
+# always asked for the kind, because a corpus annotated with course types has
+# no opinion about which snack of the day this is.
+#
+# "plan my day include two snack as well in-between" returned one snack. Not
+# because the reader missed the word: `meals` is a tuple of slot NAMES, every
+# writer refused a name it already held, and `plates`/`slot_food_groups` are
+# dicts keyed by that name — so a second snack had nowhere to exist. The
+# member asked for a shape the type could not represent, and the half that
+# could be represented was built and reported as the whole.
+_INSTANCE_RE = re.compile(r"^(?P<kind>[a-z]+)_(?P<n>[2-9])$")
+
+# Meals that anchor a day. A repeated snack goes BETWEEN these — which is what
+# "in-between" means — rather than at the position its name sorts to.
+_ANCHOR_SLOTS: frozenset[str] = frozenset(
+    {"breakfast", "brunch", "lunch", "dinner", "supper"}
+)
+
+# Instances of one kind in a single day. Four snacks is grazing; five is a
+# rendering problem.
+MAX_INSTANCES_PER_SLOT = 4
+
+
+def slot_kind(slot: str) -> str:
+    """The kind of slot this name is an instance of. `snack_2` -> `snack`.
+
+    Every boundary that speaks a vocabulary other than FoodChat's own — the
+    RecipeWrangler request, the course-type map, the scorer's five slots —
+    goes through here, so an instance never escapes as a slot nobody has
+    heard of.
+    """
+    name = str(slot or "").strip().lower()
+    match = _INSTANCE_RE.match(name)
+    return match.group("kind") if match else name
+
+
+def slot_instance(kind: str, number: int) -> str:
+    """The name of the `number`-th instance of `kind`, 1-based.
+
+    The first instance keeps the bare kind, so a plan with one snack is
+    byte-for-byte the plan it has always been — no migration, and no stored
+    plan that suddenly renders a slot called `snack_1`.
+    """
+    base = slot_kind(kind)
+    return base if number <= 1 else f"{base}_{int(number)}"
+
 # Product-level bounds. RecipeWrangler enforces its own (count 1-20, days 1-14);
 # these are tighter because a plan is rendered as cards and read aloud, and a
 # forty-plate day is neither.
@@ -168,10 +216,14 @@ class PlanSpec:
         parts = []
         for slot in self.meals:
             roles = self.roles_for(slot)
+            # The KIND, because the instance suffix is an internal id. "1 day —
+            # breakfast; snack; lunch; snack_2; dinner" is read aloud to the
+            # member, and `snack_2` is not a word.
+            name = slot_kind(slot)
             if roles == ("main",):
-                parts.append(slot)
+                parts.append(name)
             else:
-                parts.append(f"{slot}: {' + '.join(roles)}")
+                parts.append(f"{name}: {' + '.join(roles)}")
         day_word = "1 day" if self.num_days == 1 else f"{self.num_days} days"
         return f"{day_word} — " + "; ".join(parts)
 
@@ -209,6 +261,58 @@ class PlanSpec:
         )
         meals.insert(index, name)
         return replace(self, meals=tuple(meals))
+
+    def instances_of(self, kind: str) -> tuple[str, ...]:
+        """Every meal in this shape that is an instance of `kind`, in day order."""
+        base = slot_kind(kind)
+        return tuple(m for m in self.meals if slot_kind(m) == base)
+
+    def with_meal_count(self, kind: str, count: int) -> "PlanSpec":
+        """This shape with exactly `count` meals of `kind`, spread across the day.
+
+        The answer to "two snacks in-between". `with_meal` can only ever add
+        the first one — a name already in `meals` is refused, by design, so
+        that "add breakfast" twice does not build two breakfasts — and there
+        was nothing else a member could reach to say *how many*.
+
+        Placement is by GAP, not by name. A repeated snack means one between
+        each pair of anchor meals, which is what somebody who says "in-between"
+        is describing; sorting the second one by `slot_sort_key` would stack it
+        against the first, and the plan would show two snacks in a row after
+        lunch.
+
+        Instances are renumbered by position afterwards, so `snack` is always
+        the day's first snack and `snack_2` its second, whatever order they
+        were added in. Their plates and food groups travel with them.
+        """
+        base = slot_kind(kind)
+        if base not in KNOWN_SLOTS:
+            return self
+        wanted = max(0, min(int(count), MAX_INSTANCES_PER_SLOT))
+        current = list(self.instances_of(base))
+        if wanted == len(current):
+            return self
+
+        meals = list(self.meals)
+        if wanted < len(current):
+            # Drop from the END of the day: a member cutting back from three
+            # snacks to two keeps their morning one.
+            for name in current[wanted:]:
+                if len(meals) > 1:
+                    meals.remove(name)
+        else:
+            for _ in range(wanted - len(current)):
+                if len(meals) >= MAX_MEALS_PER_DAY:
+                    break
+                if not any(slot_kind(m) == base for m in meals):
+                    # The FIRST one goes where `with_meal` would put it, so
+                    # "add a snack" and "add 1 snack" describe the same day.
+                    # Only the repeats need a gap of their own.
+                    meals = list(replace(self, meals=tuple(meals)).with_meal(base).meals)
+                    continue
+                meals.insert(_next_gap(meals, base), _free_name(meals, base))
+
+        return _renumbered(self, tuple(meals), base)
 
     def reorder(self, slot: str, *, before: str = "", after: str = "") -> "PlanSpec":
         """Move one meal to sit before or after another. `(self)` when it cannot.
@@ -365,7 +469,7 @@ class PlanSpec:
             for slot in self.meals
             for role in self.roles_for(slot)
             if role == "dessert"
-        ) + sum(1 for slot in self.meals if slot == "dessert")
+        ) + sum(1 for slot in self.meals if slot_kind(slot) == "dessert")
 
         if dessert_plates > _MAX_DESSERTS_PER_DAY:
             notes.append(
@@ -379,7 +483,7 @@ class PlanSpec:
         # every meal with a main, so a role-based check here could never fire —
         # the gap is someone asking for "just snacks and a dessert", where each
         # meal is fine and the day is not.
-        if self.meals and all(slot in _NON_MEAL_SLOTS for slot in self.meals):
+        if self.meals and all(slot_kind(slot) in _NON_MEAL_SLOTS for slot in self.meals):
             notes.append(
                 "That is only " + ", ".join(self.meals) + " — no actual meal in "
                 "the day. I can plan it, but shall I add a lunch or a dinner?"
@@ -427,7 +531,13 @@ class PlanSpec:
             wanted = depth if (len(roles) > 1 or not only_multiplate) else 1
             for role in roles:
                 entry = {
-                    "slot": slot,
+                    # The KIND. RecipeWrangler's `SLOT_COURSE_TYPES` is keyed
+                    # on the eight slots it knows, and `snack_2` is not one of
+                    # them — an unknown slot would fall to the default course
+                    # types and come back as a main dish. The instance name
+                    # never leaves this process; `role_sequence` keeps it, and
+                    # the reply is paired back positionally.
+                    "slot": slot_kind(slot),
                     "count": wanted,
                     "course_types": list(request_course_types(role)),
                 }
@@ -464,6 +574,13 @@ class PlanSpec:
             "num_days": self.num_days,
             "meals": list(self.meals),
             "plates": {slot: list(roles) for slot, roles in self.plates.items()},
+            # Left out until now, and `from_spec` did not read it back, so
+            # "fruit for the snack" survived exactly as long as the process
+            # did: any turn that asked a clarifying question round-tripped the
+            # spec through here and the member's taste was gone by the answer.
+            "slot_food_groups": {
+                slot: list(groups) for slot, groups in self.slot_food_groups.items()
+            },
         }
 
     @classmethod
@@ -511,7 +628,12 @@ class PlanSpec:
         meals: list[str] = []
         for value in raw.get("meals") or ():
             slot = str(value or "").strip().lower()
-            if slot in slot_vocab and slot not in meals:
+            # Validated by KIND, so `snack_2` survives the round trip. Before
+            # this, a shape with two snacks went through `to_dict` and came
+            # back with one: the second name was not in the vocabulary, so it
+            # was dropped as an invented slot on the way home from its own
+            # serializer.
+            if slot_kind(slot) in slot_vocab and slot not in meals:
                 meals.append(slot)
             if len(meals) >= MAX_MEALS_PER_DAY:
                 break
@@ -519,7 +641,7 @@ class PlanSpec:
         plates: dict[str, tuple[str, ...]] = {}
         for slot, roles in (raw.get("plates") or {}).items():
             key = str(slot or "").strip().lower()
-            if key not in slot_vocab:
+            if slot_kind(key) not in slot_vocab:
                 continue
             cleaned: list[str] = []
             for role in roles or ():
@@ -535,9 +657,84 @@ class PlanSpec:
             if cleaned and cleaned != ["main"]:
                 plates[key] = tuple(cleaned)
 
+        groups: dict[str, tuple[str, ...]] = {}
+        for slot, wanted in (raw.get("slot_food_groups") or {}).items():
+            key = str(slot or "").strip().lower()
+            if slot_kind(key) not in slot_vocab:
+                continue
+            cleaned = tuple(
+                dict.fromkeys(
+                    str(g).strip().lower() for g in wanted or () if str(g).strip()
+                )
+            )
+            if cleaned:
+                groups[key] = cleaned
+
         if not meals:
             # Plates may name a slot the meals list forgot — "dinner should have
             # a side" implies dinner is in the plan.
             meals = [s for s in DEFAULT_MEALS] if not plates else sorted(plates)
 
-        return cls(num_days=num_days, meals=tuple(meals), plates=plates)
+        return cls(
+            num_days=num_days,
+            meals=tuple(meals),
+            plates=plates,
+            # Only for meals the shape actually serves: a food group on a slot
+            # nobody is eating is a filter with nowhere to apply.
+            slot_food_groups={k: v for k, v in groups.items() if k in meals},
+        )
+
+
+def _next_gap(meals: list[str], kind: str) -> int:
+    """Where the next instance of `kind` goes: the earliest free gap.
+
+    A gap is the space between two consecutive anchor meals. Free means no
+    instance of this kind already sits in it — otherwise a second snack would
+    land beside the first and "in-between" would have described nothing.
+
+    With every gap taken (or none to take, on a plan with fewer than two
+    anchors), the instance goes after the last anchor, which is where an extra
+    snack on a one-meal day belongs.
+    """
+    anchors = [i for i, m in enumerate(meals) if slot_kind(m) in _ANCHOR_SLOTS]
+    for left, right in zip(anchors, anchors[1:]):
+        if not any(slot_kind(m) == kind for m in meals[left + 1:right]):
+            return left + 1
+    return (anchors[-1] + 1) if anchors else len(meals)
+
+
+def _free_name(meals: list[str], kind: str) -> str:
+    """An instance name of `kind` that this shape does not already use."""
+    for number in range(1, MAX_INSTANCES_PER_SLOT + 1):
+        name = slot_instance(kind, number)
+        if name not in meals:
+            return name
+    return slot_instance(kind, MAX_INSTANCES_PER_SLOT)
+
+
+def _renumbered(spec: "PlanSpec", meals: tuple[str, ...], kind: str) -> "PlanSpec":
+    """`spec` with `meals`, and every instance of `kind` numbered by position.
+
+    Numbering is a statement about the day, not about the order somebody typed
+    things in: `snack` is the first snack you eat. A member who adds an
+    afternoon snack and then a morning one should not end up with `snack_2`
+    before `snack`, because every surface that reads the name — the reply, the
+    ledger, the card label — would then disagree with the plan it is describing.
+    """
+    rename: dict[str, str] = {}
+    number = 0
+    for name in meals:
+        if slot_kind(name) != kind:
+            continue
+        number += 1
+        rename[name] = slot_instance(kind, number)
+
+    def moved(mapping: dict) -> dict:
+        return {rename.get(k, k): v for k, v in mapping.items()}
+
+    return replace(
+        spec,
+        meals=tuple(rename.get(m, m) for m in meals),
+        plates=moved(spec.plates),
+        slot_food_groups=moved(spec.slot_food_groups),
+    )

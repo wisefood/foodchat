@@ -200,6 +200,15 @@ def intake(session_id: str, message: str, *,
     # on a REFINEMENT `plan_horizon` deliberately leaves the days alone — so
     # "switch to daily from three days plan" said one day, nothing read it as a
     # number, and the three-day plan came back three days long.
+    # How MANY of a meal — after the additions, which put the first one there,
+    # and before the horizon, which is a count of days rather than of meals.
+    #
+    # "include two snack as well in-between" reached `additions`, which added
+    # one snack and was right to; nothing read "two", so the plan came back
+    # with a single snack and a summary confidently listing it as the day.
+    shaped, counted = shape_intent.slot_counts(message, shaped)
+    changed_shape.extend(counted)
+
     # A taste the member scoped to one meal ("fruit for the snack").
     shaped, tastes = shape_intent.slot_food_groups(message, shaped)
     changed_shape.extend(tastes)

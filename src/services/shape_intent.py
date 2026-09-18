@@ -147,6 +147,89 @@ def additions(
     return result, changed
 
 
+# How many of one meal the day should have. Digits and the words up to four,
+# plus "a couple of", which everybody uses and nobody means loosely.
+_COUNT_WORDS: dict[str, int] = {
+    "1": 1, "one": 1, "a single": 1, "just one": 1,
+    "2": 2, "two": 2, "a couple of": 2, "a couple": 2, "both": 2,
+    "3": 3, "three": 3,
+    "4": 4, "four": 4,
+}
+
+_HOW_MANY = re.compile(
+    r"\b(?P<n>" + "|".join(
+        sorted((re.escape(w) for w in _COUNT_WORDS), key=len, reverse=True)
+    ) + r")\s+(?P<slot>[a-z]+)(?:e?s)?\b",
+    re.IGNORECASE,
+)
+
+
+def slot_counts(message: str, spec, *, focus_slot: Optional[str] = None):
+    """Meals the message asks for a NUMBER of. `(spec, notes)`.
+
+    "plan my day include two snack as well in-between" returned one snack, and
+    nothing in the system was wrong about it in isolation: `additions` heard
+    "snack" and added a snack, which is exactly what it is for. Nobody read the
+    word "two", because until `PlanSpec.with_meal_count` there was no shape a
+    second snack could be written into — so the reader that would have found
+    the number had nowhere to put it.
+
+    The member then got a plan with one snack and a summary that said
+    "breakfast; lunch; snack; dinner from your preferences" — a confident
+    account of a day they did not ask for. That is the failure this closes,
+    and it is the same one as "add a salad as well there": half the request
+    executed and reported as the whole.
+
+    Deliberately narrow. The count must be written — a digit or one of the
+    words above — and it must sit immediately before a slot name. "Some
+    snacks" is not a number and is left to `additions`, which adds one; a
+    member who wants a second can say so.
+    """
+    from models.plan_spec import KNOWN_SLOTS, MAX_MEALS_PER_DAY, ROLES
+
+    text = (message or "").strip()
+    if not text:
+        return spec, []
+
+    changed: list[str] = []
+    result = spec
+    target = _named_slot(text, spec) or focus_slot
+
+    for match in _HOW_MANY.finditer(text):
+        slot = match.group("slot").lower().rstrip("s")
+        if slot not in KNOWN_SLOTS:
+            # "two days", "three portions" — a number in front of a word that
+            # is not a meal this planner fills.
+            continue
+        # "a main and two sides for dinner" is a count of PLATES, and plates
+        # are `with_plate`'s business — reading it here would build a day with
+        # two meals called "side".
+        if slot in ROLES and (target or _AS_PLATE.search(text)):
+            continue
+        if _NEGATED_BEFORE.search(text[:match.start()]):
+            continue
+        wanted = _COUNT_WORDS[match.group("n").lower()]
+        before = result
+        result = result.with_meal_count(slot, wanted)
+        if result is not before:
+            # What LANDED, not what was asked for. The day has a ceiling
+            # (`MAX_MEALS_PER_DAY`), so "four snacks" on a three-meal day
+            # becomes three — and a note saying "4 snacks" would be this
+            # module telling the member's own summary line something untrue.
+            got = len(result.instances_of(slot))
+            had = len(before.instances_of(slot))
+            note = f"{got} {slot}{'s' if got != 1 else ''}"
+            if got < wanted:
+                note += f" (asked for {wanted}; a day here holds {MAX_MEALS_PER_DAY} meals)"
+            elif had:
+                note += f" (was {had})"
+            changed.append(note)
+
+    if changed:
+        logger.info("Shape counts: %s -> %s", "; ".join(changed), result.describe())
+    return result, changed
+
+
 # "remove the snack", "drop the dessert", "no snack today", "skip breakfast".
 #
 # Narrow on the verb and narrow on the target, unlike `_ADD`: a removal throws

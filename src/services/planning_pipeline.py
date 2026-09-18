@@ -657,8 +657,20 @@ class PlanningPipeline:
         if findings:
             logger.info("Composition findings: %s", "; ".join(findings[:6]))
 
+        # The order the member asked for, not the order the judge answered in.
+        #
+        # `chosen` is a dict the judge builds, and a day was rendered in
+        # whatever order its keys came back in. That was invisible while the
+        # shape was breakfast/lunch/dinner and every surface re-sorted by name
+        # anyway — but a shape can now say *where* a meal goes ("a snack
+        # in-between", a reordered day), and the spec is the only record of it.
+        order = {slot: index for index, slot in enumerate(spec.meals)}
         for day in sorted(by_day_meals):
-            meals = by_day_meals[day]
+            meals = sorted(
+                by_day_meals[day],
+                key=lambda m: order.get(m.meal_type, len(order)),
+            )
+            by_day_meals[day] = meals
 
             if not days:  # day 1 only
                 for meal in meals:

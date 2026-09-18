@@ -34,7 +34,7 @@ from typing import Any, Optional
 
 import httpx
 
-from models.plan_spec import PlanSpec
+from models.plan_spec import PlanSpec, slot_kind
 from models.recipe import CandidateRecipe
 
 logger = logging.getLogger(__name__)
@@ -532,11 +532,28 @@ class PlanClient:
                 )
             pools: dict[tuple[str, str], list[CandidateRecipe]] = {}
             for (expected_slot, role), entry in zip(sequence, entries):
-                # The slot name comes from the response so a service that
-                # reorders is still read correctly; the role comes from the
-                # request because roles are FoodChat's vocabulary and the
-                # response has never carried them.
-                slot = str(entry.get("slot") or expected_slot)
+                # The REQUESTED slot, not the echoed one.
+                #
+                # It used to be the echoed one, "so a service that reorders is
+                # still read correctly" — but the pairing above is positional,
+                # so a service that reordered would already be handing each
+                # entry the wrong role, and reading the slot from the response
+                # only made half of each pair right. Two failures that cancel
+                # are not a policy.
+                #
+                # It also made repeated slots impossible. A day with two snacks
+                # sends two entries whose `slot` is `snack` — RecipeWrangler
+                # knows kinds, not instances — and both echoes came back as
+                # `snack`, so the second pool overwrote the first and the plan
+                # had one snack. The request is what knows which plate this is.
+                slot = expected_slot
+                echoed = str(entry.get("slot") or "")
+                if echoed and echoed != slot_kind(slot):
+                    logger.warning(
+                        "day %s: asked for %r and the service answered %r — "
+                        "pairing by position, as requested",
+                        day, slot_kind(slot), echoed,
+                    )
                 bucket = pools.setdefault((slot, role), [])
                 for recipe in entry.get("recipes") or []:
                     recipe_id = str(recipe.get("recipe_id") or "").strip()

@@ -601,6 +601,17 @@ class OrchestratorService:
         # path at all — the closest available action was a full refinement,
         # which regenerates every slot and throws away a swap the member had
         # already approved.
+        # "Score my plan" — about the plan on the canvas, not a pasted one.
+        #
+        # Ahead of the tool selector, because that is what answered it: the
+        # message names no dishes, so `is_explicit_score_request` said no, and
+        # the selector reached for a weekly reader, which replied "there's no
+        # weekly plan in this conversation yet" to a member with a daily plan
+        # open in front of them. Two correct refusals, one nonsense answer.
+        scored = self._maybe_score_canvas(session, session_id, message)
+        if scored is not None:
+            return scored
+
         tool_turn = self._maybe_use_tool(session, session_id, message)
         if tool_turn is not None:
             return tool_turn
@@ -625,6 +636,47 @@ class OrchestratorService:
         logger.info("[%s] intent=%s target=%s", session_id, intent, target_plan_type)
         return self._route(session, session_id, message, intent, target_plan_type,
                            score_may_ask=score_may_ask)
+
+    def _maybe_score_canvas(self, session, session_id: str, message: str):
+        """Score the plan on the canvas, or `None` to route the turn normally.
+
+        Three conditions, all deterministic, because this runs before any
+        model is asked anything:
+
+        * a **scoring word** — the same one `is_explicit_score_request` uses;
+        * **no meal listing**, so a pasted plan still goes to the pasted path,
+          which is the one that can read it;
+        * **no request verb**. "Make it score better" is an instruction, not a
+          question about the current plan, and scoring it would answer
+          something nobody asked.
+
+        A session with no plan returns `None` and the turn routes on — the
+        member is talking about a plan they have not made yet, and the
+        classifier is better placed to work out which.
+        """
+        if not self._SCORE_REQUEST_RE.search(message or ""):
+            return None
+        if self._PLAN_REQUEST_RE.search(message or ""):
+            return None
+        if self._lists_meals(message):
+            return None      # a pasted plan; `_handle_score_plan` owns it
+        try:
+            outcome = self.plan_scorer.score_canvas(
+                session_id, self._canvas_kind(session),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[%s] Could not score the canvas plan: %s", session_id, exc)
+            return None
+        if outcome is None:
+            return None
+        logger.info("[%s] Scoring the plan on the canvas.", session_id)
+        return self._turn_from_score(outcome)
+
+    @staticmethod
+    def _canvas_kind(session) -> str:
+        """Which canvas the member is looking at, or "" when there is none."""
+        canvas = getattr(session, "active_canvas", None)
+        return str(getattr(canvas, "plan_type", "") or "")
 
     # Chooses one of FoodChat's own capabilities, or none. Fast tier: routing
     # over a handful of named tools, running before the intent classifier on

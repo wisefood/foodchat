@@ -172,6 +172,56 @@ class PlanScorerService:
 
         return self._finish(session, plan, message, context)
 
+    def score_canvas(
+        self, session_id: str, plan_type: str = "", *, context: Optional[str] = None,
+    ) -> Optional[ScoreTurn]:
+        """Score the plan already on the member's canvas. ``None`` if there is none.
+
+        The scorer was built for text a member pasted, and every entry point
+        into it required that text — so "score my plan", with a plan open on
+        the screen, had no route at all. It fell through to the tool selector,
+        which answered with the only refusal it had.
+
+        Nothing about the metrics needed changing. A canvas plan is *better*
+        grounded than a pasted one: its dishes are catalogue recipes, so the
+        lookup, the similarity threshold and the estimated servings that the
+        pasted path needs are all skipped. `canvas.from_canvas` is the whole
+        adapter.
+
+        No canvas is touched and no version created, exactly as for a pasted
+        plan — scoring is a reading, not an edit.
+        """
+        from .canvas import from_canvas
+
+        session = self._session(session_id)
+        wanted = str(plan_type or "").strip().lower()
+        weekly = session.get_current_weekly_plan()
+        daily = session.get_current_daily_plan()
+        has_weekly = weekly is not None and bool(getattr(weekly, "entries", None))
+
+        # The canvas the member is looking at wins; with nothing to go on,
+        # whichever one holds a plan, weekly first — a session with both was
+        # most recently planning a week. Same rule as `plan_tools._day_plan`,
+        # for the same reason: two readers disagreeing about which plan "my
+        # plan" means is worse than either answer.
+        if wanted == "weekly" and has_weekly:
+            plan, kind = weekly, "weekly"
+        elif wanted == "daily" and daily is not None:
+            plan, kind = daily, "daily"
+        elif has_weekly:
+            plan, kind = weekly, "weekly"
+        elif daily is not None:
+            plan, kind = daily, "daily"
+        else:
+            return None
+
+        pasted, grounded = from_canvas(plan, kind)
+        if not grounded:
+            return None
+        return self._finish(
+            session, pasted, "", context, grounded=grounded, own_plan=True,
+        )
+
     def continue_clarification(self, session_id: str, message: str) -> ScoreTurn:
         """Resume a pending ``score_plan`` question with the member's reply."""
         session = self._session(session_id)
@@ -222,16 +272,36 @@ class PlanScorerService:
         self.session_service.add_message(session_id, "assistant", text, intent=CLARIFICATION_KIND)
         return ScoreTurn(text=text)
 
-    def _finish(self, session, plan: PastedPlan, message: str, context: Optional[str]) -> ScoreTurn:
+    def _finish(
+        self,
+        session,
+        plan: PastedPlan,
+        message: str,
+        context: Optional[str],
+        *,
+        grounded: Optional[list] = None,
+        own_plan: bool = False,
+    ) -> ScoreTurn:
+        """Ground (unless already grounded), score, write the reply, store it.
+
+        `grounded` is passed by `score_canvas`, where the dishes are catalogue
+        recipes and there is nothing to look up. `own_plan` says whose plan
+        this is, which changes only what the reply is allowed to offer: the
+        pasted path must not offer to replace a plan the member wrote, and the
+        canvas path is looking at one FoodChat built, where an offer to adjust
+        it is the obvious next thing.
+        """
         profile = session.user_profile or {}
-        grounded = self.grounder.ground(plan, profile)
+        if grounded is None:
+            grounded = self.grounder.ground(plan, profile)
         built = build_scoring_input(plan, grounded)
         result = self.scorer.score(
             plan.plan_type, grounded, built, profile, context=aim_text(context, plan),
         )
         payload = score_payload(plan, grounded, built, result, context)
+        payload["source"] = "canvas" if own_plan else "pasted"
         text = self.writer.write(
-            summary_facts(plan, grounded, result), message,
+            summary_facts(plan, grounded, result, own_plan=own_plan), message,
             fallback=fallback_summary(plan, grounded, result),
         )
         text = ensure_calorie_caveat(text, grounded)
@@ -540,14 +610,35 @@ def fallback_summary(plan: PastedPlan, grounded: list[GroundedMeal], result: Sco
     return " ".join(parts)
 
 
-def summary_facts(plan: PastedPlan, grounded: list[GroundedMeal], result: ScoreResult) -> dict:
-    """What the ResponseWriter may say — and only this."""
+def summary_facts(
+    plan: PastedPlan,
+    grounded: list[GroundedMeal],
+    result: ScoreResult,
+    *,
+    own_plan: bool = False,
+) -> dict:
+    """What the ResponseWriter may say — and only this.
+
+    `own_plan` is the one thing that differs between scoring a plan FoodChat
+    built and one the member wrote. "Do not offer a new plan" is right for a
+    pasted plan — replacing what somebody wrote is not what they asked for —
+    and wrong for the plan on the canvas, where adjusting it is the obvious
+    next step and refusing to mention it makes the score a dead end.
+    """
     fit = next((m for m in result.metrics if m["key"] == "fit"), None)
     facts = {
-        "action": "scored_pasted_plan",
+        "action": "scored_own_plan" if own_plan else "scored_pasted_plan",
         "instruction": (
-            "The user wrote this plan themselves and asked for it to be scored. "
-            "Report how it scored and the most important reason. Do not offer a new plan."
+            (
+                "This is the plan FoodChat built and the user is looking at. "
+                "Report how it scored and the most important reason, then offer "
+                "to adjust it."
+            )
+            if own_plan else
+            (
+                "The user wrote this plan themselves and asked for it to be scored. "
+                "Report how it scored and the most important reason. Do not offer a new plan."
+            )
         ),
         "plan": "one day" if plan.plan_type == "daily" else f"{len(plan.days)} days",
         "dishes": len(grounded),
