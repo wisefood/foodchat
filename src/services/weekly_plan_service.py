@@ -388,7 +388,12 @@ class WeeklyPlanService:
         try:
             from models.plan_brief import PlanBrief
             from services import (
-                guidelines_service, plan_quality, plan_repair, plan_verifier, turn_budget,
+                guideline_coverage,
+                guidelines_service,
+                plan_quality,
+                plan_repair,
+                plan_verifier,
+                turn_budget,
             )
 
             adapted = _as_meal_plan(plan_entries)
@@ -429,6 +434,21 @@ class WeeklyPlanService:
                     explainability["constraints_applied"] = (
                         list(explainability.get("constraints_applied") or [])
                         + report.as_ledger_rows()
+                    )
+
+                # The same food-group coverage the daily path measures, on the
+                # path that produces 21 meals. No overlap with the guideline
+                # checklist already in `metrics`: that one counts the three
+                # meal categories `classify_meal` assigns (fish, red meat,
+                # poultry), and this counts the corpus's food groups, which is
+                # a different set of rules entirely.
+                guideline_rows = guideline_coverage.ledger_rows(
+                    adapted, session.user_profile,
+                )
+                if guideline_rows:
+                    explainability["constraints_applied"] = (
+                        list(explainability.get("constraints_applied") or [])
+                        + guideline_rows
                     )
 
                 # Quality metrics, which weekly has never had: the graders were

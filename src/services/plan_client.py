@@ -400,6 +400,7 @@ class PlanClient:
                     nutrition=_meal_nutrition(recipe),
                     nutri_score=recipe.get("default_nutri_score"),
                     source=recipe.get("source"),
+                    food_groups=_food_groups(recipe),
                 )
             )
         return out
@@ -464,6 +465,7 @@ class PlanClient:
                         nutri_score=recipe.get("default_nutri_score"),
                         image_url=recipe.get("image_url"),
                         source=recipe.get("source"),
+                        food_groups=_food_groups(recipe),
                     )
 
                     conflict = allergen_conflict(
@@ -569,6 +571,7 @@ class PlanClient:
                         nutrition=_meal_nutrition(recipe),
                         nutri_score=recipe.get("default_nutri_score"),
                         image_url=recipe.get("image_url"),
+                        food_groups=_food_groups(recipe),
                     )
                     # Same backstop, same reason: the corpus's allergen tags
                     # have been wrong in production, and a server-side filter
@@ -622,6 +625,24 @@ class PlanClient:
 
 
 PLANNER = PlanClient()
+
+
+def _food_groups(recipe: dict) -> tuple[str, ...]:
+    """The recipe's food groups, cleaned. `()` when the card carried none.
+
+    Absent is a real state and not an error: a recipe whose ingredients did
+    not resolve to a FoodOn class has no groups, and counting it as though it
+    had none of them would be right while counting it as unmeasured is righter.
+    The caller distinguishes the two by whether ANY plate has groups.
+    """
+    raw = recipe.get("food_groups")
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    return tuple(
+        dict.fromkeys(
+            str(group).strip().lower() for group in raw if str(group).strip()
+        )
+    )
 
 
 def _meal_nutrition(recipe: dict[str, Any]) -> Optional[dict[str, Any]]:

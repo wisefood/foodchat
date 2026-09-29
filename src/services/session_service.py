@@ -1051,6 +1051,12 @@ def _serialize_course(course: MealCourse) -> dict:
     # course serializes byte-identically to before (golden fence).
     if getattr(course, "role", "main") != "main":
         payload["role"] = course.role
+    # Additive for the same reason, and written only when the recipe carried
+    # any: a plan that survives a reload must still be measurable against a
+    # food-based guideline, and re-fetching every plate to find out what food
+    # groups it had is a round trip for data the card already gave us.
+    if getattr(course, "food_groups", ()):
+        payload["food_groups"] = list(course.food_groups)
     return payload
 
 
@@ -1118,6 +1124,7 @@ def _deserialize_meal_plan(plan_id: str, payload: dict) -> MealPlan:
             image_url=d.get("image_url"),
             match_reasons=d.get("match_reasons", []) or [],
             role=d.get("role", "main"),
+            food_groups=tuple(d.get("food_groups") or ()),
         )
 
     days = None

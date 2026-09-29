@@ -313,12 +313,30 @@ def effective_facets(profile: dict, state: Optional[PlanningState] = None) -> di
     likes = list(profile.get("food_likes") or [])
     from_profile = CANDIDATES.split_preferences(likes)
 
+    # A food-based guideline that asks for something at EVERY meal — "wholemeal
+    # cereals and breads at each meal" — is a plan-wide food group, which is
+    # exactly what this family is. Joining here rather than at the fetch sites
+    # means it reaches all five of them through the funnel they already share.
+    #
+    # LAST, so the member's own words are ahead of it in the list, and SOFT:
+    # RecipeWrangler drops `food_groups` before `cuisines` when a slot cannot
+    # be filled, so a guideline gives way to a taste the member stated and to
+    # an empty plate, in that order. Guidelines shape the search; they do not
+    # get to empty it.
+    from services import guideline_coverage
+
+    guideline_groups = guideline_coverage.per_meal_groups(profile)
+
     out: dict[str, list[str]] = {}
     for family in CANDIDATES.FACET_FAMILIES:
         merged = list(stated.get(family) or [])
         for value in from_profile.get(family) or []:
             if value not in merged:
                 merged.append(value)
+        if family == "food_groups":
+            for value in guideline_groups:
+                if value not in merged:
+                    merged.append(value)
         if merged:
             out[family] = merged
     return out

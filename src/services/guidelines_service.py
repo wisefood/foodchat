@@ -125,7 +125,12 @@ _FREQUENCY_RE = re.compile(
     r"(?P<low>\d+)"
     r"(?:\s*(?:[-–]|to)\s*(?P<high>\d+))?"
     r"\s*(?:times?|portions?|servings?|meals?)?"
-    r"(?:\s+of\s+[a-z][a-z\s-]{0,30}?)?"
+    # The food between the count and the period, and it is usually a LIST:
+    # "3 servings of milk, yogurt and cheese a day", "5 servings of vegetables,
+    # salad and fruit a day". Without the comma and ampersand the class stopped
+    # at the first list separator and the whole rule fell through to prose —
+    # which is most of what a food-based guideline actually says.
+    r"(?:\s+of\s+[a-z][a-z\s,&-]{0,60}?)?"
     r"\s*(?:a|per|each)\s+(?P<period>week|day)",
     re.IGNORECASE,
 )

@@ -33,6 +33,7 @@ from models.session import MealPlan
 from models.planning_state import PlanningStateDelta
 from services.adapted_recipes import overlay_plan
 from services import (
+    guideline_coverage,
     guidelines_service,
     pantry_service,
     plan_parameters,
@@ -608,6 +609,17 @@ class ChatService:
         if report.checks:
             meal_plan.constraints_applied = (
                 list(meal_plan.constraints_applied or []) + report.as_ledger_rows()
+            )
+
+        # What the member's own dietary guidelines asked for, counted on the
+        # plates that came back. Until now guidelines only ever GRADED a plan —
+        # every call site ran after one existed — so the judge marked the
+        # planner down for rules nothing had told it, and the member read a
+        # report card instead of a plan that had tried.
+        guideline_rows = guideline_coverage.ledger_rows(meal_plan, profile)
+        if guideline_rows:
+            meal_plan.constraints_applied = (
+                list(meal_plan.constraints_applied or []) + guideline_rows
             )
 
         # One repair pass. The verifier names the plates that failed a hard

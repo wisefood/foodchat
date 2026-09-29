@@ -67,6 +67,11 @@ class MealCourse:
     # A MealCourse is one PLATE within a meal. Default "main" keeps every
     # existing single-course plan a single main plate (DYNAMIC_MEALS_PLAN.md).
     role: str = "main"                                  # main | side | dessert | drink
+    # The FoodOn-derived food groups of the recipe on this plate. Carried so a
+    # finished plan can be MEASURED against a food-based guideline — "wholemeal
+    # cereals at each meal", "no dairy servings" — rather than only searched
+    # for. See `CandidateRecipe.food_groups`.
+    food_groups: tuple = ()
 
     @classmethod
     def from_candidate(cls, candidate: CandidateRecipe) -> "MealCourse":
@@ -89,6 +94,7 @@ class MealCourse:
             directions=candidate.directions,
             image_url=getattr(candidate, "image_url", None),
             nutrition=getattr(candidate, "nutrition", None),
+            food_groups=tuple(getattr(candidate, "food_groups", ()) or ()),
         )
 
     def to_candidate(self) -> CandidateRecipe:
@@ -96,6 +102,7 @@ class MealCourse:
         return CandidateRecipe(
             recipe_id=self.recipe_id, title=self.title,
             ingredients=self.ingredients, directions=self.directions,
+            food_groups=tuple(self.food_groups or ()),
         )
 
 

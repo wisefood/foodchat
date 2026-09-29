@@ -46,6 +46,17 @@ class CandidateRecipe:
     # living-lab recipe from a scraped one — including the critic, which
     # reorders the pool and had no way to know what it was demoting.
     source: Optional[str] = None
+    # The FoodOn-derived food groups this recipe carries — `grains`, `dairy`,
+    # `fruit`, `vegetables` and nine more. RecipeWrangler puts them on every
+    # card and FoodChat dropped them on arrival, which is why nothing could
+    # count what a day actually contained: a guideline like "wholemeal cereals
+    # at each meal" could be searched FOR (the per-slot `food_groups` filter
+    # has been wired since the shaped-plan work) and never checked AGAINST.
+    #
+    # Deterministic, not a model's opinion: RecipeWrangler maps each
+    # ingredient's FoodOn ancestors onto a published group and drops anything
+    # unmapped. So a count built from these is a measurement.
+    food_groups: tuple[str, ...] = ()
 
 
 # Slot name ("breakfast"/"lunch"/"dinner") → candidates for that slot.
