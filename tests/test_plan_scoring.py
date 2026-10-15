@@ -730,8 +730,14 @@ class TestWeeklyScoring:
         assert variety["detail"]["dishes_with_guessed_ingredients"] == 1
         assert f"; {before + 1} unique ingredients;" in variety["reasoning"]
         assert "(“Mystery stew”) are counted with a typical serving's ingredients — a guess" in variety["reasoning"]
-        assert variety["detail"]["category_distribution"] == \
-            self.score(self.WEEK + [dish(2, "lunch", "Mystery stew")])[0].metrics[0]["detail"]["category_distribution"]
+        # The guess decides the food group too, and the line says it is a guess.
+        assert variety["detail"]["category_distribution"]["fish"] == 2
+        assert variety["detail"]["meals_classified_from_typical_serving"] == 1
+        assert "The food group of 1 meal(s) (“Mystery stew”) is judged from a typical serving" in variety["reasoning"]
+        # With no guess either, the stew is in no food group, not vegetarian.
+        bare = self.score(self.WEEK + [dish(2, "lunch", "Mystery stew")])[0].metrics[0]["detail"]
+        assert bare["category_distribution"]["unknown"] == 1
+        assert bare["category_distribution"]["vegetarian"] == 3, "two oats and the lentil soup"
 
     def test_calories_are_judged_over_the_days_pasted_not_a_week(self):
         result, _ = self.score()
@@ -1170,3 +1176,231 @@ class TestARequestIsNotAPlanToScore:
         assert OrchestratorService.is_explicit_score_request(
             "rate this: greek for lunch, oats for breakfast",
         ) is True
+
+
+# ===================================================================== #
+# A pasted week with dishes nobody listed ingredients for               #
+#                                                                       #
+# Live, against the real catalogue: a vegetarian, peanut- and           #
+# shellfish-allergic member pasted a full English, a pad thai and a     #
+# caesar salad, none listed with ingredients. "No shellfish" read       #
+# satisfied, the full English passed the vegetarian check, both counted  #
+# towards "most meals plant-based: met", the meat row said 3 where the  #
+# variety line said 4, and the diet's "no meat" was called FoodChat's    #
+# own default.                                                           #
+# ===================================================================== #
+
+from models.pasted_plan import TYPICAL_SERVING
+from services.plan_scorer.building import meal_category
+from services.plan_scorer.grounding import flag_typical_allergens
+from services.plan_scorer.scoring import allow_for_unknown_meals
+from services.weekly_planner.day_summary import UNKNOWN_CATEGORY
+from services.weekly_planner.explainability import NO_MEAT_CONSTRAINT, weekly_constraints_ledger
+from services.weekly_planner.state_tracking import WeeklyNutritionalTracker
+
+
+def guessed(day, slot, title, *items, **kwargs):
+    """A dish listed without ingredients, with a typical serving guessed for it."""
+    meal = dish(day, slot, title, **kwargs)
+    meal.typical_ingredients = [{"name": item, "quantity": ""} for item in items]
+    return meal
+
+
+VEGETARIAN = {"diet": ["vegetarian"], "allergies": ["peanuts", "shellfish"], "preferences": []}
+
+
+class TestTypicalServingsArePossibilities:
+    def test_an_allergen_in_a_typical_serving_is_recorded_as_possible(self):
+        pad_thai = guessed(2, "dinner", "pad thai", "rice noodles", "shrimp", "peanuts")
+        flag_typical_allergens([pad_thai], ["shellfish", "peanuts"])
+
+        assert {(c["allergen"], c["evidence"]) for c in pad_thai.allergen_conflicts} == {
+            ("shellfish", TYPICAL_SERVING), ("peanuts", TYPICAL_SERVING),
+        }
+
+    def test_stronger_evidence_is_kept_and_written_ingredients_are_not_second_guessed(self):
+        closest = guessed(1, "dinner", "pad thai", "peanuts", state=APPROXIMATE, rid="r-tofu",
+                          conflicts=[{"allergen": "peanuts", "evidence": CLOSEST_RECIPE}])
+        written = dish(1, "lunch", "pad thai", ingredients="rice noodles, tofu")
+        written.typical_ingredients = [{"name": "peanuts", "quantity": ""}]
+        flag_typical_allergens([closest, written], ["peanuts"])
+
+        assert closest.allergen_conflicts == [{"allergen": "peanuts", "evidence": CLOSEST_RECIPE}]
+        assert written.allergen_conflicts == []
+
+    def test_the_allergy_row_warns_and_says_where_the_warning_comes_from(self):
+        pad_thai = guessed(2, "dinner", "pad thai", "shrimp",
+                           conflicts=[{"allergen": "shellfish", "evidence": TYPICAL_SERVING}])
+        rows, violations = constraint_rows([pad_thai], {"allergies": ["shellfish"]})
+
+        allergy = row(rows, "no shellfish")
+        assert allergy["status"] == UNCHECKED
+        assert allergy["detail"] == "may be in “pad thai” — a typical serving has it, though you didn't list it"
+        assert violations["allergens"] == []
+        assert violations["possible_allergens"] == [{"allergen": "shellfish", "dishes": ["pad thai"]}]
+
+    def test_the_reply_says_may_contain(self):
+        pad_thai = guessed(2, "dinner", "pad thai", "shrimp",
+                           conflicts=[{"allergen": "shellfish", "evidence": TYPICAL_SERVING}])
+
+        assert allergen_sentences([pad_thai])[0][1] == (
+            "Heads up: “pad thai” may contain shellfish, which is on your allergy list."
+        )
+
+    def test_a_diet_only_a_typical_serving_breaks_is_possibly_broken(self):
+        english = guessed(1, "breakfast", "full english", "bacon", "sausage", "eggs")
+        rows, violations = constraint_rows([english], {"diet": ["vegetarian"]})
+
+        diet = row(rows, "vegetarian")
+        assert diet["status"] == UNCHECKED
+        assert diet["detail"].startswith("possibly broken by “full english” (red meat)")
+        assert violations["diet"] == []
+        assert violations["possible_diet"] == [{"diet": "vegetarian", "dishes": ["full english"]}]
+
+    def test_a_broken_diet_names_the_possible_breaks_too(self):
+        week = [
+            dish(1, "dinner", "Lasagne", state=MATCHED, rid="r-las", ingredients="beef mince, pasta"),
+            guessed(2, "breakfast", "full english", "bacon", "sausage"),
+        ]
+        rows, _ = constraint_rows(week, {"diet": ["vegetarian"]})
+
+        diet = row(rows, "vegetarian")
+        assert diet["status"] == "violated"
+        assert diet["detail"] == (
+            "broken by “Lasagne” (red meat); possibly also by “full english” (red meat), "
+            "judging from a typical serving"
+        )
+
+    def test_a_possibility_caps_nothing_and_the_judge_hears_it_as_one(self):
+        week = [guessed(1, "breakfast", "full english", "bacon"), dish(1, "dinner", "Lentil soup", ingredients="lentils")]
+        scorer, judge = make_scorer()
+
+        result = scorer.score("daily", week, build_daily(week), {"diet": ["vegetarian"]})
+
+        assert next(m for m in result.metrics if m["key"] == "fit")["score"] == 5
+        assert "POSSIBLE ONLY: “full english” might break the vegetarian diet" in judge.calls[0]["conflicts"]
+
+    def test_a_clean_check_says_a_typical_serving_was_read(self):
+        rows, _ = constraint_rows([guessed(1, "lunch", "minestrone", "beans", "pasta")], {"allergies": ["peanuts"]})
+
+        assert row(rows, "no peanuts")["detail"] == (
+            "no listed dish contains it; 1 dish(es) have no ingredient list, so their names "
+            "and a typical serving's ingredients were checked"
+        )
+
+
+class TestFoodGroupsOfPastedDishes:
+    @pytest.mark.parametrize("meal,expected", [
+        (dish(1, "dinner", "Beef stew", ingredients="beef, potato"), ("red meat", "ingredients")),
+        (guessed(1, "dinner", "shepherd's pie", "lamb mince", "potatoes"), ("red meat", TYPICAL_SERVING)),
+        (dish(1, "dinner", "Chicken curry"), ("poultry", "name")),
+        (dish(1, "dinner", "Vegan chili"), ("vegetarian", "name")),
+        (dish(1, "dinner", "shepherd's pie"), (UNKNOWN_CATEGORY, "")),
+    ])
+    def test_what_a_dish_is_judged_from(self, meal, expected):
+        assert meal_category(meal) == expected
+
+    def test_a_close_matchs_name_is_not_the_members_dish(self):
+        """"Chicken Caesar salad" is the closest recipe to a "caesar salad"."""
+        caesar = guessed(1, "lunch", "caesar salad", "romaine", "croutons", "parmesan",
+                         state=APPROXIMATE, rid="r-ccs")
+        caesar.title_matched = "Chicken Caesar salad"
+        entry = build_weekly([caesar]).entries[0]
+
+        assert entry["recipe"]["recipe_title"] == "caesar salad"
+        assert meal_category(caesar) == ("vegetarian", TYPICAL_SERVING)
+
+    def test_an_unknown_meal_leaves_a_rule_it_could_tip_undecided(self):
+        rows = [
+            {"rule": "make most meals plant-based", "target": "at least 5 of 9 meals", "actual": 3, "met": False},
+            {"rule": "make most meals plant-based", "target": "at least 5 of 9 meals", "actual": 2, "met": False},
+            {"rule": "limit red meat", "target": "at most 3 meals", "actual": 4, "met": False},
+            {"rule": "limit red meat", "target": "at most 3 meals", "actual": 2, "met": True},
+            {"rule": "limit red meat", "target": "at most 3 meals", "actual": 0, "met": True},
+        ]
+
+        out = allow_for_unknown_meals(rows, 2)
+
+        assert [r["met"] for r in out] == [None, False, False, None, True]
+        assert out[0]["note"] == "2 meal(s) could not be placed in a food group"
+
+
+class TestTheWeekTheMemberPasted:
+    """The live week, with the catalogue's answers as they came back."""
+
+    WEEK = [
+        guessed(1, "breakfast", "porridge with banana", "oats", "water", "banana", state=APPROXIMATE, rid="r-cbp"),
+        guessed(1, "lunch", "caesar salad", "romaine lettuce", "croutons", "parmesan cheese",
+                state=APPROXIMATE, rid="r-ccs"),
+        dish(1, "dinner", "shepherd's pie", state=MATCHED, rid="r-sp",
+             ingredients="potatoes, milk, ground turkey, mixed vegetables"),
+        guessed(2, "breakfast", "full english", "bacon", "sausage", "eggs", "black pudding", "toast"),
+        dish(2, "lunch", "sushi", state=MATCHED, rid="r-sushi", ingredients="sushi rice, nori, cucumber"),
+        guessed(2, "dinner", "pad thai", "rice noodles", "shrimp", "peanuts", "bean sprouts",
+                state=APPROXIMATE, rid="r-tpt",
+                conflicts=[{"allergen": "peanuts", "evidence": CLOSEST_RECIPE},
+                           {"allergen": "shellfish", "evidence": TYPICAL_SERVING}]),
+        guessed(3, "breakfast", "porridge with banana", "oats", "water", "banana", state=APPROXIMATE, rid="r-cbp"),
+        dish(3, "lunch", "lasagne", state=MATCHED, rid="r-las", ingredients="lean minced beef, onion, pasta"),
+        dish(3, "dinner", "paella", state=MATCHED, rid="r-pae", ingredients="meat, chorizo, rice, onion"),
+        guessed(3, "snack", "apple", "apple"),
+    ]
+
+    def score(self, profile=VEGETARIAN):
+        for meal in self.WEEK:
+            if meal.state == APPROXIMATE:
+                meal.title_matched = {"caesar salad": "Chicken Caesar salad"}.get(meal.title_given, "Closest")
+        scorer, judge = make_scorer()
+        return scorer.score("weekly", self.WEEK, build_weekly(self.WEEK), profile), judge
+
+    def test_the_hard_constraints(self):
+        result, _ = self.score()
+
+        assert row(result.constraints, "no shellfish")["status"] == UNCHECKED
+        diet = row(result.constraints, "vegetarian")
+        assert diet["status"] == "violated"
+        assert "possibly also by “full english” (red meat), “pad thai” (fish)" in diet["detail"]
+
+    def test_the_food_groups_and_the_plant_based_rule(self):
+        result, judge = self.score()
+        variety = result.metrics[0]["detail"]
+        plant = next(r for r in result.metrics[1]["detail"]["rules"] if r["rule"].startswith("make most"))
+
+        assert variety["category_distribution"] == {
+            "vegetarian": 4, "poultry": 1, "red meat": 3, "fish": 1,
+        }
+        assert plant["actual"] == 4 and plant["met"] is False
+        assert "The food group of 5 meal(s)" in judge.calls[0]["facts"]
+
+    def test_the_meat_count_matches_the_food_groups_and_names_its_guesses(self):
+        result, _ = self.score({"allergies": [], "diet": [], "preferences": []})
+        meat = next(r for r in result.constraints if r.get("key") == "meat_limit")
+
+        assert meat["detail"].startswith("5 of 2 meat meal(s) planned")
+        assert "; 2 of the meat meals judged from a typical serving" in meat["detail"]
+
+    def test_a_vegetarian_diet_is_reported_once_by_the_diet_row(self):
+        result, _ = self.score()
+
+        assert not [r for r in result.constraints if r.get("key") == "meat_limit"]
+        assert not any("FoodChat's own default" in str(r.get("detail")) for r in result.constraints)
+
+
+class TestADietsNoMeatIsTheMembers:
+    def ledger(self, profile, meat_count):
+        targets = WeeklyNutritionalTracker(profile).targets
+        return weekly_constraints_ledger(profile, meat_count, targets, [], 0, {}, repeats={})
+
+    def test_a_vegetarian_week_with_meat_breaks_the_members_diet(self):
+        meat = next(r for r in self.ledger({"diet": ["vegetarian"]}, 3) if r.get("key") == "meat_limit")
+
+        assert meat["constraint"] == NO_MEAT_CONSTRAINT
+        assert meat["status"] == "violated" and meat["type"] == "hard"
+        assert meat["source"] == "dietary group"
+        assert meat["detail"] == "3 meat meal(s) planned"
+
+    def test_the_default_limit_is_still_ours(self):
+        meat = next(r for r in self.ledger({"diet": []}, 4) if r.get("key") == "meat_limit")
+
+        assert meat["status"] == "relaxed" and meat["source"] == "FoodChat default"
+        assert "FoodChat's own default" in meat["detail"]

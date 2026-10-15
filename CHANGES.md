@@ -2,6 +2,66 @@
 
 ---
 
+# Pasted weeks: a dish with no ingredients is not vegetarian, and a guess is a possibility
+
+> **Date:** 2026-10-16
+> **Branch:** main
+> No API change. Additive: an allergen conflict can carry evidence
+> `typical_serving`; constraint rows can say `unchecked` for a diet a typical
+> serving possibly breaks; weekly entries of a scored plan carry
+> `meal_category` / `meal_category_basis`; the variety metric's detail gains
+> `meals_classified_from_typical_serving` / `meals_unclassified`; a checklist
+> row may be `met: null` with `undecided: true`; the weekly meat-limit ledger
+> row carries `key: "meat_limit"`.
+
+Found by scoring a member's own 3-day week against the real catalogue (demo
+gateway) and Groq. The member was vegetarian and allergic to peanuts and
+shellfish; the week had a full English, a pad thai and a caesar salad with no
+ingredients listed. The scorer reported "no shellfish: satisfied", let the
+full English pass the vegetarian check, counted both towards "most meals
+plant-based: met (5 of 9)", gave a meat count of 3 beside a variety line of 4,
+and called the diet's "no meat" "FoodChat's own default, not something you
+asked for". Only the LLM judge caught it — and it was handed the wrong counts
+as facts it must not contradict.
+
+| What | Detail |
+|---|---|
+| `models/pasted_plan.py` | `TYPICAL_SERVING` evidence, `POSSIBLE_EVIDENCE`, `is_possible()`. The guess remark no longer says a typical serving is "not checked against your allergies, diet or dislikes". |
+| `plan_scorer/grounding.py` → `flag_typical_allergens` | After the typical servings are written, an allergen in one is recorded on the dish as `typical_serving` — only for dishes with no ingredient list, and never over stronger evidence (the member's words, the recipe, the closest recipe). |
+| `plan_scorer/scoring.py` → `constraint_rows` | Allergy: a `typical_serving` hit is a possibility like a closest-recipe one — `unchecked`, "may be in “pad thai” — a typical serving has it", caps nothing. Diet: a dish with no list is also checked against its typical serving; a hit there is "possibly broken by …" (`unchecked`, `violations["possible_diet"]`), or appended to a real break as "possibly also by …". A clean row says when a typical serving was what it read. The judge gets a POSSIBLE ONLY line for a possible diet break. Dislikes read no guesses, as before. |
+| `weekly_planner/day_summary.py` | `classify_meal` honours a recipe dict's own `meal_category` (incl. new `UNKNOWN_CATEGORY`). The planner never sets it, so planner categories are unchanged. `says_meat_free()` for names like "vegan chili". |
+| `plan_scorer/building.py` → `meal_category`, `recipe_dict` | Each pasted dish's food group is decided once: from its ingredients or matched tags; else its typical serving; else its name if the name names a meat or says it has none; else `unknown` — never vegetarian by default. `recipe_title` is the member's words unless the dish IS the recipe ("Chicken Caesar salad", the closest recipe to a "caesar salad", was being read as poultry). `category_dict` is the one definition the diet check uses too. |
+| `plan_scorer/scoring.py` → `_weekly_measured` | Meat count is taken from those same food groups, so the meat row, variety line and checklist agree; the meat row says how many were judged from a typical serving. The variety line names the meals classified from a guess and those that could not be classified. `allow_for_unknown_meals`: a checklist rule the unknown meals could tip either way is "not decided" rather than met or missed. The judge's facts include the same sentence. |
+| `weekly_planner/state_tracking.py`, `explainability.weekly_constraints_ledger` | `meat_limit_from_diet`: a vegetarian or vegan diet's limit of 0 is the member's. Its row is "no meat meals this week", hard, source "dietary group", `violated` when meat is planned — not "relaxed" and "FoodChat's own default". Applies to generated weeks too. The plan scorer drops this row: its diet row already names each dish, including the possible ones. |
+| `routers/foodchat_router.py` | Comment on `PlanScoreGroundingRow.typical_ingredients` brought level. |
+
+## Verification
+
+New tests (`test_plan_scoring.py`, 22): typical-serving allergens recorded as
+possible and never over stronger evidence; the allergy and diet rows, the
+"may contain" reply sentence and the judge's POSSIBLE ONLY line; a possibility
+caps nothing; the food group of each kind of dish; a close match's name is
+not the member's; unknown meals leave a rule undecided; the live week end to
+end; and the diet-derived meat row, generated and scored. Two existing tests
+pinned the old behaviour (guesses never checked; guesses never change a food
+group) and were updated. Full suite: 2,514 passed, 1 skipped. Ruff clean on
+the changed modules.
+
+**Live** (demo gateway, Groq), the same week: "no shellfish" is now
+`unchecked`, "may be in “pad thai” — a typical serving has it"; "vegetarian"
+is broken by shepherd's pie, lasagne and paella, "possibly also by “full
+english” (red meat), “pad thai” (fish)"; "most meals plant-based" is 4 of 9,
+not met; the meat row is gone for this vegetarian member. The judge: fit 1,
+guidelines 2, diversity 2.
+
+Not changed, and still open from the same review: "satisfied" for a check
+that read only names, the calorie sentence's hard-coded 2,000 kcal, the pasted
+checklist using the built-in rules rather than the member's regional ones,
+and scoring the plan on the canvas (which reads no ingredients from a weekly
+plan at all).
+
+---
+
 # Guideline adherence: a judge that fits the minute, and scores that cannot fail a plan
 
 > **Date:** 2026-09-17

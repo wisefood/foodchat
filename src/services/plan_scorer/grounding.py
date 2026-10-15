@@ -46,6 +46,9 @@ lasagna" as a beef lasagna and failed a vegetarian profile on meat nobody
 ate, read "peanut noodles" as a salmon noodle recipe and reported fish, and
 counted an apple as apple strudel. An allergen found only in the closest
 recipe is recorded with ``closest_recipe`` evidence — a warning, not a verdict.
+One found only in the typical serving the small model wrote for a dish with
+no ingredients (``flag_typical_allergens``) is recorded the same way, with
+``typical_serving`` evidence.
 
 Lookup reuses ``SeedService.find_dish`` — the seed path's search and tolerant
 autocomplete — but NOT its filters or its allergy gate. Seed resolution narrows
@@ -84,6 +87,7 @@ from models.pasted_plan import (
     NUTRITION_MODEL_ESTIMATE,
     MAIN_SLOTS,
     NUTRITION_TYPICAL,
+    TYPICAL_SERVING,
     UNKNOWN,
     UNRESOLVED,
     GroundedMeal,
@@ -282,6 +286,30 @@ def allergen_conflicts(
     return found
 
 
+def flag_typical_allergens(grounded: list[GroundedMeal], allergies: list) -> None:
+    """Record allergens a dish's typical serving has, as possibilities, in place.
+
+    Only for dishes the member listed no ingredients for and no catalogue
+    recipe described — exactly the dishes whose ``variety_ingredients`` is
+    the guess. Live, "pad thai" with a guessed serving of shrimp and peanuts
+    was reported "no shellfish: satisfied" to a member allergic to shellfish,
+    while the same guess was already counting towards food variety.
+
+    An allergen the dish already has evidence for is left as it is: the
+    member's words, the recipe and the closest recipe all outrank a guess.
+    """
+    for meal in grounded:
+        if not meal.guessed_ingredients:
+            continue
+        known = {c.get("allergen") for c in meal.allergen_conflicts}
+        for conflict in allergen_conflicts(
+            allergies, written_text="",
+            recipe_text=meal.variety_ingredients, recipe_evidence=TYPICAL_SERVING,
+        ):
+            if conflict["allergen"] not in known:
+                meal.allergen_conflicts.append(conflict)
+
+
 @dataclass
 class _Lookup:
     candidate: Optional[CandidateRecipe] = None
@@ -322,6 +350,7 @@ class DishGrounder:
                 grounded.append(self._ground_one(day.day, meal, lookups[key], allergies))
         self._enrich(grounded)
         self._estimate_missing(grounded)
+        flag_typical_allergens(grounded, allergies)
         return grounded
 
     def _search(self, title: str) -> list:

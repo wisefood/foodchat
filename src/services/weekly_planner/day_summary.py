@@ -90,6 +90,16 @@ _QUALIFIED_NOT_MEAT = re.compile(
 )
 # "meat-free" on its own, where there is no following meat word to swallow.
 _MEAT_FREE = re.compile(r"\bmeat[-\s]?free\b")
+_SAYS_MEAT_FREE = re.compile(r"\b(?:" + _VEG_QUALIFIERS + r")s?\b")
+
+
+def says_meat_free(text: str) -> bool:
+    """The words themselves say there is no meat: "vegan chili", "tofu stir fry".
+
+    A name with no meat word in it says nothing either way — "shepherd's pie"
+    and "pad thai" have none — so only an explicit qualifier counts.
+    """
+    return bool(_SAYS_MEAT_FREE.search((text or "").lower()))
 
 # Food-composition-database wording for a hen's egg: "eggs, chicken, whole,
 # raw" and "chicken egg". Read literally it makes every shakshuka a poultry
@@ -152,16 +162,32 @@ def is_meat_meal(
     return _matches(meat_text(title, ingredients), keywords)
 
 
+MEAL_CATEGORIES = ("vegan", "vegetarian", "fish", "red meat", "poultry")
+# A dish nobody can classify: no ingredients, no tags, and a name with no
+# meat word in it. Only ever set through ``MEAL_CATEGORY_KEY``.
+UNKNOWN_CATEGORY = "unknown"
+# A recipe dict may carry its category already decided, by a caller that
+# knows more than this module's keyword match. The plan scorer sets it: a
+# pasted "shepherd's pie" with no ingredients is classified from a typical
+# serving, and one with nothing to go on is UNKNOWN_CATEGORY, not vegetarian.
+MEAL_CATEGORY_KEY = "meal_category"
+
+
 def classify_meal(recipe: dict) -> str:
     """Category for one plan recipe dict.
 
     Returns one of ``"vegan" | "vegetarian" | "fish" | "red meat" |
-    "poultry"``. Accepts both weekly-entry keys (``recipe_title`` /
-    ``recipe_ingredients``) and overlay/display keys (``title`` /
-    ``ingredients``). With no tags and no meat keyword hit the recipe is
-    treated as vegetarian — the same coverage assumption the meat tracker
-    has always made, just in the other direction.
+    "poultry"``, or the dict's own ``MEAL_CATEGORY_KEY`` when it carries one
+    (which may be ``UNKNOWN_CATEGORY``). Accepts both weekly-entry keys
+    (``recipe_title`` / ``recipe_ingredients``) and overlay/display keys
+    (``title`` / ``ingredients``). With no tags and no meat keyword hit the
+    recipe is treated as vegetarian — the same coverage assumption the meat
+    tracker has always made, just in the other direction. That assumption is
+    the planner's: its recipes come with ingredient lists.
     """
+    decided = recipe.get(MEAL_CATEGORY_KEY)
+    if decided in MEAL_CATEGORIES or decided == UNKNOWN_CATEGORY:
+        return decided
     tags = {str(t).lower() for t in (recipe.get("tags") or [])}
     if "vegan" in tags:
         return "vegan"

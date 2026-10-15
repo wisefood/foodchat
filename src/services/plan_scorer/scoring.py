@@ -28,6 +28,16 @@ budget, and an apple would count toward "most meals plant-based". The same
 measured functions are called here with targets scaled to the days pasted and
 snacks kept out of the meal counts; the planner's own call is untouched.
 
+A dish with no ingredient list is not taken as meat-free for want of a meat
+word in its name. Its typical serving (a small model's guess) decides its food
+group and is checked against the member's allergies and diet — any clash is a
+POSSIBLE one: the row says "may be in" or "possibly broken by", it is
+``unchecked`` rather than ``violated``, the judge is told it is a possibility,
+and it caps nothing. A dish with no guess either is ``unknown``: it counts
+towards no food-frequency rule, and a rule it could tip either way is
+reported as not decided. The meat count is read from the same food groups,
+and a vegetarian or vegan diet's "no meat" is reported by the diet row alone.
+
 Caps, applied in code after the model answers, because a hard constraint is
 not a matter of judgment: an allergen in any dish caps the fit score at 1
 (and sets it to 1 even if the fit judge failed); a dish that breaks a
@@ -57,14 +67,17 @@ from models.pasted_plan import (
     MATCHED,
     NUTRITION_MODEL_ESTIMATE,
     NUTRITION_TYPICAL,
+    TYPICAL_SERVING,
     UNKNOWN,
     GroundedMeal,
+    is_possible,
 )
 from services.candidates_client import DIET_FILTER, allergen_conflict, diet_tag_status
 from services.plan_scoring import food_variety_score, guidelines_text, ingredient_names
 from services.transparency import constraints_ledger
-from services.weekly_planner.day_summary import classify_meal, is_meat_meal
+from services.weekly_planner.day_summary import UNKNOWN_CATEGORY, classify_meal
 from services.weekly_planner.explainability import (
+    MEAT_LIMIT_KEY,
     attach_match_reasons,
     attach_repeat_reasons,
     guideline_checklist,
@@ -75,7 +88,14 @@ from services.weekly_planner.explainability import (
 )
 from services.weekly_planner.state_tracking import WeeklyNutritionalTracker
 
-from .building import MEAL_INDEX, DailyScoringInput, ScoringInput, WeeklyScoringInput, entry_dicts
+from .building import (
+    MEAL_INDEX,
+    DailyScoringInput,
+    ScoringInput,
+    WeeklyScoringInput,
+    category_dict,
+    entry_dicts,
+)
 from .parsing import PLANT_DAIRY
 
 logger = logging.getLogger(__name__)
@@ -165,9 +185,9 @@ class ScoreResult:
     metrics: list = field(default_factory=list)
     constraints: list = field(default_factory=list)
     # {"allergens": [{allergen, dishes}], "diet": [{diet, dishes}], "dislikes": [{dislike, dishes}]}
-    violations: dict = field(default_factory=lambda: {
-        "allergens": [], "diet": [], "dislikes": [], "possible_allergens": [],
-    })
+    # plus the possibilities, which cap nothing: "possible_allergens" and
+    # "possible_diet", each [{allergen | diet, dishes}].
+    violations: dict = field(default_factory=lambda: empty_violations())
     # Daily only: the dish entries with their reason chips, for the plan card.
     plan_entries: list = field(default_factory=list)
 
@@ -187,31 +207,30 @@ def metric(key: str, score, kind: str, reasoning: str, detail: Optional[dict] = 
 # Hard constraints, measured in code                                      #
 # --------------------------------------------------------------------- #
 
+def empty_violations() -> dict:
+    return {
+        "allergens": [], "diet": [], "dislikes": [],
+        "possible_allergens": [], "possible_diet": [],
+    }
+
+
 def _unique(items):
     return list(dict.fromkeys(items))
-
-
-def _dish(meal: GroundedMeal) -> dict:
-    """What a category check may read. Catalogue tags only for a MATCHED dish:
-    the member's own words outrank the tags of a recipe that merely resembles
-    what they wrote."""
-    matched = meal.state == MATCHED
-    return {
-        "title": meal.title_given,
-        "recipe_title": meal.title_matched if matched else "",
-        "ingredients": meal.ingredients,
-        "tags": list(meal.tags) if matched else [],
-    }
 
 
 def _text(meal: GroundedMeal) -> str:
     return f"{meal.title_given} {meal.ingredients}"
 
 
-def diet_conflict(meal: GroundedMeal, diet_tag: str) -> Optional[str]:
-    """What in the dish breaks ``diet_tag`` (a RecipeWrangler diet tag), or None."""
-    category = classify_meal(_dish(meal))
-    text = _text(meal)
+def diet_conflict(meal: GroundedMeal, diet_tag: str, guessed: bool = False) -> Optional[str]:
+    """What in the dish breaks ``diet_tag`` (a RecipeWrangler diet tag), or None.
+
+    ``guessed`` reads the dish's typical serving instead of its (empty)
+    ingredient list — a possibility, which the caller reports as one.
+    """
+    dish = category_dict(meal, guessed=guessed)
+    category = classify_meal(dish)
+    text = f"{dish['title']} {dish['ingredients']}"
     if diet_tag == "vegetarian":
         return category if category in _ANIMAL else None
     if diet_tag == "vegan":
@@ -243,13 +262,34 @@ def diet_conflict(meal: GroundedMeal, diet_tag: str) -> Optional[str]:
     return None
 
 
-def _clear_detail(name_only: int, lead: str) -> str:
+def _clear_detail(name_only: int, lead: str, guessed: int = 0) -> str:
+    """``lead``, plus what the check could read for dishes with no ingredient
+    list: ``guessed`` of them had a typical serving, ``name_only`` nothing."""
+    if guessed:
+        lead += (
+            f"; {guessed} dish(es) have no ingredient list, so their names and a "
+            "typical serving's ingredients were checked"
+        )
     if name_only:
-        return (
-            f"{lead}; {name_only} dish(es) have no ingredient list, so only "
+        lead += (
+            f"; {name_only} dish(es) have no ingredient list, so only "
             "their names were checked"
         )
     return lead
+
+
+_POSSIBLE_WHY = {
+    CLOSEST_RECIPE: "the closest catalogue recipe has it, though you didn't list it",
+    TYPICAL_SERVING: "a typical serving has it, though you didn't list it",
+}
+
+
+def _possible_detail(by_evidence: dict) -> str:
+    """"may be in “X” — the closest catalogue recipe has it …; may be in “Y” — …"."""
+    return "; ".join(
+        "may be in " + ", ".join(f"“{t}”" for t in titles) + " — " + _POSSIBLE_WHY[evidence]
+        for evidence, titles in by_evidence.items() if titles
+    )
 
 
 def constraint_rows(grounded: list[GroundedMeal], profile: dict) -> tuple[list[dict], dict]:
@@ -261,8 +301,15 @@ def constraint_rows(grounded: list[GroundedMeal], profile: dict) -> tuple[list[d
     the planner filtered at fetch time; a pasted plan was never filtered, so
     each row is checked dish by dish or marked ``unchecked``.
     """
-    violations: dict = {"allergens": [], "diet": [], "dislikes": [], "possible_allergens": []}
-    name_only = sum(1 for meal in grounded if meal.ingredients_source == UNKNOWN)
+    violations = empty_violations()
+    no_list = sum(1 for meal in grounded if meal.ingredients_source == UNKNOWN)
+    guessed = sum(1 for meal in grounded if meal.guessed_ingredients)
+    # Dishes the allergy and diet checks read by name alone; the dislike check
+    # reads no guesses, so for it every dish without a list is name-only.
+    name_only = sum(
+        1 for meal in grounded
+        if meal.ingredients_source == UNKNOWN and not meal.guessed_ingredients
+    )
     rows: list[dict] = []
     for base in constraints_ledger(profile):
         row = dict(base)
@@ -277,8 +324,16 @@ def constraint_rows(grounded: list[GroundedMeal], profile: dict) -> tuple[list[d
                 for meal in grounded for conflict in meal.allergen_conflicts
                 if conflict.get("allergen") == key
             ]
-            definite = [(t, ev) for t, ev in hits if ev != CLOSEST_RECIPE]
-            possible = _unique(t for t, ev in hits if ev == CLOSEST_RECIPE)
+            definite = [(t, ev) for t, ev in hits if not is_possible(ev)]
+            # A dish is named once, under the strongest evidence it has.
+            by_evidence = {
+                evidence: _unique(t for t, ev in hits if ev == evidence)
+                for evidence in (CLOSEST_RECIPE, TYPICAL_SERVING)
+            }
+            by_evidence[TYPICAL_SERVING] = [
+                t for t in by_evidence[TYPICAL_SERVING] if t not in by_evidence[CLOSEST_RECIPE]
+            ]
+            possible = by_evidence[CLOSEST_RECIPE] + by_evidence[TYPICAL_SERVING]
             if definite:
                 named = []
                 for title in _unique(t for t, _ in definite):
@@ -289,34 +344,53 @@ def constraint_rows(grounded: list[GroundedMeal], profile: dict) -> tuple[list[d
                     "allergen": allergen, "dishes": _unique(t for t, _ in definite),
                 })
             elif possible:
-                # Only a recipe that merely resembles the dish has it. A warning
-                # the member should see, not a verdict: it caps nothing. The
-                # judge is told too, so its reasoning cannot say "no allergens".
-                row.update(status=UNCHECKED, detail=(
-                    "may be in " + ", ".join(f"“{t}”" for t in possible)
-                    + " — the closest catalogue recipe has it, though you didn't list it"
-                ))
+                # Only a recipe that merely resembles the dish has it, or a
+                # typical serving of it does. A warning the member should see,
+                # not a verdict: it caps nothing. The judge is told too, so its
+                # reasoning cannot say "no allergens".
+                row.update(status=UNCHECKED, detail=_possible_detail(by_evidence))
                 violations["possible_allergens"].append({"allergen": allergen, "dishes": possible})
             else:
-                row.update(status="satisfied", detail=_clear_detail(name_only, "no listed dish contains it"))
+                row.update(status="satisfied", detail=_clear_detail(
+                    name_only, "no listed dish contains it", guessed,
+                ))
 
         elif source == "dietary group":
             status, tag = diet_tag_status(text)
             if status == DIET_FILTER and tag in CHECKABLE_DIETS:
-                hits = []
+                hits, maybe = [], []
                 for meal in grounded:
                     reason = diet_conflict(meal, tag)
                     if reason:
                         hits.append((meal.title_given, reason))
-                if hits:
-                    pairs = _unique(hits)
-                    row.update(
-                        status="violated",
-                        detail="broken by " + ", ".join(f"“{t}” ({r})" for t, r in pairs),
+                    elif meal.guessed_ingredients:
+                        # Live: a "full english" with nothing listed passed a
+                        # vegetarian check, while its typical serving — bacon,
+                        # sausage, black pudding — sat on the same dish.
+                        guess = diet_conflict(meal, tag, guessed=True)
+                        if guess:
+                            maybe.append((meal.title_given, guess))
+                broken_by = ", ".join(f"“{t}” ({r})" for t, r in _unique(hits))
+                possibly = ", ".join(f"“{t}” ({r})" for t, r in _unique(maybe))
+                if maybe:
+                    violations["possible_diet"].append(
+                        {"diet": text, "dishes": _unique(t for t, _ in maybe)},
                     )
+                if hits:
+                    detail = "broken by " + broken_by
+                    if maybe:
+                        detail += f"; possibly also by {possibly}, judging from a typical serving"
+                    row.update(status="violated", detail=detail)
                     violations["diet"].append({"diet": text, "dishes": _unique(t for t, _ in hits)})
+                elif maybe:
+                    row.update(status=UNCHECKED, detail=(
+                        f"possibly broken by {possibly} — a typical serving has it, "
+                        "though you didn't list the ingredients"
+                    ))
                 else:
-                    row.update(status="satisfied", detail=_clear_detail(name_only, "no listed dish breaks it"))
+                    row.update(status="satisfied", detail=_clear_detail(
+                        name_only, "no listed dish breaks it", guessed,
+                    ))
             else:
                 row.update(
                     status=UNCHECKED,
@@ -332,7 +406,7 @@ def constraint_rows(grounded: list[GroundedMeal], profile: dict) -> tuple[list[d
                 row.update(status="violated", detail="in " + ", ".join(f"“{t}”" for t in dishes))
                 violations["dislikes"].append({"dislike": dislike, "dishes": dishes})
             else:
-                row.update(status="satisfied", detail=_clear_detail(name_only, "no listed dish has it"))
+                row.update(status="satisfied", detail=_clear_detail(no_list, "no listed dish has it"))
 
         else:
             row.update(status=UNCHECKED, detail="the fit score weighs this; it is not checked dish by dish")
@@ -446,9 +520,105 @@ def scale_checklist(rows: list[dict], days: int) -> list[dict]:
     return scaled
 
 
+_AT_LEAST = re.compile(r"\bat least (\d+)", re.IGNORECASE)
+_AT_MOST = re.compile(r"\bat most (\d+)", re.IGNORECASE)
+_RANGE = re.compile(r"\b(\d+)\s*[–-]\s*(\d+)\b")
+
+
+def _bounds(target: str) -> tuple[Optional[int], Optional[int]]:
+    """``(floor, ceiling)`` of a checklist target: "at least 5 of 9 meals",
+    "at most 3 meals", "1–2 meals". ``(None, None)`` when it says neither."""
+    low = _AT_LEAST.search(target)
+    high = _AT_MOST.search(target)
+    if low or high:
+        return (int(low.group(1)) if low else None), (int(high.group(1)) if high else None)
+    both = _RANGE.search(target)
+    if both:
+        return int(both.group(1)), int(both.group(2))
+    return None, None
+
+
+def allow_for_unknown_meals(rows: list[dict], unknown: int) -> list[dict]:
+    """A rule the unclassified meals could still tip either way is undecided.
+
+    Two meals nobody could place in a food group might be plant-based or red
+    meat. "Most meals plant-based: met" was reported over a full English and a
+    shrimp pad thai counted as vegetarian; with those two unknown, "3 of 9,
+    target 5" can be neither met nor missed, and saying either is a guess.
+    A rule already settled whichever way they fall keeps its verdict.
+    """
+    if not unknown:
+        return rows
+    out = []
+    for row in rows:
+        row = dict(row)
+        floor, ceiling = _bounds(str(row.get("target") or ""))
+        if row.get("met") is not None and (floor is not None or ceiling is not None):
+            actual = int(row.get("actual") or 0)
+            could_meet = (floor is None or actual + unknown >= floor) and (
+                ceiling is None or actual <= ceiling
+            )
+            could_miss = (floor is not None and actual < floor) or (
+                ceiling is not None and actual + unknown > ceiling
+            )
+            if could_meet and could_miss:
+                row["met"] = None
+                row["undecided"] = True
+                row["note"] = f"{unknown} meal(s) could not be placed in a food group"
+        out.append(row)
+    return out
+
+
+def category_basis(entries: list[dict]) -> dict:
+    """Which meals' food group is a guess, and which have none.
+
+    ``{"guessed": [titles], "unknown": [titles]}``, one title per meal.
+    """
+    guessed, unknown = [], []
+    for entry in entries:
+        recipe = entry["recipe"]
+        title = str(recipe.get("title") or "")
+        if classify_meal(recipe) == UNKNOWN_CATEGORY:
+            unknown.append(title)
+        elif recipe.get("meal_category_basis") == TYPICAL_SERVING:
+            guessed.append(title)
+    return {"guessed": guessed, "unknown": unknown}
+
+
+def _some(titles: list[str]) -> str:
+    distinct = _unique(titles)
+    return _quoted(distinct[:4]) + (", …" if len(distinct) > 4 else "")
+
+
+def category_sentence(basis: dict) -> str:
+    """What the food-group counts rest on, when it is less than an ingredient list."""
+    parts = []
+    if basis["guessed"]:
+        parts.append(
+            f"The food group of {len(basis['guessed'])} meal(s) ({_some(basis['guessed'])}) is "
+            "judged from a typical serving, since no ingredients were listed"
+        )
+    if basis["unknown"]:
+        parts.append(
+            f"{len(basis['unknown'])} meal(s) ({_some(basis['unknown'])}) could not be placed in "
+            "a food group, so they count towards no food-frequency rule"
+        )
+    return ". ".join(parts) + "." if parts else ""
+
+
+def with_category_basis(variety: dict, basis: dict) -> dict:
+    variety["meals_classified_from_typical_serving"] = len(basis["guessed"])
+    variety["meals_unclassified"] = len(basis["unknown"])
+    sentence = category_sentence(basis)
+    if sentence:
+        variety["reasoning"] = variety["reasoning"].rstrip(".") + ". " + sentence
+    return variety
+
+
 def _rule_line(row: dict) -> str:
     if row.get("met") is None:
-        verdict = f"not applicable ({row.get('note', '')})"
+        word = "not decided" if row.get("undecided") else "not applicable"
+        verdict = f"{word} ({row.get('note', '')})"
     else:
         verdict = "met" if row["met"] else "not met"
     return f"{row['rule']}: {row['actual']} (target {row['target']}), {verdict}"
@@ -467,8 +637,10 @@ def checklist_metric(rows: list[dict], days: int) -> dict:
     )
 
 
-def checklist_facts(rows: list[dict], days: int) -> str:
-    return f"The plan covers {days} day(s).\n" + "\n".join("- " + _rule_line(r) for r in rows)
+def checklist_facts(rows: list[dict], days: int, basis: Optional[dict] = None) -> str:
+    facts = f"The plan covers {days} day(s).\n" + "\n".join("- " + _rule_line(r) for r in rows)
+    sentence = category_sentence(basis) if basis else ""
+    return f"{facts}\n{sentence}" if sentence else facts
 
 
 # --------------------------------------------------------------------- #
@@ -577,10 +749,15 @@ def judge_inputs(
         for v in violations["dislikes"]
     ] + [
         f"- POSSIBLE ONLY: {_quoted(v['dishes'])} might contain {v['allergen']}, an allergy — a "
-        "catalogue recipe with a similar name does, but the user did not list it and their dish "
-        "may well not. Not a broken hard constraint: do not score fit as if it were; you may "
+        "catalogue recipe with a similar name or a typical serving of the dish does, but the user "
+        "did not list it and their dish may well not. Not a broken hard constraint: do not score fit as if it were; you may "
         "mention the risk."
         for v in violations.get("possible_allergens", [])
+    ] + [
+        f"- POSSIBLE ONLY: {_quoted(v['dishes'])} might break the {v['diet']} diet — a typical "
+        "serving of it does, but the user listed no ingredients and their dish may not. "
+        "Not a broken hard constraint: weigh the likelihood, and say it is a possibility."
+        for v in violations.get("possible_diet", [])
     ]
 
     preferences = []
@@ -730,9 +907,9 @@ class PastedPlanScorer:
 
         if weekly:
             days = max(int(built.days or 0), 1)
-            measured, rows, checklist = self._weekly_measured(built, profile)
+            measured, rows, checklist, basis = self._weekly_measured(built, profile)
             constraints = constraints + rows
-            facts = checklist_facts(checklist, days)
+            facts = checklist_facts(checklist, days, basis)
         else:
             days = 1
             measured, entries = self._daily_measured(built, profile)
@@ -801,28 +978,54 @@ class PastedPlanScorer:
 
         variety = variety_metrics(built.entries, repeats)
         with_guesses(variety, built)
-        checklist = scale_checklist(
-            guideline_checklist(variety["category_distribution"], variety["total_meals"]), days,
+        basis = category_basis(built.entries)
+        with_category_basis(variety, basis)
+        checklist = allow_for_unknown_meals(
+            scale_checklist(
+                guideline_checklist(variety["category_distribution"], variety["total_meals"]), days,
+            ),
+            len(basis["unknown"]),
         )
         nutrition = with_daily_average(nutrition_metrics(everything, targets), days)
         nutrition["estimated_dishes"] = estimated_dishes(built.meals)
-        meat_count = sum(
-            1 for entry in everything
-            if is_meat_meal(
-                str(entry["recipe"].get("title") or ""),
-                str(entry["recipe"].get("ingredients") or ""),
-                tags=entry["recipe"].get("tags") or None,
-                count_fish=tracker.counts_fish_as_meat,
-            )
+        # Counted from the same food groups the variety line and the checklist
+        # show, so the three cannot disagree. Live, the meat row said 3 while
+        # the variety line said 2 poultry and 2 red meat: one read the
+        # member's "caesar salad", the other the closest recipe's "Chicken
+        # Caesar salad".
+        meat_groups = {"red meat", "poultry"} | ({"fish"} if tracker.counts_fish_as_meat else set())
+        meat_entries = [e for e in everything if classify_meal(e["recipe"]) in meat_groups]
+        meat_count = len(meat_entries)
+        guessed_meat = sum(
+            1 for e in meat_entries if e["recipe"].get("meal_category_basis") == TYPICAL_SERVING
         )
         ledger = weekly_constraints_ledger(profile, meat_count, targets, [], 0, nutrition, repeats=repeats)
         profile_rows = constraints_ledger(profile)
         explicit = explicit_calorie_target(profile)
+        diet_says_no_meat = bool(targets.get("meat_limit_from_diet")) and not targets.get(
+            "meat_limit_explicit"
+        )
         measured_rows = []
         for row in ledger:
             if row in profile_rows:
                 continue  # re-measured by constraint_rows
+            if row.get("key") == MEAT_LIMIT_KEY and diet_says_no_meat:
+                # A vegetarian or vegan diet's "no meat": the diet row above
+                # already names every dish that breaks it, and which of them
+                # only possibly do. A second row counting the same meals — by
+                # food group, guesses included — would be the same fact twice,
+                # with a different number.
+                continue
             row = dict(row)
+            if row.get("key") == MEAT_LIMIT_KEY:
+                if guessed_meat:
+                    row["detail"] += (
+                        f"; {guessed_meat} of the meat meals judged from a typical serving"
+                    )
+                if basis["unknown"]:
+                    row["detail"] += (
+                        f"; {len(basis['unknown'])} meal(s) could not be placed in a food group"
+                    )
             constraint = str(row.get("constraint") or "")
             if days < 7 and constraint.endswith(" this week"):
                 row["constraint"] = constraint[: -len(" this week")] + f" over these {days} days"
@@ -838,4 +1041,4 @@ class PastedPlanScorer:
             checklist_metric(checklist, days),
             nutrition_metric("weekly_nutrition", nutrition, targets, days, explicit),
         ]
-        return metrics, measured_rows, checklist
+        return metrics, measured_rows, checklist, basis

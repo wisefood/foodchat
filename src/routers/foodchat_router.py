@@ -378,8 +378,9 @@ class PlanScoreGroundingRow(BaseModel):
     # calorie guess, calories only) | "" when nothing is known
     nutrition_source: str = ""
     # A small model's typical serving [{name, quantity}] — a guess. Present for
-    # dishes missing calories or ingredients; counted towards food variety when
-    # the dish has no other ingredient list; never checked against allergies.
+    # dishes missing calories or ingredients. When the dish has no other
+    # ingredient list it counts towards food variety, decides the food group,
+    # and an allergen in it is a POSSIBLE conflict (evidence "typical_serving").
     typical_ingredients: List[dict] = []
     # Plain sentences naming what in this row is a guess (calories, ingredients)
     guess_remarks: List[str] = []

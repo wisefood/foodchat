@@ -1061,7 +1061,7 @@ class TestEstimatedCalories:
         assert len(remarks) == 2
         assert remarks[0].startswith("The calories are an estimate")
         assert remarks[1].startswith("The ingredients are a guess at a typical serving")
-        assert "not checked against your allergies" in remarks[1]
+        assert "flagged as possible, not as a fact about your dish" in remarks[1]
 
     def test_a_calorie_guess_says_it_is_a_rough_one(self):
         (meal,) = DishGrounder(

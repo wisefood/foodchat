@@ -68,6 +68,11 @@ logger = logging.getLogger(__name__)
 
 DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
+# The meat-limit ledger row: its `key`, and its wording when the limit is a
+# vegetarian or vegan diet's none rather than a number.
+MEAT_LIMIT_KEY = "meat_limit"
+NO_MEAT_CONSTRAINT = "no meat meals this week"
+
 # Soft calorie budget counts as satisfied up to this share of the target.
 CALORIE_TOLERANCE = 1.05
 # ...and down to this share of it. A ceiling on its own is not a budget check:
@@ -881,10 +886,19 @@ def weekly_constraints_ledger(
 
     meat_limit = int(targets.get("meat_limit") or 0)
     meat_limit_chosen = bool(targets.get("meat_limit_explicit"))
+    # A limit of none because the member is vegetarian or vegan is theirs as
+    # much as one they typed — it is what their diet means.
+    from_diet = (
+        not meat_limit_chosen and meat_limit == 0 and bool(targets.get("meat_limit_from_diet"))
+    )
+    members_limit = meat_limit_chosen or from_diet
     if meat_limit > 0 or meat_count > 0:
         relaxed = [e for e in selection_events if e.get("type") == "meat_limit_relaxed"]
         pruned = [e for e in selection_events if e.get("type") == "meat_pool_pruned"]
-        detail = f"{meat_count} of {meat_limit} meat meal(s) planned"
+        detail = (
+            f"{meat_count} meat meal(s) planned" if from_diet
+            else f"{meat_count} of {meat_limit} meat meal(s) planned"
+        )
         if pruned:
             detail += f"; meat dishes left the candidate pool from {_slot_name(pruned[0])} on"
         if relaxed:
@@ -900,18 +914,26 @@ def weekly_constraints_ledger(
         elif meat_count > meat_limit:
             # Only a limit the MEMBER set can be violated. Ours being exceeded
             # is our default giving way, which is what a default is for.
-            status = "violated" if meat_limit_chosen else "relaxed"
+            status = "violated" if members_limit else "relaxed"
         else:
             status = "satisfied"
-        if not meat_limit_chosen:
+        if not members_limit:
             detail += " — FoodChat's own default, not something you asked for"
+        if from_diet:
+            constraint, source = NO_MEAT_CONSTRAINT, "dietary group"
+        else:
+            constraint = f"at most {meat_limit} meat meal(s) this week"
+            source = "dietary preference" if meat_limit_chosen else "FoodChat default"
         ledger.append({
-            "constraint": f"at most {meat_limit} meat meal(s) this week",
+            "constraint": constraint,
             # A default is a soft house rule; only the member's is hard.
-            "type": "hard" if meat_limit_chosen else "soft",
+            "type": "hard" if members_limit else "soft",
             "status": status,
-            "source": "dietary preference" if meat_limit_chosen else "FoodChat default",
+            "source": source,
             "detail": detail,
+            # Which row this is, for a consumer that re-measures it its own
+            # way (the plan scorer checks a diet dish by dish).
+            "key": MEAT_LIMIT_KEY,
         })
 
     target_kcal = float(targets.get("calories") or 0.0)

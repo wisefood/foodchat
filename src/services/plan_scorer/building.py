@@ -22,8 +22,16 @@ Two identity rules decide what later metrics count as "the same dish":
   built from the member's own title. "Chicken curry" on Monday and "Thai
   green curry" on Wednesday may both land near one catalogue recipe; they
   are still two different things the member wrote, not a repeat. Their
-  catalogue tags are not carried either: a category or diet check reads the
-  member's words, not the tags of a recipe that merely resembles them.
+  catalogue tags are not carried either, and neither is the catalogue name:
+  a category or diet check reads the member's words, not those of a recipe
+  that merely resembles them.
+
+Every entry carries its food group already decided (``meal_category``, read
+by ``classify_meal``) and what it was judged from (``meal_category_basis``):
+the ingredients, a typical serving, the name, or nothing — in which case it
+is ``unknown``. The planner's keyword reading treats a dish with no meat word
+as vegetarian, which is fair for a recipe with an ingredient list and wrong
+for "shepherd's pie" with none.
 
 Repeats are the member's own. A dish written on two days is labelled
 ``repeat_source = REPEAT_BY_AUTHOR`` with ``repeat_of_day`` the most recent
@@ -38,8 +46,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional, Union
 
-from models.pasted_plan import MAIN_SLOTS, MATCHED, GroundedMeal, PastedPlan
+from models.pasted_plan import MAIN_SLOTS, MATCHED, TYPICAL_SERVING, GroundedMeal, PastedPlan
 from models.recipe import CandidateRecipe, ScoredPlan
+from services.weekly_planner.day_summary import (
+    MEAL_CATEGORY_KEY,
+    UNKNOWN_CATEGORY,
+    classify_meal,
+    says_meat_free,
+)
 from services.weekly_planner.explainability import REPEAT_BY_AUTHOR
 
 from .parsing import content_tokens
@@ -47,6 +61,10 @@ from .parsing import content_tokens
 MEAL_INDEX = {"breakfast": 0, "lunch": 1, "dinner": 2}
 EXTRA_MEAL_INDEX = 3
 PASTED_ID_PREFIX = "pasted:"
+# What a dish's food group was judged from (``recipe["meal_category_basis"]``).
+# ``TYPICAL_SERVING`` is the third; "" means nothing was known.
+CATEGORY_FROM_INGREDIENTS = "ingredients"
+CATEGORY_FROM_NAME = "name"
 
 
 def entry_recipe_id(meal: GroundedMeal) -> str:
@@ -56,12 +74,54 @@ def entry_recipe_id(meal: GroundedMeal) -> str:
     return PASTED_ID_PREFIX + (key or meal.title_given.strip().lower())
 
 
+def category_dict(meal: GroundedMeal, guessed: bool = False) -> dict:
+    """What a food-group or diet check may read about a dish.
+
+    Catalogue name and tags only for a MATCHED dish: the member's own words
+    outrank a recipe that merely resembles what they wrote. ``guessed`` reads
+    the typical serving in place of the (empty) ingredient list.
+    """
+    matched = meal.state == MATCHED
+    return {
+        "title": meal.title_given,
+        "recipe_title": meal.title_matched if matched else "",
+        "ingredients": meal.variety_ingredients if guessed else meal.ingredients,
+        "tags": list(meal.tags) if matched else [],
+    }
+
+
+def meal_category(meal: GroundedMeal) -> tuple[str, str]:
+    """``(category, basis)`` for one pasted dish.
+
+    ``basis`` says what the category was judged from, best first:
+    ``ingredients`` (the member's list, or the matched recipe's ingredients or
+    tags), ``typical_serving`` (a guess), ``name`` (the dish's name names a
+    meat or fish, or says it has none). With none of those the dish is
+    ``UNKNOWN_CATEGORY`` — never vegetarian by default: live, a full English
+    and a shrimp pad thai counted towards "most meals plant-based".
+    """
+    known = category_dict(meal)
+    if known["ingredients"] or known["tags"]:
+        return classify_meal(known), CATEGORY_FROM_INGREDIENTS
+    if meal.guessed_ingredients:
+        return classify_meal(category_dict(meal, guessed=True)), TYPICAL_SERVING
+    by_name = classify_meal(known)
+    if by_name != "vegetarian" or says_meat_free(meal.title_given):
+        return by_name, CATEGORY_FROM_NAME
+    return UNKNOWN_CATEGORY, ""
+
+
 def recipe_dict(meal: GroundedMeal) -> dict:
-    """A weekly-entry recipe dict. ``title`` is always the member's words."""
+    """A weekly-entry recipe dict. ``title`` is always the member's words, and
+    so is ``recipe_title`` unless the dish IS the catalogue recipe — every
+    keyword reader looks at both, and "Chicken Caesar salad", the closest
+    recipe to a "caesar salad", made the week's food groups disagree with its
+    meat count."""
+    category, basis = meal_category(meal)
     return {
         "recipe_id": entry_recipe_id(meal),
         "title": meal.title_given,
-        "recipe_title": meal.title_matched or meal.title_given,
+        "recipe_title": (meal.title_matched if meal.state == MATCHED else None) or meal.title_given,
         "ingredients": meal.ingredients,
         "recipe_ingredients": meal.ingredients,
         "recipe_directions": "",
@@ -73,6 +133,8 @@ def recipe_dict(meal: GroundedMeal) -> dict:
         "grounding": meal.state,
         "catalogue_recipe_id": meal.recipe_id,
         "ingredients_source": meal.ingredients_source,
+        MEAL_CATEGORY_KEY: category,
+        "meal_category_basis": basis,
     }
 
 

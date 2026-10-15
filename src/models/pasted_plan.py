@@ -48,6 +48,16 @@ UNKNOWN = "unknown"
 # Allergen evidence found only in the closest catalogue recipe of an
 # APPROXIMATE dish — a possibility to warn about, not a fact about the dish.
 CLOSEST_RECIPE = "closest_recipe"
+# Evidence found only in a small model's typical serving of a dish the member
+# listed no ingredients for — "pad thai" usually has shrimp. Also a possibility:
+# their pad thai may well not.
+TYPICAL_SERVING = "typical_serving"
+POSSIBLE_EVIDENCE = frozenset({CLOSEST_RECIPE, TYPICAL_SERVING})
+
+
+def is_possible(evidence) -> bool:
+    """Evidence that warns rather than decides: not the member's words or the recipe."""
+    return evidence in POSSIBLE_EVIDENCE
 
 # Where a dish's nutrition figures come from, most to least grounded:
 #   recipe               the matched catalogue recipe
@@ -176,7 +186,8 @@ class GroundedMeal:
     nutrition: Optional[dict] = None
     tags: list = field(default_factory=list)
     dish_types: list = field(default_factory=list)
-    # [{"allergen": "peanuts", "evidence": AS_WRITTEN | FROM_RECIPE}]
+    # [{"allergen": "peanuts", "evidence": AS_WRITTEN | FROM_RECIPE
+    #   | CLOSEST_RECIPE | TYPICAL_SERVING}] — the last two are possibilities
     allergen_conflicts: list = field(default_factory=list)
     quantity_note: Optional[str] = None
     image_url: Optional[str] = None            # MATCHED dishes only
@@ -187,8 +198,10 @@ class GroundedMeal:
     nutrition_source: str = NUTRITION_NONE
     # A small model's typical single serving, [{"name", "quantity"}], written
     # for dishes missing calories or ingredients. A guess: it feeds the calorie
-    # estimate and, when ``ingredients`` is empty, the variety count — never
-    # the allergy, diet or dislike checks, which read ``ingredients`` only.
+    # estimate and, when ``ingredients`` is empty, the variety count, the meal
+    # category, and the allergy and diet checks — there only as a POSSIBLE
+    # conflict (``TYPICAL_SERVING``), a warning that caps no score. The dislike
+    # check reads ``ingredients`` only.
     typical_ingredients: list = field(default_factory=list)
     # A catalogue recipe's calories too low to be a serving of this meal
     # ("Quick Chili", 12 kcal), set aside rather than used: {"title", "kcal"}.
@@ -247,8 +260,9 @@ class GroundedMeal:
         if self.guessed_ingredients:
             remarks.append(
                 "The ingredients are a guess at a typical serving, not what you wrote or a "
-                "recipe. They count towards food variety but are not checked against your "
-                "allergies, diet or dislikes."
+                "recipe. They count towards food variety and decide the meal's food group, "
+                "and anything in them that clashes with your allergies or diet is flagged "
+                "as possible, not as a fact about your dish."
             )
         return remarks
 

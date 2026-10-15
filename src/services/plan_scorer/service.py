@@ -46,7 +46,6 @@ from typing import Optional
 
 from models.pasted_plan import (
     APPROXIMATE,
-    CLOSEST_RECIPE,
     NUTRITION_MODEL_ESTIMATE,
     NUTRITION_TYPICAL,
     MAIN_SLOTS,
@@ -56,6 +55,7 @@ from models.pasted_plan import (
     UNRESOLVED,
     GroundedMeal,
     PastedPlan,
+    is_possible,
 )
 
 from .building import (
@@ -477,7 +477,7 @@ def allergen_sentences(grounded: list[GroundedMeal]) -> list[tuple[list[str], st
     for meal in grounded:
         title = meal.title_given.strip()
         for conflict in meal.allergen_conflicts:
-            possible = conflict["evidence"] == CLOSEST_RECIPE
+            possible = is_possible(conflict["evidence"])
             entry = per_dish.setdefault((title.lower(), possible), {"title": title, "allergens": []})
             if conflict["allergen"] not in entry["allergens"]:
                 entry["allergens"].append(conflict["allergen"])

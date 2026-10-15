@@ -121,6 +121,11 @@ class WeeklyNutritionalTracker:
             # honored" — to a member who never set one. A default is a fine
             # thing to have and a lie to attribute.
             "meat_limit_explicit": False,
+            # ...and the 0 above, when it is there, is the member's too: it is
+            # what their vegetarian or vegan diet means, not a house rule. The
+            # ledger called it "FoodChat's own default, not something you
+            # asked for" and marked three meat meals against it as "relaxed".
+            "meat_limit_from_diet": bool(diet & {"vegetarian", "vegan"}),
         }
 
         for pref in preferences:
