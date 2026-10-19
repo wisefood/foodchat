@@ -33,6 +33,10 @@ import sys
 import time
 import traceback
 
+from dotenv import load_dotenv
+
+load_dotenv()  # repo-root .env; already-exported variables win
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 VOCAB = {

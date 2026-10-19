@@ -28,10 +28,20 @@ import os
 import sys
 
 import httpx
+from dotenv import load_dotenv
 
-BASE = os.environ.get("WISEFOOD_API_URL", "").rstrip("/")
-USERNAME = os.environ.get("DEMO_USERNAME")
-PASSWORD = os.environ.get("DEMO_PASSWORD")
+load_dotenv()  # repo-root .env; already-exported variables win
+
+
+def _env(*names: str) -> str:
+    """First non-empty value among `names`."""
+    return next((os.environ[n].strip() for n in names
+                 if os.environ.get(n, "").strip()), "")
+
+
+BASE = _env("WISEFOOD_API_URL").rstrip("/")
+USERNAME = _env("WISEFOOD_USERNAME", "WISEFOOD_DEMO_USERNAME", "DEMO_USERNAME")
+PASSWORD = _env("WISEFOOD_PASSWORD", "WISEFOOD_DEMO_PASSWORD", "DEMO_PASSWORD")
 
 DEMO_DISHES = ["pastitsio", "fakes", "moussaka"]
 
@@ -80,7 +90,7 @@ def result(response: httpx.Response) -> dict | list:
 
 def main() -> None:
     if not (BASE and USERNAME and PASSWORD):
-        die("Set WISEFOOD_API_URL, DEMO_USERNAME, DEMO_PASSWORD")
+        die("Set WISEFOOD_API_URL, WISEFOOD_USERNAME, WISEFOOD_PASSWORD (in .env or the shell)")
 
     client = httpx.Client(base_url=f"{BASE}/api/v1", timeout=60)
 
