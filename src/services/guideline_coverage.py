@@ -152,6 +152,87 @@ def _corpus_groups(rule: dict) -> tuple[str, str, ...]:
     return group, GUIDELINE_TO_CORPUS[group]
 
 
+# ── whom a rule is for ────────────────────────────────────────────────────
+
+#: The audience a rule names in its opening words. The catalogue has no field
+#: for sex or activity level — it is only in the wording — and guides write
+#: one rule per audience: "Active women aged 19-50 should have 4-5 servings…",
+#: "Inactive men…", "Active adults…". Read as a member's guidance, every one of
+#: them landed on every plan as its own chip, contradicting each other.
+_AUDIENCE = re.compile(
+    r"^\s*(?:(?P<activity>active|inactive|sedentary|less active|more active)\s+)?"
+    r"(?P<who>women|woman|men|man|adults?|females?|males?|girls|boys)\b",
+    re.IGNORECASE,
+)
+
+_SEX_OF = {
+    "women": "female", "woman": "female", "female": "female", "females": "female",
+    "girls": "female",
+    "men": "male", "man": "male", "male": "male", "males": "male", "boys": "male",
+}
+
+_ACTIVITY_OF = {
+    "active": "active", "more active": "active",
+    "inactive": "inactive", "sedentary": "inactive", "less active": "inactive",
+}
+
+
+def _activity(profile: Optional[dict]) -> Optional[str]:
+    """`active` / `inactive` when the profile says so; None, as it almost always is."""
+    prefs = (profile or {}).get("nutritional_preferences") or {}
+    for value in ((profile or {}).get("activity_level"), prefs.get("activity_level")):
+        found = _ACTIVITY_OF.get(str(value or "").strip().lower())
+        if found:
+            return found
+    return None
+
+
+def applies_to(rule: dict, profile: Optional[dict]) -> bool:
+    """Whether a rule written for one audience is written for this member.
+
+    A rule for a sex applies only when the profile says that sex; one for an
+    activity level only when it says that level — which no profile does yet,
+    so those are left out rather than guessed. A rule for adults generally, or
+    with no audience in its wording, always applies: the scope already
+    narrowed it to this member's country and life stage.
+    """
+    from services.guidelines_service import _rule_text
+    from services.reference_intake import sex_proxy
+
+    match = _AUDIENCE.match(_rule_text(rule) or "")
+    if not match:
+        return True
+    activity = match.group("activity")
+    if activity and _ACTIVITY_OF.get(activity.lower()) != _activity(profile):
+        return False
+    sex = _SEX_OF.get(match.group("who").lower())
+    return sex is None or sex == sex_proxy(profile or {})
+
+
+def applicable(rules: list[dict], profile: Optional[dict]) -> list[dict]:
+    return [rule for rule in rules or [] if applies_to(rule, profile)]
+
+
+def _distinct(targets_in: list[CoverageTarget]) -> list[CoverageTarget]:
+    """One target per thing measured, the first in catalogue order.
+
+    A country's guidance often comes from two documents saying the same thing
+    in different words — "Have 3 servings a day of milk, yogurt and cheese"
+    and "Eat 3 servings a day of milk, yogurt, and cheese" — and the member
+    was shown both, as if they were two rules to keep.
+    """
+    seen: set[tuple] = set()
+    out: list[CoverageTarget] = []
+    for target in targets_in:
+        key = (tuple(sorted(target.groups)), target.direction, target.low,
+               target.high, target.period, target.per_meal)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(target)
+    return out
+
+
 def targets(profile: Optional[dict] = None, plan_type: str = "daily") -> list[CoverageTarget]:
     """The rules this member's scope carries that the corpus can act on.
 
@@ -165,7 +246,7 @@ def targets(profile: Optional[dict] = None, plan_type: str = "daily") -> list[Co
     except Exception as exc:  # noqa: BLE001
         logger.warning("Guideline coverage unavailable: %s", exc)
         return []
-    return from_rules(rules)
+    return _distinct(from_rules(applicable(rules, profile)))
 
 
 def from_rules(rules: list[dict]) -> list[CoverageTarget]:
@@ -512,7 +593,8 @@ def ledger_rows(plan, profile: Optional[dict] = None) -> list[dict]:
     if not rules:
         return []
 
-    rows = measure(plan, from_rules(rules)) + unverifiable(rules)
+    rules = applicable(rules, profile)
+    rows = measure(plan, _distinct(from_rules(rules))) + unverifiable(rules)
     out: list[dict] = []
     for row in rows:
         met = row.get("met")
@@ -524,6 +606,9 @@ def ledger_rows(plan, profile: Optional[dict] = None) -> list[dict]:
             detail = f"{detail} — {row['detail']}" if detail else row["detail"]
         out.append({
             "constraint": row["rule"],
+            # So the plan can fold its guidance into one line instead of a
+            # chip per rule beside the member's own constraints.
+            "kind": "guideline",
             # Never hard. Allergens and diet are the member's; this is guidance.
             "type": "soft",
             "status": status,

@@ -351,3 +351,76 @@ class TestFoodGroupsReachThePlate:
 
         source = Path("src/services/weekly_plan_service.py").read_text()
         assert "guideline_coverage.ledger_rows(" in source
+
+
+# ── whom a rule is for ───────────────────────────────────────────────────
+#
+# Live, an Irish member's daily plan carried every audience's version of the
+# same rule as its own chip — active women, active men, inactive women,
+# inactive men, active adults, inactive adults — beside two wordings of the
+# dairy rule from two guides. These are those rules, verbatim.
+
+from services import guideline_coverage as gc  # noqa: E402
+
+AUDIENCE_RULES = [
+    "Active women aged 19-50 should have 4-5 servings a day of wholemeal cereals and breads, potatoes, pasta and rice.",
+    "Active men aged 19-50 should have 5-7 servings a day of wholemeal cereals and breads, potatoes, pasta and rice.",
+    "Inactive women aged 19-50 should have 3-4 servings a day of wholemeal cereals and breads, potatoes, pasta and rice.",
+    "Inactive men aged 19-50 should have 4-6 servings a day of wholemeal cereals and breads, potatoes, pasta and rice.",
+    "Active adults aged 19–50 should have 4–5 servings a day of wholemeal cereals and breads, potatoes, pasta, and rice, increasing to 5–7 servings a day for men.",
+    "Inactive adults aged 19–50 should have 3–4 servings a day of wholemeal cereals and breads, potatoes, pasta, and rice, increasing to 4–6 servings a day for men.",
+    "Have 3 servings a day of milk, yogurt and cheese.",
+    "Include wholemeal cereals and breads, potatoes, pasta, or rice at each meal.",
+]
+
+
+def _texts(rules):
+    return [r["rule_text"] for r in rules]
+
+
+class TestWhomARuleIsFor:
+    def rules(self):
+        return [{"rule_text": text} for text in AUDIENCE_RULES]
+
+    def test_nobody_gets_an_activity_rule_while_activity_is_unknown(self):
+        kept = _texts(gc.applicable(self.rules(), {}))
+        assert kept == [
+            "Have 3 servings a day of milk, yogurt and cheese.",
+            "Include wholemeal cereals and breads, potatoes, pasta, or rice at each meal.",
+        ]
+
+    def test_a_stated_activity_and_sex_select_their_own_rule(self):
+        profile = {"sex": "female", "nutritional_preferences": {"activity_level": "active"}}
+        kept = _texts(gc.applicable(self.rules(), profile))
+        assert AUDIENCE_RULES[0] in kept  # active women
+        assert AUDIENCE_RULES[4] in kept  # active adults
+        for other in (AUDIENCE_RULES[1], AUDIENCE_RULES[2], AUDIENCE_RULES[3], AUDIENCE_RULES[5]):
+            assert other not in kept
+
+    def test_a_rule_for_one_sex_needs_the_profile_to_say_it(self):
+        rule = {"rule_text": "Women should have 2 servings of oily fish a week."}
+        assert not gc.applies_to(rule, {})
+        assert gc.applies_to(rule, {"sex": "female"})
+        assert not gc.applies_to(rule, {"sex": "male"})
+
+    def test_a_rule_that_names_nobody_always_applies(self):
+        assert gc.applies_to({"rule_text": "Use fats, spreads and oils in very small amounts."}, {})
+        assert gc.applies_to({"rule_text": "Adults should eat fish twice a week."}, {})
+
+
+class TestOneTargetPerThingMeasured:
+    def target(self, rule, source="guide A"):
+        return gc.CoverageTarget(
+            rule=rule, groups=("dairy",), direction="about", low=3, high=3,
+            period="day", per_meal=False, source=source, urn="", guideline_group="dairy",
+        )
+
+    def test_two_guides_saying_the_same_thing_show_once(self):
+        first = self.target("Have 3 servings a day of milk, yogurt and cheese.")
+        second = self.target("Eat 3 servings a day of milk, yogurt, and cheese.", "guide B")
+        assert gc._distinct([first, second]) == [first]
+
+    def test_a_different_amount_is_a_different_target(self):
+        three = self.target("three a day")
+        two = gc.CoverageTarget(**{**three.__dict__, "low": 2, "high": 2, "rule": "two a day"})
+        assert gc._distinct([three, two]) == [three, two]
