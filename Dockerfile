@@ -69,6 +69,9 @@ RUN groupadd -r foodchat && useradd -r -g foodchat foodchat
 
 # Copy application code
 COPY src/ ./src/
+# Operator scripts run inside the pod with its database and credentials
+# (e.g. the research export); nothing imports them at runtime.
+COPY scripts/ ./scripts/
 
 # Set ownership
 RUN chown -R foodchat:foodchat /app

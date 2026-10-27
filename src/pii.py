@@ -128,19 +128,25 @@ _DETECTORS: List[Tuple[str, re.Pattern, Optional[callable]]] = [
 ]
 
 
-def redact(text: Optional[str]) -> Tuple[Optional[str], Dict[str, int]]:
+def redact(
+    text: Optional[str], *, force: bool = False
+) -> Tuple[Optional[str], Dict[str, int]]:
     """Return the text with personal data replaced, and a count per kind.
 
     The counts are the point as much as the text: they are what lets the
     platform say how often people are typing identifiers into a chat, without
     keeping a single example of one.
 
+    ``force`` scans whatever the deployment's switch says. The switch governs
+    what a model is told mid-conversation, where redaction can cost answer
+    quality; text leaving the platform for a test set is redacted always.
+
     Never raises. A redactor that throws on the request path takes the chat
     down with it, and failing open on an exception is the wrong call — so it
     fails *closed* on the one thing it can: an unreadable input is returned
     unchanged and reported as unscanned, and the caller decides.
     """
-    if not text or not ENABLED:
+    if not text or not (ENABLED or force):
         return text, {}
     if len(text) > MAX_SCAN_CHARS:
         return text, {"unscanned": 1}
