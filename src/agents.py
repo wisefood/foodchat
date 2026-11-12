@@ -549,12 +549,36 @@ class QueryReconciler:
             ", ".join(f"likes {like}" for like in (user_profile.get("food_likes") or [])[:5]),
         ])) or "(nothing on file)"
 
+        # Several people eating: say whose restriction each one is. Handed a
+        # flat "Allergies: milk", the reconciler addressed another diner's
+        # allergy to the session member as their own.
+        diners = user_profile.get("cooking_for_names") or []
+        origins = user_profile.get("constraint_origins") or {}
+
+        def attributed(key: str) -> list:
+            values = user_profile.get(key, []) or []
+            if len(diners) < 2:
+                return values
+            values = [values] if isinstance(values, str) else list(values)
+            by_value = origins.get(key) or {}
+            return [
+                f"{value} ({', '.join(by_value[value])})" if by_value.get(value) else value
+                for value in values
+            ]
+
+        if len(diners) > 1:
+            known_facts += (
+                f"; this plan is for several people: {', '.join(str(d) for d in diners)}"
+                f" - the user is {diners[0]}, and a restriction with a name after"
+                " it belongs to that person"
+            )
+
         result = self.query_reconciler.invoke(as_json_messages([
             SystemMessage(content=QUERY_RECONCILER_SYSTEM.compile()),
             HumanMessage(content=QUERY_RECONCILER_USER.compile(
                 query=query,
-                diet=user_profile.get("diet", []),
-                allergies=user_profile.get("allergies", []),
+                diet=attributed("diet"),
+                allergies=attributed("allergies"),
                 known_facts=known_facts,
             )),
         ]), config=build_trace_config(run_name="query_reconcile", tags=["clarify"]))

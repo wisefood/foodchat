@@ -31,6 +31,7 @@ from typing import Optional
 
 from agents import EditCommandExtractor
 from models.recipe import CandidateRecipe, RecipeEnrichment
+from models.household import table_favorites
 from models.session import MealCourse, MealPlan
 from services import plan_parameters
 from services.candidates_client import CANDIDATES, effective_diet, screening_allergens
@@ -545,7 +546,7 @@ class EditService:
             # slot's top candidate matched it.
             facts["named_miss"] = predicate.directive
         if passing:
-            favorites = set(session.user_profile.get("favorite_recipe_ids") or [])
+            favorites = set(table_favorites(session.user_profile))
             choice = next((c for c in passing if c.recipe_id in favorites), passing[0])
             return choice, old_rich, enrichment.get(choice.recipe_id), facts
 
@@ -584,7 +585,7 @@ class EditService:
                     profile.get("plan_parameters") or {}
                 ),
                 min_nutri_score=profile.get("min_nutri_score"),
-                favorite_recipe_ids=profile.get("favorite_recipe_ids") or [],
+                favorite_recipe_ids=table_favorites(profile),
                 limit=3,
             )
         except Exception as exc:  # noqa: BLE001

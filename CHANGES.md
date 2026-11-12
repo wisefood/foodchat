@@ -2,6 +2,69 @@
 
 ---
 
+# Household planning, phase 1: satisfy-all, hardened
+
+> **Date:** 2026-11-12
+> **Branch:** main
+> Additive API: `DinersResponse.unavailable` (names of selected diners whose
+> profile could not be loaded). `POST /sessions` and `PUT /sessions/{id}/diners`
+> answer 404 for a diner from another household. Session profile snapshot gains
+> `like_conflicts`, `household_favorites` and `diners_unavailable`. Two prompts
+> are registered under new names (`query_reconciler_system_v2`,
+> `preference_extractor_system_v2`). Group plans change; solo plans do
+> not, except that a like of "milk" no longer labels a coconut-milk dish.
+
+Satisfy-all stays the only strategy. This closes the gaps the household study
+found in it, and the ones phase 0 listed as unused.
+
+| What | Detail |
+|---|---|
+| `models/household.py` → `_satisfy_all`, `_like_blocker` | A like that another diner cannot or will not eat is left out of the merged `food_likes` and recorded in `like_conflicts` (`{like, liked_by, blocked_by: allergy \| diet \| dislike, value, members}`), strongest reason first. Allergy uses the allergen backstop (so plant milk is not blocked by a milk allergy); diet covers the tags RecipeWrangler filters on (vegetarian, vegan, pescatarian, dairy/gluten/nut free) and ignores labels that filter nothing (flexitarian); dislike is a word match. The diner's own record keeps the like. A diner's like is never checked against their own profile, and the solo path does not come through here. |
+| `services/transparency.py` → `constraints_ledger` | One `relaxed` row per set-aside like, naming who likes it and whose allergy, diet or dislike came first; the constraint text carries the reason because the reply writer receives only that text. One `unsupported` row per diner whose profile could not be loaded. |
+| `services/transparency.py` → `match_reasons` | A like held only by another diner renders "Sam likes lentils" (`kind: diner`) instead of "you like lentils". Plant "dairy" is masked before matching a dairy like, so coconut milk is not "you like milk". |
+| `agents.py` → `QueryReconciler.reconcile` | In a group, diet and allergy values are sent with the diner's name ("milk (Miranda)") and the known facts say who the user is. Likes come from the merged view, so a like that clashes with another diner's allergy is no longer offered beside it. |
+| `prompts.py` → `query_reconciler_system_v2` | Two rules added: a conflict is between the query and the profile, never between two profile entries; a restriction with a name after it belongs to that person. Registered under a new name because `sync_prompts` never overwrites. |
+| `services/feedback_service.py` → `household_signals` (new) | The session member's signals plus every other diner's downvoted recipes; their rating-history lines are added under their name. Used by `chat_service`, `weekly_plan_service` and `tools/plan_tools.py` in place of `get_signals`. Solo sessions get exactly what they got. |
+| `services/profile_service.py` → `build_session_profile` | A diner whose profile fetch fails is left out of `cooking_for`, recorded in `diners_unavailable`, and no constraint is claimed for them; the session member's own fetch failing is still an error. A diner whose `household_id` differs from the session member's raises `DinerNotInHousehold` (a `ValueError`); a missing id on either side is not a mismatch. |
+| `routers/foodchat_router.py` | `create_session` and `set_diners` map `DinerNotInHousehold` to 404. `DinersResponse.unavailable`. |
+| `models/household.py` → `table_favorites` (new); `profile_service.build_session_profile` | The other diners' favourites are fetched into `household_favorites` (`{recipe_id: [names]}`), apart from the session member's `favorite_recipe_ids`. `table_favorites(profile, own=…)` is the boost list: own favourites (unless the offer was declined), then the others'. Used by `planning_pipeline`, `weekly_planner/action_adapter.py`, `weekly_planner/planner.py` and `edit_service`. They are never pinned and never part of the favourites offer. `match_reasons` labels such a dish "one of Anna's favorites" (`kind: diner`). |
+| `services/transparency.py` → `_life_stage_rows` | Guidelines are still resolved once, for the session member. A diner in another life stage now gets an `unsupported` ledger row ("guidelines for adolescents (Miranda)") saying which stage the plan was checked against. |
+| `services/transparency.py` → `attributed` (new); `chat_service.no_plan_message`; `weekly_plan_service` | The "couldn't find enough recipes" replies name each allergen, dislike and (weekly) diet with its diner, and say "this table's constraints" for a group. |
+| `schemas.py`, `prompts.py` → `preference_extractor_system_v2` | Memory candidates carry `subject` ("user", or the name/relation as written). New prompt name, same reason as the reconciler's. |
+| `services/memory_service.py` → `suggest`, `_apply_to_other_diners` | A candidate about somebody else is no longer offered as the session member's memory. If the subject is a diner at the table, an allergy (any confidence), a dislike or a diet (stated outright) is applied to this session only: that diner's record, the merged view and `constraint_origins`. Nothing is written to the gateway. A subject who is not at the table is ignored. |
+| `models/household.py` → `remember_for` | `remember_for_primary` generalised to any diner. |
+
+Not done here, by decision or by scope:
+
+* Guidelines are reported, not yet applied, per life stage — judging one plan
+  against several stages is per-member scoring, which is phase 2.
+* A statement about another diner is session-scoped. Writing it to that
+  member's durable profile needs a consent rule for cross-member writes.
+* `like_conflicts` is computed when the diners are set. A like accepted as a
+  memory, or a constraint learned about another diner, mid-session is not
+  re-checked against it until the diners are set again.
+* Named-dish search, the pantry boost and seeds still boost the session
+  member's favourites only.
+
+## Verification
+
+New tests in `test_household_context.py`: likes set aside by allergy, diet and
+dislike, strongest reason reported, plant milk, non-filtering labels, shared
+likes, the ledger rows; match reasons for another diner's like and for
+coconut milk; the reconciler prompt for a group and for a solo member; an
+unreachable diner, the only extra diner failing, the session member failing,
+another household, an unknown household; the downvote union. Two existing
+fixtures had a vegetarian diner who liked salmon; one expectation changed and
+one fixture now uses lentils. Also covered: the other diners' favourites
+(kept apart, in the boost, surviving a declined offer, the chip); the
+life-stage row; the attributed empty-plan message; statements about another
+diner (not offered, applied to that diner, confidence bar, not at the table,
+statements about the user unchanged). One source-inspection test in
+`test_structured_path.py` now looks for `table_favorites(`. Full suite: 2660
+passed, 1 skipped.
+
+---
+
 # Allergen names: the gateway's spellings now reach the ingredient check
 
 > **Date:** 2026-11-12

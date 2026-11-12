@@ -64,6 +64,82 @@ def _as_list(value: Any) -> list[str]:
     return [str(v) for v in value if v is not None and str(v).strip()]
 
 
+# What a food someone likes has to be free of for each diet RecipeWrangler
+# filters on. Service imports are local: this model stays importable alone.
+
+def _blocking_allergen(like: str, diner: "DinerProfile") -> Optional[str]:
+    """The diner's allergen that a liked food names or contains, if any."""
+    from services.candidates_client import allergen_conflict, screening_allergens
+
+    for allergen in screening_allergens({"allergies": diner.allergies, "diet": diner.diet}):
+        if allergen_conflict(like, [allergen]):
+            return str(allergen)
+    return None
+
+
+def _blocking_diet(like: str, diner: "DinerProfile") -> Optional[str]:
+    """The diner's diet that rules a liked food out, if any."""
+    from services.candidates_client import DIET_FILTER, allergen_conflict, diet_tag_status
+    from services.weekly_planner.day_summary import (
+        FISH_KEYWORDS, POULTRY_KEYWORDS, RED_MEAT_KEYWORDS, _matches, says_meat_free,
+    )
+
+    text = str(like).lower()
+    if says_meat_free(text):
+        land_meat = fish = False
+    else:
+        land_meat = _matches(text, RED_MEAT_KEYWORDS | POULTRY_KEYWORDS)
+        fish = _matches(text, FISH_KEYWORDS)
+    for diet in diner.diet:
+        status, tag = diet_tag_status(diet)
+        if status != DIET_FILTER:
+            continue
+        if tag in ("vegetarian", "vegetarian_or_vegan", "vegan") and (land_meat or fish):
+            return str(diet)
+        if tag == "vegan" and allergen_conflict(text, ["dairy", "eggs"]):
+            return str(diet)
+        if tag in ("pescatarian", "pescatarian_safe") and land_meat:
+            return str(diet)
+        if tag == "dairy_free" and allergen_conflict(text, ["dairy"]):
+            return str(diet)
+        if tag == "gluten_free" and allergen_conflict(text, ["gluten"]):
+            return str(diet)
+        if tag == "nut_free" and allergen_conflict(text, ["nuts"]):
+            return str(diet)
+    return None
+
+
+def _blocking_dislike(like: str, diner: "DinerProfile") -> Optional[str]:
+    """The diner's dislike that a liked food names, if any ("salmon" blocks
+    "smoked salmon"; "smoked salmon" does not block "salmon")."""
+    from services.candidates_client import allergen_conflict
+
+    for dislike in diner.food_dislikes:
+        if allergen_conflict(like, [dislike]):
+            return str(dislike)
+    return None
+
+
+HOUSEHOLD_FAVORITES_KEY = "household_favorites"
+
+
+def table_favorites(profile: Optional[dict], own: bool = True) -> list[str]:
+    """Recipe ids to float in candidate ranking: the session member's
+    favourites, then the other diners'.
+
+    ``own=False`` leaves the session member's out — they declined the
+    favourites offer, and that has to keep meaning no. The other diners'
+    favourites were never part of that offer: they are a ranking boost only,
+    never pinned, and a boosted recipe still has to pass every hard filter.
+    """
+    profile = profile or {}
+    ids = [str(r) for r in (profile.get("favorite_recipe_ids") or [])] if own else []
+    for recipe_id in profile.get(HOUSEHOLD_FAVORITES_KEY) or {}:
+        if str(recipe_id) not in ids:
+            ids.append(str(recipe_id))
+    return ids
+
+
 class DinerProfile(BaseModel):
     """One household member's own planning profile, unmerged."""
 
@@ -235,7 +311,16 @@ class HouseholdContext(BaseModel):
         view would know and the member it is about would not. Returns whether
         anything changed. Kinds with no per-diner field are ignored.
         """
-        primary = self.primary
+        return self.remember_for(self.primary, kind, value)
+
+    def remember_for(self, diner: Optional[DinerProfile], kind: str, value: str) -> bool:
+        """Apply one stated preference to one diner's own record.
+
+        The general form of `remember_for_primary`: "Miranda hates mushrooms"
+        is about Miranda, and belongs on her record, not the session member's.
+        Returns whether anything changed.
+        """
+        primary = diner  # the diner being updated; name kept for the body below
         value = str(value or "").strip().lower()
         if primary is None or not value:
             return False
@@ -275,6 +360,33 @@ class HouseholdContext(BaseModel):
     # ------------------------------------------------------------------ #
     # Derived views                                                       #
     # ------------------------------------------------------------------ #
+
+    def _like_blocker(self, like: str, exclude: Optional[DinerProfile] = None) -> Optional[dict]:
+        """What stops the table from being served something one diner likes.
+
+        ``{"blocked_by": "allergy" | "diet" | "dislike", "value", "members"}``
+        for the first reason found, strongest first, or None. ``exclude`` is
+        the diner whose like it is: their own profile disagreeing with itself
+        is theirs to sort out, and the solo path never comes through here.
+        """
+        others = [d for d in self.diners if d is not exclude]
+        for reason, check in (
+            ("allergy", _blocking_allergen),
+            ("diet", _blocking_diet),
+            ("dislike", _blocking_dislike),
+        ):
+            value, members = None, []
+            for d in others:
+                found = check(like, d)
+                if found is None:
+                    continue
+                if value is None:
+                    value = found
+                if found == value and d.name and d.name not in members:
+                    members.append(d.name)
+            if value is not None:
+                return {"blocked_by": reason, "value": value, "members": members}
+        return None
 
     def merged_view(self, primary_profile: dict) -> dict:
         """The single plan-generation profile every existing consumer reads.
@@ -330,12 +442,35 @@ class HouseholdContext(BaseModel):
         merged["food_dislikes"] = union("food_dislikes")
         merged["constraint_origins"] = origins
 
+        # A like that somebody at the table cannot or will not eat is not a
+        # like of the TABLE. Left in, it steered retrieval towards dishes the
+        # hard filters then removed, was offered to the reconciler beside the
+        # allergy it contradicts (which asked the session member why "their"
+        # milk allergy disagreed with their liking for milk — the allergy was
+        # another diner's), and labelled a coconut-milk dish "you like milk".
+        # It stays on the diner's own record; only the merged view drops it,
+        # and `like_conflicts` says what was set aside and for whom.
         likes: list[str] = []
+        like_conflicts: list[dict] = []
         for d in self.diners:
             for like in d.food_likes:
-                if str(like).lower() not in [str(seen).lower() for seen in likes]:
+                low = str(like).lower()
+                if low in [str(seen).lower() for seen in likes]:
+                    continue
+                known = next((c for c in like_conflicts if c["like"].lower() == low), None)
+                if known is not None:
+                    if d.name and d.name not in known["liked_by"]:
+                        known["liked_by"].append(d.name)
+                    continue
+                blocker = self._like_blocker(like, exclude=d)
+                if blocker is None:
                     likes.append(like)
+                    continue
+                like_conflicts.append({
+                    "like": like, "liked_by": [d.name] if d.name else [], **blocker,
+                })
         merged["food_likes"] = likes
+        merged["like_conflicts"] = like_conflicts
 
         # ── Goal reconciliation ──
         primary = self.primary

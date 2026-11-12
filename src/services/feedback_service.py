@@ -33,6 +33,42 @@ class FeedbackSignals:
     history_text: str = ""
 
 
+def household_signals(feedback_service, member_id: str, profile: dict) -> FeedbackSignals:
+    """The session member's signals, plus what the other diners have rejected.
+
+    A recipe anyone at the table has voted down does not come back: it is the
+    same rule as a dislike, which is already a union across diners. Until this
+    existed only the session member's votes counted, so a dish another diner
+    had rejected in their own sessions was served to them here.
+
+    Rating history stays the session member's, with the other diners' lines
+    added under their names so the grader can tell whose taste a line is.
+    Takes the service as an argument (anything with ``get_signals``) rather
+    than being a method, so every caller's existing fake keeps working.
+    """
+    from models.household import HouseholdContext
+
+    own = feedback_service.get_signals(member_id)
+    household = HouseholdContext.from_profile(profile)
+    if household is None or not household.is_group:
+        return own
+
+    downvoted = list(own.downvoted_recipe_ids or [])
+    lines = [line for line in (own.history_text or "").splitlines() if line]
+    for diner in household.others:
+        if not diner.member_id or diner.member_id == member_id:
+            continue
+        theirs = feedback_service.get_signals(diner.member_id)
+        for recipe_id in theirs.downvoted_recipe_ids or []:
+            if recipe_id not in downvoted:
+                downvoted.append(recipe_id)
+        name = diner.name or "another diner"
+        for line in (theirs.history_text or "").splitlines():
+            if line and len(lines) < MAX_HISTORY_LINES:
+                lines.append(f"{name} - {line}")
+    return FeedbackSignals(downvoted_recipe_ids=downvoted, history_text="\n".join(lines))
+
+
 class FeedbackService:
     """Aggregates a member's message feedback into recommendation signals."""
 

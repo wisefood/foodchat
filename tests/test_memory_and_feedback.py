@@ -204,13 +204,13 @@ class TestDinerMerge:
     def test_hard_constraints_union_soft_weighted(self):
         primary = {
             "diet": ["omnivore"], "allergies": ["peanuts"],
-            "food_likes": ["salmon"], "food_dislikes": ["olives"],
+            "food_likes": ["lentils"], "food_dislikes": ["olives"],
             "preferences": ["2000 calories target"],
             "favorite_recipe_ids": ["r-1"],
         }
         anna = {
             "diet": ["vegetarian"], "allergies": [],
-            "food_likes": ["halloumi", "salmon"], "food_dislikes": ["mushrooms"],
+            "food_likes": ["halloumi", "lentils"], "food_dislikes": ["mushrooms"],
             "preferences": ["1600 calories target"],
         }
         tom = {
@@ -225,7 +225,7 @@ class TestDinerMerge:
         assert set(merged["diet"]) == {"omnivore", "vegetarian"}
         assert set(merged["food_dislikes"]) == {"olives", "mushrooms"}
         # Soft: primary's likes lead, others follow without duplicates
-        assert merged["food_likes"] == ["salmon", "halloumi"]
+        assert merged["food_likes"] == ["lentils", "halloumi"]
         # Primary keeps macros and favorites
         assert merged["preferences"] == ["2000 calories target"]
         assert merged["favorite_recipe_ids"] == ["r-1"]

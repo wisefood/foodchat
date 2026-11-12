@@ -149,6 +149,9 @@ class CandidateMemorySchema(BaseModel):
     statement: str                   # user-facing nudge text
     evidence: str                    # what in the message supports this
     confidence: Literal["low", "medium", "high"]
+    # Who the statement is about: "user" for the person writing (also "we"),
+    # otherwise the name or relation as written ("Miranda", "my son").
+    subject: str = "user"
 
 
 class PreferenceExtractionSchema(BaseModel):

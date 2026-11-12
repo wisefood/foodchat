@@ -29,6 +29,14 @@ def match_reasons(
 
     if course_recipe_id in (profile.get("favorite_recipe_ids") or []):
         reasons.append({"kind": "favorite", "label": "one of your favorites"})
+    else:
+        # Another diner's favourite, boosted for the table: say whose.
+        whose = (profile.get("household_favorites") or {}).get(str(course_recipe_id))
+        if whose:
+            reasons.append({
+                "kind": "diner",
+                "label": "one of " + _names([f"{name}'s" for name in whose]) + " favorites",
+            })
 
     text = (ingredients_text or "").lower()
     memory_values = {
@@ -48,15 +56,146 @@ def match_reasons(
     # "the text mentions this" shared by both.
     from services.pantry_service import matched_items
 
+    from services.candidates_client import PLANT_DAIRY
+
+    # "coconut milk" is not the milk somebody likes, nor "peanut butter" their
+    # butter: a korma carried "you like milk" on the strength of its coconut.
+    dairy_free_text = PLANT_DAIRY.sub(" ", text)
+    likers = _likers(profile)
+
     for like in profile.get("food_likes") or []:
         like_l = str(like).lower()
-        if like_l and matched_items(text, [like_l]):
-            kind = "memory" if like_l in memory_values else "profile"
-            label = f"you like {like_l}"
-            reasons.append({"kind": kind, "label": label})
+        searched = dairy_free_text if like_l in _DAIRY_WORDS else text
+        if like_l and matched_items(searched, [like_l]):
+            who = likers.get(like_l)
+            if who:
+                # Another diner's like, not the session member's: say whose.
+                reasons.append({"kind": "diner", "label": f"{_names(who)} like{'s' if len(who) == 1 else ''} {like_l}"})
+            else:
+                kind = "memory" if like_l in memory_values else "profile"
+                reasons.append({"kind": kind, "label": f"you like {like_l}"})
             break  # one like-chip per course keeps cards readable
 
     return reasons
+
+
+_DAIRY_WORDS = {"milk", "butter", "cream", "cheese", "yogurt", "yoghurt", "dairy"}
+
+
+def _names(names: list[str]) -> str:
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+
+
+def _likers(profile: dict) -> dict[str, list[str]]:
+    """Like -> the OTHER diners who hold it, for likes the session member does
+    not. Empty for a solo plan, and for a like the session member shares:
+    "you like salmon" is still true when Anna likes it too.
+    """
+    from models.household import HouseholdContext
+
+    household = HouseholdContext.from_profile(profile)
+    if household is None or not household.is_group:
+        return {}
+    own = {str(v).lower() for v in household.primary.food_likes}
+    out: dict[str, list[str]] = {}
+    for diner in household.others:
+        for like in diner.food_likes:
+            low = str(like).lower()
+            if low in own or not diner.name:
+                continue
+            who = out.setdefault(low, [])
+            if diner.name not in who:
+                who.append(diner.name)
+    return out
+
+
+def attributed(profile: dict, key: str, values=None) -> list[str]:
+    """Constraint values with the diner each came from, for a sentence.
+
+    ``["milk (Miranda)", "peanut (Liza)"]`` when several people are eating and
+    the origin is known; the bare values otherwise. ``values`` defaults to
+    ``profile[key]`` — pass the list that was actually applied when it is not
+    the stored one. An apology that lists the table's constraints without
+    saying whose they are leaves the member guessing which diner to ask.
+    """
+    values = profile.get(key) if values is None else values
+    values = [values] if isinstance(values, str) else [str(v) for v in (values or [])]
+    if len(profile.get("cooking_for_names") or []) < 2:
+        return values
+    origins = {
+        str(value).lower(): who
+        for value, who in ((profile.get("constraint_origins") or {}).get(key) or {}).items()
+    }
+    return [
+        f"{value} ({', '.join(origins[value.lower()])})" if origins.get(value.lower()) else value
+        for value in values
+    ]
+
+
+def _life_stage_rows(profile: dict) -> list[dict]:
+    """One row per life stage at the table that the plan is NOT judged for.
+
+    Guidelines are resolved once, for the session member (`resolve_scope`).
+    A teenager or a child eating the same plan is therefore held to adult
+    rules, and until that changes the plan has to say so rather than let
+    "follows the guidelines" be read as true of everyone eating it.
+    """
+    from models.household import HouseholdContext
+    from services.guidelines_service import (
+        DEFAULT_LIFE_STAGE, _STAGE_LABELS, life_stage_of,
+    )
+
+    household = HouseholdContext.from_profile(profile)
+    if household is None or not household.is_group:
+        return []
+    judged = life_stage_of(profile) or DEFAULT_LIFE_STAGE
+    by_stage: dict[str, list[str]] = {}
+    for diner in household.others:
+        stage = life_stage_of({"age_group": diner.age_group})
+        if stage and stage != judged and diner.name:
+            by_stage.setdefault(stage, []).append(diner.name)
+    return [
+        {
+            "constraint": f"guidelines for {_STAGE_LABELS.get(stage, stage)} ({_names(names)})",
+            "type": "soft", "status": "unsupported",
+            "source": "guidelines",
+            "detail": "This plan is checked against the guidelines for "
+                      f"{_STAGE_LABELS.get(judged, judged)}. The ones written for "
+                      f"{_STAGE_LABELS.get(stage, stage)} were not applied.",
+            "members": names,
+        }
+        for stage, names in by_stage.items()
+    ]
+
+
+def _like_conflict_rows(profile: dict) -> list[dict]:
+    """One row per like the table could not have, saying who it gave way to.
+
+    A like that vanished without a word is the same silence as a dropped
+    goal: the member who likes cheese sees a week without it and no reason.
+    """
+    reasons = {"allergy": "allergy", "diet": "diet", "dislike": "dislike"}
+    rows = []
+    for conflict in profile.get("like_conflicts") or []:
+        like = str(conflict.get("like") or "")
+        if not like:
+            continue
+        members = [str(m) for m in conflict.get("members") or [] if m]
+        whose = f"{_names(members)}'s" if members else "another diner's"
+        reason = reasons.get(str(conflict.get("blocked_by")), "restriction")
+        value = str(conflict.get("value") or "")
+        rows.append({
+            # The reply writer is handed the constraint text alone
+            # (`split_ledger`), so the text has to carry the reason.
+            "constraint": f"liking for {like} (set aside for {whose} {reason})",
+            "type": "soft", "status": "relaxed",
+            "source": "preferences",
+            "detail": f"Not used to choose dishes for this plan: {whose} {reason}"
+                      + (f" ({value})" if value and value.lower() != like.lower() else "")
+                      + " comes first.",
+            "members": [str(m) for m in conflict.get("liked_by") or [] if m],
+        })
+    return rows
 
 
 def _diet_row(diet, members: list[str]) -> dict:
@@ -154,6 +293,19 @@ def constraints_ledger(profile: dict, downvoted_count: int = 0) -> list[dict]:
             return []
         return list((origins.get(key) or {}).get(value) or [])
 
+    for missing in profile.get("diners_unavailable") or []:
+        who = str(missing.get("name") or "A selected diner")
+        ledger.append({
+            "constraint": f"{who}'s profile could not be loaded",
+            # `unsupported`, not `violated`: nothing on the plate is known to
+            # be wrong, but nothing was checked for this person either.
+            "type": "hard", "status": "unsupported",
+            "source": "household",
+            "detail": f"This plan does not account for {who}'s allergies or diet. "
+                      "Select them again to retry.",
+            "members": [who],
+        })
+
     for allergen in profile.get("allergies") or []:
         ledger.append({
             "constraint": f"no {allergen}",
@@ -171,6 +323,8 @@ def constraints_ledger(profile: dict, downvoted_count: int = 0) -> list[dict]:
             "members": members_for("food_dislikes", dislike),
         })
 
+    ledger.extend(_like_conflict_rows(profile))
+    ledger.extend(_life_stage_rows(profile))
     ledger.extend(_goal_rows(profile, household))
 
     if downvoted_count:

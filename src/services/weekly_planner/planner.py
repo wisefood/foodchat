@@ -26,6 +26,7 @@ Three things live here beyond the loop itself:
 import logging
 import random
 import re
+from models.household import table_favorites
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .environment import WeeklyMealPlanEnv
@@ -553,7 +554,7 @@ def build_preference_scorer(
     profile makes "equal terms" mean a one-in-eleven share of the slot. On a
     default setting the weight is 0.0 and nothing about the week changes.
     """
-    favorites = {str(f) for f in (user_profile.get("favorite_recipe_ids") or [])}
+    favorites = set(table_favorites(user_profile))
     likes = [str(like).lower() for like in (user_profile.get("food_likes") or [])]
 
     from services import plan_parameters  # local import; avoids a cycle at module load

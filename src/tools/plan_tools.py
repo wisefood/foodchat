@@ -688,9 +688,9 @@ def replace_day(session_id: str, day: int, note: str = "") -> dict:
         if recipe_id:
             action_space.mark_selected(recipe_id)
     # And nothing they have rejected, on this day or any earlier one.
-    from services.feedback_service import FeedbackService
+    from services.feedback_service import FeedbackService, household_signals
 
-    signals = FeedbackService().get_signals(session.member_id)
+    signals = household_signals(FeedbackService(), session.member_id, session.user_profile)
     for recipe_id in (signals.downvoted_recipe_ids or []):
         action_space.mark_selected(recipe_id)
     for recipe_id in state.excluded_recipe_ids:

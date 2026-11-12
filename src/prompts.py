@@ -253,6 +253,8 @@ Your task is to analyze the user's query and their dietary profile to identify:
 
 Instructions:
 - If an item in the query violates the user's diet or allergies, set `has_dietary_conflict` to true and provide a `conflict_explanation` that warns the user and asks if they want to proceed.
+- A conflict is between the QUERY and the profile, never between two entries of the profile. If the profile itself lists something as both liked and restricted, that is not a conflict to report: the restriction applies and you say nothing about it.
+- When a restriction is followed by a name in brackets, the plan is for several people and that restriction belongs to the named person, not necessarily to the user. In `conflict_explanation`, name that person ("Miranda is allergic to milk") rather than saying "your allergy".
 - DEFAULT TO NOT ASKING. `missing_info` should almost always be an empty list. A meal plan can be generated from any profile signal (dietary groups, food likes/dislikes, allergies) or any qualifier in the query ("healthy", "quick", "high-protein", "for the week", a cuisine, a dish name). If ANY such signal exists, return `missing_info: []`.
 - Only add a topic to `missing_info` when BOTH the query is completely bare (no qualifier at all, e.g. just "make me a plan") AND the KNOWN USER INFORMATION provides no direction whatsoever. Even then, ask at most ONE topic — the single most useful one (usually food preferences or cravings for this plan).
 - NEVER ask about "cooking time", "difficulty level", or "goal" — the app collects these through interactive controls, never through questions. Never re-ask anything the KNOWN USER INFORMATION covers (food likes cover taste direction). Interrogating users who already told us things erodes trust.
@@ -978,9 +980,10 @@ For each candidate:
 - "statement": a short, friendly confirmation question phrased as an observation, e.g. "It seems you don't like blueberries — remember this?"
 - "evidence": quote or paraphrase the part of the message that supports it
 - "confidence": "high" only when the user stated it explicitly and durably; "medium"/"low" for implication
+- "subject": who the statement is ABOUT. "user" when it is about the person writing, including "we" ("I hate olives", "we don't eat pork"). When it is about somebody else, the name or relation exactly as written ("Miranda hates mushrooms" → "Miranda"; "my son is allergic to eggs" → "my son"). Still extract it — never rewrite another person's preference as the user's.
 
 OUTPUT FORMAT (MANDATORY) — a single JSON object:
-{"memories": [{"kind": ..., "value": ..., "statement": ..., "evidence": ..., "confidence": ...}, ...]}
+{"memories": [{"kind": ..., "value": ..., "statement": ..., "evidence": ..., "confidence": ..., "subject": ...}, ...]}
 Return {"memories": []} when nothing durable was expressed.
 """
 
@@ -1351,7 +1354,10 @@ GRADER_USER = _reg("grader_user", GRADER_USER_INSTRUCTIONS)
 BATCH_GRADER_USER = _reg("batch_grader_user", BATCH_GRADER_USER_INSTRUCTIONS)
 PLAN_GRADER_SYSTEM = _reg("plan_grader_system", PLAN_GRADER_SYSTEM_INSTRUCTIONS)
 PLAN_GRADER_USER = _reg("plan_grader_user", PLAN_GRADER_USER_INSTRUCTIONS)
-QUERY_RECONCILER_SYSTEM = _reg("query_reconciler_system", QUERY_RECONCILER_SYSTEM_INSTRUCTIONS)
+# v2. `sync_prompts` never overwrites, so the two household rules (a conflict
+# is query-vs-profile only; a restriction with a name after it is that
+# person's) would ship dead under the old name.
+QUERY_RECONCILER_SYSTEM = _reg("query_reconciler_system_v2", QUERY_RECONCILER_SYSTEM_INSTRUCTIONS)
 QUERY_RECONCILER_USER = _reg("query_reconciler_user", QUERY_RECONCILER_USER_INSTRUCTIONS)
 QUERY_CHECKER_SYSTEM = _reg("query_checker_system", QUERY_CHECKER_SYSTEM_INSTRUCTIONS)
 QUERY_CHECKER_USER = _reg("query_checker_user", QUERY_CHECKER_USER_INSTRUCTIONS)
@@ -1381,7 +1387,9 @@ SEED_EXTRACTOR_SYSTEM = _reg("seed_extractor_system", SEED_EXTRACTOR_SYSTEM_INST
 SEED_EXTRACTOR_USER = _reg("seed_extractor_user", SEED_EXTRACTOR_USER_INSTRUCTIONS)
 PANTRY_EXTRACTOR_SYSTEM = _reg("pantry_extractor_system", PANTRY_EXTRACTOR_SYSTEM_INSTRUCTIONS)
 PANTRY_EXTRACTOR_USER = _reg("pantry_extractor_user", PANTRY_EXTRACTOR_USER_INSTRUCTIONS)
-PREFERENCE_EXTRACTOR_SYSTEM = _reg("preference_extractor_system", PREFERENCE_EXTRACTOR_SYSTEM_INSTRUCTIONS)
+# v2 (`sync_prompts` never overwrites): adds `subject`, so a statement about
+# another diner is not offered as the session member's own memory.
+PREFERENCE_EXTRACTOR_SYSTEM = _reg("preference_extractor_system_v2", PREFERENCE_EXTRACTOR_SYSTEM_INSTRUCTIONS)
 PREFERENCE_EXTRACTOR_USER = _reg("preference_extractor_user", PREFERENCE_EXTRACTOR_USER_INSTRUCTIONS)
 # New names, not edits to existing ones: `sync_prompts` creates only missing
 # prompts and never overwrites, so a changed prompt body would ship dead.

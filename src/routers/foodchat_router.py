@@ -50,6 +50,7 @@ from models.session import MealCourse
 from services import plan_parameters
 from services.candidates_client import MEAL_SLOTS
 from services.orchestrator_service import SessionAccessError
+from services.profile_service import DinerNotInHousehold
 
 logger = logging.getLogger(__name__)
 
@@ -532,6 +533,9 @@ class SetDinersRequest(BaseModel):
 class DinersResponse(BaseModel):
     cooking_for: List[str]
     cooking_for_names: List[str]
+    # Selected diners whose profile could not be loaded. They are NOT in
+    # `cooking_for`: the plan does not account for them, and says so.
+    unavailable: List[str] = []
 
 
 class FeedbackResponse(BaseModel):
@@ -649,6 +653,8 @@ def create_session(request: CreateSessionRequest):
             message_count=len(session.conversation),
             created_at=session.created_at,
         )
+    except DinerNotInHousehold as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
         logger.error("Failed to create session for member %s: %s", request.member_id, e, exc_info=True)
         raise HTTPException(
@@ -1326,9 +1332,12 @@ def set_diners(session_id: str, request: SetDinersRequest):
     """
     session = _require_session(session_id, request.member_id)
 
-    profile = services.profile_service.build_session_profile(
-        request.member_id, request.cooking_for, always_name_diners=True
-    )
+    try:
+        profile = services.profile_service.build_session_profile(
+            request.member_id, request.cooking_for, always_name_diners=True
+        )
+    except DinerNotInHousehold as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     names = profile["cooking_for_names"]
 
     # The rebuild starts from member records, so anything the member did in
@@ -1339,7 +1348,13 @@ def set_diners(session_id: str, request: SetDinersRequest):
     session.user_profile = profile
     services.session_service.persist_profile(session_id)
     logger.info("[%s] Diners set: %s", session_id, names)
-    return DinersResponse(cooking_for=profile["cooking_for"], cooking_for_names=names)
+    return DinersResponse(
+        cooking_for=profile["cooking_for"], cooking_for_names=names,
+        unavailable=[
+            str(d.get("name") or d.get("member_id") or "")
+            for d in profile.get("diners_unavailable") or []
+        ],
+    )
 
 
 # --------------------------------------------------------------------------- #

@@ -4,7 +4,7 @@ import time
 from typing import Any
 
 from backend.platform import WISEFOOD, WiseFoodPool
-from models.household import HOUSEHOLD_KEY, HouseholdContext
+from models.household import HOUSEHOLD_FAVORITES_KEY, HOUSEHOLD_KEY, HouseholdContext
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +127,16 @@ GOAL_PREFERENCE_STRINGS = {
 def goal_preference_strings(goal_slugs: list[str]) -> list[str]:
     """Map dietary-goal slugs to soft preference strings for the LLM grader."""
     return [GOAL_PREFERENCE_STRINGS[s] for s in goal_slugs if s in GOAL_PREFERENCE_STRINGS]
+
+
+class DinerNotInHousehold(ValueError):
+    """A selected diner belongs to a different household than the session
+    member. A `ValueError` so the router answers 404, never 403: the caller
+    learns nothing about whether that member exists."""
+
+    def __init__(self, member_id: str):
+        super().__init__("Diner not found in this household")
+        self.member_id = member_id
 
 
 class ProfileService:
@@ -511,13 +521,50 @@ class ProfileService:
         diners = list(dict.fromkeys(
             m for m in (cooking_for or []) if m and m != member_id
         ))
-        ids = [member_id, *diners]
-        if diners:
-            others = [self.get_member_profile(d) for d in diners]
+        others, loaded, unavailable = [], [], []
+        own_household = str(profile.get("household_id") or "")
+        for diner_id in diners:
+            try:
+                other = self.get_member_profile(diner_id)
+            except Exception as exc:  # noqa: BLE001 — one diner must not sink the session
+                # Planning "for Tom" from a profile that never arrived would
+                # be a plan labelled safe for someone whose allergies are
+                # unknown. He is left out, by name, and the ledger says so.
+                logger.warning("Diner %s left out: profile unavailable (%s)", diner_id, exc)
+                unavailable.append({"member_id": diner_id, "name": self.get_member_name(diner_id)})
+                continue
+            their_household = str(other.get("household_id") or "")
+            if own_household and their_household and their_household != own_household:
+                # Another household's member: their allergies and diet are not
+                # this member's to read. Only refused when BOTH sides say
+                # where they belong — an unknown household is not a mismatch.
+                raise DinerNotInHousehold(diner_id)
+            others.append(other)
+            loaded.append(diner_id)
+
+        # The other diners' favourites: a ranking boost for the table, kept
+        # apart from the session member's own list, which also drives the
+        # "plan around your favourites?" offer and its decline.
+        household_favorites: dict[str, list[str]] = {}
+        for diner_id in loaded:
+            name = self.get_member_name(diner_id)
+            for recipe_id in self.get_member_favorites(diner_id):
+                who = household_favorites.setdefault(str(recipe_id), [])
+                if name not in who:
+                    who.append(name)
+
+        ids = [member_id, *loaded]
+        if loaded:
             names = [self.get_member_name(m) for m in ids]
             profile = self.merge_profiles(profile, others, names, ids)
             profile["cooking_for"] = ids
+            if household_favorites:
+                profile[HOUSEHOLD_FAVORITES_KEY] = household_favorites
+            if unavailable:
+                profile["diners_unavailable"] = unavailable
             return profile
+        if unavailable:
+            profile["diners_unavailable"] = unavailable
 
         names = [self.get_member_name(member_id)] if always_name_diners else [""]
         profile[HOUSEHOLD_KEY] = HouseholdContext.build(

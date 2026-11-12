@@ -48,6 +48,15 @@ VALID_KINDS = {
 MAX_SUGGESTIONS_PER_TURN = 2
 
 
+_THE_USER = {"", "user", "me", "i", "myself", "we", "us"}
+
+
+def _about_the_user(candidate: dict) -> bool:
+    """A candidate with no subject is the user's: extractors and stored
+    prompts from before the field existed never set one."""
+    return str(candidate.get("subject") or "").strip().lower() in _THE_USER
+
+
 class MemoryService:
     """Suggestion policy + consented write-back for durable preferences."""
 
@@ -68,6 +77,17 @@ class MemoryService:
     def suggest(self, session, message: str) -> list[dict]:
         """Return nudge-worthy memory suggestions for this user turn."""
         candidates = self.extractor.extract(message)
+        if not candidates:
+            return []
+
+        # A statement about somebody else is not the session member's memory.
+        # "Miranda hates mushrooms" used to be offered as "It seems you don't
+        # like mushrooms — remember this?", and a yes wrote it to the wrong
+        # person's durable profile.
+        about_others = [c for c in candidates if not _about_the_user(c)]
+        candidates = [c for c in candidates if _about_the_user(c)]
+        if about_others:
+            self._apply_to_other_diners(session, about_others)
         if not candidates:
             return []
 
@@ -184,6 +204,64 @@ class MemoryService:
             session.user_profile["memory_optouts"] = optouts
             self.session_service.persist_profile(session.session_id)
         return False
+
+    # What a statement about another diner may change for this session, and
+    # the merged-profile key it lands in. Hard constraints only: they are the
+    # ones a plan must not miss, and they are already a union across diners.
+    _OTHER_DINER_KEYS = {"allergy_hint": "allergies", "dislike": "food_dislikes", "diet": "diet"}
+
+    def _apply_to_other_diners(self, session, candidates: list[dict]) -> None:
+        """Apply statements about another diner AT THE TABLE to this session.
+
+        Session-scoped only — the module's principle: adaptation within a
+        session is automatic, a durable write needs an explicit yes, and the
+        yes has to be that person's (or a deliberate household decision), not
+        the session member's by default. So nothing is written to the gateway
+        and no nudge is shown; the diner's own record and the merged view are
+        updated, attributed to them, and the next plan honours it.
+
+        A subject who is not one of this session's diners is ignored: there
+        is nobody at this table to apply it to.
+        """
+        profile = session.user_profile
+        household = HouseholdContext.from_profile(profile)
+        if household is None or not household.is_group:
+            return
+        changed = False
+        for cand in candidates:
+            kind = cand.get("kind")
+            key = self._OTHER_DINER_KEYS.get(kind)
+            value = str(cand.get("value", "")).strip().lower()
+            diner = household.diner(str(cand.get("subject") or ""))
+            if not key or not value or diner is None or diner.primary:
+                continue
+            # Same bar as a nudge: allergies at any confidence, the rest only
+            # when stated outright.
+            if kind != "allergy_hint" and cand.get("confidence") != "high":
+                continue
+            household.remember_for(diner, kind, value)
+            items = profile.get(key) or []
+            items = [items] if isinstance(items, str) else list(items)
+            if value not in [str(v).lower() for v in items]:
+                items.append(value)
+            profile[key] = items
+            origins = dict(profile.get("constraint_origins") or {})
+            by_value = dict(origins.get(key) or {})
+            shown = next((k for k in by_value if str(k).lower() == value), value)
+            who = list(by_value.get(shown) or [])
+            if diner.name and diner.name not in who:
+                who.append(diner.name)
+            by_value[shown] = who
+            origins[key] = by_value
+            profile["constraint_origins"] = origins
+            changed = True
+            logger.info(
+                "[%s] Session-scoped %s for diner %s: %s",
+                session.session_id, kind, diner.name or diner.member_id, value,
+            )
+        if changed:
+            profile[HOUSEHOLD_KEY] = household.snapshot()
+            self.session_service.persist_profile(session.session_id)
 
     @staticmethod
     def _attribute_to_session_member(profile: dict, key: str, value: str) -> None:

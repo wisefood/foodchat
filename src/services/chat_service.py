@@ -47,7 +47,7 @@ from services import (
 from services import diet_intent
 from services.candidates_client import CANDIDATES
 from services.clarification import ClarificationManager, ClarificationState
-from services.feedback_service import FeedbackService
+from services.feedback_service import FeedbackService, household_signals
 from services.planning_pipeline import PlanningPipeline
 from services.seed_service import SeedService
 from services import transparency
@@ -80,15 +80,20 @@ def no_plan_message(profile: dict) -> str:
         constraints.append("diet — " + diet_line)
     allergies = profile.get("allergies") or []
     if allergies:
-        constraints.append("allergens excluded: " + ", ".join(sorted(map(str, allergies))))
+        constraints.append(
+            "allergens excluded: " + ", ".join(sorted(transparency.attributed(profile, "allergies")))
+        )
     dislikes = profile.get("food_dislikes") or []
     if dislikes:
-        constraints.append("avoiding: " + ", ".join(sorted(map(str, dislikes))))
+        constraints.append(
+            "avoiding: " + ", ".join(sorted(transparency.attributed(profile, "food_dislikes")))
+        )
 
     if constraints:
         return (
-            "I couldn't find enough recipes for a complete plan with your "
-            "current constraints (" + "; ".join(constraints) + "). "
+            "I couldn't find enough recipes for a complete plan with "
+            + ("this table's" if len(profile.get("cooking_for_names") or []) > 1 else "your")
+            + " current constraints (" + "; ".join(constraints) + "). "
             "Tell me which one to relax, or name a dish you'd like and "
             "I'll plan around it."
         )
@@ -492,7 +497,9 @@ class ChatService:
         # Feedback finally drives recommendations (M3): downvoted recipes are
         # excluded and the rating history reaches the grader prompts.
         session = self._get_session(session_id)
-        signals = self.feedback_service.get_signals(session.member_id)
+        signals = household_signals(
+            self.feedback_service, session.member_id, session.user_profile,
+        )
 
         # The standing plan shape. A non-default spec — extra meals, several
         # days, a multi-plate lunch — goes through the structured path, which

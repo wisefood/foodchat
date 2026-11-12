@@ -21,6 +21,7 @@ import os
 
 from agents import DocumentGrader
 from models.plan_spec import PlanSpec
+from models.household import table_favorites
 from models.recipe import CandidateRecipe, ScoredPlan
 from models.session import MealPlan
 from services import (
@@ -458,8 +459,7 @@ class PlanningPipeline:
         # favourites offer had their favourites ignored on every plan whose
         # shape was not the default three meals — and with no pantry the field
         # went out empty.
-        boost_ids = list(profile.get("favorite_recipe_ids") or []) \
-            if profile.get("use_favorites") is not False else []
+        boost_ids = table_favorites(profile, own=profile.get("use_favorites") is not False)
         if pantry:
             for recipe_id in pantry_service.pantry_boost_ids(profile, pantry):
                 if recipe_id not in boost_ids:
@@ -854,7 +854,7 @@ def _fetch_candidate_pool(
             favorite_recipe_ids=(
                 favorite_recipe_ids
                 if favorite_recipe_ids is not None
-                else profile.get("favorite_recipe_ids") or []
+                else table_favorites(profile)
             ),
             max_minutes=max_minutes,
             min_nutri_score=profile.get("min_nutri_score"),

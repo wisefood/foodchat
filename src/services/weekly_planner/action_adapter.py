@@ -57,6 +57,7 @@ import logging
 from typing import Any, Dict, List, Optional, Union
 
 from services import intent_facets
+from models.household import table_favorites
 from services.candidates_client import CANDIDATES, MEAL_SLOTS, normalize_diet_tags
 
 # The failure path below logs; without this the except clause itself raised
@@ -234,9 +235,7 @@ class RecipeActionSpace:
         self._served: Dict[tuple, Dict[str, Any]] = {}
         # Leftover lunches taken so far, against `MAX_LEFTOVER_MEALS`.
         self._leftovers_taken = 0
-        self._favorites = {
-            str(f) for f in (user_profile.get("favorite_recipe_ids") or [])
-        }
+        self._favorites = set(table_favorites(user_profile))
         # What the member was served on their LAST few plans. A soft ask: it
         # rides the same exclusion list, and is dropped for the whole plan if
         # the first day cannot be filled with it. Without it, a second "plan my
@@ -831,9 +830,9 @@ class RecipeActionSpace:
             pools, notes = meal_composer.role_pools(
                 self.user_profile, self.spec,
                 exclude_recipe_ids=self._fetch_exclusions(day),
-                boost_ids=(
-                    list(self.user_profile.get("favorite_recipe_ids") or [])
-                    if self.user_profile.get("use_favorites") is not False else []
+                boost_ids=table_favorites(
+                    self.user_profile,
+                    own=self.user_profile.get("use_favorites") is not False,
                 ),
                 # One day at a time, because the exclusion list is what stops a
                 # week repeating a dish and it only exists once earlier days are
@@ -1003,7 +1002,7 @@ def _fetch_candidate_pool(
             **intent_facets.facet_kwargs(profile, cuisines),
             exclude_ingredients=profile.get("food_dislikes") or [],
             exclude_recipe_ids=exclude_recipe_ids,
-            favorite_recipe_ids=profile.get("favorite_recipe_ids") or [],
+            favorite_recipe_ids=table_favorites(profile),
             max_minutes=plan_parameters.max_duration_minutes(
                 profile.get("plan_parameters") or {}
             ),

@@ -1,7 +1,7 @@
 import logging
 from typing import Optional, Tuple
 
-from .feedback_service import FeedbackService
+from .feedback_service import FeedbackService, household_signals
 from .seed_service import SeedService
 from .session_service import SessionService
 from .weekly_planner.action_adapter import RecipeActionSpace
@@ -12,7 +12,7 @@ from .weekly_planner.explainability import (
     annotate_shared_ingredients,
     build_weekly_explainability,
 )
-from .transparency import split_ledger
+from .transparency import attributed, split_ledger
 from .weekly_planner.planner import (
     PlanGenerationError,
     WeeklyPlanner,
@@ -271,7 +271,9 @@ class WeeklyPlanService:
         for entry in pinned.values():
             action_space.mark_selected(entry["recipe_id"])
         # Downvoted recipes never come back (M3 feedback loop).
-        signals = self.feedback_service.get_signals(session.member_id)
+        signals = household_signals(
+            self.feedback_service, session.member_id, session.user_profile,
+        )
         for recipe_id in signals.downvoted_recipe_ids:
             action_space.mark_selected(recipe_id)
         # Nor does anything the member rejected in conversation. This used the
@@ -312,13 +314,20 @@ class WeeklyPlanService:
             logger.warning("[%s] Weekly plan unfillable: %s", session_id, exc)
             constraints = []
             if action_space.diet:
-                constraints.append("diet: " + ", ".join(sorted(map(str, action_space.diet))))
+                constraints.append("diet: " + ", ".join(sorted(
+                    attributed(session.user_profile, "diet", action_space.diet)
+                )))
             if action_space.allergens:
                 constraints.append(
-                    "allergens excluded: " + ", ".join(sorted(map(str, action_space.allergens)))
+                    "allergens excluded: " + ", ".join(sorted(
+                        attributed(session.user_profile, "allergies", action_space.allergens)
+                    ))
                 )
             because = (
-                " with your current constraints (" + "; ".join(constraints) + ")"
+                " with "
+                + ("this table's" if len(session.user_profile.get("cooking_for_names") or []) > 1
+                   else "your")
+                + " current constraints (" + "; ".join(constraints) + ")"
                 if constraints else ""
             )
             message = (

@@ -177,7 +177,8 @@ class TestThePipelineTakesTheQuery:
 
         src = inspect.getsource(PlanningPipeline.plan_structured)
         head = src[:src.find("PLANNER.plan_meals(")]
-        assert "favorite_recipe_ids" in head, "the member's own favourites"
+        # `table_favorites` reads `favorite_recipe_ids` and adds the other diners'.
+        assert "table_favorites(" in head, "the member's own favourites"
 
     def test_a_declined_favourites_offer_is_honoured_here_too(self):
         from services.planning_pipeline import PlanningPipeline
