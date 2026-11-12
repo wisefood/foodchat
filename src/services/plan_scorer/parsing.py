@@ -39,6 +39,7 @@ import unicodedata
 from dataclasses import dataclass, field
 from typing import Optional
 
+from services.candidates_client import PLANT_DAIRY  # noqa: F401 — re-exported
 from models.pasted_plan import (
     MAIN_SLOTS,
     MAX_DAYS,
@@ -107,14 +108,6 @@ _DISH_LEAD = re.compile(
 _PROSE_INTRO = re.compile(
     r"^.*?\b(?:consisting of|comprising|made up of|made of|composed of|containing"
     r"|which (?:is|was|includes)|that (?:is|was|includes))\s+",
-    re.IGNORECASE,
-)
-# "peanut butter" is not butter, "oat milk" is not milk, "vegan cheese" and
-# "dairy-free yoghurt" are not dairy. Masked before a dairy or lactose check.
-PLANT_DAIRY = re.compile(
-    r"\b(?:peanut|almond|cashew|hazelnut|nut|seed|sunflower|apple|coconut|oat|soy|soya|rice"
-    r"|plant|vegan|dairy[\s-]*free|lactose[\s-]*free)"
-    r"[\s-]+(?:butter|milk|cream|yogh?urt|cheese)\b",
     re.IGNORECASE,
 )
 # Words joining the parts of one dish: "roast chicken WITH potatoes",

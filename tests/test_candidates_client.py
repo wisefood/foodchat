@@ -88,6 +88,71 @@ class TestAllergenConflict:
         assert allergen_conflict("almond walnut shrimp", []) is None
 
 
+class TestGatewayAllergenNames:
+    """The gateway writes EU-list slugs, not the synonym table's keys.
+
+    Live: a member allergic to `milk` was planned yoghurt, and one allergic to
+    `crustacean_shellfish` was told a shrimp salad was clear — the backstop
+    searched for the slug itself and nothing else.
+    """
+
+    @pytest.mark.parametrize("allergy, text, term", [
+        ("milk", "veggie burrito bowl with yoghurt", "yoghurt"),
+        ("milk", "cheese and crackers", "cheese"),
+        ("crustacean_shellfish", "shrimp and avocado salad", "shrimp"),
+        ("molluscs", "steamed mussels in white wine", "mussel"),
+        ("peanut", "chicken with peanuts", "peanut"),
+        ("egg", "scrambled eggs on toast", "egg"),
+        ("tree_nut", "pesto with cashews", "cashew"),
+        ("soybeans", "crispy tofu stir fry", "tofu"),
+        ("sesame_seeds", "houmous with tahini", "tahini"),
+    ])
+    def test_a_gateway_name_reaches_the_ingredients(self, allergy, text, term):
+        assert allergen_conflict(text, [allergy]) == term
+
+    @pytest.mark.parametrize("name", [
+        "milk", "egg", "eggs", "peanut", "peanuts", "tree_nut", "tree_nuts", "nuts",
+        "crustacean_shellfish", "crustaceans", "molluscs", "shellfish", "fish",
+        "soy", "soybeans", "sesame", "sesame_seeds", "gluten", "celery", "lupin",
+    ])
+    def test_every_known_name_expands_beyond_itself(self, name):
+        """A name that only matches its own spelling is the bug coming back."""
+        assert cc.canonical_allergen(name) in cc.ALLERGEN_SYNONYMS
+
+    def test_every_alias_points_at_a_real_key(self):
+        assert set(cc.ALLERGEN_ALIASES.values()) <= set(cc.ALLERGEN_SYNONYMS)
+
+    def test_a_crustacean_allergy_does_not_refuse_molluscs(self):
+        assert allergen_conflict("grilled squid with lemon", ["crustacean_shellfish"]) is None
+        assert allergen_conflict("grilled squid with lemon", ["shellfish"]) == "squid"
+
+    def test_plant_dairy_is_not_milk(self):
+        assert allergen_conflict("coconut milk curry with peanut butter", ["milk"]) is None
+        assert allergen_conflict("coconut milk curry with peanut butter", ["peanut"]) == "peanut"
+        assert allergen_conflict("oat milk porridge with butter", ["dairy"]) == "butter"
+
+    def test_an_unknown_allergen_is_still_searched_by_name(self):
+        assert allergen_conflict("mustard-glazed carrots", ["Mustard"]) == "mustard"
+        assert allergen_conflict("kiwi_fruit salad with kiwi fruit", ["kiwi_fruit"])
+
+    def test_a_recipe_label_is_compared_canonically(self):
+        assert cc.allergen_label_match("milk", ["dairy"])
+        assert cc.allergen_label_match("crustacean_shellfish", ["shellfish"])
+        assert cc.allergen_label_match("shellfish", ["mollusc"])
+        assert not cc.allergen_label_match("crustacean_shellfish", ["molluscs"])
+        assert not cc.allergen_label_match("milk", ["egg"])
+
+    def test_the_verifier_no_longer_passes_yoghurt_for_a_milk_allergy(self):
+        from types import SimpleNamespace
+
+        from services import plan_verifier
+
+        plates = [SimpleNamespace(recipe_id="r1", title="Burrito bowl", ingredients="rice, yoghurt")]
+        check = plan_verifier._check_allergens(plates, {"allergens": ["milk"]}, {})
+
+        assert check.status == plan_verifier.FAILED and check.offenders == ("r1",)
+
+
 class TestAllergenBackstopMoved:
     """The backstop now runs in `plan_client.to_candidates`.
 

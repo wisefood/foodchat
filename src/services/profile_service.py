@@ -4,6 +4,7 @@ import time
 from typing import Any
 
 from backend.platform import WISEFOOD, WiseFoodPool
+from models.household import HOUSEHOLD_KEY, HouseholdContext
 
 logger = logging.getLogger(__name__)
 
@@ -458,95 +459,74 @@ class ProfileService:
         return new_profile
 
     @staticmethod
-    def merge_profiles(primary: dict, others: list[dict], diner_names: list[str]) -> dict:
+    def merge_profiles(
+        primary: dict,
+        others: list[dict],
+        diner_names: list[str],
+        member_ids: list[str] | None = None,
+    ) -> dict:
         """Merge diner profiles into one plan-generation profile.
 
-        Hard constraints (safety/identity) are the UNION across all diners:
-        allergies, dietary groups, dislikes-as-exclusions. Soft preferences
-        keep the primary member's weighting (their likes lead, other diners'
-        likes follow). The primary member's favorites keep their boost.
+        A thin wrapper: the per-member profiles are kept in a
+        `models.household.HouseholdContext`, and the merged dict is that
+        context's derived view (see `HouseholdContext._satisfy_all` for the
+        merge rules — union of hard constraints, primary-led likes, goal
+        reconciliation, `constraint_origins`). The context itself rides in
+        the result under ``household`` so nothing downstream has to work
+        from the flattened form alone.
 
-        Goals are the delicate part. The primary member's goals keep their
-        numeric targets (``nutrition_profile``, ``min_nutri_score``), because
-        stacking several members' targets can empty the candidate set. Every
-        other diner's goal is demoted to the soft ``preferences`` channel
-        instead of being dropped, and the whole picture — whose goal, applied
-        as a target or only as a signal — is recorded in
-        ``goal_reconciliation`` so the plan can say so out loud. A goal that
-        vanished silently is what made a household plan look like one member's
-        plan.
-
-        ``constraint_origins`` keeps the member each constraint came from, so
-        the ledger can attribute "no peanuts" to the diner who is allergic
-        rather than to everyone at the table.
+        ``diner_names`` / ``member_ids`` are ``[primary, *others]``.
         """
-        merged = dict(primary)
-        names = [str(n) for n in (diner_names or [])]
-        primary_name = names[0] if names else ""
-        # names is [primary, *others]; a short list just yields empty names
-        other_names = names[1:]
-        attributed = [(primary_name, primary)] + [
-            (other_names[i] if i < len(other_names) else "", profile)
-            for i, profile in enumerate(others)
-        ]
-
-        origins: dict[str, dict[str, list[str]]] = {}
-
-        def union(key: str) -> list:
-            seen: dict[str, str] = {}
-            key_origins: dict[str, list[str]] = {}
-            for name, profile in attributed:
-                for item in profile.get(key) or []:
-                    low = str(item).lower()
-                    seen.setdefault(low, item)
-                    who = key_origins.setdefault(low, [])
-                    if name and name not in who:
-                        who.append(name)
-            # Re-key origins by the value as it will be displayed
-            origins[key] = {seen[low]: who for low, who in key_origins.items()}
-            return list(seen.values())
-
-        merged["allergies"] = union("allergies")
-        merged["diet"] = union("diet")
-        merged["food_dislikes"] = union("food_dislikes")
-        merged["constraint_origins"] = origins
-
-        likes = list(primary.get("food_likes") or [])
-        for other in others:
-            for like in other.get("food_likes") or []:
-                if str(like).lower() not in [str(seen).lower() for seen in likes]:
-                    likes.append(like)
-        merged["food_likes"] = likes
-
-        # ── Goal reconciliation ──
-        primary_goals = [str(s).lower() for s in (primary.get("dietary_goals") or [])]
-        reconciliation: list[dict] = [
-            {"slug": slug, "member": primary_name, "applied": "target"}
-            for slug in primary_goals
-        ]
-
-        demoted: list[str] = []
-        for name, profile in attributed[1:]:
-            for slug in profile.get("dietary_goals") or []:
-                slug = str(slug).lower()
-                if slug in primary_goals:
-                    # Two diners wanting the same thing is agreement, not conflict
-                    reconciliation.append({"slug": slug, "member": name, "applied": "target"})
-                    continue
-                if slug not in demoted:
-                    demoted.append(slug)
-                reconciliation.append({"slug": slug, "member": name, "applied": "soft"})
-
-        if demoted:
-            preferences = list(merged.get("preferences") or [])
-            for text in goal_preference_strings(demoted):
-                if text not in preferences:
-                    preferences.append(text)
-            merged["preferences"] = preferences
-
-        merged["goal_reconciliation"] = reconciliation
+        context = HouseholdContext.build(primary, others, diner_names, member_ids)
+        merged = context.merged_view(primary)
+        # The caller's own list object, as before
         merged["cooking_for_names"] = diner_names
         return merged
+
+    def build_session_profile(
+        self, member_id: str, cooking_for: list[str] | None = None,
+        always_name_diners: bool = False,
+    ) -> dict:
+        """The profile snapshot a session plans from: the owning member's
+        profile, favorites and adapted recipes, merged with any extra diners.
+
+        The one place both `POST /sessions` and `PUT /sessions/{id}/diners`
+        build it, so the two cannot drift. The owner is always the primary
+        diner; ``cooking_for`` may or may not repeat their id.
+
+        Every result carries ``household`` (a `HouseholdContext` snapshot,
+        a household of one for a solo session). ``cooking_for`` /
+        ``cooking_for_names`` are set when there are extra diners, or always
+        when ``always_name_diners`` — `PUT /diners` has always echoed a solo
+        selection, session creation never wrote one.
+        """
+        profile = self.get_member_profile(member_id)
+        # Favorites ride in the profile snapshot: RecipeWrangler boosts them
+        # in candidate ranking, and the proactive offer (M2) reads them.
+        profile["favorite_recipe_ids"] = self.get_member_favorites(member_id)
+        # The member's saved adapted recipes (owner-scoped): plans and seed
+        # anchors use these as the starting point instead of the originals.
+        profile["adapted_recipes"] = self.get_member_adapted_recipes(member_id)
+
+        diners = list(dict.fromkeys(
+            m for m in (cooking_for or []) if m and m != member_id
+        ))
+        ids = [member_id, *diners]
+        if diners:
+            others = [self.get_member_profile(d) for d in diners]
+            names = [self.get_member_name(m) for m in ids]
+            profile = self.merge_profiles(profile, others, names, ids)
+            profile["cooking_for"] = ids
+            return profile
+
+        names = [self.get_member_name(member_id)] if always_name_diners else [""]
+        profile[HOUSEHOLD_KEY] = HouseholdContext.build(
+            profile, [], names, ids
+        ).snapshot()
+        if always_name_diners:
+            profile["cooking_for"] = ids
+            profile["cooking_for_names"] = names
+        return profile
 
     # household_id -> (region, fetched_at). A household's country does not
     # change between turns, and this lookup sits on the profile fetch, which is

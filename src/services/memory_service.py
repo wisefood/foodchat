@@ -28,6 +28,7 @@ import uuid
 from typing import Optional
 
 from agents import PreferenceExtractor
+from models.household import HOUSEHOLD_KEY, HouseholdContext
 from .profile_service import (
     GOAL_PREFERENCE_STRINGS,
     goals_min_nutri_score,
@@ -307,4 +308,9 @@ class MemoryService:
                     "applied": "target",
                 })
                 profile["goal_reconciliation"] = reconciliation
+        # Keep the per-member record in step with the merged view: the memory
+        # is the session member's, so it lands on the primary diner.
+        household = HouseholdContext.from_profile(profile)
+        if household is not None and household.remember_for_primary(kind, value):
+            profile[HOUSEHOLD_KEY] = household.snapshot()
         self.session_service.persist_profile(session.session_id)

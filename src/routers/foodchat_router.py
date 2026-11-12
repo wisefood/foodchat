@@ -633,29 +633,11 @@ def create_session(request: CreateSessionRequest):
     # member and then legitimately own everything they did in it.
     _require_member(request.member_id)
     try:
-        user_profile = services.profile_service.get_member_profile(request.member_id)
-        # Favorites ride in the profile snapshot: RecipeWrangler boosts them
-        # in candidate ranking, and the proactive offer (M2) reads them.
-        user_profile["favorite_recipe_ids"] = services.profile_service.get_member_favorites(
-            request.member_id
+        # Owner profile + favorites + adapted recipes, merged with any extra
+        # household diners (M3). Carries the per-member `household` context.
+        user_profile = services.profile_service.build_session_profile(
+            request.member_id, request.cooking_for
         )
-        # The member's saved adapted recipes (owner-scoped): plans and seed
-        # anchors use these as the starting point instead of the originals.
-        user_profile["adapted_recipes"] = services.profile_service.get_member_adapted_recipes(
-            request.member_id
-        )
-
-        # Household diners (M3): merge extra diners' hard constraints and
-        # soft preferences into the session profile.
-        diners = [m for m in (request.cooking_for or []) if m and m != request.member_id]
-        if diners:
-            other_profiles = [services.profile_service.get_member_profile(d) for d in diners]
-            names = [services.profile_service.get_member_name(m)
-                     for m in [request.member_id, *diners]]
-            user_profile = services.profile_service.merge_profiles(
-                user_profile, other_profiles, names
-            )
-            user_profile["cooking_for"] = [request.member_id, *diners]
 
         session = services.session_service.create_session(request.member_id, user_profile)
         logger.info("Session %s created for member %s.", session.session_id, request.member_id)
@@ -1344,18 +1326,10 @@ def set_diners(session_id: str, request: SetDinersRequest):
     """
     session = _require_session(session_id, request.member_id)
 
-    diners = [m for m in request.cooking_for if m and m != request.member_id]
-    profile = services.profile_service.get_member_profile(request.member_id)
-    profile["favorite_recipe_ids"] = services.profile_service.get_member_favorites(request.member_id)
-    profile["adapted_recipes"] = services.profile_service.get_member_adapted_recipes(request.member_id)
-
-    names = [services.profile_service.get_member_name(request.member_id)]
-    if diners:
-        other_profiles = [services.profile_service.get_member_profile(d) for d in diners]
-        names += [services.profile_service.get_member_name(d) for d in diners]
-        profile = services.profile_service.merge_profiles(profile, other_profiles, names)
-    profile["cooking_for"] = [request.member_id, *diners]
-    profile["cooking_for_names"] = names
+    profile = services.profile_service.build_session_profile(
+        request.member_id, request.cooking_for, always_name_diners=True
+    )
+    names = profile["cooking_for_names"]
 
     # The rebuild starts from member records, so anything the member did in
     # THIS session — hand-picked dishes, applied slider values, facts they

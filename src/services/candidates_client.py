@@ -128,7 +128,14 @@ ALLERGEN_SYNONYMS = {
              "macadamia", "brazil nut", "pine nut", "peanut"],
     "peanuts": ["peanut"],
     "shellfish": ["shrimp", "prawn", "crab", "lobster", "mussel", "oyster",
-                  "scallop", "clam", "crayfish", "squid", "octopus"],
+                  "scallop", "clam", "crayfish", "squid", "octopus",
+                  "langoustine", "scampi", "calamari", "cuttlefish"],
+    # The EU list splits shellfish in two, and so does the gateway. A member
+    # allergic to crustaceans only is not refused mussels.
+    "crustaceans": ["shrimp", "prawn", "crab", "lobster", "crayfish",
+                    "langoustine", "scampi"],
+    "molluscs": ["mussel", "oyster", "scallop", "clam", "squid", "octopus",
+                 "calamari", "cuttlefish", "snail"],
     "fish": ["salmon", "tuna", "cod", "haddock", "trout", "sardine", "anchovy",
              "mackerel", "halibut", "sea bass", "tilapia"],
     "dairy": ["milk", "cheese", "butter", "cream", "yogurt", "yoghurt", "ghee"],
@@ -137,7 +144,82 @@ ALLERGEN_SYNONYMS = {
     "gluten": ["wheat", "flour", "barley", "rye", "semolina", "couscous"],
     "soy": ["soy", "soya", "tofu", "edamame"],
     "sesame": ["sesame", "tahini"],
+    "celery": ["celery", "celeriac"],
+    "lupin": ["lupin", "lupine"],
 }
+
+# Allergen names as profiles actually carry them -> the keys above. The
+# gateway stores allergies as free strings and its UI writes EU-list slugs
+# (`milk`, `crustacean_shellfish`, `molluscs`, `peanut`), none of which is a
+# key of the table — so the backstop searched for the literal slug only. Live,
+# a member allergic to `milk` was served yoghurt and one allergic to
+# `crustacean_shellfish` was told a shrimp salad was clear, both under a ledger
+# row reading "satisfied". Keys are compared after `canonical_allergen`
+# lowercases and turns `_`/`-` into spaces.
+ALLERGEN_ALIASES = {
+    "milk": "dairy", "milk products": "dairy", "cow milk": "dairy",
+    "cows milk": "dairy", "milk protein": "dairy",
+    "peanut": "peanuts", "groundnut": "peanuts", "groundnuts": "peanuts",
+    "egg": "eggs",
+    "nut": "nuts",
+    "tree nut": "tree nuts", "treenut": "tree nuts", "treenuts": "tree nuts",
+    "crustacean": "crustaceans", "crustacean shellfish": "crustaceans",
+    "mollusc": "molluscs", "mollusk": "molluscs", "mollusks": "molluscs",
+    "molluscan shellfish": "molluscs",
+    "soya": "soy", "soybean": "soy", "soybeans": "soy", "soya beans": "soy",
+    "sesame seed": "sesame", "sesame seeds": "sesame",
+    "cereals containing gluten": "gluten",
+    "lupine": "lupin",
+}
+
+# Broader allergen names and the narrower ones they contain, for comparing a
+# profile allergen with a recipe's allergen label (`allergen_label_match`).
+_ALLERGEN_FAMILIES = {
+    "shellfish": {"crustaceans", "molluscs"},
+    "nuts": {"tree nuts", "peanuts"},
+    "dairy": {"lactose"},
+}
+
+# "peanut butter" is not butter, "oat milk" is not milk, "vegan cheese" and
+# "dairy-free yoghurt" are not dairy. Masked before a dairy or lactose check.
+PLANT_DAIRY = re.compile(
+    r"\b(?:peanut|almond|cashew|hazelnut|nut|seed|sunflower|apple|coconut|oat|soy|soya|rice"
+    r"|plant|vegan|dairy[\s-]*free|lactose[\s-]*free)"
+    r"[\s-]+(?:butter|milk|cream|yogh?urt|cheese)\b",
+    re.IGNORECASE,
+)
+_DAIRY_KEYS = {"dairy", "lactose"}
+
+
+def canonical_allergen(name) -> str:
+    """The `ALLERGEN_SYNONYMS` key a profile allergen name stands for.
+
+    Lowercased, `_`/`-` read as spaces, then looked up in `ALLERGEN_ALIASES`.
+    A name with no alias comes back normalized and unchanged otherwise, so an
+    allergen the table has never heard of is still searched for by name.
+    """
+    key = re.sub(r"[\s_-]+", " ", str(name or "").strip().lower())
+    return ALLERGEN_ALIASES.get(key, key)
+
+
+def allergen_label_match(allergen, labels) -> bool:
+    """Whether a recipe's allergen labels name this profile allergen.
+
+    Compared canonically, so a `milk` allergy meets a `dairy` label, and by
+    family in both directions: a `shellfish` label counts against a crustacean
+    allergy (it cannot be ruled out) and a `crustacean` label against a
+    shellfish one.
+    """
+    wanted = canonical_allergen(allergen)
+    if not wanted:
+        return False
+    for label in labels or ():
+        found = canonical_allergen(label)
+        if found == wanted:
+            return True
+        if found in _ALLERGEN_FAMILIES.get(wanted, ()) or wanted in _ALLERGEN_FAMILIES.get(found, ()):
+            return True
+    return False
 
 # The gateway's dietary_groups enum carries free-from values that RecipeWrangler
 # has no diet tag for, so they were dropped and nothing filtered on them — while
@@ -178,23 +260,42 @@ def free_from_allergens(diet) -> list[str]:
 
 
 def _allergen_terms(allergies: list[str]) -> list[str]:
-    """Expand profile allergen names into matchable ingredient terms."""
+    """Expand profile allergen names into matchable ingredient terms.
+
+    The name as given (and its spaced form) is always a term; the synonyms
+    come from the canonical key, so `milk` expands like `dairy`.
+    """
     terms: list[str] = []
     for allergen in allergies or []:
         key = str(allergen).strip().lower()
         if not key:
             continue
+        canonical = canonical_allergen(key)
         terms.append(key)
-        terms.extend(ALLERGEN_SYNONYMS.get(key, []))
+        terms.append(re.sub(r"[\s_-]+", " ", key))
+        if canonical not in ALLERGEN_SYNONYMS:
+            terms.append(canonical)
+        terms.extend(ALLERGEN_SYNONYMS.get(canonical, []))
     return list(dict.fromkeys(terms))
 
 
 def allergen_conflict(text: str, allergies: list[str]) -> Optional[str]:
-    """First allergen term found in the text (word-boundary match), or None."""
+    """First allergen term found in the text (word-boundary match), or None.
+
+    Plant "dairy" (peanut butter, coconut milk) is masked for a dairy, lactose
+    or milk allergen only — it stays visible to a peanut or tree-nut check.
+    """
     haystack = (text or "").lower()
-    for term in _allergen_terms(allergies):
-        if re.search(r"\b" + re.escape(term) + r"s?\b", haystack):
-            return term
+    masked: Optional[str] = None
+    for allergen in allergies or []:
+        searched = haystack
+        if canonical_allergen(allergen) in _DAIRY_KEYS:
+            if masked is None:
+                masked = PLANT_DAIRY.sub(" ", haystack)
+            searched = masked
+        for term in _allergen_terms([allergen]):
+            if re.search(r"\b" + re.escape(term) + r"s?\b", searched):
+                return term
     return None
 
 

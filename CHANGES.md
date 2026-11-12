@@ -2,6 +2,88 @@
 
 ---
 
+# Allergen names: the gateway's spellings now reach the ingredient check
+
+> **Date:** 2026-11-12
+> **Branch:** main
+> No API change. Plans change for members whose allergies are stored under
+> the gateway's names (`milk`, `crustacean_shellfish`, `molluscs`, `egg`, …).
+
+The ingredient backstop expands a profile allergen through
+`ALLERGEN_SYNONYMS`, which is keyed `dairy`, `shellfish`, `peanuts`. The
+gateway stores allergies as free strings and its UI writes EU-list slugs, so
+the lookup missed and only the slug itself was searched for. Found in the
+household study: two plans made for a member allergic to `milk` contained
+yoghurt, and the scorer reported "no crustacean_shellfish: satisfied" for a
+plan with a shrimp salad. The plan verifier had the same gap by a different
+route: it looked for the allergen name as a substring of the dish text.
+
+| What | Detail |
+|---|---|
+| `services/candidates_client.py` → `ALLERGEN_ALIASES`, `canonical_allergen` (new) | Profile spelling → synonym-table key, after lowercasing and reading `_`/`-` as spaces: `milk → dairy`, `peanut → peanuts`, `egg → eggs`, `tree_nut → tree nuts`, `crustacean_shellfish → crustaceans`, `mollusc(s)/mollusk(s) → molluscs`, `soybeans/soya → soy`, `sesame_seeds → sesame`. An unknown name is returned normalized and still searched for by name. |
+| `services/candidates_client.py` → `ALLERGEN_SYNONYMS` | New keys `crustaceans` and `molluscs` (a crustacean allergy does not refuse squid), `celery`, `lupin`. `shellfish` gains langoustine, scampi, calamari, cuttlefish. |
+| `services/candidates_client.py` → `_allergen_terms`, `allergen_conflict` | Synonyms come from the canonical key. For a dairy, lactose or milk allergen the text is first masked with `PLANT_DAIRY` (peanut butter, coconut milk, oat milk), so mapping `milk` to the dairy terms does not drop every peanut-butter recipe; the mask is per allergen, so a peanut check still sees "peanut butter". |
+| `services/candidates_client.py` → `allergen_label_match` (new) | Compares a profile allergen with a recipe's allergen labels canonically and by family (`shellfish` ⊇ crustaceans, molluscs; `nuts` ⊇ tree nuts, peanuts), in both directions. |
+| `services/candidates_client.py` → `PLANT_DAIRY` | Moved here from `plan_scorer/parsing.py`, which re-exports it. |
+| `services/plan_verifier.py` → `_check_allergens` | Uses `allergen_label_match` and `allergen_conflict` instead of `allergen in labelled or allergen in text`. Catches yoghurt for `milk`; no longer fails "eggplant" for `egg` or "coconut milk" for `milk`. |
+| `services/plan_scorer/grounding.py` → `allergen_conflicts` | Recipe allergen tags compared with `allergen_label_match`; the dairy masking it did itself is now inside `allergen_conflict`. |
+
+Not done here: the ledger still prints the allergen under the gateway's name
+("no crustacean_shellfish"). The gateway has no allergen enum (the field is
+`list[str]`), so the alias list covers the EU-14 spellings seen or expected,
+not a guaranteed-complete vocabulary; sulphites and mustard have no synonyms.
+
+## Verification
+
+New tests (`test_candidates_client.py::TestGatewayAllergenNames`): gateway
+names reach the ingredients; every known name resolves to a table key and
+every alias points at one; crustacean vs mollusc; plant dairy is not milk;
+unknown names still match by name; label matching; the verifier fails a
+yoghurt dish for a `milk` allergy. Full suite: 2626 passed, 1 skipped.
+
+---
+
+# Household planning, phase 0: every diner keeps their own profile
+
+> **Date:** 2026-11-12
+> **Branch:** main
+> No API change and no change to any plan: the merged profile every consumer
+> reads is the same dict as before, plus one key. Additive: the session
+> profile snapshot carries `household` (`{strategy, diners: [...]}`).
+
+The only record of who a session cooks for was the merged profile
+`merge_profiles` returned — one flat set of allergies, diets, likes and
+dislikes. That is enough for "one plan everybody can eat" and for nothing
+else: once the profiles are flattened nothing downstream can ask how well a
+dish suits one particular member, so least-misery scoring, fairness across a
+week, split slots and per-member portions could not be expressed. This change
+keeps the members and makes the merged dict a view derived from them.
+
+| What | Detail |
+|---|---|
+| `models/household.py` (new) | `DinerProfile` — one member's own planning fields (diet, allergies, likes, dislikes, goals, preferences, calorie target, sex, age group); memory bookkeeping, favorites and adapted recipes are not copied per diner. `HouseholdContext` — `strategy` (closed vocabulary, only `satisfy_all`) and `diners` (`diners[0]` is the session member). `merged_view()` holds the merge rules that used to live in `merge_profiles`, unchanged. `from_profile()` reads the snapshot back and returns None for older sessions or an unreadable snapshot. `remember_for_primary()` mirrors a consented memory onto the session member's own record. |
+| `services/profile_service.py` → `merge_profiles` | Now a wrapper: builds the context, returns its merged view. Same signature plus an optional `member_ids`; same result plus `household`. |
+| `services/profile_service.py` → `build_session_profile` (new) | The one place the session snapshot is built (owner profile + favorites + adapted recipes + diners). `POST /sessions` and `PUT /sessions/{id}/diners` both call it; they used to carry two copies of the same code. The owner's id and duplicates in `cooking_for` are not extra diners. A solo session gets a household of one; it still gets no `cooking_for_names` / `constraint_origins` at creation, so nothing renders it as a group. |
+| `routers/foodchat_router.py` | `create_session` and `set_diners` call `build_session_profile`. Request and response shapes unchanged. |
+| `services/memory_service.py` → `_apply_to_session_profile` | After updating the merged profile, applies the same memory to the primary diner in `household`, so the per-member record does not go stale when a member accepts "I'm vegetarian" mid-session. |
+
+Not done here, by design: nothing reads `household` yet to change a plan.
+Other diners' favorites, downvotes, calorie targets and age groups are now
+recorded per member where the profile has them but still not used; that is
+phase 1.
+
+## Verification
+
+New tests (`test_household_context.py`, 21): the per-member record is
+complete and answers what the union cannot; it survives the snapshot's JSON
+round-trip; a missing or bad snapshot is None, not an error; the merged view
+equals what the merge returned before and can be rebuilt from the stored
+context; `build_session_profile` for solo, group, duplicate and
+back-to-solo selections; an accepted memory lands on the primary diner only.
+Full suite: 2535 passed, 1 skipped.
+
+---
+
 # Pasted weeks: a dish with no ingredients is not vegetarian, and a guess is a possibility
 
 > **Date:** 2026-10-16

@@ -41,6 +41,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Optional
 
+from services.candidates_client import allergen_conflict, allergen_label_match
+
 logger = logging.getLogger(__name__)
 
 # Statuses, in the order a reader should worry about them. The first three are
@@ -210,7 +212,7 @@ def _check_allergens(plates, requested, enrichment) -> Optional[Check]:
         labelled = {str(a).lower() for a in (getattr(rich, "allergens", None) or [])}
         text = _text(plate)
         for allergen in allergens:
-            if allergen in labelled or allergen in text:
+            if allergen_label_match(allergen, labelled) or allergen_conflict(text, [allergen]):
                 offenders.append(plate.recipe_id)
                 hits.append(f"{plate.title} ({allergen})")
                 break

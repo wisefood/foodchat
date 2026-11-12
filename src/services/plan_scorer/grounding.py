@@ -95,9 +95,11 @@ from models.pasted_plan import (
     PastedPlan,
 )
 from models.recipe import CandidateRecipe, ResolvedRecipe
-from services.candidates_client import ProfilingTimeout, allergen_conflict
+from services.candidates_client import (
+    ProfilingTimeout, allergen_conflict, allergen_label_match,
+)
 
-from .parsing import PLANT_DAIRY, content_tokens, dish_heads, spelling_variants
+from .parsing import content_tokens, dish_heads, spelling_variants
 
 logger = logging.getLogger(__name__)
 
@@ -275,13 +277,12 @@ def allergen_conflicts(
         key = str(allergy).strip().lower()
         if not key:
             continue
+        # `allergen_conflict` masks plant "dairy" (coconut milk, peanut
+        # butter) itself, and reads gateway names such as `milk`.
         written, recipe = written_text, recipe_text
-        if key in ("dairy", "lactose", "milk"):
-            # "coconut milk" and "peanut butter" are not dairy.
-            written, recipe = PLANT_DAIRY.sub(" ", written), PLANT_DAIRY.sub(" ", recipe)
         if allergen_conflict(written, [key]):
             found.append({"allergen": key, "evidence": AS_WRITTEN})
-        elif key in tagged or (recipe and allergen_conflict(recipe, [key])):
+        elif allergen_label_match(key, tagged) or (recipe and allergen_conflict(recipe, [key])):
             found.append({"allergen": key, "evidence": recipe_evidence})
     return found
 
