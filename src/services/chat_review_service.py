@@ -7,7 +7,9 @@ a row in this service's database, and the console has no route to it.
 
 This is the route. Deliberately narrow: one message, the turns immediately
 around it, and nothing else. Enough to judge the complaint, not a general
-window onto anyone's chat history.
+window onto anyone's chat history. Beside it, one plan by id — what FoodChat
+put on the table, never what the member typed — so a session read in the
+console can say what a plan was, not only that one was made.
 
 **Authorization lives at the gateway**, which requires an admin or expert token
 and records the read as expert activity. This service verifies the caller is
@@ -141,6 +143,136 @@ class ChatReviewService:
             # exchange shown is the whole conversation.
             "session_messages": total,
         }
+
+
+    def plan_summary(self, plan_id: str) -> Optional[Dict[str, Any]]:
+        """What one meal plan put on the table, and how it was judged.
+
+        A reviewer reading a session saw "made a daily plan, 7 items" and a
+        thumbs-down, and could not tell what the plan was. This is the plan as
+        FoodChat produced it: the dishes per meal, the judges' scores with
+        their reasoning, and the constraint rows the member was shown.
+
+        Only what FoodChat wrote. Left out on purpose: the personalisation
+        summary, which is the member's profile restated; the title a member
+        typed when saving; and each dish's ingredients and method, which are
+        the recipe's and make the plan a page long.
+
+        None when the plan is gone, which is ordinary: plans die with their
+        conversation unless saved.
+        """
+        from db import MealPlanRow, SessionLocal
+
+        if not plan_id:
+            return None
+        db = SessionLocal()
+        try:
+            row = db.query(MealPlanRow).filter(MealPlanRow.id == str(plan_id)).first()
+        except Exception:
+            logger.warning("chat_review.plan_failed id=%s", plan_id, exc_info=True)
+            return None
+        finally:
+            db.close()
+        if row is None:
+            return None
+
+        payload = _load_json(row.payload) or {}
+        weekly = row.plan_type == "weekly"
+        return {
+            "plan_id": row.id,
+            "session_id": row.session_id,
+            "plan_type": row.plan_type,
+            "version": row.version,
+            "parent_id": row.parent_id,
+            "saved": bool(row.saved),
+            "saved_at": row.saved_at.isoformat() if row.saved_at else None,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+            "meals": _weekly_meals(payload) if weekly else _daily_meals(payload),
+            "reasoning": _clip(payload.get("reasoning")),
+            "scores": [] if weekly else _scores(payload),
+            "metrics": payload.get("metrics") if weekly else None,
+            "constraints_applied": list(payload.get("constraints_applied") or []),
+        }
+
+
+#: Reasoning is the model's prose about the plan. Clipped like chat content.
+MAX_REASONING_CHARS = 2000
+
+
+def _clip(text: Any) -> Optional[str]:
+    if not text:
+        return None
+    text = str(text)
+    return text if len(text) <= MAX_REASONING_CHARS else text[:MAX_REASONING_CHARS] + "…"
+
+
+def _plate(course: Dict[str, Any]) -> Dict[str, Any]:
+    """A dish by name, never by its ingredients or method."""
+    nutrition = course.get("nutrition") or {}
+    return {
+        "recipe_id": course.get("recipe_id") or course.get("id"),
+        "title": course.get("title") or "",
+        "role": course.get("role") or "main",
+        "kcal": nutrition.get("kcal") if isinstance(nutrition, dict) else None,
+        "match_reasons": [
+            reason.get("label")
+            for reason in course.get("match_reasons") or []
+            if isinstance(reason, dict) and reason.get("label")
+        ],
+    }
+
+
+def _daily_meals(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    # Multi-plate and multi-day plans carry `days`; a legacy plan has one
+    # course per slot and nothing else.
+    if payload.get("days"):
+        return [
+            {
+                "day": day.get("day"),
+                "meal_type": meal.get("meal_type") or "",
+                "plates": [_plate(p) for p in meal.get("plates") or []],
+            }
+            for day in payload["days"]
+            for meal in day.get("meals") or []
+        ]
+    return [
+        {"day": None, "meal_type": slot, "plates": [_plate(payload[slot])]}
+        for slot in ("breakfast", "lunch", "dinner")
+        if isinstance(payload.get(slot), dict)
+    ]
+
+
+def _weekly_meals(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    meals: Dict[tuple, Dict[str, Any]] = {}
+    for entry in payload.get("entries") or []:
+        key = (entry.get("day"), entry.get("meal_idx"), entry.get("meal_type"))
+        meal = meals.setdefault(
+            key, {"day": entry.get("day"), "meal_type": entry.get("meal_type") or "", "plates": []}
+        )
+        plate = _plate(entry.get("recipe") or {})
+        plate["role"] = entry.get("role") or plate["role"]
+        meal["plates"].append(plate)
+    return list(meals.values())
+
+
+def _scores(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The judges' verdicts, each with the reasoning it gave."""
+    judged = (
+        ("overall", "llm_score", "llm_reasoning"),
+        ("fruit_and_veg", "fvs_count", "fvs_reasoning"),
+        ("variety", "diversity_llm_score", "diversity_llm_reasoning"),
+        ("guidelines", "guideline_adherence_score", "guideline_adherence_reasoning"),
+    )
+    return [
+        {
+            "name": name,
+            "score": payload.get(score),
+            "reasoning": _clip(payload.get(reasoning)),
+        }
+        for name, score, reasoning in judged
+        # Zero with no reasoning is a judge that did not run, not a verdict.
+        if payload.get(score) or payload.get(reasoning)
+    ]
 
 
 CHAT_REVIEW_SERVICE = ChatReviewService()

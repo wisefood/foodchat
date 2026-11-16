@@ -9,7 +9,9 @@ degrade to a sentence rather than an error page.
 
 import pytest
 
-from db import Base, MessageRow, SessionLocal, SessionRow, engine
+import json
+
+from db import Base, MealPlanRow, MessageRow, SessionLocal, SessionRow, engine
 from services.chat_review_service import (
     CHAT_REVIEW_SERVICE,
     DEFAULT_WINDOW,
@@ -158,7 +160,7 @@ class TestItLivesApartFromTheMemberScopedRouter:
         paths = {route.path for route in foodchat_router.router.routes}
         assert not any("review" in path for path in paths)
 
-    def test_the_review_router_exposes_only_the_context_read(self):
+    def test_the_review_router_exposes_only_the_two_reads(self):
         from routers import review_router
 
         methods = {
@@ -166,7 +168,8 @@ class TestItLivesApartFromTheMemberScopedRouter:
             for route in review_router.router.routes
         }
         assert methods == {
-            ("/foodchat/review/messages/{message_id}/context", ("GET",))
+            ("/foodchat/review/messages/{message_id}/context", ("GET",)),
+            ("/foodchat/review/plans/{plan_id}", ("GET",)),
         }
 
     def test_it_is_documented_as_gateway_gated(self):
@@ -175,3 +178,157 @@ class TestItLivesApartFromTheMemberScopedRouter:
         import services.chat_review_service as module
 
         assert "gateway" in (module.__doc__ or "").lower()
+
+
+DAILY = {
+    "id": "p-daily",
+    "reasoning": "Light and quick, with fish twice.",
+    "llm_score": 7,
+    "llm_reasoning": "Balanced, a little repetitive.",
+    "fvs_count": 4,
+    "fvs_reasoning": "Four portions of fruit and veg.",
+    "diversity_llm_score": 0,
+    "diversity_llm_reasoning": "",
+    "guideline_adherence_score": 6,
+    "guideline_adherence_reasoning": "Salt is high at dinner.",
+    "constraints_applied": [
+        {"constraint": "no peanuts", "type": "hard", "status": "satisfied"},
+        {"constraint": "3 servings of dairy", "type": "soft", "status": "unmet", "kind": "guideline"},
+    ],
+    "personalization_summary": {"name": "Maria", "allergies": ["peanuts"]},
+    "breakfast": {"recipe_id": "r1", "title": "Oat porridge", "ingredients": "oats, milk",
+                  "directions": "Stir.", "nutrition": {"kcal": 320},
+                  "match_reasons": [{"kind": "diet", "label": "Vegetarian"}]},
+    "lunch": {"recipe_id": "r2", "title": "Tuna salad", "ingredients": "tuna",
+              "directions": "Mix.", "nutrition": None, "match_reasons": []},
+    "dinner": {"recipe_id": "r3", "title": "Baked cod", "ingredients": "cod",
+               "directions": "Bake.", "nutrition": {"kcal": 510}, "match_reasons": []},
+}
+
+WEEKLY = {
+    "id": "p-weekly",
+    "entries": [
+        {"day": 1, "meal_idx": 0, "meal_type": "breakfast", "recipe": {"recipe_id": "r1", "title": "Oat porridge"}, "reward": 1},
+        {"day": 1, "meal_idx": 2, "meal_type": "dinner", "recipe": {"recipe_id": "r3", "title": "Baked cod"}, "reward": 1},
+        {"day": 1, "meal_idx": 2, "meal_type": "dinner", "recipe": {"recipe_id": "r4", "title": "Green salad"}, "reward": 1, "role": "side"},
+        {"day": 2, "meal_idx": 0, "meal_type": "breakfast", "recipe": {"recipe_id": "r5", "title": "Yoghurt"}, "reward": 1},
+    ],
+    "metrics": {"variety": 0.8},
+    "constraints_applied": [],
+    "personalization_summary": {"name": "Maria"},
+    "reasoning": "A week of quick dinners.",
+}
+
+
+@pytest.fixture()
+def plans():
+    Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+    try:
+        db.query(MealPlanRow).filter(MealPlanRow.session_id == "s-plans").delete()
+        db.query(SessionRow).filter(SessionRow.session_id == "s-plans").delete()
+        db.commit()
+        db.add(SessionRow(session_id="s-plans", member_id="m-1", user_profile="{}"))
+        db.commit()
+        db.add(MealPlanRow(id="p-daily", session_id="s-plans", plan_type="daily", version=2,
+                           parent_id="p-v1", saved=1, saved_title="Maria's Tuesday",
+                           payload=json.dumps(DAILY)))
+        db.add(MealPlanRow(id="p-weekly", session_id="s-plans", plan_type="weekly",
+                           payload=json.dumps(WEEKLY)))
+        db.commit()
+        yield
+    finally:
+        db.query(MealPlanRow).filter(MealPlanRow.session_id == "s-plans").delete()
+        db.query(SessionRow).filter(SessionRow.session_id == "s-plans").delete()
+        db.commit()
+        db.close()
+
+
+class TestWhatAPlanWas:
+    def test_a_daily_plan_is_its_dishes_per_meal(self, plans):
+        plan = CHAT_REVIEW_SERVICE.plan_summary("p-daily")
+        assert [m["meal_type"] for m in plan["meals"]] == ["breakfast", "lunch", "dinner"]
+        assert plan["meals"][0]["plates"] == [{
+            "recipe_id": "r1", "title": "Oat porridge", "role": "main", "kcal": 320,
+            "match_reasons": ["Vegetarian"],
+        }]
+        assert plan["version"] == 2 and plan["parent_id"] == "p-v1" and plan["saved"] is True
+
+    def test_the_judges_say_why(self, plans):
+        scores = {s["name"]: s for s in CHAT_REVIEW_SERVICE.plan_summary("p-daily")["scores"]}
+        assert scores["guidelines"] == {"name": "guidelines", "score": 6,
+                                        "reasoning": "Salt is high at dinner."}
+        # A judge that did not run is not a verdict of zero.
+        assert "variety" not in scores
+
+    def test_the_rows_the_member_saw_come_back(self, plans):
+        rows = CHAT_REVIEW_SERVICE.plan_summary("p-daily")["constraints_applied"]
+        assert [r["constraint"] for r in rows] == ["no peanuts", "3 servings of dairy"]
+
+    def test_a_weekly_plan_groups_plates_into_meals(self, plans):
+        plan = CHAT_REVIEW_SERVICE.plan_summary("p-weekly")
+        dinner = [m for m in plan["meals"] if m["day"] == 1 and m["meal_type"] == "dinner"][0]
+        assert [p["title"] for p in dinner["plates"]] == ["Baked cod", "Green salad"]
+        assert dinner["plates"][1]["role"] == "side"
+        assert len(plan["meals"]) == 3
+        assert plan["scores"] == [] and plan["metrics"] == {"variety": 0.8}
+
+    def test_nothing_the_member_wrote_or_their_profile_leaves(self, plans):
+        flat = repr(CHAT_REVIEW_SERVICE.plan_summary("p-daily"))
+        for private in ("Maria", "allergies", "personalization", "Stir.", "oats, milk"):
+            assert private not in flat, private
+
+    def test_a_pruned_plan_is_not_an_error(self, plans):
+        assert CHAT_REVIEW_SERVICE.plan_summary("gone") is None
+        assert CHAT_REVIEW_SERVICE.plan_summary("") is None
+
+    def test_long_reasoning_is_clipped(self, plans):
+        from services.chat_review_service import MAX_REASONING_CHARS, _clip
+
+        assert len(_clip("x" * (MAX_REASONING_CHARS + 50))) == MAX_REASONING_CHARS + 1
+
+
+class TestOnlyTheGatewaysReviewerGetsIn:
+    """Where assertions are configured, a review read must be signed as the
+    reviewer. A member's assertion opened these routes before, and the
+    gateway's own reads — which name no member — were refused."""
+
+    SECRET = "review-test-secret"
+
+    def _call(self, monkeypatch, header):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        import auth
+        from routers import review_router
+
+        # The review router behind the real middleware, without the rest of
+        # the service's startup.
+        app = FastAPI()
+        app.middleware("http")(auth.assertion_middleware)
+        app.include_router(review_router.router)
+        monkeypatch.setenv("FOODCHAT_ASSERTION_SECRET", self.SECRET)
+        client = TestClient(app)
+        headers = {auth.HEADER: header} if header else {}
+        return client.get("/foodchat/review/plans/nope", headers=headers)
+
+    def test_the_reviewer_reaches_the_route(self, monkeypatch):
+        import auth
+
+        response = self._call(monkeypatch, auth.sign(auth.REVIEWER, key=self.SECRET))
+        assert response.status_code == 404  # through the gate, to a missing plan
+
+    def test_a_member_is_refused(self, monkeypatch):
+        import auth
+
+        assert self._call(monkeypatch, auth.sign("m-1", key=self.SECRET)).status_code == 401
+
+    def test_nobody_is_refused(self, monkeypatch):
+        assert self._call(monkeypatch, None).status_code == 401
+
+    def test_without_a_secret_nothing_is_checked(self, monkeypatch):
+        import auth
+
+        monkeypatch.delenv("FOODCHAT_ASSERTION_SECRET", raising=False)
+        auth.set_asserted_member(None)
+        auth.check_reviewer()  # no raise

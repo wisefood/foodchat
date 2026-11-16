@@ -173,6 +173,28 @@ def check_member(member_id: str) -> None:
         raise AssertionError_("Member assertion does not match this request")
 
 
+#: Who a review read is signed as. Not a member id — the gateway signs a
+#: member id only after checking the caller owns that member, and member ids
+#: are UUIDs — so the review routes can tell a reviewer the gateway vouched
+#: for apart from a member, and from a caller nobody vouched for.
+REVIEWER = "reviewer"
+
+
+def check_reviewer() -> None:
+    """Refuse a review read the gateway did not sign as one.
+
+    The review routes read conversations and plans no caller owns, so the
+    member check cannot guard them. Before this, any member's assertion opened
+    them — and a deployment that enforced assertions refused the gateway's own
+    review reads, which named no member at all. A no-op when assertions are
+    not configured, like `check_member`.
+    """
+    if not enforcing():
+        return
+    if asserted_member() != REVIEWER:
+        raise AssertionError_("Review reads need the gateway's reviewer assertion")
+
+
 async def assertion_middleware(request, call_next):
     """Verify the assertion once per request and stash who it names.
 
