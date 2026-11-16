@@ -19,7 +19,7 @@ from .weekly_planner.planner import (
     build_preference_scorer,
 )
 from .adapted_recipes import overlay_weekly_entries
-from .candidates_client import CANDIDATES
+from .candidates_client import CANDIDATES, display_allergen
 from agents import ResponseWriter
 from models.session import WeeklyMealPlan
 
@@ -320,6 +320,7 @@ class WeeklyPlanService:
             if action_space.allergens:
                 constraints.append(
                     "allergens excluded: " + ", ".join(sorted(
+                        display_allergen(a) for a in
                         attributed(session.user_profile, "allergies", action_space.allergens)
                     ))
                 )

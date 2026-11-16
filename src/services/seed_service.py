@@ -32,6 +32,7 @@ from services.candidates_client import (
     CANDIDATES,
     RecipeCandidatesClient,
     allergen_conflict,
+    allergen_label_match,
     effective_diet,
     screening_allergens,
 )
@@ -232,8 +233,11 @@ class SeedService:
         allergies = [a.lower().strip() for a in profile.get("allergies", []) if a]
         if not allergies:
             return None
+        tagged = {str(a).lower() for a in (resolved.allergens or [])}
         for allergen in allergies:
-            if allergen in resolved.allergens:
+            # Through the alias table, so "nuts" on a profile meets `tree_nut`
+            # on the recipe and `milk` meets `dairy`.
+            if allergen_label_match(allergen, tagged):
                 return allergen
         return allergen_conflict(
             f"{resolved.recipe.title} {resolved.recipe.ingredients}", allergies

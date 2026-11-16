@@ -122,30 +122,48 @@ def split_diet_intent(tags) -> tuple[list[str], list[str]]:
 # --------------------------------------------------------------------------- #
 
 ALLERGEN_SYNONYMS = {
+    # Keys are what `canonical_allergen` folds a profile name to: the gateway's
+    # EU-list slugs (`milk`, `tree_nut`, `crustacean_shellfish`, ...) reach a
+    # key here through `ALLERGEN_ALIASES`. The words are what a recipe's title
+    # or ingredient text says instead of the allergen's name. Ingredients, not
+    # dishes: satay or halva can be made without the allergen, so naming the
+    # dish would refuse safe plates and still miss the unsafe ones it misnames.
     "tree nuts": ["almond", "walnut", "cashew", "pecan", "hazelnut", "pistachio",
-                  "macadamia", "brazil nut", "pine nut", "chestnut"],
+                  "macadamia", "brazil nut", "pine nut", "chestnut", "praline",
+                  "marzipan"],
     "nuts": ["almond", "walnut", "cashew", "pecan", "hazelnut", "pistachio",
-             "macadamia", "brazil nut", "pine nut", "peanut"],
-    "peanuts": ["peanut"],
+             "macadamia", "brazil nut", "pine nut", "peanut", "praline",
+             "marzipan", "groundnut"],
+    "peanuts": ["peanut", "groundnut"],
     "shellfish": ["shrimp", "prawn", "crab", "lobster", "mussel", "oyster",
                   "scallop", "clam", "crayfish", "squid", "octopus",
-                  "langoustine", "scampi", "calamari", "cuttlefish"],
+                  "langoustine", "scampi", "calamari", "cuttlefish", "cockle",
+                  "whelk"],
     # The EU list splits shellfish in two, and so does the gateway. A member
     # allergic to crustaceans only is not refused mussels.
     "crustaceans": ["shrimp", "prawn", "crab", "lobster", "crayfish",
                     "langoustine", "scampi"],
     "molluscs": ["mussel", "oyster", "scallop", "clam", "squid", "octopus",
-                 "calamari", "cuttlefish", "snail"],
+                 "calamari", "cuttlefish", "snail", "escargot", "cockle",
+                 "whelk"],
     "fish": ["salmon", "tuna", "cod", "haddock", "trout", "sardine", "anchovy",
              "mackerel", "halibut", "sea bass", "tilapia"],
-    "dairy": ["milk", "cheese", "butter", "cream", "yogurt", "yoghurt", "ghee"],
+    "dairy": ["milk", "cheese", "butter", "cream", "yogurt", "yoghurt", "ghee",
+              "whey", "paneer", "halloumi", "mozzarella", "parmesan", "ricotta",
+              "feta", "mascarpone", "cheddar", "brie", "gouda", "camembert"],
     "lactose": ["milk", "cheese", "cream", "yogurt", "yoghurt"],
-    "eggs": ["egg"],
-    "gluten": ["wheat", "flour", "barley", "rye", "semolina", "couscous"],
-    "soy": ["soy", "soya", "tofu", "edamame"],
+    "eggs": ["egg", "mayonnaise", "meringue", "aioli"],
+    "gluten": ["wheat", "flour", "barley", "rye", "semolina", "couscous",
+               "spelt", "bulgur", "seitan"],
+    "wheat": ["wheat", "flour", "semolina", "couscous", "spelt", "bulgur",
+              "seitan"],
+    "soy": ["soy", "soya", "tofu", "edamame", "miso", "tempeh"],
     "sesame": ["sesame", "tahini"],
     "celery": ["celery", "celeriac"],
-    "lupin": ["lupin", "lupine"],
+    "lupin": ["lupin", "lupine", "lupini"],
+    "mustard": ["mustard", "dijon"],
+    "sulphites": ["sulphite", "sulfite", "sulphur dioxide", "sulfur dioxide",
+                  "metabisulphite", "metabisulfite"],
 }
 
 # Allergen names as profiles actually carry them -> the keys above. The
@@ -170,6 +188,8 @@ ALLERGEN_ALIASES = {
     "sesame seed": "sesame", "sesame seeds": "sesame",
     "cereals containing gluten": "gluten",
     "lupine": "lupin",
+    "sulphite": "sulphites", "sulfite": "sulphites", "sulfites": "sulphites",
+    "sulphur dioxide": "sulphites", "sulfur dioxide": "sulphites",
 }
 
 # Broader allergen names and the narrower ones they contain, for comparing a
@@ -178,6 +198,7 @@ _ALLERGEN_FAMILIES = {
     "shellfish": {"crustaceans", "molluscs"},
     "nuts": {"tree nuts", "peanuts"},
     "dairy": {"lactose"},
+    "gluten": {"wheat"},
 }
 
 # "peanut butter" is not butter, "oat milk" is not milk, "vegan cheese" and
@@ -257,6 +278,11 @@ def free_from_allergens(diet) -> list[str]:
         if allergen and allergen not in out:
             out.append(allergen)
     return out
+
+
+def display_allergen(name: object) -> str:
+    """How an allergen identifier reads in a sentence: `tree_nut` → "tree nut"."""
+    return str(name or "").replace("_", " ").strip()
 
 
 def _allergen_terms(allergies: list[str]) -> list[str]:

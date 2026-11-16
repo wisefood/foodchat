@@ -14,6 +14,8 @@ Reason kinds (shared contract with the UI):
 
 from typing import Optional
 
+from services.candidates_client import display_allergen
+
 
 def match_reasons(
     course_recipe_id: str,
@@ -308,7 +310,7 @@ def constraints_ledger(profile: dict, downvoted_count: int = 0) -> list[dict]:
 
     for allergen in profile.get("allergies") or []:
         ledger.append({
-            "constraint": f"no {allergen}",
+            "constraint": f"no {display_allergen(allergen)}",
             "type": "hard", "status": "satisfied",
             "source": "allergy",
             "members": members_for("allergies", allergen),

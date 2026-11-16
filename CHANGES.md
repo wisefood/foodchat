@@ -2,6 +2,35 @@
 
 ---
 
+# Allergen names, part 2: every EU group, both spellings, read as words
+
+> **Date:** 2026-11-16
+> **Branch:** main
+> No API change. Builds on the alias table of 2026-11-12 below. Also pins
+> SQLAlchemy to the 2.0 line and names the PostgreSQL driver, so a rebuild
+> cannot crash-loop on `No module named 'psycopg'` again.
+
+The gateway folds every profile write to RecipeWrangler's EU-list identifiers.
+After the alias table, three safety paths still read those identifiers
+narrowly, three allergen groups had no ingredient words at all, and the member
+saw identifiers instead of words.
+
+| What | Detail |
+|---|---|
+| `services/candidates_client.py` → `ALLERGEN_SYNONYMS` | New keys `mustard`, `sulphites` and `wheat`, each of which was searched for by its own name only. More ingredient words per group: cheeses and whey under dairy, mayonnaise/meringue/aioli under eggs, miso/tempeh under soy, praline/marzipan under nuts, spelt/bulgur/seitan under gluten, cockle/whelk/escargot under molluscs, `dijon`, `lupini`, the sulphite additive names. Ingredients only: a dish name (satay, halva) can be made without the allergen and would refuse safe plates. |
+| `services/candidates_client.py` → `ALLERGEN_ALIASES`, `_ALLERGEN_FAMILIES` | Sulfite/sulphite spellings fold to `sulphites`. `gluten` contains `wheat`, so a wheat label counts against a gluten allergy and a gluten label against a wheat one. |
+| `services/candidates_client.py` → `display_allergen` (new) | `tree_nut` → "tree nut". |
+| `services/plan_verifier.py`, `transparency.constraints_ledger`, `chat_service.no_plan_message`, `weekly_plan_service` (unfillable week) | Every sentence a member reads names the allergen in words: "no tree nut", not "no tree_nut". Closes the "not done here" item of the entry below. |
+| `services/seed_service.py` | The seed gate compared the profile allergen with the recipe's labels by exact string, so a `milk` profile met a `dairy` label as clear. Now `allergen_label_match`, like the verifier and the scorer. |
+| `requirements.txt`, `db.py` | `sqlalchemy>=2.0.0,<2.1`; a bare `postgresql://` URL is rewritten to `postgresql+psycopg2://`. 2.1 changed the default driver to psycopg 3, which the image does not install. |
+
+New tests: `tests/test_allergen_vocabulary.py` — every EU identifier has
+ingredient words, both spellings meet across labels and text, a crustacean
+allergy is not refused mussels by label, and the ledger and the no-plan reply
+print words. Full suite: 2705 passed.
+
+---
+
 # Household planning, phase 1: satisfy-all, hardened
 
 > **Date:** 2026-11-12

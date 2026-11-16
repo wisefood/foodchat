@@ -41,7 +41,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Optional
 
-from services.candidates_client import allergen_conflict, allergen_label_match
+from services.candidates_client import allergen_conflict, allergen_label_match, display_allergen
 
 logger = logging.getLogger(__name__)
 
@@ -212,9 +212,12 @@ def _check_allergens(plates, requested, enrichment) -> Optional[Check]:
         labelled = {str(a).lower() for a in (getattr(rich, "allergens", None) or [])}
         text = _text(plate)
         for allergen in allergens:
+            # Through the alias table on both sides: the corpus labels the
+            # canonical identifier (`tree_nut`) while a profile may still say
+            # "nuts", and the ingredient text names almonds, not either.
             if allergen_label_match(allergen, labelled) or allergen_conflict(text, [allergen]):
                 offenders.append(plate.recipe_id)
-                hits.append(f"{plate.title} ({allergen})")
+                hits.append(f"{plate.title} ({display_allergen(allergen)})")
                 break
 
     if offenders:
@@ -226,7 +229,7 @@ def _check_allergens(plates, requested, enrichment) -> Optional[Check]:
         )
     return Check(
         name="allergens", status=PASSED,
-        detail=f"No {', '.join(allergens)} on any of the {len(plates)} dishes",
+        detail=f"No {', '.join(display_allergen(a) for a in allergens)} on any of the {len(plates)} dishes",
         observed=observed, of=len(plates),
     )
 

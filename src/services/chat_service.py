@@ -45,7 +45,7 @@ from services import (
     turn_intake,
 )
 from services import diet_intent
-from services.candidates_client import CANDIDATES
+from services.candidates_client import CANDIDATES, display_allergen
 from services.clarification import ClarificationManager, ClarificationState
 from services.feedback_service import FeedbackService, household_signals
 from services.planning_pipeline import PlanningPipeline
@@ -81,7 +81,9 @@ def no_plan_message(profile: dict) -> str:
     allergies = profile.get("allergies") or []
     if allergies:
         constraints.append(
-            "allergens excluded: " + ", ".join(sorted(transparency.attributed(profile, "allergies")))
+            "allergens excluded: " + ", ".join(sorted(
+                display_allergen(a) for a in transparency.attributed(profile, "allergies")
+            ))
         )
     dislikes = profile.get("food_dislikes") or []
     if dislikes:
