@@ -18,6 +18,7 @@ survives restarts and works across replicas (see ``services.clarification``).
 """
 
 import logging
+import re
 from typing import Optional, Tuple
 
 from agents import (
@@ -40,6 +41,7 @@ from services import (
     plan_history,
     plan_quality,
     plan_repair,
+    plan_budget,
     plan_verifier,
     turn_budget,
     turn_intake,
@@ -104,6 +106,25 @@ def no_plan_message(profile: dict) -> str:
         "that request. Try being a little broader, or name a dish you'd "
         "like and I'll plan around it."
     )
+
+
+def _names_a_number(text: str) -> bool:
+    """Whether the member's words contain a figure a calorie target could be."""
+    return bool(re.search(r"\d{3,4}", text or ""))
+
+
+def _words_of(state: ClarificationState) -> str:
+    """The member's request and every answer they gave, in their own words.
+
+    What the strategist, the grader and the reply writer should hear after a
+    clarification — the reformulated query is the planner's reading of these,
+    and a reading can add things the member never said.
+    """
+    parts = [state.original_query or ""]
+    if state.conflict_note:
+        parts.append(state.conflict_note)
+    parts += [str(qa.get("answer") or "") for qa in state.transcript]
+    return " — ".join(part.strip() for part in parts if part and part.strip())
 
 
 def _format_plan_as_context(plan: MealPlan) -> str:
@@ -279,7 +300,8 @@ class ChatService:
             return outcome.question, True, None
 
         return self._generate_and_store(
-            session_id, outcome.final_query, outcome.profile, is_refinement
+            session_id, outcome.final_query, outcome.profile, is_refinement,
+            member_words=effective_message,
         )
 
     def _apply_standing_state(self, session_id: str, profile: dict, state) -> None:
@@ -364,6 +386,8 @@ class ChatService:
         # phase's answer can retract a stated diet.
         was_conflict = state.phase == "conflict"
         outcome = self.clarifier.step(state, message)
+        # Read now: `state` is reused for the planning state further down.
+        member_words = _words_of(state)
 
         if was_conflict and diet_intent.is_conflict_refusal(message):
             # "No, follow my profile." Until now the answer to this question
@@ -415,7 +439,8 @@ class ChatService:
         self._apply_standing_state(session_id, outcome.profile, state)
 
         text, needs, plan = self._generate_and_store(
-            session_id, outcome.final_query, outcome.profile, is_refinement
+            session_id, outcome.final_query, outcome.profile, is_refinement,
+            member_words=member_words,
         )
         return text, needs, plan, origin_intent
 
@@ -480,10 +505,21 @@ class ChatService:
         final_query: str,
         profile: dict,
         is_refinement: bool,
+        member_words: Optional[str] = None,
     ) -> Tuple[str, bool, Optional[MealPlan]]:
-        """Run the pipeline, compute quality metrics, and store the plan version."""
+        """Run the pipeline, compute quality metrics, and store the plan version.
+
+        ``member_words`` is what the member actually said: their message, or
+        their request and their answers after a clarification. The strategist,
+        the grader and the reply writer hear THAT, not the planner's rewrite
+        of it. They used to hear the rewrite, which is how "plan my day" was
+        graded and announced as a day with two snacks nobody asked for.
+        """
         self.session_service.clear_clarification_state(session_id)
+        words = (member_words or final_query or "").strip() or final_query
         logger.info("[%s] Generating plan (query=%.120s)", session_id, final_query)
+        if words != final_query:
+            logger.info("[%s] Member's words: %.120s", session_id, words)
 
         # Anchor pins ride in the profile snapshot (see process_plan_request);
         # pop the transient keys so they never leak into grader prompts.
@@ -514,7 +550,7 @@ class ChatService:
         spec = PlanSpec.coerce(spec_raw) if spec_raw is not None else None
         if spec is not None and not spec.is_default:
             return self._generate_structured(
-                session_id, final_query, profile, spec, pinned, seed_note,
+                session_id, words, profile, spec, pinned, seed_note,
                 signals, is_refinement,
             )
 
@@ -530,10 +566,10 @@ class ChatService:
         # brief, no strategist, and not one measured constraint: it reported
         # the request back as though it were a result, which is the whole
         # failure the verifier was built to end.
-        brief = self._brief_for(final_query, profile)
+        brief = self._brief_for(words, profile)
 
         plans = self.pipeline.generate(
-            final_query, profile, pinned=pinned,
+            words, profile, pinned=pinned,
             exclude_recipe_ids=list(signals.downvoted_recipe_ids or [])
             + list(profile.get("_excluded_recipe_ids") or []),
             # What the member was just served — the session's recent plans on a
@@ -553,7 +589,9 @@ class ChatService:
             self.session_service.add_message(session_id, "assistant", apology)
             return apology, False, None
 
-        best = plans[0]
+        # The grader's first, unless it misses the member's calorie budget
+        # badly and a day it rated almost as highly does not.
+        best = plan_budget.pick(plans, brief.kcal_target)
         # Scores describe a plan that has already been chosen — they make the
         # card richer and change nothing about what the member eats. First
         # thing to drop when the turn is running late.
@@ -713,8 +751,17 @@ class ChatService:
         # the case where the writer fails outright.
         formatted = (
             canned if turn_budget.skip("response writer", turn_budget.COST_WRITER)
-            else self.response_writer.write(facts, final_query, fallback=canned)
+            else self.response_writer.write(facts, words, fallback=canned)
         )
+
+        # The plan's reasoning is what FoodChat told the member about it. It
+        # held the grader's note on the batch ("highest score among the
+        # batch", "the maximum possible score is 2"), which is the judge
+        # talking to itself: reviewers read it from `llm_reasoning`, where it
+        # also lives, and the refinement prompts that quote a plan's reasoning
+        # back to the model now quote what the member was told.
+        meal_plan.reasoning = formatted
+        self.session_service.resave_meal_plan(meal_plan)
 
         self.session_service.add_message(session_id, "assistant", formatted)
         return formatted, False, meal_plan
@@ -969,9 +1016,19 @@ class ChatService:
         try:
             vocab = CANDIDATES.vocabularies() or {}
             if vocab:
-                brief = brief.with_strategy(
-                    self.strategist.propose(query, brief, vocab), vocab
-                )
+                proposal = self.strategist.propose(query, brief, vocab)
+                # A calorie figure is the member's only if they said one. A
+                # guest who typed "plan my day" was checked against "your
+                # 2000 kcal target" and told the day fell short of "the 2,000
+                # kcal goal": the strategist had supplied the number, and
+                # everything after it treats `kcal_target` as chosen.
+                if proposal.get("kcal_target") and not _names_a_number(query):
+                    logger.info(
+                        "Strategist's kcal_target %s dropped: the request names no figure",
+                        proposal.get("kcal_target"),
+                    )
+                    proposal = {**proposal, "kcal_target": None}
+                brief = brief.with_strategy(proposal, vocab)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Strategy step skipped: %s", exc)
         logger.info("Brief: %s", brief.describe())

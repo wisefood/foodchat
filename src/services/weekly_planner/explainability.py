@@ -480,6 +480,9 @@ def annotate_shared_ingredients(
             "status": "satisfied",
             "source": "the plan",
             "detail": "shares " + ", ".join(facts["items"][:6]),
+            "name_code": "sharedIngredients",
+            "name_params": {"meals": facts["meals"]},
+            "code": "sharedIngredients", "params": {"items": list(facts["items"][:6])},
         })
         explainability["constraints_applied"] = ledger
 

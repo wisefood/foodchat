@@ -128,16 +128,19 @@ class TestStartOutcomes:
         final = mgr.step(outcome.state, "italian")
         assert final.final_query == "italian vegan plan"
 
-    def test_vague_query_with_rich_profile_reformulates_silently(self):
+    def test_vague_query_with_rich_profile_plans_from_the_members_words(self):
+        """No question asked, so nothing new was said: the plan is built from
+        the member's own words, and the rewriter is not called at all (no
+        payload is queued, so a call would raise). Rewriting here is where
+        "plan my day" became a day with two snacks nobody asked for."""
         mgr = make_manager(
             reconcile_result={"needs_clarification": False},
             checker_payloads=[{"response": "NO"}],
             profile_payloads=[{"response": "YES", "suggestions": []}],
-            reformulate_payloads=[{"reformulated_query": "vegan plan matching profile"}],
         )
         outcome = mgr.start("food please", PROFILE, "daily_plan")
         assert not outcome.needs_clarification
-        assert outcome.final_query == "vegan plan matching profile"
+        assert outcome.final_query == "food please"
 
 
 class TestTheConversationAlreadyGaveDirection:
@@ -156,14 +159,15 @@ class TestTheConversationAlreadyGaveDirection:
         mgr = make_manager(
             reconcile_result={"needs_clarification": False},
             checker_payloads=[{"response": "NO"}],
-            reformulate_payloads=[{"reformulated_query": "a plan from what they said"}],
         )
         return mgr.start("plan my day", {**self.BARE, **session}, "daily_plan")
 
     def test_the_kitchen_is_direction(self):
         outcome = self._start(_pantry=["spinach", "feta"])
         assert not outcome.needs_clarification
-        assert outcome.final_query == "a plan from what they said"
+        # The member's words, unrewritten: the kitchen reaches the plan
+        # through the brief, not through a sentence about it.
+        assert outcome.final_query == "plan my day"
 
     def test_a_cuisine_heard_is_direction(self):
         assert not self._start(_facets={"cuisines": ["mediterranean"]}).needs_clarification

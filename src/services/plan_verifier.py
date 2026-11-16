@@ -79,6 +79,11 @@ class Check:
     # is not the same evidence as a check over 21, and a reader deserves both.
     observed: int = 0
     of: int = 0
+    # The same outcome as a key and its numbers, for a reader that says it in
+    # the member's language. `detail` is English and stays the fallback: the
+    # Hungarian and Slovenian living labs read every one of these sentences.
+    code: str = ""
+    params: dict = field(default_factory=dict)
 
     @property
     def is_blocking(self) -> bool:
@@ -132,16 +137,20 @@ class VerificationReport:
             UNVERIFIED: "unsupported",
             UNKNOWN: "unsupported",
         }
-        return [
-            {
+        rows = []
+        for check in self.checks:
+            row = {
                 "constraint": check.name,
                 "type": "hard" if check.name in {"allergens", "diet"} else "soft",
                 "status": mapping.get(check.status, "unsupported"),
                 "source": "measured on the plan",
                 "detail": check.detail,
             }
-            for check in self.checks
-        ]
+            if check.code:
+                row["code"] = check.code
+                row["params"] = dict(check.params)
+            rows.append(row)
+        return rows
 
 
 def _plates(plan) -> list:
@@ -204,6 +213,7 @@ def _check_allergens(plates, requested, enrichment) -> Optional[Check]:
 
     offenders: list[str] = []
     hits: list[str] = []
+    found: list[dict] = []
     observed = 0
     for plate in plates:
         rich = enrichment.get(plate.recipe_id)
@@ -218,6 +228,7 @@ def _check_allergens(plates, requested, enrichment) -> Optional[Check]:
             if allergen_label_match(allergen, labelled) or allergen_conflict(text, [allergen]):
                 offenders.append(plate.recipe_id)
                 hits.append(f"{plate.title} ({display_allergen(allergen)})")
+                found.append({"dish": plate.title, "allergen": allergen})
                 break
 
     if offenders:
@@ -226,11 +237,14 @@ def _check_allergens(plates, requested, enrichment) -> Optional[Check]:
             detail="Found " + ", ".join(hits[:3]) + (
                 f" and {len(hits) - 3} more" if len(hits) > 3 else ""),
             offenders=tuple(offenders), observed=observed, of=len(plates),
+            code="allergens.found",
+            params={"found": found[:3], "more": max(len(found) - 3, 0)},
         )
     return Check(
         name="allergens", status=PASSED,
         detail=f"No {', '.join(display_allergen(a) for a in allergens)} on any of the {len(plates)} dishes",
         observed=observed, of=len(plates),
+        code="allergens.clear", params={"allergens": allergens, "dishes": len(plates)},
     )
 
 
@@ -275,6 +289,8 @@ def _check_diet(plates, requested, enrichment) -> Optional[Check]:
                 f"{', '.join(diet)}"
             ),
             offenders=tuple(offenders), observed=checked, of=len(plates),
+            code="diet.offenders",
+            params={"count": len(offenders), "checked": checked, "diets": diet},
         )
     if checked == 0:
         return Check(
@@ -284,6 +300,7 @@ def _check_diet(plates, requested, enrichment) -> Optional[Check]:
                 "dishes carry dietary labels to check against"
             ),
             observed=0, of=len(plates),
+            code="diet.unlabelled", params={"diets": diet, "dishes": len(plates)},
         )
     if checked < len(plates):
         return Check(
@@ -293,11 +310,14 @@ def _check_diet(plates, requested, enrichment) -> Optional[Check]:
                 f"{', '.join(diet)}; the rest carry no dietary labels"
             ),
             observed=checked, of=len(plates),
+            code="diet.partial",
+            params={"checked": checked, "dishes": len(plates), "diets": diet},
         )
     return Check(
         name="diet", status=PASSED,
         detail=f"All {len(plates)} dishes are labelled {', '.join(diet)}",
         observed=checked, of=len(plates),
+        code="diet.all", params={"dishes": len(plates), "diets": diet},
     )
 
 
@@ -329,18 +349,23 @@ def _check_claim_tags(plates, requested, enrichment) -> Optional[Check]:
     if observed == 0:
         return Check(name="claims", status=UNKNOWN,
                      detail=f"Asked for {label}; no dish details available to check",
-                     of=len(plates))
+                     of=len(plates),
+                     code="claims.unknown", params={"tags": wanted})
     if matching == 0:
         return Check(name="claims", status=FAILED,
                      detail=f"None of the {observed} dishes are tagged {label}",
-                     observed=observed, of=len(plates))
+                     observed=observed, of=len(plates),
+                     code="claims.none", params={"observed": observed, "tags": wanted})
     if matching < observed:
         return Check(name="claims", status=PARTIAL,
                      detail=f"{matching} of {observed} dishes are tagged {label}",
-                     observed=observed, of=len(plates))
+                     observed=observed, of=len(plates),
+                     code="claims.some",
+                     params={"matching": matching, "observed": observed, "tags": wanted})
     return Check(name="claims", status=PASSED,
                  detail=f"All {observed} dishes are tagged {label}",
-                 observed=observed, of=len(plates))
+                 observed=observed, of=len(plates),
+                 code="claims.all", params={"observed": observed, "tags": wanted})
 
 
 def _measured(plate, enrichment, attribute: str, nutrition_key: str):
@@ -448,6 +473,8 @@ def _check_kcal(plan, requested, enrichment) -> Optional[Check]:
 
     if not per_day:
         return Check(name=name, status=UNKNOWN,
+                     code="kcal.unknown",
+                     params={"target": int(target), "own": chosen},
                      detail=f"Nothing to compare against {against}: no dish has "
                             "nutrition data to add up")
 
@@ -464,6 +491,9 @@ def _check_kcal(plan, requested, enrichment) -> Optional[Check]:
         return Check(
             name=name, status=PASSED, detail=detail,
             observed=len(per_day), of=len(plan.day_plans),
+            code="kcal.ok",
+            params={"average": int(average), "target": int(target), "own": chosen,
+                    "partial": not complete},
         )
 
     worst = max(misses, key=lambda item: abs(item[1] - target))
@@ -472,12 +502,18 @@ def _check_kcal(plan, requested, enrichment) -> Optional[Check]:
         f"{len(misses)} of {len(per_day)} days miss {against} — day {worst[0]} "
         f"is {int(abs(worst[1] - target))} kcal {direction}{caveat}"
     )
+    params = {
+        "misses": len(misses), "days": len(per_day), "day": worst[0],
+        "delta": int(abs(worst[1] - target)), "direction": direction,
+        "target": int(target), "own": chosen, "partial": not complete,
+    }
     # Only when the day is OVER, and only the plate that would move it most.
     # Under-target is a different conversation and naming its lightest dish
     # would be telling somebody to eat more of something.
     if direction == "over":
         heaviest = _heaviest_plate(plan, enrichment, worst[0])
         if heaviest and heaviest[0]:
+            params["heaviest"] = {"dish": heaviest[0], "kcal": int(heaviest[1])}
             detail += (
                 f". The heaviest plate is “{heaviest[0]}” at {int(heaviest[1])} "
                 "kcal — ask me for a lighter one there and I will re-plan it"
@@ -491,6 +527,7 @@ def _check_kcal(plan, requested, enrichment) -> Optional[Check]:
         status=FAILED if chosen else PARTIAL,
         detail=detail,
         observed=len(per_day), of=len(plan.day_plans),
+        code="kcal.miss", params=params,
     )
 
 
@@ -519,17 +556,22 @@ def _check_time(plates, requested, enrichment) -> Optional[Check]:
     if observed == 0:
         return Check(name="cooking time", status=UNKNOWN,
                      detail=f"Asked for {int(limit)} minutes or less; no dish "
-                            "records a cooking time", of=len(plates))
+                            "records a cooking time", of=len(plates),
+                     code="time.unknown", params={"limit": int(limit)})
     if offenders:
         return Check(
             name="cooking time", status=FAILED,
             detail=f"{len(offenders)} of {observed} dishes run over "
                    f"{int(limit)} minutes — the longest is {int(worst)}",
             offenders=tuple(offenders), observed=observed, of=len(plates),
+            code="time.over",
+            params={"count": len(offenders), "observed": observed,
+                    "limit": int(limit), "longest": int(worst)},
         )
     return Check(name="cooking time", status=PASSED,
                  detail=f"All {observed} timed dishes are {int(limit)} minutes or less",
-                 observed=observed, of=len(plates))
+                 observed=observed, of=len(plates),
+                 code="time.ok", params={"observed": observed, "limit": int(limit)})
 
 
 def _check_nutri_score(plates, requested, enrichment) -> Optional[Check]:
@@ -553,17 +595,21 @@ def _check_nutri_score(plates, requested, enrichment) -> Optional[Check]:
     if observed == 0:
         return Check(name="nutri-score", status=UNKNOWN,
                      detail=f"Asked for {minimum.upper()} or better; no dish "
-                            "has a Nutri-Score", of=len(plates))
+                            "has a Nutri-Score", of=len(plates),
+                     code="nutri.unknown", params={"minimum": minimum.upper()})
     if offenders:
         return Check(
             name="nutri-score", status=FAILED,
             detail=f"{len(offenders)} of {observed} scored dishes are below "
                    f"{minimum.upper()}",
             offenders=tuple(offenders), observed=observed, of=len(plates),
+            code="nutri.below",
+            params={"count": len(offenders), "observed": observed, "minimum": minimum.upper()},
         )
     return Check(name="nutri-score", status=PASSED,
                  detail=f"All {observed} scored dishes are {minimum.upper()} or better",
-                 observed=observed, of=len(plates))
+                 observed=observed, of=len(plates),
+                 code="nutri.ok", params={"observed": observed, "minimum": minimum.upper()})
 
 
 def _check_pantry(plates, requested) -> Optional[Check]:
@@ -592,17 +638,21 @@ def _check_pantry(plates, requested) -> Optional[Check]:
     if not used:
         return Check(name="pantry", status=FAILED,
                      detail="None of " + ", ".join(pantry) + " are used by this plan",
-                     of=len(plates))
+                     of=len(plates),
+                     code="pantry.none", params={"items": pantry})
     if unused:
         return Check(
             name="pantry", status=PARTIAL,
             detail=f"Uses {', '.join(used)} across {plates_using} dishes; "
                    f"{', '.join(unused)} went unused",
             observed=plates_using, of=len(plates),
+            code="pantry.some",
+            params={"used": used, "dishes": plates_using, "unused": unused},
         )
     return Check(name="pantry", status=PASSED,
                  detail=f"Uses all of {', '.join(used)} across {plates_using} dishes",
-                 observed=plates_using, of=len(plates))
+                 observed=plates_using, of=len(plates),
+                 code="pantry.all", params={"used": used, "dishes": plates_using})
 
 
 def _check_anchors(plates, requested) -> Optional[Check]:
@@ -627,10 +677,12 @@ def _check_anchors(plates, requested) -> Optional[Check]:
             detail=f"{len(missing)} dish you asked for is missing: "
                    + ", ".join(sorted(missing)),
             observed=len(anchors) - len(missing), of=len(anchors),
+            code="picks.missing", params={"count": len(missing), "slots": sorted(missing)},
         )
     return Check(name="your picks", status=PASSED,
                  detail=f"All {len(anchors)} dishes you asked for are on the plan",
-                 observed=len(anchors), of=len(anchors))
+                 observed=len(anchors), of=len(anchors),
+                 code="picks.all", params={"count": len(anchors)})
 
 
 def _check_facets(requested) -> Optional[Check]:
@@ -661,6 +713,7 @@ def _check_facets(requested) -> Optional[Check]:
             + " — the recipe search filtered on these, but the dish details "
               "carry no annotation to check them against"
         ),
+        code="tastes.unverified", params={"values": [str(v) for v in values]},
     )
 
 

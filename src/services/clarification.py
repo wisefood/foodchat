@@ -271,12 +271,15 @@ class ClarificationManager:
             or profile.get("plan_parameters")
         )
         if has_profile_signal or has_session_signal(profile):
+            # Planning without questions plans from the member's OWN words.
+            # Rewriting them here added nothing the later stages lack — the
+            # profile, the kitchen and the tastes all reach the brief and the
+            # grader directly — and it invented: "plan my day" came back as
+            # "breakfast, lunch, dinner and two snacks at about 2000 calories",
+            # the grader marked the day down for snacks nobody asked for, and
+            # the reply promised them.
             logger.info("Profile carries concrete signal — planning without questions")
-            state = ClarificationState(
-                original_query=query, profile=profile,
-                origin_intent=origin_intent, phase="collect",
-            )
-            return ClarificationOutcome(profile=profile, final_query=self._reformulate(state))
+            return ClarificationOutcome(profile=profile, final_query=query)
 
         preferences = profile.get("preferences", [])
         suggestions: list[str] = []
@@ -289,12 +292,9 @@ class ClarificationManager:
             ], config=build_trace_config(run_name="profile_signal", tags=["clarify"]))
             pc_json = json.loads(pc.content)
             if pc_json.get("response") != "NO":
-                # Profile carries enough signal — reformulate without asking.
-                state = ClarificationState(
-                    original_query=query, profile=profile,
-                    origin_intent=origin_intent, phase="collect",
-                )
-                return ClarificationOutcome(profile=profile, final_query=self._reformulate(state))
+                # The profile answers it; plan from the member's own words, for
+                # the reason given above.
+                return ClarificationOutcome(profile=profile, final_query=query)
             suggestions = list(pc_json.get("suggestions", []))[:1]
         else:
             suggestions = ["food preferences or cravings for this plan"]

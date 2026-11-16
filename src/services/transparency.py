@@ -239,11 +239,16 @@ def _diet_row(diet, members: list[str]) -> dict:
             "detail": "a description of how you eat, not a recipe filter — "
                       "no dishes were excluded for it",
             "members": members,
+            # Codes so a reader can say the row in the member's language;
+            # `constraint` and `detail` stay the English fallback.
+            "name_code": "diet", "name_params": {"diet": str(diet)},
+            "code": "diet.notAFilter", "params": {},
         }
     if status == DIET_FILTER:
         return {
             "constraint": str(diet), "type": "hard", "status": "satisfied",
             "source": "dietary group", "members": members,
+            "name_code": "diet", "name_params": {"diet": str(diet)},
         }
 
     detail = (
@@ -260,6 +265,9 @@ def _diet_row(diet, members: list[str]) -> dict:
     row = {
         "constraint": str(diet), "type": "hard", "status": "unsupported",
         "source": "dietary group", "detail": detail, "members": members,
+        "name_code": "diet", "name_params": {"diet": str(diet)},
+        "code": "diet.noFilterBackstop" if backstop else "diet.noFilter",
+        "params": {"backstop": backstop} if backstop else {},
     }
     if backstop:
         # Read by `split_ledger`: an unsupported value that something ELSE
@@ -306,6 +314,8 @@ def constraints_ledger(profile: dict, downvoted_count: int = 0) -> list[dict]:
             "detail": f"This plan does not account for {who}'s allergies or diet. "
                       "Select them again to retry.",
             "members": [who],
+            "name_code": "profileMissing", "name_params": {"who": who},
+            "code": "profileMissing", "params": {"who": who},
         })
 
     for allergen in profile.get("allergies") or []:
@@ -314,6 +324,7 @@ def constraints_ledger(profile: dict, downvoted_count: int = 0) -> list[dict]:
             "type": "hard", "status": "satisfied",
             "source": "allergy",
             "members": members_for("allergies", allergen),
+            "name_code": "allergy", "name_params": {"allergen": str(allergen)},
         })
     for diet in profile.get("diet") or []:
         ledger.append(_diet_row(diet, members_for("diet", diet)))
@@ -323,6 +334,7 @@ def constraints_ledger(profile: dict, downvoted_count: int = 0) -> list[dict]:
             "type": "soft", "status": "satisfied",
             "source": "preferences",
             "members": members_for("food_dislikes", dislike),
+            "name_code": "dislike", "name_params": {"item": str(dislike)},
         })
 
     ledger.extend(_like_conflict_rows(profile))
@@ -335,6 +347,7 @@ def constraints_ledger(profile: dict, downvoted_count: int = 0) -> list[dict]:
             "type": "soft", "status": "satisfied",
             "source": "your feedback",
             "members": [],
+            "name_code": "downvoted", "name_params": {"count": int(downvoted_count)},
         })
     return ledger
 
@@ -350,6 +363,7 @@ def _goal_rows(profile: dict, household: bool) -> list[dict]:
                 "constraint": _goal_label(slug),
                 "type": "soft", "status": "satisfied",
                 "source": "your goal", "members": [],
+                "name_code": "goal", "name_params": {"goal": str(slug)},
             }
             for slug in (profile.get("dietary_goals") or [])
         ]
@@ -368,6 +382,7 @@ def _goal_rows(profile: dict, household: bool) -> list[dict]:
             "status": "satisfied" if applied else "relaxed",
             "source": "goal",
             "members": [],
+            "name_code": "goal", "name_params": {"goal": slug},
         })
         if member and member not in row["members"]:
             row["members"].append(member)
@@ -381,8 +396,10 @@ def _goal_rows(profile: dict, household: bool) -> list[dict]:
                 "Applied as a preference, not a target — another diner's goal "
                 "sets this plan's numeric targets."
             )
+            row["code"], row["params"] = "goal.preference", {}
         elif household:
             row["detail"] = "Sets this plan's numeric targets."
+            row["code"], row["params"] = "goal.target", {}
 
     return list(rows.values())
 

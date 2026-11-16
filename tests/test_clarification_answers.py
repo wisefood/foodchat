@@ -63,6 +63,8 @@ def clarifying(session_service, sample_profile, monkeypatch):
     class _Clarifier:
         @staticmethod
         def step(state, message):
+            # As the real step does: the answer joins the transcript.
+            state.transcript.append({"question": state.current_question, "answer": message})
             return type("O", (), {
                 "needs_clarification": False,
                 "question": "",
@@ -76,8 +78,10 @@ def clarifying(session_service, sample_profile, monkeypatch):
 
     captured = {}
 
-    def _generate(session_id, final_query, profile, is_refinement):
+    def _generate(session_id, final_query, profile, is_refinement, member_words=None):
         captured["profile"] = profile
+        captured["final_query"] = final_query
+        captured["member_words"] = member_words
         return "ok", False, None
 
     svc._generate_and_store = _generate
@@ -162,3 +166,25 @@ class TestTheAnswerIsHeard:
 
         assert needs is True and plan is None
         assert "profile" not in captured, "it generated a plan mid-question"
+
+
+class TestThePlanHearsTheMemberNotTheRewrite:
+    """The planner's rewrite of a request is a reading, and a reading can add
+    things. In production "plan my day" was rewritten as a day "with two
+    snacks at about 2000 calories"; the grader marked every day down for the
+    missing snacks and the reply promised them. What the grader and the reply
+    writer hear is the member's own request and answers."""
+
+    def test_the_request_and_the_answer_both_reach_generation(self, clarifying, monkeypatch):
+        svc, session_id, captured = clarifying
+        _extractor_says(monkeypatch, PlanSpec(meals=("dinner",)))
+
+        svc.continue_clarification(session_id, "just a dinner")
+
+        words = captured["member_words"]
+        assert "spinach and half a jar of olives" in words
+        assert "just a dinner" in words
+        # The rewrite still travels as the planner's query; it is not what
+        # the member is answered from.
+        assert captured["final_query"] == "dinner using spinach and olives"
+        assert words != captured["final_query"]

@@ -31,8 +31,11 @@ cannot drift apart into two hand-maintained lists.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field, replace
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 # The order preferences are given up when a slot cannot be filled.
 #
@@ -64,6 +67,10 @@ NEVER_RELAXED: frozenset[str] = frozenset({
 # no age, sex, weight or activity data, so anything more specific would be
 # arithmetic performed on nothing.
 DEFAULT_DAILY_KCAL = 2000.0
+
+# A day budget at or above this cannot be met from dishes filtered to
+# `low_calorie`: three of them came to 1,003 kcal against 2,000 in production.
+FULL_DAY_KCAL = 1600.0
 
 
 @dataclass(frozen=True)
@@ -243,6 +250,26 @@ class PlanBrief:
         rationale = str(proposal.get("rationale") or "").strip()
         if rationale:
             updates["rationale"] = rationale[:500]
+
+        # A calorie budget is not a request for low-calorie dishes. The
+        # strategist read "about 2000 calories" as `low_calorie` and the
+        # search then returned only light dishes, so the day landed at half
+        # its budget. Only the strategist's own addition is dropped: a member
+        # who asked for light food, or whose goal is weight loss, already
+        # carries the tag in `self.claim_tags`.
+        budget = updates.get("kcal_target", self.kcal_target) or self.kcal_reference
+        if (
+            budget and budget >= FULL_DAY_KCAL
+            and "low_calorie" in updates.get("claim_tags", ())
+            and "low_calorie" not in self.claim_tags
+        ):
+            updates["claim_tags"] = tuple(
+                tag for tag in updates["claim_tags"] if tag != "low_calorie"
+            )
+            logger.info(
+                "Strategist's low_calorie dropped: a %d kcal day is not a low-calorie request",
+                int(budget),
+            )
 
         return replace(self, **updates) if updates else self
 

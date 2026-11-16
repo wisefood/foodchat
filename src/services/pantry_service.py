@@ -417,6 +417,8 @@ def _ledger_row(facts: dict) -> dict:
         "type": "soft",
         "status": status,
         "source": "your pantry",
+        "name_code": "pantry",
+        "name_params": {"used": facts["used_count"], "total": facts["total"]},
     }
 
 
