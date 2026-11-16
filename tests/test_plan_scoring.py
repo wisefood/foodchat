@@ -206,7 +206,7 @@ PLANNER_PROMPTS = {
     "GUIDELINE_ADHERENCE_SYSTEM_INSTRUCTIONS": "8ee8697411adbae6f21ae8006599fd9ba4ec37f65ad372ab5bc772380fc678a6",
     # Changed on purpose (plan-honesty): the writer describes only the meals
     # in the facts, after a reply promised two snacks the plan did not have.
-    "RESPONSE_WRITER_SYSTEM_INSTRUCTIONS": "c433524c8ffe4e31d86bb708380311c5d0d24195dc0976ca256f01eee0dd73f7",
+    "RESPONSE_WRITER_SYSTEM_INSTRUCTIONS": "a6ec0226e45b96c66b88d1b10b254889ca5a2405942d0501293be6592bdf0546",
     "RESPONSE_WRITER_USER_INSTRUCTIONS": "fd6f19679401c6bc0cb8cd061564751d806559937114a3598c2f81cd1dc0cde8",
 }
 

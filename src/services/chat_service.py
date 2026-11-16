@@ -108,6 +108,21 @@ def no_plan_message(profile: dict) -> str:
     )
 
 
+def _add_calorie_reference(facts: dict, report) -> None:
+    """Tell the writer when the day is far from an average adult's intake.
+
+    Only failed checks reached the reply, and a day measured against the
+    population reference (no target of the member's own) is never "failed",
+    only partly met. So a guest's 1,084 kcal day was announced as "staying
+    under 1,100 kcal", a virtue, while the notice under the plan said it was
+    916 kcal short of what an average adult eats.
+    """
+    for check in report.checks:
+        if check.code == "kcal.miss" and not check.params.get("own"):
+            facts["calorie_reference"] = check.detail
+            return
+
+
 def _names_a_number(text: str) -> bool:
     """Whether the member's words contain a figure a calorie target could be."""
     return bool(re.search(r"\d{3,4}", text or ""))
@@ -737,6 +752,7 @@ class ChatService:
             facts["verified_problems"] = [
                 {"constraint": c.name, "detail": c.detail} for c in report.failed
             ]
+        _add_calorie_reference(facts, report)
         if brief.rationale:
             facts["strategy"] = brief.rationale
         if repair_note:
@@ -967,6 +983,7 @@ class ChatService:
             facts["verified_problems"] = [
                 {"constraint": c.name, "detail": c.detail} for c in report.failed
             ]
+        _add_calorie_reference(facts, report)
         if brief.rationale:
             facts["strategy"] = brief.rationale
         if pantry_facts:

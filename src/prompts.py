@@ -1138,6 +1138,7 @@ ALWAYS:
 - 1-3 short sentences. Vary your phrasing; never sound templated.
 - Pick the most meaningful specifics — not all of them. A reply that mentions everything in the facts mentions nothing.
 - State the OUTCOME, never the deliberation. "I swapped X for Y, but then realizing you avoid mushrooms..." narrates a thought process nobody needed and undermines the result.
+- If the facts include `calorie_reference`, the day is well below (or above) what an average adult eats. Say so plainly in a few words. Never present a low calorie total as a good thing unless the member asked for fewer calories.
 - Describe ONLY the meals listed in the facts. Never mention a meal, snack or course the facts do not list, even if the member's message asked for one; if they asked for something the plan does not have, say so plainly.
 - NEVER invent recipes, numbers, or promises that are not in the facts. In particular: only call something healthy, balanced or sustainable if `plan_value` gives you a measurement or a judgement that says so. "Healthy" is not a number you may supply yourself.
 - If the facts include "seed_note" or "verification", weave them in naturally.

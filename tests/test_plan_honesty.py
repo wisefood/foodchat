@@ -32,7 +32,9 @@ from services import plan_budget                                     # noqa: E40
 
 
 def _dish(rid: str, kcal: float | None) -> CandidateRecipe:
-    nutrition = None if kcal is None else {"calories": kcal, "protein_g": 20}
+    # `kcal`, as plan_client renames RecipeWrangler's `calories` at the
+    # boundary; the budget pick reads either.
+    nutrition = None if kcal is None else {"kcal": kcal, "protein_g": 20}
     return CandidateRecipe(rid, f"Dish {rid}", "beans, rice", "cook", nutrition=nutrition)
 
 
@@ -140,9 +142,11 @@ class TestThePromptsForbidInventing:
 class _Writer:
     def __init__(self):
         self.heard = None
+        self.facts = None
 
     def write(self, facts, query, fallback):
         self.heard = query
+        self.facts = facts
         return f"Here's a day with {facts['meals']['dinner']} for dinner."
 
 
@@ -266,3 +270,31 @@ class TestACalorieTargetIsTheMembersOnlyIfTheySaidOne:
         svc, _session_id, profile = turn  # sample_profile: "2000 calories target"
         brief = svc._brief_for("Plan my day", dict(profile))
         assert brief.kcal_target == 2000
+
+
+class TestALowDayIsNotSoldAsAVirtue:
+    """A guest's day came to 1,084 kcal; the notice said it was 916 kcal under
+    an average adult's intake, and the reply said "staying under 1,100 kcal"
+    as if that were the point. The writer was never told."""
+
+    NO_TARGET = {"diet": [], "allergies": [], "preferences": [], "history": ""}
+
+    def test_the_writer_hears_about_a_reference_miss(self, turn):
+        svc, session_id, _profile = turn
+        svc._generate_and_store(session_id, "plan my day", dict(self.NO_TARGET), False)
+        note = svc.response_writer.facts.get("calorie_reference")
+        assert note and "reference" in note
+
+    def test_a_members_own_target_is_reported_as_a_problem_instead(self, turn):
+        """Their own target already reaches the reply as a failed check."""
+        svc, session_id, profile = turn
+        svc.pipeline.plans = svc.pipeline.plans[:1]  # only the light day
+        svc._generate_and_store(session_id, "plan my day", dict(profile), False)
+        facts = svc.response_writer.facts
+        assert "calorie_reference" not in facts
+        assert any(p["constraint"] == "calories" for p in facts.get("verified_problems", []))
+
+    def test_the_writer_is_told_not_to_praise_a_low_total(self):
+        from prompts import RESPONSE_WRITER_SYSTEM_INSTRUCTIONS as text
+        assert "Never present a low calorie total as a good thing" in text
+
