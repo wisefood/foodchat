@@ -13,8 +13,12 @@ langchain-groq>=1.0.0
 # machine had it as a side effect of something else, so the suite never saw it.
 langchain>=1.0
 
-# Persistence
-sqlalchemy>=2.0.0
+# Persistence. Pinned to the 2.0 line: 2.1 changed the default PostgreSQL
+# driver for plain postgresql:// URLs from psycopg2 to psycopg (3), which is
+# not installed here, and a rebuild on 2026-10-05 took 2.1.3 off PyPI and
+# crash-looped the pod on `No module named 'psycopg'`. Moving to 2.1 means
+# adding psycopg[binary] and running the suite against it, not a rebuild.
+sqlalchemy>=2.0.0,<2.1
 
 # WiseFood platform client (member profiles)
 # Pinned: unpinned, a rebuild silently takes whatever is newest on PyPI, and

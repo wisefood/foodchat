@@ -31,6 +31,12 @@ from sqlalchemy import (
 from sqlalchemy.orm import DeclarativeBase, Session as DBSession, sessionmaker
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./foodchat.db")
+# Name the driver instead of taking SQLAlchemy's default for a bare
+# postgresql:// URL: 2.0 defaults to psycopg2, 2.1 to psycopg (3), and the
+# deployment manifest cannot know which one the image happens to install.
+# The installed driver is psycopg2-binary (requirements.txt).
+if DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = "postgresql+psycopg2://" + DATABASE_URL[len("postgresql://"):]
 _IS_SQLITE = DATABASE_URL.startswith("sqlite")
 
 
