@@ -211,7 +211,9 @@ def _plate(course: Dict[str, Any]) -> Dict[str, Any]:
     nutrition = course.get("nutrition") or {}
     return {
         "recipe_id": course.get("recipe_id") or course.get("id"),
-        "title": course.get("title") or "",
+        # A day plan's course says `title`; a week plan's entry carries the
+        # recipe as the planner retrieved it, which says `recipe_title`.
+        "title": course.get("title") or course.get("recipe_title") or "",
         "role": course.get("role") or "main",
         "kcal": nutrition.get("kcal") if isinstance(nutrition, dict) else None,
         "match_reasons": [

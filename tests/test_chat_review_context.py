@@ -205,13 +205,23 @@ DAILY = {
                "directions": "Bake.", "nutrition": {"kcal": 510}, "match_reasons": []},
 }
 
+def _week_recipe(recipe_id: str, title: str, kcal: float = 400.0) -> dict:
+    """A week plan's recipe as the planner stores it: `recipe_*` keys."""
+    return {
+        "recipe_id": recipe_id, "recipe_title": title,
+        "recipe_ingredients": "cod, lemon", "recipe_directions": "Bake it.",
+        "nutrition": {"kcal": kcal}, "match_reasons": [], "tags": "['main-dish']",
+        "dish_types": "['dinner']", "image_url": None,
+    }
+
+
 WEEKLY = {
     "id": "p-weekly",
     "entries": [
-        {"day": 1, "meal_idx": 0, "meal_type": "breakfast", "recipe": {"recipe_id": "r1", "title": "Oat porridge"}, "reward": 1},
-        {"day": 1, "meal_idx": 2, "meal_type": "dinner", "recipe": {"recipe_id": "r3", "title": "Baked cod"}, "reward": 1},
-        {"day": 1, "meal_idx": 2, "meal_type": "dinner", "recipe": {"recipe_id": "r4", "title": "Green salad"}, "reward": 1, "role": "side"},
-        {"day": 2, "meal_idx": 0, "meal_type": "breakfast", "recipe": {"recipe_id": "r5", "title": "Yoghurt"}, "reward": 1},
+        {"day": 1, "meal_idx": 0, "meal_type": "breakfast", "recipe": _week_recipe("r1", "Oat porridge"), "reward": 1},
+        {"day": 1, "meal_idx": 2, "meal_type": "dinner", "recipe": _week_recipe("r3", "Baked cod", 510), "reward": 1},
+        {"day": 1, "meal_idx": 2, "meal_type": "dinner", "recipe": _week_recipe("r4", "Green salad"), "reward": 1, "role": "side"},
+        {"day": 2, "meal_idx": 0, "meal_type": "breakfast", "recipe": _week_recipe("r5", "Yoghurt"), "reward": 1},
     ],
     "metrics": {"variety": 0.8},
     "constraints_applied": [],
@@ -269,6 +279,7 @@ class TestWhatAPlanWas:
         plan = CHAT_REVIEW_SERVICE.plan_summary("p-weekly")
         dinner = [m for m in plan["meals"] if m["day"] == 1 and m["meal_type"] == "dinner"][0]
         assert [p["title"] for p in dinner["plates"]] == ["Baked cod", "Green salad"]
+        assert dinner["plates"][0]["kcal"] == 510
         assert dinner["plates"][1]["role"] == "side"
         assert len(plan["meals"]) == 3
         assert plan["scores"] == [] and plan["metrics"] == {"variety": 0.8}
@@ -277,6 +288,9 @@ class TestWhatAPlanWas:
         flat = repr(CHAT_REVIEW_SERVICE.plan_summary("p-daily"))
         for private in ("Maria", "allergies", "personalization", "Stir.", "oats, milk"):
             assert private not in flat, private
+        week = repr(CHAT_REVIEW_SERVICE.plan_summary("p-weekly"))
+        for private in ("Maria", "cod, lemon", "Bake it."):
+            assert private not in week, private
 
     def test_a_pruned_plan_is_not_an_error(self, plans):
         assert CHAT_REVIEW_SERVICE.plan_summary("gone") is None
