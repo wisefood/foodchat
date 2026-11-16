@@ -543,10 +543,22 @@ class QueryReconciler:
     def reconcile(self, query: str, user_profile: dict) -> dict:
         # Never-ask-twice (M4c): everything the profile already answers is
         # surfaced to the reconciler so it cannot mark it "missing".
+        # What this conversation already holds counts too: the kitchen the
+        # member listed and the cuisines, moods and flavours heard. They ride
+        # the profile snapshot as underscore keys, and without them here the
+        # reconciler could mark "ingredients" or "cuisine" missing for a
+        # member who had just named both.
+        pantry = user_profile.get("_pantry") or []
+        facets = user_profile.get("_facets") or {}
         known_facts = "; ".join(filter(None, [
             ", ".join(user_profile.get("preferences") or []),
             user_profile.get("history") or "",
             ", ".join(f"likes {like}" for like in (user_profile.get("food_likes") or [])[:5]),
+            ("has these to use up: " + ", ".join(map(str, pantry))) if pantry else "",
+            "; ".join(
+                f"asked for {family.replace('_', ' ')}: {', '.join(map(str, values))}"
+                for family, values in facets.items() if values
+            ),
         ])) or "(nothing on file)"
 
         # Several people eating: say whose restriction each one is. Handed a

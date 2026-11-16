@@ -140,6 +140,76 @@ class TestStartOutcomes:
         assert outcome.final_query == "vegan plan matching profile"
 
 
+class TestTheConversationAlreadyGaveDirection:
+    """What the session holds is as concrete as a saved like.
+
+    Live, a guest listed spinach and feta, said "Mediterranean", and was asked
+    "any cravings, favourite ingredients or cuisines?" — the specificity check
+    judged the query vague and the signal gate read only the durable profile.
+    No profile checker and no question generator payloads are queued below:
+    reaching either raises, so these tests fail if a question is even drafted.
+    """
+
+    BARE = {"diet": [], "allergies": [], "preferences": []}
+
+    def _start(self, **session):
+        mgr = make_manager(
+            reconcile_result={"needs_clarification": False},
+            checker_payloads=[{"response": "NO"}],
+            reformulate_payloads=[{"reformulated_query": "a plan from what they said"}],
+        )
+        return mgr.start("plan my day", {**self.BARE, **session}, "daily_plan")
+
+    def test_the_kitchen_is_direction(self):
+        outcome = self._start(_pantry=["spinach", "feta"])
+        assert not outcome.needs_clarification
+        assert outcome.final_query == "a plan from what they said"
+
+    def test_a_cuisine_heard_is_direction(self):
+        assert not self._start(_facets={"cuisines": ["mediterranean"]}).needs_clarification
+
+    def test_a_named_dish_is_direction(self):
+        assert not self._start(_pinned_slots={"breakfast": {"recipe_id": "r1"}}).needs_clarification
+
+    def test_a_stated_diet_or_nutrition_ask_is_direction(self):
+        assert not self._start(_diet_tags=["vegetarian"]).needs_clarification
+        assert not self._start(_claim_tags=["high_protein"]).needs_clarification
+
+    def test_nothing_held_still_asks(self):
+        mgr = make_manager(
+            reconcile_result={"needs_clarification": False},
+            checker_payloads=[{"response": "NO"}],
+            question_payloads=["Any cravings for today?"],
+        )
+        outcome = mgr.start("plan my day", dict(self.BARE), "daily_plan")
+        assert outcome.question == "Any cravings for today?"
+
+    def test_the_reconciler_is_told_what_the_session_holds(self):
+        from agents import QueryReconciler
+
+        sent: list = []
+
+        class Capture:
+            def invoke(self, messages, config=None):
+                sent.extend(messages)
+
+                class R:
+                    content = json.dumps({"needs_clarification": False, "missing_info": []})
+                return R()
+
+        reconciler = QueryReconciler.__new__(QueryReconciler)
+        reconciler.query_reconciler = Capture()
+        reconciler.reconcile("plan my day", {
+            **self.BARE,
+            "_pantry": ["spinach", "feta"],
+            "_facets": {"cuisines": ["mediterranean"], "flavor_profiles": ["herby"]},
+        })
+        text = " ".join(str(getattr(m, "content", m)) for m in sent)
+        assert "has these to use up: spinach, feta" in text
+        assert "asked for cuisines: mediterranean" in text
+        assert "asked for flavor profiles: herby" in text
+
+
 class TestStateSerialization:
     def test_json_roundtrip(self):
         state = ClarificationState(

@@ -126,6 +126,27 @@ class ClarificationOutcome:
         return self.question is not None
 
 
+def has_session_signal(profile: dict) -> bool:
+    """Whether this conversation already gave the plan a direction.
+
+    What the member said earlier, or set on screen, rides the profile snapshot
+    as underscore keys (`ChatService._apply_standing_state`): the kitchen they
+    listed, a dish they named, a cuisine, mood or flavour heard, a diet or a
+    nutrition ask. Any of them is as concrete as a saved like. Asking "any
+    cravings, favourite ingredients or cuisines?" of a member who has just
+    listed their fridge and said "Mediterranean" is the question this gate
+    exists to suppress, and it was being asked because the gate read only the
+    durable profile.
+    """
+    return bool(
+        profile.get("_pantry")
+        or profile.get("_pinned_slots")
+        or profile.get("_facets")
+        or profile.get("_diet_tags")
+        or profile.get("_claim_tags")
+    )
+
+
 class ClarificationManager:
     """Stateless orchestrator of the clarification state machine.
 
@@ -237,7 +258,8 @@ class ClarificationManager:
         logger.info("Query too general — checking profile signal before asking")
 
         # Deterministic signal gate BEFORE any LLM judgment: dietary goals,
-        # likes, favorites, standing seeds, or applied slider values are all
+        # likes, favorites, standing seeds, applied slider values, or anything
+        # this conversation already holds (`has_session_signal`) are all
         # concrete direction. With any of them we plan immediately — parameter
         # and cuisine topics belong to the slider card shipped with the plan,
         # not to a text interrogation the card was built to replace.
@@ -248,7 +270,7 @@ class ClarificationManager:
             or profile.get("standing_seeds")
             or profile.get("plan_parameters")
         )
-        if has_profile_signal:
+        if has_profile_signal or has_session_signal(profile):
             logger.info("Profile carries concrete signal — planning without questions")
             state = ClarificationState(
                 original_query=query, profile=profile,

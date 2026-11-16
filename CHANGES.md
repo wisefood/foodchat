@@ -2,6 +2,31 @@
 
 ---
 
+# Clarification: what the conversation already said counts as an answer
+
+> **Date:** 2026-11-16
+> **Branch:** main
+> No API change. Fewer clarifying questions; none of them were needed.
+
+Live, a guest listed spinach and feta and asked for "my day with Mediterranean
+food, using what I have", and FoodChat replied "any cravings, favourite
+ingredients or cuisines?". The reconciler had said nothing was missing; the
+specificity check called the query vague, and its signal gate read only the
+durable profile (goals, likes, favourites, seeds, slider values). The kitchen,
+the cuisine heard, a named dish, a stated diet and a nutrition ask were all on
+the profile snapshot as underscore keys, and nothing looked at them.
+
+| What | Detail |
+|---|---|
+| `services/clarification.py` → `has_session_signal` (new), `_specificity_path` | `_pantry`, `_pinned_slots`, `_facets`, `_diet_tags` or `_claim_tags` on the snapshot plans without a question, like a saved like does. A conversation with none of them still gets the one food-direction question. |
+| `agents.py` → `QueryReconciler.reconcile` | The known facts include the kitchen ("has these to use up: spinach, feta") and the facets heard ("asked for cuisines: mediterranean"), so the reconciler cannot mark either missing. |
+
+New tests: `tests/test_clarification.py::TestTheConversationAlreadyGaveDirection`
+(5 of the 6 fail without the change; the sixth pins that a bare conversation
+still asks).
+
+---
+
 # Allergen names, part 2: every EU group, both spellings, read as words
 
 > **Date:** 2026-11-16
