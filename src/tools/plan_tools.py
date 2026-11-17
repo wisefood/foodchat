@@ -951,6 +951,7 @@ def shopping_list(session_id: str, plan_type: str = "") -> dict:
                 f"{_day_label(e.get('day'))} {e.get('meal_type') or 'meal'}",
                 _entry_title(e),
                 ((e.get("recipe") or {}).get("recipe_ingredients") or ""),
+                {"day": e.get("day"), "meal_type": e.get("meal_type") or "meal", "weekdays": True},
             )
             for e in plan.entries
         ]
@@ -962,6 +963,8 @@ def shopping_list(session_id: str, plan_type: str = "") -> dict:
                  if len(plan.day_plans) > 1 else meal.meal_type),
                 plate.title,
                 plate.ingredients or "",
+                {"day": day.day if len(plan.day_plans) > 1 else None,
+                 "meal_type": meal.meal_type, "weekdays": False},
             )
             for day in plan.day_plans
             for meal in day.meals
@@ -976,14 +979,18 @@ def shopping_list(session_id: str, plan_type: str = "") -> dict:
     items: dict[str, dict] = {}
     from services.plan_quality import extract_ingredient_names
 
-    for where, title, text in dishes:
+    for where, title, text, use in dishes:
         # The plan's own normalizer, not a second one. A shopping list that
         # groups items differently from the way the variety score counts them
         # is two answers to "what is in this plan".
         for name in extract_ingredient_names(text):
-            row = items.setdefault(name, {"item": name, "for": []})
+            row = items.setdefault(name, {"item": name, "for": [], "uses": []})
             if where not in row["for"]:
                 row["for"].append(where)
+                # `for` is English prose that the plan analyst reads; `uses`
+                # is the same slot as codes, for the interface to name in the
+                # reader's language. `weekdays` says whether day 1 is Monday.
+                row["uses"].append(use)
 
     ordered = sorted(
         items.values(), key=lambda r: (-len(r["for"]), r["item"]),

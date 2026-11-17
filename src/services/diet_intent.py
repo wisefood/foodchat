@@ -29,6 +29,7 @@ import logging
 import re
 from typing import Optional
 
+import texts
 from models.planning_state import PlanningStateDelta
 from services.candidates_client import split_diet_intent
 
@@ -161,6 +162,8 @@ def suggest_diet_memory(diet_tags, message: str, profile: dict) -> Optional[dict
         "kind": "diet",
         "value": value,
         "statement": (
+            texts.say("memory.diet", diet=texts.quote(texts.term(value)))
+            if texts.active() else
             f"You asked for {label} meals — should I remember that you eat "
             f"{label}, so every plan starts there?"
         ),

@@ -34,6 +34,7 @@ from typing import Optional
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
+import reply_language
 from backend.groq import GROQ_CHAT
 from backend.observability import build_trace_config
 # DEFAULT_MODEL/DEFAULT_TEMPERATURE come from agents rather than a second
@@ -316,7 +317,7 @@ class ClarificationManager:
 
         response = self.question_generator.invoke(
             [
-                SystemMessage(content=USER_INFO_COLLECTOR_SYSTEM.compile()),
+                SystemMessage(content=USER_INFO_COLLECTOR_SYSTEM.compile() + reply_language.instruction()),
                 HumanMessage(content=USER_INFO_COLLECTOR_USER.compile(
                     user_query=state.original_query,
                     preferences=state.profile.get("preferences", []),

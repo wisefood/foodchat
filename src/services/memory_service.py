@@ -27,6 +27,7 @@ import logging
 import uuid
 from typing import Optional
 
+import texts
 from agents import PreferenceExtractor
 from models.household import HOUSEHOLD_KEY, HouseholdContext
 from .profile_service import (
@@ -133,17 +134,21 @@ class MemoryService:
             # Allergy hints always nudge; everything else needs an explicit statement.
             if kind != "allergy_hint" and cand.get("confidence") != "high":
                 continue
+            local = texts.active()
             statement = cand.get("statement") or (
+                texts.say("memory.matters", value=texts.quote(value)) if local else
                 f"It seems “{value}” matters to you — want me to remember this?"
             )
             # Contradiction with the existing profile deserves an explicit callout.
             if kind == "dislike" and value in likes:
                 statement = (
+                    texts.say("memory.gone_off", value=texts.quote(value)) if local else
                     f"“{value}” is currently in your likes, but it sounds like "
                     f"you've gone off it — update your profile?"
                 )
             elif kind in ("like", "cuisine") and value in dislikes:
                 statement = (
+                    texts.say("memory.come_round", value=texts.quote(value)) if local else
                     f"“{value}” is currently in your dislikes, but it sounds like "
                     f"you enjoy it now — update your profile?"
                 )

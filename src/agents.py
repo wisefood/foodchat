@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Optional, Sequence
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
+import reply_language
 from backend.groq import GROQ_CHAT
 from backend.observability import build_trace_config
 from models.recipe import CandidatesBySlot, ScoredPlan, slot_sort_key
@@ -415,7 +416,8 @@ class MealDiversityGrader:
 
     def score(self, plan_text: str) -> dict:
         result = self.client.invoke(as_json_messages([
-            SystemMessage(content=MEAL_DIVERSITY_SYSTEM.compile()),
+            SystemMessage(content=MEAL_DIVERSITY_SYSTEM.compile()
+                          + reply_language.instruction(fields="the `reasoning` field")),
             HumanMessage(content=plan_text),
         ]), config=build_trace_config(run_name="meal_diversity", tags=["metrics"]))
         try:
@@ -436,7 +438,8 @@ class GuidelineAdherenceGrader:
 
     def score(self, plan_text: str, guidelines_text: str) -> dict:
         result = self.client.invoke(as_json_messages([
-            SystemMessage(content=GUIDELINE_ADHERENCE_SYSTEM.compile()),
+            SystemMessage(content=GUIDELINE_ADHERENCE_SYSTEM.compile()
+                          + reply_language.instruction(fields="the `reasoning` field")),
             HumanMessage(content=f"GUIDELINES:\n{guidelines_text}\n\nMEAL PLAN:\n{plan_text}"),
         ]), config=build_trace_config(run_name="guideline_adherence", tags=["metrics"]))
         try:
@@ -475,7 +478,8 @@ class PlanJudge:
     ) -> dict:
         system = PLAN_JUDGE_WEEKLY_SYSTEM if weekly else PLAN_JUDGE_DAILY_SYSTEM
         result = self.client.invoke(as_json_messages([
-            SystemMessage(content=system.compile()),
+            SystemMessage(content=system.compile()
+                          + reply_language.instruction(fields="every `reasoning` field")),
             HumanMessage(content=PLAN_JUDGE_USER.compile(
                 hard_constraints=hard_constraints,
                 conflicts=conflicts,
@@ -517,7 +521,7 @@ class SimpleChatBot:
 
     def chat(self, query: str, history: list[tuple[str, str]] = None) -> str:
         """Respond to ``query`` given recent (role, content) history pairs."""
-        messages = [SystemMessage(content=CHATBOT_SYSTEM.compile())]
+        messages = [SystemMessage(content=CHATBOT_SYSTEM.compile() + reply_language.instruction())]
         for role, content in (history or [])[-CHATBOT_HISTORY_TURNS:]:
             if role == "assistant":
                 messages.append(AIMessage(content=content))
@@ -586,7 +590,8 @@ class QueryReconciler:
             )
 
         result = self.query_reconciler.invoke(as_json_messages([
-            SystemMessage(content=QUERY_RECONCILER_SYSTEM.compile()),
+            SystemMessage(content=QUERY_RECONCILER_SYSTEM.compile()
+                          + reply_language.instruction(fields="`conflict_explanation`")),
             HumanMessage(content=QUERY_RECONCILER_USER.compile(
                 query=query,
                 diet=attributed("diet"),
@@ -816,7 +821,10 @@ class PreferenceExtractor:
     def extract(self, message: str) -> list[dict]:
         try:
             result = self.llm.invoke(as_json_messages([
-                SystemMessage(content=PREFERENCE_EXTRACTOR_SYSTEM.compile()),
+                # Only `statement` is read by the member; `value` is written to
+                # their profile and must stay the canonical English item.
+                SystemMessage(content=PREFERENCE_EXTRACTOR_SYSTEM.compile()
+                              + reply_language.instruction(fields="each `statement`")),
                 HumanMessage(content=PREFERENCE_EXTRACTOR_USER.compile(message=message)),
             ]), config=build_trace_config(run_name="preference_extract", tags=["memory"]))
             memories = json.loads(result.content).get("memories", [])
@@ -919,7 +927,8 @@ class EditCommandExtractor:
         degrades to a whole-plan refinement)."""
         try:
             result = self.llm.invoke(as_json_messages([
-                SystemMessage(content=EDIT_COMMAND_EXTRACTOR_SYSTEM.compile()),
+                SystemMessage(content=EDIT_COMMAND_EXTRACTOR_SYSTEM.compile()
+                              + reply_language.instruction(fields="`question`")),
                 HumanMessage(content=EDIT_COMMAND_EXTRACTOR_USER.compile(
                     plan_type=plan_type, message=message,
                 )),
@@ -950,15 +959,17 @@ class ResponseWriter:
     def write(self, facts: dict, user_message: str, fallback: str) -> str:
         try:
             result = self.llm.invoke([
-                SystemMessage(content=RESPONSE_WRITER_SYSTEM.compile()),
+                SystemMessage(content=RESPONSE_WRITER_SYSTEM.compile() + reply_language.instruction()),
                 HumanMessage(content=RESPONSE_WRITER_USER.compile(
                     facts=json.dumps(facts, ensure_ascii=False),
                     user_message=user_message[:400],
                 )),
             ], config=build_trace_config(run_name="response_write", tags=["chat"]))
             text = (result.content or "").strip()
-            # Guard against runaway or empty generations.
-            if not text or len(text) > 900:
+            # Guard against runaway or empty generations. Hungarian and Greek
+            # say the same thing in more letters than English, so they get room.
+            limit = 900 if reply_language.current() == reply_language.DEFAULT else 1300
+            if not text or len(text) > limit:
                 return fallback
             return text
         except Exception as e:
@@ -982,7 +993,7 @@ class PlanAnalyst:
 
     def answer(self, question: str, plan_summary: str,
                history: list[tuple[str, str]] = None) -> str:
-        messages = [SystemMessage(content=PLAN_ANALYST_SYSTEM.compile())]
+        messages = [SystemMessage(content=PLAN_ANALYST_SYSTEM.compile() + reply_language.instruction())]
         for role, content in (history or [])[-CHATBOT_HISTORY_TURNS:]:
             if role == "assistant":
                 messages.append(AIMessage(content=content))
@@ -1315,8 +1326,9 @@ class SessionTitler:
     not a reasoning task, and it happens once per session.
     """
 
-    # Longer than any name this prompt should produce; the column allows 120.
-    _MAX_LEN = 60
+    # Longer than any name this prompt should produce, with room for Hungarian
+    # and Greek, which take more letters to say it; the column allows 120.
+    _MAX_LEN = 80
 
     def __init__(self, model: str = None, temperature: float = None):
         self.llm = GROQ_CHAT.get_client(
@@ -1350,7 +1362,8 @@ class SessionTitler:
     def title(self, message: str) -> Optional[str]:
         try:
             result = self.llm.invoke([
-                SystemMessage(content=SESSION_TITLE_SYSTEM.compile()),
+                SystemMessage(content=SESSION_TITLE_SYSTEM.compile() + reply_language.instruction(
+                    fields="the title (an answer of NONE stays NONE)")),
                 HumanMessage(content=SESSION_TITLE_USER.compile(message=message)),
             ], config=build_trace_config(run_name="session_title", tags=["session"]))
             return self._clean(result.content)

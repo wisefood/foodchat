@@ -29,6 +29,7 @@ from urllib.parse import quote
 import httpx
 
 import obs_context
+import reply_language
 
 from models.attribution import Attribution, Citation
 from .session_service import SessionService
@@ -79,6 +80,9 @@ class FoodScholarClient:
             "mode": "simple",
             "member_id": member_id,
             "top_k": FOODSCHOLAR_TOP_K,
+            # FoodScholar writes its answer in this language; without it, every
+            # nutrition answer inside a chat came back in English.
+            "language": reply_language.current(),
         }
         if qa_thread_id:
             payload["qa_thread_id"] = qa_thread_id

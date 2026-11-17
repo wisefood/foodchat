@@ -29,6 +29,7 @@ load_dotenv()
 from fastapi import FastAPI  # noqa: E402 — must follow load_dotenv()
 
 import auth  # noqa: E402
+import reply_language  # noqa: E402
 from db import init_db  # noqa: E402
 from routers import foodchat_router, review_router  # noqa: E402
 from services import (  # noqa: E402
@@ -143,6 +144,11 @@ app.middleware("http")(auth.assertion_middleware)
 # after the assertion middleware, so it sits outermost: the id exists before
 # anything else can log, including an assertion rejection.
 app.add_middleware(obs_context.RequestContextMiddleware)
+
+# The reader's interface language (the gateway forwards X-Locale), for every
+# text written for them. Outermost, so the assertion middleware's child task
+# inherits it.
+app.add_middleware(reply_language.ReplyLanguageMiddleware)
 
 if auth.enforcing():
     logger.info("Member assertions ENFORCED (FOODCHAT_ASSERTION_SECRET is set).")

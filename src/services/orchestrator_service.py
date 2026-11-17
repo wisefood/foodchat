@@ -59,6 +59,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Optional
 
+import texts
 from agents import DishIngredientEstimator, OrchestratorAgent, PlanAnalyst, ToolSelector
 from backend.observability import trace_context
 from models.attribution import Attribution
@@ -194,6 +195,7 @@ class OrchestratorService:
         return ChatTurn(
             role="assistant",
             content=(
+                texts.say("turn.limit", limit=session.max_messages) if texts.active() else
                 f"This conversation has reached the {session.max_messages}-message limit. "
                 "Please start a new session to continue."
             ),
@@ -257,6 +259,7 @@ class OrchestratorService:
         return ChatTurn(
             role="assistant",
             content=(
+                texts.say("turn.busy") if texts.active() else
                 "I'm still working on your last message — give me a moment and "
                 "then try again."
             ),
@@ -1185,6 +1188,9 @@ class OrchestratorService:
         named = ", ".join(f"“{title}”" for _rid, title in resolved_favorites)
 
         offer_text = (
+            texts.say("favorites.offer", named=", ".join(
+                texts.quote(title) for _rid, title in resolved_favorites))
+            if texts.active() else
             f"Before I plan — I noticed you've favorited {named}. "
             "Want me to work them into this plan? (yes / no)"
         )
@@ -1424,6 +1430,7 @@ class OrchestratorService:
         except Exception as e:
             logger.warning("[%s] PlanAnalyst failed: %s", session_id, e)
             answer = (
+                texts.say("analyst.failed") if texts.active() else
                 "I couldn't analyze the plan just now — try asking again, or "
                 "tell me what you'd like changed and I'll take it from there."
             )
@@ -1567,13 +1574,17 @@ class OrchestratorService:
                 state = self.session_service.get_planning_state(session_id)
                 state = state.merge(delta)
                 self.session_service.set_planning_state(session_id, state)
-                if state.pantry:
+                if state.pantry and texts.active():
+                    text = texts.say("pantry.noted", items=", ".join(state.pantry))
+                elif state.pantry:
                     text = (
                         "Noted — I'll plan around your "
                         + ", ".join(state.pantry)
                         + " to keep food waste down. Ask me for a daily or "
                         "weekly plan and I'll work them in."
                     )
+                elif texts.active():
+                    text = texts.say("pantry.cleared")
                 else:
                     text = "Noted — I've cleared those from your use-up list."
                 self.session_service.add_message(session_id, "user", message)
@@ -2078,11 +2089,13 @@ class OrchestratorService:
         logger.info("[%s] switch_plan_type → %s", session_id, target)
 
         if target == "weekly":
-            ack = "Sure! I'm setting aside the daily plan and starting a fresh weekly plan for you."
+            ack = (texts.say("switch.weekly") if texts.active() else
+                   "Sure! I'm setting aside the daily plan and starting a fresh weekly plan for you.")
             self.session_service.add_message(session_id, "assistant", ack, intent="switch_plan_type")
             return self._handle_weekly(session_id, message, "weekly_plan", is_refinement=False)
 
-        ack = "Sure! I'm setting aside the weekly plan and starting a fresh daily plan for you."
+        ack = (texts.say("switch.daily") if texts.active() else
+               "Sure! I'm setting aside the weekly plan and starting a fresh daily plan for you.")
         self.session_service.add_message(session_id, "assistant", ack, intent="switch_plan_type")
         return self._handle_plan(session_id, message, "daily_plan", is_refinement=False)
 

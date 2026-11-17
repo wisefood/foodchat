@@ -29,6 +29,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Optional
 
+import texts
 from agents import EditCommandExtractor
 from models.recipe import CandidateRecipe, RecipeEnrichment
 from models.household import table_favorites
@@ -1021,6 +1022,8 @@ class EditService:
 
     @staticmethod
     def _success_text(changed: dict, predicate, *, weekdays: bool = True) -> str:
+        if texts.active():
+            return EditService._success_text_localized(changed, predicate, weekdays=weekdays)
         where = EditService._slot_phrase(
             changed["meal_type"], changed["day"], weekdays=weekdays,
         )
@@ -1046,8 +1049,46 @@ class EditService:
         return text
 
     @staticmethod
+    def _success_text_localized(changed: dict, predicate, *, weekdays: bool) -> str:
+        """`_success_text` in the reader's language (src/texts.py), same branches."""
+        text = texts.say(
+            "edit.done",
+            where=texts.slot(changed["meal_type"], changed["day"], weekdays=weekdays),
+            old=texts.quote(changed["old"]["title"]),
+            new=texts.quote(changed["new"]["title"]),
+        )
+        old_kcal, new_kcal = changed["old"]["kcal"], changed["new"]["kcal"]
+        directive = texts.quote(texts.term(changed["directive"]))
+        if predicate.kind == "lighter" and old_kcal and new_kcal:
+            text += texts.say("edit.lighter", old=f"{old_kcal:.0f}", new=f"{new_kcal:.0f}")
+        elif predicate.kind == "uses_ingredient":
+            text += texts.say("edit.uses", tag=predicate.tag)
+        elif predicate.verifiable and changed["verified"]:
+            text += texts.say("edit.verified", directive=directive)
+        elif changed.get("named_dish"):
+            pass
+        elif changed.get("named_miss"):
+            text += texts.say("edit.named_miss", dish=texts.quote(changed["named_miss"]))
+        elif not predicate.verifiable:
+            text += texts.say("edit.best_match", directive=directive)
+        return text
+
+    @staticmethod
     def _failure_text(meal_type, predicate, facts, day=None, *,
                       weekdays: bool = True) -> str:
+        if texts.active():
+            text = texts.say(
+                "edit.failed",
+                where=texts.slot(meal_type, day, weekdays=weekdays),
+                directive=texts.quote(texts.term(predicate.directive)),
+            )
+            nearest = facts.get("nearest_miss")
+            if nearest and nearest.get("kcal") is not None:
+                return text + texts.say(
+                    "edit.failed_nearest", title=texts.quote(nearest["title"]),
+                    kcal=f"{nearest['kcal']:.0f}",
+                )
+            return text + texts.say("edit.failed_relax")
         where = EditService._slot_phrase(meal_type, day, weekdays=weekdays)
         text = (f"I looked for a replacement for {where} that's provably "
                 f"“{predicate.directive}”, but nothing in the matching recipes passes the bar")
