@@ -162,3 +162,19 @@ class TestFixedSentences:
         import texts
         for key, by_lang in texts._TEXT.items():
             assert set(by_lang) == {"hu", "sl", "el"}, key
+
+    def test_a_meal_the_plan_does_not_have(self):
+        from types import SimpleNamespace
+        from services.edit_service import EditService
+        days = [SimpleNamespace(day=1, meals=[SimpleNamespace(meal_type="dinner")])]
+        text = self._in("sl", lambda: EditService._structured_miss_text(days, 1, "lunch"))
+        assert text.startswith("V tem načrtu ni obroka »kosilo« — ima: večerja.")
+        english = EditService._structured_miss_text(days, 1, "lunch")
+        assert english.startswith("This plan has no lunch — it has dinner.")
+
+    def test_a_day_the_plan_does_not_have(self):
+        from types import SimpleNamespace
+        from services.edit_service import EditService
+        days = [SimpleNamespace(day=1, meals=[]), SimpleNamespace(day=2, meals=[])]
+        text = self._in("hu", lambda: EditService._structured_miss_text(days, 3, "lunch"))
+        assert text.startswith("Ez a terv ezeket a napokat fedi le: 1. nap, 2. nap — 3. nap nincs benne.")

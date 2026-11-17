@@ -336,8 +336,9 @@ class EditService:
 
         canvas = session.active_canvas
         if canvas is None:
-            text = ("There's no plan on the canvas yet — ask me for a daily or "
-                    "weekly plan first, then I can swap meals in it.")
+            text = texts.say("edit.no_canvas") if texts.active() else (
+                "There's no plan on the canvas yet — ask me for a daily or "
+                "weekly plan first, then I can swap meals in it.")
             self.session_service.add_message(session_id, "user", message)
             self.session_service.add_message(session_id, "assistant", text)
             return EditOutcome(text=text)
@@ -367,6 +368,8 @@ class EditService:
         )
         if missing_slot:
             question = command.get("question") or (
+                texts.say("edit.which_meal_day" if needs_day else "edit.which_meal")
+                if texts.active() else
                 "Which meal should I swap — breakfast, lunch, or dinner"
                 + (", and on which day?" if needs_day else "?")
             )
@@ -601,7 +604,8 @@ class EditService:
                     day: Optional[int] = None) -> EditOutcome:
         plan = session.get_current_daily_plan()
         if plan is None:
-            text = "I couldn't find the current daily plan to edit."
+            text = (texts.say("edit.no_daily") if texts.active() else
+                    "I couldn't find the current daily plan to edit.")
             self.session_service.add_message(session.session_id, "assistant", text)
             return EditOutcome(text=text)
 
@@ -811,6 +815,11 @@ class EditService:
         """Say what the plan actually covers rather than editing the wrong slot."""
         numbers = [int(getattr(dp, "day", i + 1)) for i, dp in enumerate(days)]
         matching = [dp for i, dp in enumerate(days) if numbers[i] == day]
+        if not matching and texts.active():
+            return texts.say(
+                "edit.no_day", span=", ".join(texts.day(n, weekdays=False) for n in numbers),
+                day=texts.day(day, weekdays=False),
+            )
         if not matching:
             span = ", ".join(f"day {n}" for n in numbers)
             return (
@@ -818,6 +827,11 @@ class EditService:
                 "Tell me which of those you meant and I'll swap it."
             )
         have = [m.meal_type for m in matching[0].meals]
+        if texts.active():
+            return texts.say(
+                "edit.no_meal", meal=texts.quote(texts.meal(meal_type)),
+                have=", ".join(texts.meal(m) for m in have) or texts.say("edit.no_meals"),
+            )
         # Offering to ADD it, not asking which existing meal to change.
         #
         # The old sentence sent the member in a circle: they asked for a meal
@@ -833,7 +847,8 @@ class EditService:
     def _edit_weekly(self, session, day: int, meal_type: str, predicate, original_message: str) -> EditOutcome:
         plan = session.get_current_weekly_plan()
         if plan is None:
-            text = "I couldn't find the current weekly plan to edit."
+            text = (texts.say("edit.no_weekly") if texts.active() else
+                    "I couldn't find the current weekly plan to edit.")
             self.session_service.add_message(session.session_id, "assistant", text)
             return EditOutcome(text=text)
 
@@ -843,7 +858,8 @@ class EditService:
             None,
         )
         if target is None:
-            text = f"I couldn't find {meal_type} on {DAY_NAMES[day - 1]} in the current plan."
+            text = (texts.say("edit.no_slot", slot=texts.slot(meal_type, day)) if texts.active() else
+                    f"I couldn't find {meal_type} on {DAY_NAMES[day - 1]} in the current plan.")
             self.session_service.add_message(session.session_id, "assistant", text)
             return EditOutcome(text=text)
 

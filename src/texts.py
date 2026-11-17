@@ -122,6 +122,50 @@ _TEXT = {
         "sl": ". Naj omilim zahtevo ali kakšno drugo omejitev?",
         "el": ". Να χαλαρώσω την απαίτηση ή κάποιον άλλο περιορισμό;",
     },
+    "edit.no_canvas": {
+        "hu": "Még nincs terv — előbb kérj napi vagy heti tervet, utána tudok benne étkezéseket cserélni.",
+        "sl": "Načrta še ni — najprej prosi za dnevni ali tedenski načrt, potem lahko v njem zamenjam obroke.",
+        "el": "Δεν υπάρχει ακόμα πλάνο — ζήτησέ μου πρώτα ημερήσιο ή εβδομαδιαίο πλάνο και μετά μπορώ να αλλάξω γεύματα σε αυτό.",
+    },
+    "edit.which_meal": {
+        "hu": "Melyik étkezést cseréljem — a reggelit, az ebédet vagy a vacsorát?",
+        "sl": "Kateri obrok naj zamenjam — zajtrk, kosilo ali večerjo?",
+        "el": "Ποιο γεύμα να αλλάξω — πρωινό, μεσημεριανό ή βραδινό;",
+    },
+    "edit.which_meal_day": {
+        "hu": "Melyik étkezést cseréljem (reggeli, ebéd vagy vacsora), és melyik napon?",
+        "sl": "Kateri obrok naj zamenjam (zajtrk, kosilo ali večerja) in na kateri dan?",
+        "el": "Ποιο γεύμα να αλλάξω (πρωινό, μεσημεριανό ή βραδινό) και ποια μέρα;",
+    },
+    "edit.no_daily": {
+        "hu": "Nem találom a mostani napi tervet, amit módosíthatnék.",
+        "sl": "Trenutnega dnevnega načrta za urejanje ni mogoče najti.",
+        "el": "Δεν βρίσκω το τρέχον ημερήσιο πλάνο για να το αλλάξω.",
+    },
+    "edit.no_weekly": {
+        "hu": "Nem találom a mostani heti tervet, amit módosíthatnék.",
+        "sl": "Trenutnega tedenskega načrta za urejanje ni mogoče najti.",
+        "el": "Δεν βρίσκω το τρέχον εβδομαδιαίο πλάνο για να το αλλάξω.",
+    },
+    "edit.no_day": {
+        "hu": "Ez a terv ezeket a napokat fedi le: {span} — {day} nincs benne. Mondd meg, melyikre gondoltál, és kicserélem.",
+        "sl": "Ta načrt zajema: {span}; {day} ni v njem. Povej, katerega misliš, in ga zamenjam.",
+        "el": "Αυτό το πλάνο καλύπτει: {span} — η {day} δεν υπάρχει. Πες μου ποια εννοείς και θα την αλλάξω.",
+    },
+    "edit.no_meal": {
+        "hu": "Ebben a tervben nincs {meal} — ez van benne: {have}. Kérd, hogy tervezzek bele egyet, "
+              "vagy mondd meg, melyiket változtassam meg.",
+        "sl": "V tem načrtu ni obroka {meal} — ima: {have}. Prosi, naj ga dodam, "
+              "ali povej, katerega od teh naj spremenim.",
+        "el": "Αυτό το πλάνο δεν έχει {meal} — έχει: {have}. Ζήτησέ μου να το προσθέσω "
+              "ή πες μου ποιο από αυτά να αλλάξω.",
+    },
+    "edit.no_meals": {"hu": "semmit", "sl": "nič", "el": "τίποτα"},
+    "edit.no_slot": {
+        "hu": "Nem találom ezt az étkezést a mostani tervben: {slot}.",
+        "sl": "V trenutnem načrtu ni tega obroka: {slot}.",
+        "el": "Δεν βρίσκω αυτό το γεύμα στο τρέχον πλάνο: {slot}.",
+    },
     "memory.matters": {
         "hu": "Úgy tűnik, ez fontos neked: {value} — megjegyezzem?",
         "sl": "Zdi se, da ti je to pomembno: {value} — si to zapomnim?",
