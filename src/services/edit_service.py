@@ -659,7 +659,8 @@ class EditService:
         if new_rich:
             new_course.nutrition = new_rich.nutrition_dict() or new_course.nutrition
             new_course.image_url = new_rich.image_url or new_course.image_url
-        new_course.match_reasons = [{"kind": "pinned", "label": "swapped at your request"}]
+        new_course.match_reasons = [{"kind": "pinned", "label": (
+            texts.say("reason.swapped") if texts.active() else "swapped at your request")}]
         new_plan.constraints_applied = plan.constraints_applied
         new_plan.personalization_summary = plan.personalization_summary
 
@@ -762,7 +763,8 @@ class EditService:
             # a picture must not erase the one the candidate arrived with.
             replacement.image_url = new_rich.image_url or replacement.image_url
         replacement.match_reasons = [
-            {"kind": "pinned", "label": "swapped at your request"}
+            {"kind": "pinned", "label": (
+                texts.say("reason.swapped") if texts.active() else "swapped at your request")}
         ]
         new_days[di].meals[mi].plates[pi] = replacement
 

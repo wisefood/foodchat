@@ -14,6 +14,7 @@ Reason kinds (shared contract with the UI):
 
 from typing import Optional
 
+import texts
 from services.candidates_client import display_allergen
 
 
@@ -27,17 +28,18 @@ def match_reasons(
     reasons: list[dict] = []
 
     if course_recipe_id in pinned_recipe_ids:
-        reasons.append({"kind": "pinned", "label": "requested by you"})
+        reasons.append({"kind": "pinned", "label": texts.say("reason.requested") if texts.active() else "requested by you"})
 
     if course_recipe_id in (profile.get("favorite_recipe_ids") or []):
-        reasons.append({"kind": "favorite", "label": "one of your favorites"})
+        reasons.append({"kind": "favorite", "label": texts.say("reason.favorite") if texts.active() else "one of your favorites"})
     else:
         # Another diner's favourite, boosted for the table: say whose.
         whose = (profile.get("household_favorites") or {}).get(str(course_recipe_id))
         if whose:
             reasons.append({
                 "kind": "diner",
-                "label": "one of " + _names([f"{name}'s" for name in whose]) + " favorites",
+                "label": texts.say("reason.diner_favorite", names=texts.names(whose)) if texts.active()
+                else "one of " + _names([f"{name}'s" for name in whose]) + " favorites",
             })
 
     text = (ingredients_text or "").lower()
@@ -72,10 +74,13 @@ def match_reasons(
             who = likers.get(like_l)
             if who:
                 # Another diner's like, not the session member's: say whose.
-                reasons.append({"kind": "diner", "label": f"{_names(who)} like{'s' if len(who) == 1 else ''} {like_l}"})
+                reasons.append({"kind": "diner", "label": (
+                    texts.say("reason.diner_likes", names=texts.names(who), like=like_l) if texts.active()
+                    else f"{_names(who)} like{'s' if len(who) == 1 else ''} {like_l}")})
             else:
                 kind = "memory" if like_l in memory_values else "profile"
-                reasons.append({"kind": kind, "label": f"you like {like_l}"})
+                reasons.append({"kind": kind, "label": (
+                    texts.say("reason.you_like", like=like_l) if texts.active() else f"you like {like_l}")})
             break  # one like-chip per course keeps cards readable
 
     return reasons

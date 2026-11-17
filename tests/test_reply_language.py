@@ -178,3 +178,15 @@ class TestFixedSentences:
         days = [SimpleNamespace(day=1, meals=[]), SimpleNamespace(day=2, meals=[])]
         text = self._in("hu", lambda: EditService._structured_miss_text(days, 3, "lunch"))
         assert text.startswith("Ez a terv ezeket a napokat fedi le: 1. nap, 2. nap — 3. nap nincs benne.")
+
+    def test_names_join_with_the_languages_own_and(self):
+        import texts
+        assert texts.names(["Anna", "Bence", "Csilla"], "hu") == "Anna, Bence és Csilla"
+        assert texts.names(["Ana", "Luka"], "sl") == "Ana in Luka"
+        assert texts.names(["Anna"], "el") == "Anna"
+
+    def test_a_pantry_chip(self):
+        from services.pantry_service import _badge_reasons
+        chip = self._in("sl", lambda: _badge_reasons(["tomatoes", "spinach"]))
+        assert chip == [{"kind": "pantry", "label": "porabi: tomatoes, spinach — manj zavržene hrane"}]
+        assert _badge_reasons(["tomatoes"])[0]["label"].startswith("uses your tomatoes")

@@ -166,6 +166,17 @@ _TEXT = {
         "sl": "V trenutnem načrtu ni tega obroka: {slot}.",
         "el": "Δεν βρίσκω αυτό το γεύμα στο τρέχον πλάνο: {slot}.",
     },
+    "reason.requested": {"hu": "te kérted", "sl": "na tvojo željo", "el": "το ζήτησες εσύ"},
+    "reason.swapped": {"hu": "kérésedre cserélve", "sl": "zamenjano na tvojo željo", "el": "άλλαξε όπως ζήτησες"},
+    "reason.favorite": {"hu": "az egyik kedvenced", "sl": "med tvojimi priljubljenimi", "el": "από τα αγαπημένα σου"},
+    "reason.diner_favorite": {"hu": "{names} kedvence", "sl": "priljubljeno pri: {names}", "el": "αγαπημένο για: {names}"},
+    "reason.diner_likes": {"hu": "{names} szereti: {like}", "sl": "po okusu: {names} ({like})", "el": "αρέσει σε: {names} ({like})"},
+    "reason.you_like": {"hu": "szereted: {like}", "sl": "tebi všeč: {like}", "el": "σου αρέσει: {like}"},
+    "reason.pantry": {
+        "hu": "felhasználja: {items} — kevesebb pazarlás",
+        "sl": "porabi: {items} — manj zavržene hrane",
+        "el": "χρησιμοποιεί: {items} — λιγότερη σπατάλη",
+    },
     "memory.matters": {
         "hu": "Úgy tűnik, ez fontos neked: {value} — megjegyezzem?",
         "sl": "Zdi se, da ti je to pomembno: {value} — si to zapomnim?",
@@ -276,6 +287,17 @@ def slot(meal_type: object, n: object = None, *, weekdays: bool = True,
     """A slot in the nominative: "vacsora", "vacsora (szerda)", "večerja (2. dan)"."""
     name = meal(meal_type, lang)
     return f"{name} ({day(n, weekdays=weekdays, lang=lang)})" if n else name
+
+
+_AND = {"hu": "és", "sl": "in", "el": "και"}
+
+
+def names(items: list, lang: Optional[str] = None) -> str:
+    """Anna; Anna és Bence; Anna, Bence és Csilla."""
+    items = [str(i) for i in items]
+    if len(items) < 2:
+        return "".join(items)
+    return ", ".join(items[:-1]) + f" {_AND.get(_lang(lang), 'and')} " + items[-1]
 
 
 def say(key: str, lang: Optional[str] = None, **params) -> str:

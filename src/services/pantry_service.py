@@ -38,6 +38,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 from typing import Iterable, Optional
 
+import texts
 from models.planning_state import PlanningStateDelta
 from models.recipe import CandidateRecipe
 
@@ -402,7 +403,8 @@ def _badge_reasons(matches: list[str]) -> list[dict]:
     is that every user-facing claim comes from the matcher; the food-waste chip
     already carries the intent without asserting the item's history.
     """
-    label = "uses your " + ", ".join(matches) + f" — {BADGE_FOODWASTE}"
+    label = (texts.say("reason.pantry", items=", ".join(matches)) if texts.active()
+             else "uses your " + ", ".join(matches) + f" — {BADGE_FOODWASTE}")
     return [{"kind": "pantry", "label": label}]
 
 
