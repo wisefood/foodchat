@@ -190,3 +190,11 @@ class TestFixedSentences:
         chip = self._in("sl", lambda: _badge_reasons(["tomatoes", "spinach"]))
         assert chip == [{"kind": "pantry", "label": "porabi: tomatoes, spinach — manj zavržene hrane"}]
         assert _badge_reasons(["tomatoes"])[0]["label"].startswith("uses your tomatoes")
+
+    def test_the_reader_is_addressed_informally_as_you(self):
+        assert "tikanje" in reply_language.instruction("sl")
+        assert "never write as if you were the reader" in reply_language.instruction("hu", fields="each `statement`")
+
+    def test_the_title_request_repeats_the_language(self):
+        assert reply_language.request_line("sl") == "\n\n(Answer in Slovenian (slovenščina).)"
+        assert reply_language.request_line("en") == ""

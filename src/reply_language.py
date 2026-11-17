@@ -26,6 +26,15 @@ from typing import Optional
 LOCALE_HEADER = "X-Locale"
 DEFAULT = "en"
 
+#: How the interface addresses the reader in each language: informally, as
+#: "you". A reply that switched to the formal form, or spoke as the reader
+#: ("I like to cook…" in a memory offer), read as a different product.
+_REGISTER = {
+    "hu": "informally (tegezés: te)",
+    "sl": "informally (tikanje: ti)",
+    "el": "informally (εσύ)",
+}
+
 #: The interface languages (wisefood-ui app/i18n/locales). The value is the
 #: name a prompt uses, with the language's own name so the model cannot
 #: mistake one for a neighbour (Slovenian for Slovak, above all).
@@ -94,18 +103,36 @@ def instruction(code: Optional[str] = None, *, fields: Optional[str] = None) -> 
         "Keep recipe titles exactly as they are given (they must match the "
         "meal cards the reader sees)"
     )
+    register = (
+        f"Address the reader {_REGISTER[lang]}, in the second person, as the "
+        "app does; never write as if you were the reader."
+    )
     if fields:
         return (
             f"\n\nLANGUAGE: the reader uses the app in {language}. Write {fields} "
-            f"in {language}. {titles}. Every other field, and every key, code and "
-            "enum value, stays in English exactly as specified above."
+            f"in {language}. {register} {titles}. Every other field, and every "
+            "key, code and enum value, stays in English exactly as specified above."
         )
     return (
         f"\n\nLANGUAGE: the reader uses the app in {language}. Write every "
         f"sentence the reader will see in {language}, whatever language the "
-        f"conversation, the profile or the data below is in. {titles}, and "
-        "keep JSON keys, codes and enum values in English."
+        f"conversation, the profile or the data below is in. {register} "
+        f"{titles}, and keep JSON keys, codes and enum values in English."
     )
+
+
+def request_line(code: Optional[str] = None) -> str:
+    """A one-line reminder for the user turn of a small model's prompt; empty for English.
+
+    The session titler runs on the fast model, which followed the system
+    prompt's examples (English, Title Case) over its closing language line:
+    a Slovenian conversation was still named "Mediterranean High Protein
+    Light Dinner". Said again in the request itself, it is followed.
+    """
+    lang = normalize(code) if code else current()
+    if lang == DEFAULT:
+        return ""
+    return f"\n\n(Answer in {SUPPORTED[lang]}.)"
 
 
 class ReplyLanguageMiddleware:

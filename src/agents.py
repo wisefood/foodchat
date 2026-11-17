@@ -1364,7 +1364,8 @@ class SessionTitler:
             result = self.llm.invoke([
                 SystemMessage(content=SESSION_TITLE_SYSTEM.compile() + reply_language.instruction(
                     fields="the title (an answer of NONE stays NONE)")),
-                HumanMessage(content=SESSION_TITLE_USER.compile(message=message)),
+                HumanMessage(content=SESSION_TITLE_USER.compile(message=message)
+                             + reply_language.request_line()),
             ], config=build_trace_config(run_name="session_title", tags=["session"]))
             return self._clean(result.content)
         except Exception as exc:  # noqa: BLE001
