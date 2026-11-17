@@ -36,6 +36,7 @@ import httpx
 
 from models.plan_spec import PlanSpec, slot_kind
 from models.recipe import CandidateRecipe
+from services.dislikes import expand_dislikes
 
 logger = logging.getLogger(__name__)
 
@@ -256,7 +257,9 @@ class PlanClient:
             "slots": request_slots,
             "diet": diet or [],
             "exclude_allergens": allergens or [],
-            "exclude_ingredients": exclude_ingredients or [],
+            # Categories in the words recipes use: "fish" alone never
+            # matched a tuna recipe (see services/dislikes.py).
+            "exclude_ingredients": expand_dislikes(exclude_ingredients),
             "include_ingredients": include_ingredients or [],
             "cuisines": cuisines or [],
             "moods": moods or [],
@@ -359,7 +362,7 @@ class PlanClient:
             "slots": [],
             "exclude_allergens": allergens or [],
             "diet": diet or [],
-            "exclude_ingredients": exclude_ingredients or [],
+            "exclude_ingredients": expand_dislikes(exclude_ingredients),
             "course_types": course_types or [],
             "exclude_recipe_ids": exclude_recipe_ids or [],
             "favorite_recipe_ids": favorite_recipe_ids or [],

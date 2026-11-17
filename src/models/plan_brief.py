@@ -112,6 +112,10 @@ class PlanBrief:
     pantry: tuple[str, ...] = ()
     anchors: dict[str, str] = field(default_factory=dict)
     exclude_recipe_ids: tuple[str, ...] = ()
+    # What the member dislikes, as they wrote it. Checked on the finished plan
+    # (plan_verifier) — sent to the search as `exclude_ingredients` by the
+    # fetch sites, expanded into what recipes call them.
+    dislikes: tuple[str, ...] = ()
 
     # ── policy ──────────────────────────────────────────────────────────
     relaxation_order: tuple[str, ...] = DEFAULT_RELAXATION_ORDER
@@ -170,6 +174,7 @@ class PlanBrief:
             pantry=tuple(profile.get("_pantry") or getattr(state, "pantry", ()) or ()),
             anchors=dict(getattr(state, "anchors", {}) or {}),
             exclude_recipe_ids=tuple(profile.get("_excluded_recipe_ids") or ()),
+            dislikes=tuple(str(d) for d in (profile.get("food_dislikes") or ()) if d),
         )
 
     def with_strategy(self, proposal: dict, vocabularies: Optional[dict] = None) -> "PlanBrief":
@@ -298,6 +303,7 @@ class PlanBrief:
             "min_nutri_score": self.min_nutri_score,
             "pantry": list(self.pantry),
             "anchors": dict(self.anchors),
+            "dislikes": list(self.dislikes),
         }
 
     def facet_kwargs(self) -> dict:

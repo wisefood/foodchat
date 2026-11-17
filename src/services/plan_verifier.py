@@ -84,6 +84,8 @@ class Check:
     # Hungarian and Slovenian living labs read every one of these sentences.
     code: str = ""
     params: dict = field(default_factory=dict)
+    # Every finding, when `params` can only carry the first few (dislikes).
+    found: tuple = ()
 
     @property
     def is_blocking(self) -> bool:
@@ -153,6 +155,80 @@ class VerificationReport:
         return rows
 
 
+#: Marks the dislike rows `merge` changed or added, so a second merge (after a
+#: repair changed the plates) starts from the profile's rows again.
+_MEASURED_DISLIKE = "dislikes"
+
+
+def merge(rows, report: "VerificationReport") -> list[dict]:
+    """The plan's rule list with this report's measurements in it.
+
+    Measured rows are appended, as before. Dislikes are folded in rather than
+    appended: the profile's "avoiding X" rows (household attribution, a name
+    code) said "satisfied" without looking; now one that a dish breaks says
+    "violated" and names the dish, a disliked food not among the rows shown
+    gets a row of its own, and the summary row stays only when nothing was
+    found — otherwise the member would read the same finding twice.
+
+    Safe to call again on its own output: rows it touched are reset first.
+    """
+    out: list[dict] = []
+    for row in rows or []:
+        if row.get("measured") == _MEASURED_DISLIKE:
+            if row.get("added"):
+                continue
+            row = {k: v for k, v in row.items() if k not in ("measured", "code", "params", "detail")}
+            row["status"] = "satisfied"
+        out.append(dict(row))
+
+    check = report.get("dislikes") if report else None
+    measured = report.as_ledger_rows() if report else []
+    if check is None:
+        return out + measured
+
+    dishes_for: dict[str, list[str]] = {}
+    written: dict[str, str] = {}
+    for hit in check.found or ():
+        key = str(hit.get("dislike") or "").strip().lower()
+        if not key:
+            continue
+        written.setdefault(key, str(hit.get("dislike")))
+        dishes = dishes_for.setdefault(key, [])
+        if hit.get("dish") and hit["dish"] not in dishes:
+            dishes.append(hit["dish"])
+
+    def found_on(row: dict, dishes: list[str]) -> None:
+        row.update(
+            status="violated", measured=_MEASURED_DISLIKE,
+            detail="on the plan: " + ", ".join(dishes),
+            code="dislike.found", params={"dishes": list(dishes)},
+        )
+
+    shown = set()
+    for row in out:
+        if row.get("name_code") != "dislike":
+            continue
+        key = str((row.get("name_params") or {}).get("item") or "").strip().lower()
+        shown.add(key)
+        if key in dishes_for:
+            found_on(row, dishes_for[key])
+    for key, dishes in dishes_for.items():
+        if key in shown:
+            continue
+        row = {
+            "constraint": f"avoiding {written[key]}", "type": "soft",
+            "source": "preferences", "members": [],
+            "name_code": "dislike", "name_params": {"item": written[key]},
+            "added": True,
+        }
+        found_on(row, dishes)
+        out.append(row)
+
+    if check.status == FAILED:
+        measured = [r for r in measured if r.get("constraint") != "dislikes"]
+    return out + measured
+
+
 def _plates(plan) -> list:
     """Every plate on every day, which is the only complete view of a plan."""
     return [
@@ -189,6 +265,7 @@ def verify(plan, requested: dict, enrichment: Optional[dict] = None) -> Verifica
         _check_time(plates, requested, enrichment),
         _check_nutri_score(plates, requested, enrichment),
         _check_pantry(plates, requested),
+        _check_dislikes(plates, requested),
         _check_anchors(plates, requested),
         _check_facets(requested),
     ):
@@ -610,6 +687,48 @@ def _check_nutri_score(plates, requested, enrichment) -> Optional[Check]:
                  detail=f"All {observed} scored dishes are {minimum.upper()} or better",
                  observed=observed, of=len(plates),
                  code="nutri.ok", params={"observed": observed, "minimum": minimum.upper()})
+
+
+def _check_dislikes(plates, requested) -> Optional[Check]:
+    """Whether a food the member dislikes made it onto a plate.
+
+    Measured, not restated: the rule list used to repeat the first five
+    dislikes and mark each "satisfied" without looking, and a member who
+    dislikes fish was served Tuna filo pies under it. Soft — a dish that slips
+    through is named, not withheld; the search already excluded what it could.
+    """
+    from services.dislikes import dislike_hits
+
+    dislikes = [str(d) for d in (requested.get("dislikes") or []) if str(d).strip()]
+    if not dislikes or not plates:
+        return None
+    found: list[dict] = []
+    offenders: list[str] = []
+    for plate in plates:
+        for dislike in dislike_hits(_text(plate), dislikes):
+            found.append({"dish": plate.title, "dislike": dislike})
+            rid = getattr(plate, "recipe_id", None)
+            if rid and rid not in offenders:
+                offenders.append(rid)
+    if found:
+        shown = found[:6]
+        more = len(found) - len(shown)
+        detail = "; ".join(f"{hit['dish']} has {hit['dislike']}" for hit in shown)
+        if more:
+            detail += f" (and {more} more)"
+        return Check(
+            name="dislikes", status=FAILED, detail=detail,
+            offenders=tuple(offenders), observed=len(plates), of=len(plates),
+            code="dislikes.found", params={"hits": shown, "more": more},
+            found=tuple(found),
+        )
+    count = len(dislikes)
+    return Check(
+        name="dislikes", status=PASSED,
+        detail=f"None of the {count} food{'s' if count != 1 else ''} you dislike on any of the {len(plates)} dishes",
+        observed=len(plates), of=len(plates),
+        code="dislikes.clear", params={"count": count, "dishes": len(plates)},
+    )
 
 
 def _check_pantry(plates, requested) -> Optional[Check]:

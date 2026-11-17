@@ -172,7 +172,27 @@ class TestEveryPathIsWired:
         from services.chat_service import ChatService
 
         src = inspect.getsource(getattr(ChatService, method))
-        assert "list(meal_plan.constraints_applied or []) + report.as_ledger_rows()" in src
+        # Through `plan_verifier.merge`, which keeps every declarative row in
+        # place and appends the measured ones; it only folds dislikes in (see
+        # test_dislikes). The behaviour is pinned below, not just the call.
+        flat = " ".join(src.split()).replace("( ", "(").replace(" )", ")")
+        assert "plan_verifier.merge(meal_plan.constraints_applied, report)" in flat
+
+    def test_merge_keeps_declarative_rows_first_and_appends_measurements(self):
+        from services import plan_verifier as pv
+
+        declared = [
+            {"constraint": "no peanuts", "type": "hard", "status": "satisfied",
+             "source": "allergy", "members": ["Tom"]},
+            {"constraint": "vegetarian", "type": "hard", "status": "satisfied",
+             "source": "dietary group", "members": ["Anna"]},
+        ]
+        report = pv.VerificationReport(checks=[
+            pv.Check(name="allergens", status=pv.PASSED, detail="clear"),
+        ])
+        merged = pv.merge(declared, report)
+        assert merged[:2] == declared
+        assert merged[2]["source"] == "measured on the plan"
 
     @pytest.mark.parametrize("method", ["_generate_and_store", "_generate_structured"])
     def test_a_failed_check_reaches_the_reply(self, method):

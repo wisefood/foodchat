@@ -159,8 +159,41 @@ class TestAPlanKeepsItsRequest:
         finally:
             service._sessions.pop("s-snapshot", None)
         assert snapshot["message"] == "Plan my week"
+        assert snapshot["messages"] == ["hello", "Plan my week"]
         assert snapshot["reading"]["spec"]["num_days"] == 7
         assert snapshot["profile"] == {"allergies": ["peanut"], "food_dislikes": ["fish"], "calorie_target": 2000}
+
+    def test_the_request_starts_after_the_previous_plan(self):
+        """A second plan's request is what was said since the first one."""
+        import services
+        from models.session import Message
+
+        service = services.session_service
+        fake = SimpleNamespace(
+            conversation=[
+                Message(role="user", content="Plan my day"),
+                Message(role="assistant", content="Anything you crave?"),
+                Message(role="user", content="Surprise me"),
+                Message(role="assistant", content="Your day", plan_id="plan-1"),
+                Message(role="user", content="Make dinner vegetarian"),
+            ],
+            user_profile={},
+        )
+        service._sessions["s-snapshot-2"] = fake
+        try:
+            snapshot = json.loads(service._plan_request("s-snapshot-2"))
+        finally:
+            service._sessions.pop("s-snapshot-2", None)
+        assert snapshot["messages"] == ["Make dinner vegetarian"]
+
+        fake.conversation = fake.conversation[:4]
+        fake.conversation[3] = Message(role="assistant", content="Your day")
+        service._sessions["s-snapshot-2"] = fake
+        try:
+            snapshot = json.loads(service._plan_request("s-snapshot-2"))
+        finally:
+            service._sessions.pop("s-snapshot-2", None)
+        assert snapshot["messages"] == ["Plan my day", "Surprise me"]
 
     def test_no_session_still_saves_the_plan(self):
         import services

@@ -441,9 +441,8 @@ class WeeklyPlanService:
                             )
 
                 if report.checks:
-                    explainability["constraints_applied"] = (
-                        list(explainability.get("constraints_applied") or [])
-                        + report.as_ledger_rows()
+                    explainability["constraints_applied"] = plan_verifier.merge(
+                        explainability.get("constraints_applied"), report
                     )
 
                 # The same food-group coverage the daily path measures, on the

@@ -669,8 +669,8 @@ class ChatService:
         report = plan_verifier.verify(meal_plan, brief.to_requested(), enrichment)
         logger.info("[%s] Verified: %s", session_id, plan_verifier.describe(report))
         if report.checks:
-            meal_plan.constraints_applied = (
-                list(meal_plan.constraints_applied or []) + report.as_ledger_rows()
+            meal_plan.constraints_applied = plan_verifier.merge(
+                meal_plan.constraints_applied, report
             )
 
         # What the member's own dietary guidelines asked for, counted on the
@@ -699,10 +699,10 @@ class ChatService:
                 # the pre-repair ones are replaced rather than appended to. The
                 # declarative rows stay: they carry `source`, which a
                 # measurement cannot know.
-                meal_plan.constraints_applied = [
+                meal_plan.constraints_applied = plan_verifier.merge([
                     row for row in (meal_plan.constraints_applied or [])
                     if row.get("source") != "measured on the plan"
-                ] + report.as_ledger_rows()
+                ], report)
             repair_note = plan_repair.describe(outcome)
 
         self.session_service.resave_meal_plan(meal_plan)
@@ -898,8 +898,8 @@ class ChatService:
             # replacing it: the declarative rows carry `source` (which diner a
             # constraint is for), which a measurement cannot know, and the
             # measured rows carry evidence, which a declaration cannot have.
-            meal_plan.constraints_applied = (
-                list(meal_plan.constraints_applied or []) + report.as_ledger_rows()
+            meal_plan.constraints_applied = plan_verifier.merge(
+                meal_plan.constraints_applied, report
             )
 
         # One repair pass. The verifier names the plates that failed a hard
@@ -917,10 +917,10 @@ class ChatService:
                 # the pre-repair ones are replaced rather than appended to. The
                 # declarative rows stay: they carry `source`, which a
                 # measurement cannot know.
-                meal_plan.constraints_applied = [
+                meal_plan.constraints_applied = plan_verifier.merge([
                     row for row in (meal_plan.constraints_applied or [])
                     if row.get("source") != "measured on the plan"
-                ] + report.as_ledger_rows()
+                ], report)
             repair_note = plan_repair.describe(outcome)
 
         if is_refinement:

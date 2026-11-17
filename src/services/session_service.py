@@ -466,6 +466,8 @@ class SessionService:
         "food_likes", "food_dislikes", "preferences", "age_group",
     )
 
+    _REQUEST_MAX_MESSAGES = 6
+
     def _plan_request(self, session_id: str) -> Optional[str]:
         """What this plan was asked for, as JSON, or None if unknowable.
 
@@ -477,16 +479,23 @@ class SessionService:
         """
         try:
             session = self._sessions.get(session_id)
-            message = None
+            # Everything the member wrote since the previous plan: a request
+            # is often two messages ("Plan my day", then the answer to
+            # FoodChat's question), and the answer alone says little.
+            asked: list[str] = []
             if session:
                 for item in reversed(session.conversation):
-                    if item.role == "user":
-                        message = item.content
+                    if item.role == "assistant" and getattr(item, "plan_id", None):
                         break
+                    if item.role == "user":
+                        asked.insert(0, item.content)
+                        if len(asked) >= self._REQUEST_MAX_MESSAGES:
+                            break
             profile = dict((session.user_profile if session else None) or {})
             state = profile.get(self.PLANNING_STATE_KEY)
             return json.dumps({
-                "message": message,
+                "message": asked[-1] if asked else None,
+                "messages": asked,
                 "reading": state if isinstance(state, dict) else None,
                 "profile": {k: profile.get(k) for k in self._REQUEST_PROFILE_FIELDS if k in profile},
             }, default=str)
