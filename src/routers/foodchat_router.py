@@ -885,6 +885,11 @@ def _finalize_turn(session_id: str, turn) -> ChatTurnResponse:
     must not turn a successful turn into a 500.
     """
     services.session_service.attach_turn_extras(session_id, _turn_extras(turn))
+    # Which intent the turn had and which plan it made, on its messages, so a
+    # reviewer reading the conversation back can tell which message asked for
+    # which plan. Best-effort, like the extras.
+    plan = turn.weekly_meal_plan or turn.meal_plan
+    services.session_service.stamp_turn(session_id, turn.intent, getattr(plan, "id", None))
     return _chat_turn_response(turn)
 
 

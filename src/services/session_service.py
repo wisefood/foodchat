@@ -39,6 +39,7 @@ from db import (
     db_get_session_meal_plans,
     db_get_meal_plan,
     db_set_last_assistant_extras,
+    db_stamp_last_turn,
     db_update_meal_plan_payload,
 )
 from models.recipe import CandidateRecipe
@@ -435,6 +436,64 @@ class SessionService:
                     break
         return ok
 
+    def stamp_turn(self, session_id: str, intent: Optional[str], plan_id: Optional[str]) -> bool:
+        """Record which intent a turn had and which plan it produced, on its
+        messages. Best-effort like `attach_turn_extras`: a reviewer losing the
+        link is a pity, a member losing a turn over it would be a bug."""
+        if not intent and not plan_id:
+            return False
+        db = SessionLocal()
+        try:
+            ok = db_stamp_last_turn(db, session_id, intent, plan_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[%s] Could not stamp the turn: %s", session_id, exc)
+            return False
+        finally:
+            db.close()
+        session = self._sessions.get(session_id)
+        if session:
+            for message in reversed(session.conversation):
+                if message.role == "assistant":
+                    message.intent = message.intent or intent
+                    message.plan_id = message.plan_id or plan_id
+                    break
+        return ok
+
+    #: The profile fields a plan is built around, kept with each plan so a
+    #: reviewer can set what was asked beside what came out.
+    _REQUEST_PROFILE_FIELDS = (
+        "diet", "allergies", "calorie_target", "dietary_goals", "min_nutri_score",
+        "food_likes", "food_dislikes", "preferences", "age_group",
+    )
+
+    def _plan_request(self, session_id: str) -> Optional[str]:
+        """What this plan was asked for, as JSON, or None if unknowable.
+
+        The member's latest message, FoodChat's reading of the request (the
+        planning state: days, meals, anchors, pantry, tags, time limit), and the
+        profile fields planned around. Saved with the plan because the planning
+        state is overwritten by the next turn: without a copy, "asked for" and
+        "got" can only be compared for the newest plan. Never raises.
+        """
+        try:
+            session = self._sessions.get(session_id)
+            message = None
+            if session:
+                for item in reversed(session.conversation):
+                    if item.role == "user":
+                        message = item.content
+                        break
+            profile = dict((session.user_profile if session else None) or {})
+            state = profile.get(self.PLANNING_STATE_KEY)
+            return json.dumps({
+                "message": message,
+                "reading": state if isinstance(state, dict) else None,
+                "profile": {k: profile.get(k) for k in self._REQUEST_PROFILE_FIELDS if k in profile},
+            }, default=str)
+        except Exception:  # noqa: BLE001
+            logger.debug("[%s] No request snapshot for the plan", session_id, exc_info=True)
+            return None
+
     def get_messages_page(
         self,
         session_id: str,
@@ -487,6 +546,7 @@ class SessionService:
                 db, meal_plan.id, session_id, "daily",
                 _serialize_meal_plan(meal_plan),
                 version=1, parent_id=None,
+                request=self._plan_request(session_id),
             )
         finally:
             db.close()
@@ -525,6 +585,7 @@ class SessionService:
                 db, meal_plan.id, session_id, "daily",
                 _serialize_meal_plan(meal_plan),
                 version=meal_plan.version, parent_id=meal_plan.parent_id,
+                request=self._plan_request(session_id),
             )
         finally:
             db.close()
@@ -575,6 +636,7 @@ class SessionService:
                 db, meal_plan.id, session_id, "daily",
                 _serialize_meal_plan(meal_plan),
                 version=meal_plan.version, parent_id=meal_plan.parent_id,
+                request=self._plan_request(session_id),
             )
         finally:
             db.close()
@@ -626,6 +688,7 @@ class SessionService:
                 db, meal_plan.id, session_id, "daily",
                 _serialize_meal_plan(meal_plan),
                 version=next_version, parent_id=parent_id,
+                request=self._plan_request(session_id),
             )
         finally:
             db.close()
@@ -675,6 +738,7 @@ class SessionService:
                 db, weekly_plan.id, session_id, "weekly",
                 _serialize_weekly_plan(weekly_plan),
                 version=1, parent_id=None,
+                request=self._plan_request(session_id),
             )
         finally:
             db.close()
@@ -732,6 +796,7 @@ class SessionService:
                 db, weekly_plan.id, session_id, "weekly",
                 _serialize_weekly_plan(weekly_plan),
                 version=next_version, parent_id=parent_id,
+                request=self._plan_request(session_id),
             )
         finally:
             db.close()

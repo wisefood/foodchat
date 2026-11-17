@@ -69,3 +69,16 @@ def get_plan_summary(plan_id: str):
     if summary is None:
         raise HTTPException(status_code=404, detail="No such meal plan")
     return summary
+
+
+@router.get("/sessions/{session_id}/transcript")
+def get_session_transcript(session_id: str):
+    """One conversation, turn by turn, with its plans and what each was asked for.
+
+    404 when the conversation is gone: members delete conversations and
+    sessions are pruned, and the console says so rather than erroring.
+    """
+    transcript = CHAT_REVIEW_SERVICE.transcript(session_id)
+    if transcript is None:
+        raise HTTPException(status_code=404, detail="No such conversation")
+    return transcript

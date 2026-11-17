@@ -5,11 +5,19 @@ a rating, a message id, and nothing else. The reviewer saw that somebody was
 unhappy and had no way to see what they were unhappy *about* — the id points at
 a row in this service's database, and the console has no route to it.
 
-This is the route. Deliberately narrow: one message, the turns immediately
-around it, and nothing else. Enough to judge the complaint, not a general
-window onto anyone's chat history. Beside it, one plan by id — what FoodChat
-put on the table, never what the member typed — so a session read in the
-console can say what a plan was, not only that one was made.
+This is the route: one message and the turns immediately around it. Beside
+it, one plan by id, so a session read in the console can say what a plan was,
+not only that one was made.
+
+**And one conversation, whole** (`transcript`), added on 2026-11-17 at the
+research team's request: a reviewer studying how FoodChat reads requests
+needs what a person typed, turn by turn, and what came back — and, for each
+plan, what it was asked for (the message, FoodChat's reading of it, the
+profile planned around) beside what it produced. It is a wider window than
+the rest of this module, so it stays narrow in every other way: one
+conversation per read, by its id, which the console only has from a session
+it is already looking at; the same admin/expert gate and expert-activity
+record at the gateway; long messages truncated as elsewhere.
 
 **Authorization lives at the gateway**, which requires an admin or expert token
 and records the read as expert activity. This service verifies the caller is
@@ -39,6 +47,10 @@ MAX_WINDOW = 20
 #: Chat messages are free text a person wrote. Truncated so a reviewer sees
 #: the exchange without the inbox becoming a transcript store.
 MAX_CONTENT_CHARS = 4000
+
+#: A conversation is capped at 200 messages by the session itself; this is a
+#: ceiling on the read, not a policy.
+MAX_TRANSCRIPT_MESSAGES = 400
 
 
 def _to_dict(row: Any, *, rated: bool) -> Dict[str, Any]:
@@ -145,6 +157,65 @@ class ChatReviewService:
         }
 
 
+    def transcript(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """One conversation, every turn in order, with its plans and what each
+        plan was asked for. None when the conversation is gone.
+
+        Messages carry the intent FoodChat read and the plan a reply produced
+        (stamped per turn since 2026-11-17; older turns have neither). Plans
+        come as a list beside them, each with `request` — the member's message,
+        FoodChat's reading of it and the profile it planned around — so "asked"
+        and "produced" sit side by side; the dishes are one `plan_summary`
+        away. Ordered by id, like `message_context`.
+        """
+        from db import MealPlanRow, MessageRow, SessionLocal, SessionRow
+
+        if not session_id:
+            return None
+        db = SessionLocal()
+        try:
+            session = db.query(SessionRow).filter(SessionRow.session_id == str(session_id)).first()
+            if session is None:
+                return None
+            rows = (
+                db.query(MessageRow)
+                .filter(MessageRow.session_id == session.session_id)
+                .order_by(MessageRow.id.asc())
+                .limit(MAX_TRANSCRIPT_MESSAGES + 1)
+                .all()
+            )
+            plans = (
+                db.query(MealPlanRow)
+                .filter(MealPlanRow.session_id == session.session_id)
+                .order_by(MealPlanRow.created_at.asc())
+                .all()
+            )
+        except Exception:
+            logger.warning("chat_review.transcript_failed id=%s", session_id, exc_info=True)
+            return None
+        finally:
+            db.close()
+
+        return {
+            "session_id": session.session_id,
+            "created_at": session.created_at.isoformat() if session.created_at else None,
+            "messages": [_to_dict(row, rated=False) for row in rows[:MAX_TRANSCRIPT_MESSAGES]],
+            # A conversation longer than this is cut, and says so.
+            "truncated": len(rows) > MAX_TRANSCRIPT_MESSAGES,
+            "plans": [
+                {
+                    "plan_id": plan.id,
+                    "plan_type": plan.plan_type,
+                    "version": plan.version,
+                    "parent_id": plan.parent_id,
+                    "saved": bool(plan.saved),
+                    "created_at": plan.created_at.isoformat() if plan.created_at else None,
+                    "request": _load_json(getattr(plan, "request", None)),
+                }
+                for plan in plans
+            ],
+        }
+
     def plan_summary(self, plan_id: str) -> Optional[Dict[str, Any]]:
         """What one meal plan put on the table, and how it was judged.
 
@@ -192,6 +263,8 @@ class ChatReviewService:
             "scores": [] if weekly else _scores(payload),
             "metrics": payload.get("metrics") if weekly else None,
             "constraints_applied": list(payload.get("constraints_applied") or []),
+            # What the plan was asked for. None for plans made before it was kept.
+            "request": _load_json(getattr(row, "request", None)),
         }
 
 

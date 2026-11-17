@@ -127,6 +127,11 @@ class MealPlanRow(Base):
     version = Column(Integer, nullable=False, default=1)
     parent_id = Column(String, nullable=True)        # id of previous version, NULL for v1
     payload = Column(Text, nullable=False)           # full plan as JSON
+    # What the plan was asked for: the member's message, how FoodChat read it,
+    # and the profile it planned around (JSON). Kept apart from `payload` so a
+    # shared plan can never carry what somebody typed; read only by the review
+    # routes, which the gateway restricts to admins and experts.
+    request = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), default=utcnow)
 
 
@@ -191,6 +196,7 @@ def _migrate_existing_db() -> None:
             ("saved", "INTEGER NOT NULL DEFAULT 0"),
             ("saved_title", "TEXT"),
             ("saved_at", "TIMESTAMP"),
+            ("request", "TEXT"),
         ]:
             if col_name not in existing_plan_cols:
                 conn.execute(sa.text(f"ALTER TABLE meal_plans ADD COLUMN {col_name} {col_type}"))
@@ -399,6 +405,46 @@ def db_set_last_assistant_extras(
     return True
 
 
+def db_stamp_last_turn(
+    db: DBSession, session_id: str, intent: Optional[str], plan_id: Optional[str],
+) -> bool:
+    """Write the turn's intent and plan onto the messages it produced.
+
+    The columns existed from the start and every handler left them empty, so a
+    reviewer reading a conversation back could not tell which message asked
+    for which plan. Stamped here, once per turn, for the same reason as
+    `db_set_last_assistant_extras`: the newest assistant row IS this turn's
+    reply. The member's message before it gets the intent too: how FoodChat
+    read what they typed. A value already set is never overwritten.
+    """
+    reply = (
+        db.query(MessageRow)
+        .filter(MessageRow.session_id == session_id, MessageRow.role == "assistant")
+        .order_by(MessageRow.id.desc())
+        .first()
+    )
+    if reply is None:
+        return False
+    if intent and not reply.intent:
+        reply.intent = intent
+    if plan_id and not reply.plan_id:
+        reply.plan_id = plan_id
+    asked = (
+        db.query(MessageRow)
+        .filter(
+            MessageRow.session_id == session_id,
+            MessageRow.role == "user",
+            MessageRow.id < reply.id,
+        )
+        .order_by(MessageRow.id.desc())
+        .first()
+    )
+    if asked is not None and intent and not asked.intent:
+        asked.intent = intent
+    db.commit()
+    return True
+
+
 def db_get_messages(
     db: DBSession,
     session_id: str,
@@ -432,6 +478,7 @@ def db_save_meal_plan(
     payload: dict,
     version: int = 1,
     parent_id: Optional[str] = None,
+    request: Optional[str] = None,
 ) -> MealPlanRow:
     row = MealPlanRow(
         id=plan_id,
@@ -440,6 +487,7 @@ def db_save_meal_plan(
         version=version,
         parent_id=parent_id,
         payload=json.dumps(payload),
+        request=request,
     )
     db.add(row)
     db.commit()

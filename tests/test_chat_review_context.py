@@ -160,7 +160,10 @@ class TestItLivesApartFromTheMemberScopedRouter:
         paths = {route.path for route in foodchat_router.router.routes}
         assert not any("review" in path for path in paths)
 
-    def test_the_review_router_exposes_only_the_two_reads(self):
+    def test_the_review_router_exposes_only_the_three_reads(self):
+        """Every route here reads conversations the caller does not own, so
+        each one is a decision. The transcript was added on purpose (see the
+        service's docstring); a fourth needs the same."""
         from routers import review_router
 
         methods = {
@@ -170,6 +173,7 @@ class TestItLivesApartFromTheMemberScopedRouter:
         assert methods == {
             ("/foodchat/review/messages/{message_id}/context", ("GET",)),
             ("/foodchat/review/plans/{plan_id}", ("GET",)),
+            ("/foodchat/review/sessions/{session_id}/transcript", ("GET",)),
         }
 
     def test_it_is_documented_as_gateway_gated(self):
